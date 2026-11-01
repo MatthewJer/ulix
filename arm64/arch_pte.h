@@ -16,6 +16,7 @@ typedef unsigned long u64;
 #define PTE_AF      (1UL << 10)
 #define PTE_PXN     (1UL << 53)
 #define PTE_UXN     (1UL << 54)
+#define PTE_COW     (1UL << 55)             // software bit (ignored by the hardware): copy-on-write page
 #define PTE_ADDR    0x0000FFFFFFFFF000UL
 
 #define PAGE_RW     (PTE_PAGE | PTE_ATTR (1) | PTE_SH | PTE_AF | PTE_PXN | PTE_UXN)

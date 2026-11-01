@@ -15,3 +15,8 @@ Your options are ...
 * lecture notes of Ulix-based courses (on the [http://ulixos.org/](http://ulixos.org/) page) 
 
 Note: ulix-book.nw is the literate document.
+
+## ARM64 port
+Ulix also runs on 64-bit ARM (AArch64) in `qemu-system-aarch64`, for example on Apple-silicon Macs. The x86 version still builds as before.
+See [`arm64/README.md`](arm64/README.md) (build, run, tests, and how the port reuses the code of this book) and
+[`ARM64-PORT.md`](ARM64-PORT.md) (work log, in German).

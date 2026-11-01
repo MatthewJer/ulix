@@ -4,6 +4,7 @@
 #include "ulix.h"
 
 extern u64 kernel_l0[512];
+extern int arch_cow_fault (u64 va);
 extern char __kernel_end[];
 
 #define RAM_START   0x40000000UL
@@ -11,6 +12,8 @@ extern char __kernel_end[];
 
 // ---- frame allocator: bump pointer first, free list for released frames ----
 static u64 next_free;                       // physical address
+static unsigned short frame_refs[RAM_SIZE / PAGE_SIZE];     // how many page table entries use a frame (COW)
+#define REFS(pa)  frame_refs[((pa) - RAM_START) / PAGE_SIZE]
 static u64 free_list = 0;                   // singly linked through the frames themselves
 long frames_in_use = 0;
 
@@ -42,22 +45,29 @@ u64 alloc_frame (void) {                    // returns a zeroed frame (physical 
   }
   zero_page (KVA (pa));
   frames_in_use++;
+  REFS (pa) = 1;
   return pa;
 }
 
 u64 alloc_frames_contig (int n) {           // only the bump area is contiguous
   u64 first = bump ();
   zero_page (KVA (first));
-  for (int i = 1; i < n; i++) zero_page (KVA (bump ()));
+  REFS (first) = 1;
+  for (int i = 1; i < n; i++) { u64 pa = bump (); zero_page (KVA (pa)); REFS (pa) = 1; }
   frames_in_use += n;
   return first;
 }
 
+// give up one reference; the frame is free when nobody uses it any more
 void free_frame (u64 pa) {
+  if (--REFS (pa) > 0) return;
   *(u64 *)KVA (pa) = free_list;
   free_list = pa;
   frames_in_use--;
 }
+
+void get_frame (u64 pa)       { REFS (pa)++; }                  // one more user of the frame (fork shares pages)
+int  frame_refcount (u64 pa)  { return REFS (pa); }
 
 // ---- page tables ----
 #define IDX(va, lvl) (((va) >> (39 - 9 * (lvl))) & 511)
@@ -115,6 +125,9 @@ u64 user_to_phys (u64 va, int write) {
   u64 par;
   if (write) __asm__ volatile ("at s1e1w, %1; isb; mrs %0, par_el1" : "=r" (par) : "r" (va));
   else       __asm__ volatile ("at s1e1r, %1; isb; mrs %0, par_el1" : "=r" (par) : "r" (va));
+  if ((par & 1) && write && arch_cow_fault (va)) {         // a shared page: copy it, then try again
+    __asm__ volatile ("at s1e1w, %1; isb; mrs %0, par_el1" : "=r" (par) : "r" (va));
+  }
   if (par & 1) return 0;
   return (par & PTE_ADDR) | (va & 0xfff);
 }
@@ -153,4 +166,27 @@ void sync_icache (void *p, u64 len) {
   u64 a = (u64)p & ~63UL;
   for (; a < (u64)p + len; a += 64) __asm__ volatile ("dc cvau, %0" :: "r" (a) : "memory");
   __asm__ volatile ("dsb ish; ic ialluis; dsb ish; isb");
+}
+
+
+// ---- copy-on-write ----
+// fork() maps the pages of the parent in the child, too, and marks both entries read-only with PTE_COW.
+// The first write (by the process, or by the kernel inside a system call) causes a permission fault;
+// cow_fault() then gives the writer its own copy. Returns 1 if the fault was a COW fault and is resolved.
+int cow_fault (u64 l0_pa, u64 va) {
+  if (va < USER_MIN || va >= USER_MAX) return 0;
+  u64 *e = walk (KVA (l0_pa), va & ~(PAGE_SIZE - 1), 0);
+  if (!e || !(*e & PTE_VALID) || !(*e & PTE_COW)) return 0;
+  u64 old = *e & PTE_ADDR, flags = *e & ~(PTE_ADDR | PTE_RO | PTE_COW);
+  if (REFS (old) == 1) {                                   // the last user: just make it writable again
+    *e = old | flags;
+  } else {
+    u64 pa = alloc_frame ();
+    u64 *src = KVA (old), *dst = KVA (pa);
+    for (int i = 0; i < (int)(PAGE_SIZE / 8); i++) dst[i] = src[i];
+    REFS (old)--;                                          // we no longer use the shared frame
+    *e = pa | flags;
+  }
+  __asm__ volatile ("dsb ishst; tlbi vaae1is, %0; dsb ish; isb" :: "r" (va >> 12));
+  return 1;
 }

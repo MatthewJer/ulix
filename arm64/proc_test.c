@@ -104,6 +104,15 @@ int proc_test (void) {
   CHECK (count_in (out, "worker 2 round 2") == 1 && count_in (out, "child: pid") == 1, "children printed their lines");
   CHECK (live_threads () == 0, "all processes are gone");
 
+  // copy-on-write fork
+  char *cow_argv[] = { "cowtest64", 0 };
+  capture_start ();
+  pid = run ("/cowtest64", 1, cow_argv);
+  capture_stop (&out);
+  CHECK (pid > 0 && thread_table[pid].exitcode == 0, "/cowtest64 finished with exit status 0 (no failed checks)");
+  CHECK (count_in (out, "user FAIL") == 0 && count_in (out, "user ok:") == 10, "all 10 copy-on-write checks passed");
+  CHECK (live_threads () == 0, "no process is left");
+
   // signals: handler with exact register restore, SIG_IGN, default action, SIGSTOP/SIGCONT/SIGKILL
   char *sig_argv[] = { "sigtest64", 0 };
   capture_start ();

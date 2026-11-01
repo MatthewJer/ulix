@@ -10,3 +10,4 @@ verify.log
 ulix-console.elf
 ulix-shell.elf
 userland/build/
+check-el*.log

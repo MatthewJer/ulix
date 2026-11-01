@@ -5,7 +5,7 @@ CFLAGS = -O1 -g0 -ffreestanding -nostdlib -fno-builtin -fno-stack-protector -fno
          -mgeneral-regs-only -std=gnu99 -Wall
 LDFLAGS = -nostdlib -static -z max-page-size=4096 -z noexecstack -T user.ld
 
-PROGS = hello.elf cat.elf crash.elf forktest.elf sigtest.elf contest.elf
+PROGS = hello.elf cat.elf crash.elf forktest.elf sigtest.elf contest.elf cowtest.elf
 
 all: $(PROGS)
 

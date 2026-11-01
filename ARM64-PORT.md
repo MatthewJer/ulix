@@ -345,3 +345,35 @@ Das System bootet jetzt wie das x86-Original: `/init` → `/bin/login` (automati
 x86: Von 353 Funktionen im Kernel-Objekt unterscheiden sich nur `hexdump`, `mx_open`, `mx_rmdir`, `syscall_waitpid`, `u_chdir`, `u_open` und die zwei Semaphor-Funktionen (alles Korrekturen); der x86-Kernel bootet mit identischer Ausgabe, der `.text`-Abschnitt der x86-Bibliothek ist unverändert.
 
 **Offen:** keine Pthreads (`thread`, `mutex`-Werkzeuge laufen nicht), kein Swap, keine VGA-Funktionen (`vi`, Cursor-Positionierung), `recurse` (x86-Assembler); das `ls`-Werkzeug zeigt keine Zeiten, da die Uhr nicht aus dem PL031 gelesen wird (Zeitstempel 0).
+
+
+## 19. Schritt 7: Uhr, Copy-on-Write, ein Befehl für alle Tests, Dokumentation
+
+- **Uhr** (`arch_clock.c`): `system_start_time` kommt aus der PL031-RTC des Boards, `system_ticks`/`system_time` werden wie im
+  Timer-Handler des Buchs fortgeschrieben (100 Hz). Dateien bekommen jetzt echte Zeitstempel (`ls -l`, `stat`).
+- **Copy-on-Write für `fork`** (`mmu.c`, `arch_thread.c`, `irq.c`): Beschreibbare Seiten werden in Eltern- und Kindprozess
+  schreibgeschützt und mit einem Software-Bit (Bit 55) markiert, jeder Frame hat einen Referenzzähler. Der erste Schreibzugriff
+  löst einen Permission Fault aus; `cow_fault` kopiert die Seite (oder macht sie wieder beschreibbar, wenn der Frame nur noch einen
+  Nutzer hat). Der Fall „der Kernel schreibt im Systemaufruf in einen Benutzerpuffer“ (`read`, `waitpid`) läuft über dieselbe Fehlerbehandlung
+  im EL1, der Befehl wird wiederholt; `user_to_phys` löst COW ebenfalls auf. Code-Seiten (schreibgeschützt) werden dauerhaft geteilt.
+  Test `user/cowtest.c` zählt freie Frames: `fork` kopiert keine Datenseiten, Lesen kopiert nichts, Schreiben kopiert genau die 64
+  betroffenen Seiten, der Elternprozess behält seine Daten, nach dem Ende des Kindes sind alle Frames zurück (10 Prüfungen).
+- **`make check`** führt alles aus: Kerneltests (EL1 mit Legacy-virtio, EL2 mit modernem virtio, je 104 Prüfungen), `make verify`
+  (Schreibtests plus unabhängige Prüfung des Images), `make console-test` (21), `make shell-test` (63). Dauer etwa 2 Minuten.
+  `make run-shell` startet das System zum Selbstbedienen.
+- **Dokumentation:** `arm64/README.md` (Englisch, im Stil des Repositorys), Abschnitt im Haupt-`README.md`, dieser Bericht.
+
+**Bewusst nicht gemacht:**
+- **Buffer Cache des Buchs:** Er verzögert Schreibzugriffe (ein Flush-Thread schreibt später). Die Tests, die das Image von außen prüfen,
+  setzen voraus, dass geschrieben ist; der Gewinn (weniger Plattenzugriffe) ist unter qemu gering. `writeblock` schreibt durch.
+- **Pthreads** (`u_pthread_create` baut x86-Stacks): bräuchte einen ARM64-Entwurf für mehrere Threads je Adressraum
+  (gemeinsame TTBR0-Tabelle, getrennte Kernel- und User-Stacks, Referenzzähler am Adressraum).
+- **Swap** (`page_out`, Swapper-Prozess): setzt die x86-Frametabelle und ihre Seitenersetzung voraus; mit COW und 128 MByte RAM ohne
+  praktischen Nutzen.
+- **Rückführung als Kapitel ins Buch:** `ulix-arm64.nw` ist bereits eine kommentierte noweb-Datei, aber ein eigenes Kapitel in
+  `ulix-book.nw` wäre ein größerer Eingriff in den TeX-Text, den ich ohne LaTeX-Installation nicht prüfen konnte
+  (`make pdf` ist hier nicht möglich).
+- **Echte Hardware:** GICv3, Device-Tree, Cache-Wartung für DMA, andere Boards.
+
+**Zählung des Umfangs:** 13 Commits auf dem Branch `arm64-port`; im Buch 213 Zeilen hinzugefügt, 49 geändert (alles x86-neutral oder
+Fehlerkorrekturen); im Verzeichnis `arm64/` rund 4 000 Zeilen (ohne die aus dem Buch erzeugten Teile).

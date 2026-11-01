@@ -83,6 +83,8 @@ int thread_test (void) {
   fails = 0;
   long frames_before = frames_in_use;
   arch_threads_init ();
+  CHECK (system_start_time > 1700000000UL && system_time >= system_start_time,
+         "the clock starts at a plausible Unix time (after November 2023)");
   CHECK (current_task == 1 && thread_table[0].next == 1 && thread_table[1].next == 0,
          "idle thread 1 is the only entry of the ready queue");
 

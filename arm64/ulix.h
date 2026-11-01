@@ -37,7 +37,10 @@ extern volatile u64 fault_esr, fault_far;
 void frames_init (void);
 u64  alloc_frame (void);                    // zeroed frame, returns physical address
 u64  alloc_frames_contig (int n);           // n zeroed, physically contiguous frames
-void free_frame (u64 pa);
+void free_frame (u64 pa);                   // drops one reference
+void get_frame (u64 pa);                    // adds one reference (shared page)
+int  frame_refcount (u64 pa);
+int  cow_fault (u64 l0_pa, u64 va);
 extern long frames_in_use;
 int  map_page (u64 va, u64 pa, u64 flags);                   // kernel (TTBR1)
 int  map_page_in (u64 l0_pa, u64 va, u64 pa, u64 flags);     // any address space

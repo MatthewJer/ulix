@@ -12,6 +12,8 @@ extern int  book_current_pid (void);
 extern void arch_signal_check (void *frame);
 extern void uart_rx_irq (void);
 extern void uart_rx_enable (void);
+extern void arch_clock_tick (void);
+extern int  arch_cow_fault (u64 va);
 
 // ---- GICv2 on qemu "virt" ------------------------------------------------
 #define GICD_BASE   (KERNEL_VA + 0x08000000UL)
@@ -68,7 +70,7 @@ void exc_handler (struct frame *f, int kind) {
     u32 irq = iar & 0x3ff;
     if (irq < 1020) GICC_EOIR = iar;        // acknowledge first: nested interrupts must be possible
                                             // (the kernel shell waits for keys inside the UART handler)
-    if (irq == IRQ_TIMER) { ticks++; timer_reload (); }
+    if (irq == IRQ_TIMER) { ticks++; timer_reload (); arch_clock_tick (); }
     else if (irq == IRQ_UART) { if (book_scheduler_on) uart_rx_irq (); }
     else if (irq < 1020) printf ("spurious IRQ %u\n", irq);
     if (irq == IRQ_TIMER && book_scheduler_on) book_timer_tick ();   // time slice over (10 ms)
@@ -80,6 +82,12 @@ void exc_handler (struct frame *f, int kind) {
   __asm__ volatile ("mrs %0, esr_el1" : "=r" (esr));
   __asm__ volatile ("mrs %0, far_el1" : "=r" (far));
   u32 ec = esr >> 26;
+
+  // write to a copy-on-write page (a permission fault on a write): from user mode, or from the kernel while
+  // it writes into a user buffer during a system call. After the copy the instruction is simply repeated.
+  if (kind == 0 && (ec == 0x24 || ec == 0x25) && (esr & (1 << 6)) && (esr & 0x3c) == 0x0c &&
+      far < 0x80000000UL && book_scheduler_on && arch_cow_fault (far))
+    return;
 
   if (kind == 0 && ec == 0x15) {            // SVC from AArch64
     if (from_user) { book_syscall (f); arch_signal_check (f); return; }       // the book's system call dispatcher

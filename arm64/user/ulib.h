@@ -29,6 +29,8 @@ static inline long syscall3 (long nr, long a, long b, long c) {
 #define SYS_lseek   19
 #define SYS_getpid  20
 #define SYS_getppid 64
+#define SYS_brk     45
+#define SYS_free_frames 509
 #define SYS_kill    37
 #define SYS_signal  48
 #define SYS_resign  66
@@ -55,6 +57,8 @@ typedef void (*sighandler_t) (int);
 #define SIGUSR2  31
 static inline sighandler_t signal (int sig, sighandler_t f) { return (sighandler_t)syscall3 (SYS_signal, sig, (long)f, 0); }
 static inline int  kill (int pid, int sig)                  { return syscall3 (SYS_kill, pid, sig, 0); }
+static inline void *sbrk (int incr)                         { return (void *)(long)syscall3 (SYS_brk, incr, 0, 0); }
+static inline int  get_free_frames (void)                   { return syscall3 (SYS_free_frames, 0, 0, 0); }
 static inline int  close (int fd)                          { return syscall3 (SYS_close, fd, 0, 0); }
 static inline int  lseek (int fd, int off, int whence)     { return syscall3 (SYS_lseek, fd, off, whence); }
 

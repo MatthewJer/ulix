@@ -19,6 +19,8 @@ struct kctx { u64 x19_x28[10]; u64 x29, x30, sp, sp_el0; };      // layout known
 extern void cpu_switch (struct kctx *old, struct kctx *new);
 extern u64  alloc_frames_contig (int n);
 extern void free_frame (u64 pa);
+extern void get_frame (u64 pa);
+extern int  cow_fault (u64 l0_pa, u64 va);
 extern u64  alloc_frame (void);
 extern u64  new_user_l0 (void);
 extern void free_user_space (u64 l0_pa);
@@ -36,6 +38,7 @@ extern void exit_exception (void);
 static struct kctx kctx[MAX_THREADS];
 static void arch_syscalls_init (void);
 void syscall_sigreturn (context_t *r);
+void arch_clock_init (void);
 void arch_syscall_clrscr (context_t *r);
 void arch_syscall_idle (context_t *r);
 void arch_syscall_ignore (context_t *r);
@@ -130,6 +133,7 @@ void arch_threads_init (void) {
   add_to_ready_queue (1);
   current_task = 1;
   next_pid = 3;                                // pids 1 (idle) and 2 (init) are protected by the book's kill()
+  arch_clock_init ();                          // system_start_time from the real-time clock
   current_mounts = 1;                          // the book mounts three disks; there is one: / (its /tmp and /mnt are plain directories)
   buffer_lock = get_new_lock ("buffer");       // the book creates it when it initializes the buffer cache
   scheduler_is_active = true;
@@ -225,7 +229,9 @@ void destroy_address_space (addr_space_id id) {
   address_spaces[id].status = AS_FREE;
 }
 
-// copy every mapped page of a user address space (no copy-on-write, like the book's fork)
+// Duplicate a user address space for fork(): the child gets the same frames. Read-only pages (the code) are
+// shared for good; writable pages become copy-on-write in parent AND child (both entries read-only, marked
+// PTE_COW, the frame has one more reference), the copy is made by cow_fault() at the first write.
 static int clone_level (u64 old_pa, u64 new_l0, int lvl, u64 va_prefix) {
   u64 *t = KVA (old_pa);
   for (int i = 0; i < 512; i++) {
@@ -235,14 +241,21 @@ static int clone_level (u64 old_pa, u64 new_l0, int lvl, u64 va_prefix) {
     if (lvl < 3) {
       if (clone_level (e & PTE_ADDR, new_l0, lvl + 1, va) < 0) return -1;
     } else {
-      u64 pa = alloc_frame ();
-      u64 *src = KVA (e & PTE_ADDR), *dst = KVA (pa);
-      for (int k = 0; k < (int)(PAGE / 8); k++) dst[k] = src[k];
-      if (!(e & PTE_UXN)) sync_icache (dst, PAGE);          // executable page: make the copy fetchable
+      u64 pa = e & PTE_ADDR;
+      if (!(e & PTE_RO)) {                                  // writable: copy-on-write from now on
+        e |= PTE_RO | PTE_COW;
+        t[i] = e;                                           // the parent's entry, too
+      }
+      get_frame (pa);
       if (map_page_in (new_l0, va, pa, e & ~PTE_ADDR) != 0) { free_frame (pa); return -1; }
     }
   }
   return 0;
+}
+
+// fault handler for write accesses to shared pages (called from the exception handler)
+int arch_cow_fault (u64 va) {
+  return cow_fault (as_l0[current_as], va);
 }
 
 // Map the user stack and build  [argc][argv]  at its top, with the argument strings and the
@@ -367,7 +380,9 @@ int u_fork (context_t *r) {
   if (new_as == -1) return -1;
   u64 nl0 = new_user_l0 ();
   as_l0[new_as] = nl0;
-  if (clone_level (as_l0[old_as], nl0, 0, 0) < 0) { destroy_address_space (new_as); return -1; }
+  int cloned = clone_level (as_l0[old_as], nl0, 0, 0);
+  __asm__ volatile ("dsb ishst; tlbi vmalle1; dsb ish; isb" ::: "memory");   // the parent's pages are read-only now
+  if (cloned < 0) { destroy_address_space (new_as); return -1; }
   address_spaces[new_as].memstart = address_spaces[old_as].memstart;
   address_spaces[new_as].memend   = address_spaces[old_as].memend;
 

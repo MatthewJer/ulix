@@ -11,7 +11,7 @@ CFLAGS = -I$(GENDIR) -O0 -g -ffreestanding -nostdlib -fno-builtin -fno-stack-pro
 # "-snapshot" keeps the file unmodified when running.
 DISK ?= disk.img
 
-OBJS = start.o vectors.o irq.o mmu.o virtio.o minixfs.o elf.o ulix-port.o glue.o arch_thread.o arch_console.o \
+OBJS = start.o vectors.o irq.o mmu.o virtio.o minixfs.o elf.o ulix-port.o glue.o arch_thread.o arch_console.o arch_clock.o \
        bookfs_test.o thread_test.o proc_test.o kmain.o
 
 all: ulix.elf ulix-console.elf ulix-shell.elf $(DISK) $(GENDIR)/disk_expected.h
@@ -22,13 +22,13 @@ USERLAND_BIN = userland/build/bin
 userland/build/bin/init.elf: FORCE
 	$(MAKE) -C userland
 
-disk.img: $(wildcard userland/build/bin/*.elf) ../bin-build/minixdata.img user/hello.elf user/cat.elf user/crash.elf user/forktest.elf user/sigtest.elf user/contest.elf userland/build/bin/init.elf tools/minix_add.py
+disk.img: $(wildcard userland/build/bin/*.elf) ../bin-build/minixdata.img user/hello.elf user/cat.elf user/crash.elf user/forktest.elf user/sigtest.elf user/contest.elf user/cowtest.elf userland/build/bin/init.elf tools/minix_add.py
 	cp ../bin-build/minixdata.img $@
 	# two deliberately broken variants of hello.elf for the loader tests:
 	# e_machine = EM_386, and a code segment with flags RWX
 	python3 -c "d=bytearray(open('user/hello.elf','rb').read()); d[18]=3; d[19]=0; open('bad-arch.elf','wb').write(d)"
 	python3 -c "d=bytearray(open('user/hello.elf','rb').read()); d[68]=7; open('bad-wx.elf','wb').write(d)"
-	python3 tools/minix_add.py $@ --grow=4096 --chmod=/tmp:1777 hello64=user/hello.elf cat64=user/cat.elf crash64=user/crash.elf forktest64=user/forktest.elf sigtest64=user/sigtest.elf contest64=user/contest.elf \
+	python3 tools/minix_add.py $@ --grow=4096 --chmod=/tmp:1777 hello64=user/hello.elf cat64=user/cat.elf crash64=user/crash.elf forktest64=user/forktest.elf sigtest64=user/sigtest.elf contest64=user/contest.elf cowtest64=user/cowtest.elf \
 		badarch64=bad-arch.elf badwx64=bad-wx.elf \
 		/init=$(USERLAND_BIN)/init.elf \
 		$$(for f in $(USERLAND_BIN)/*.elf; do n=$$(basename $$f .elf); [ $$n != init ] && echo /bin/$$n=$$f; done)
@@ -88,6 +88,9 @@ bookfs_test.o: bookfs_test.c $(GENFILES) $(GENDIR)/ulix-api.h
 arch_thread.o: arch_thread.c $(GENFILES) $(GENDIR)/ulix-api.h
 	$(CC) $(BOOKFLAGS) -Dhash=arch_unused_hash -c -o $@ $<
 
+arch_clock.o: arch_clock.c $(GENFILES) $(GENDIR)/ulix-api.h
+	$(CC) $(BOOKFLAGS) -Dhash=clock_unused_hash -c -o $@ $<
+
 arch_console.o: arch_console.c $(GENFILES) $(GENDIR)/ulix-api.h
 	$(CC) $(BOOKFLAGS) -Dhash=console_unused_hash -c -o $@ $<
 
@@ -121,6 +124,27 @@ verify: ulix.elf $(DISK)
 	grep -E "FAIL|RESULT" verify.log; true
 	python3 tools/minix_check.py disk-after.img --files | grep -E "keep|d1/|inodes|leaked|PROBLEM"
 
+# Use the system: boots /init -> login -> shell on this terminal. Ctrl-C ends the foreground program, Ctrl-T 2 switches
+# to terminal 2, Ctrl-] opens the kernel shell, Ctrl-A X leaves qemu. Changes to the disk are discarded (-snapshot).
+run-shell: ulix-shell.elf $(DISK)
+	qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128 -nographic -kernel ulix-shell.elf -snapshot \
+		-drive file=$(DISK),format=raw,if=none,id=hd0 -device virtio-blk-device,drive=hd0
+
+# Everything: kernel test suites (EL1 with the legacy and EL2 with the modern virtio transport), the file system
+# check of the modified image, the console test and the complete shell session.
+check: ulix.elf ulix-console.elf ulix-shell.elf $(DISK)
+	@echo "== kernel tests, started at EL1, virtio legacy transport"
+	tools/run_kernel_tests.sh ulix.elf $(DISK) check-el1.log
+	@echo "== kernel tests, started at EL2, virtio modern transport"
+	tools/run_kernel_tests.sh ulix.elf $(DISK) check-el2.log -M virt,virtualization=on -global virtio-mmio.force-legacy=false
+	@echo "== write tests on a copy of the disk, then independent check of the file system"
+	$(MAKE) --no-print-directory verify
+	@echo "== console test"
+	$(MAKE) --no-print-directory console-test
+	@echo "== shell session"
+	$(MAKE) --no-print-directory shell-test
+	@echo "== ALL TESTS PASSED"
+
 # Interactive console test: types into the UART of a second kernel image and checks the answers
 console-test: ulix-console.elf $(DISK)
 	python3 tools/console_test.py ulix-console.elf $(DISK)
@@ -133,4 +157,4 @@ clean:
 	$(MAKE) -C user clean
 	rm -rf gen
 	$(MAKE) -C userland clean
-	rm -f *.o ulix.elf ulix-console.elf ulix-shell.elf disk.img disk-after.img verify.log bad-arch.elf bad-wx.elf
+	rm -f check-el1.log check-el2.log *.o ulix.elf ulix-console.elf ulix-shell.elf disk.img disk-after.img verify.log bad-arch.elf bad-wx.elf

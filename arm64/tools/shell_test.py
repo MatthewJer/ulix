@@ -70,6 +70,7 @@ try:
     run('wc h2', r'16 45 316 h2', 'wc counts 16 lines, 45 words, 316 bytes', P)
     run('grep Hello h2', r'printf \("Hello World', 'grep finds the line', P)
     run('stat h2', r'size:\s+316', 'stat shows size 316', P)
+    run('stat h2', r'mtime:\s+1[7-9]\d{8}', 'the new file has a current modification time', P)
     run('mkdir d', r'', 'mkdir d', P)
     run('ls', r'f1.*h2.*d/', 'ls shows f1, h2 and d/', P)
     run('wc h2 > out', r'', 'output redirection with >', P)

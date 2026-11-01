@@ -201,3 +201,4 @@ function atoi
 function atoi8
 function dev_getdent
 function syscall_setterm
+global system_start_time
