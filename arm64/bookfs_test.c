@@ -140,6 +140,24 @@ int bookfs_test (void) {
   // (mx_mkdir itself does not check whether the directory exists; u_mkdir above it does)
   CHECK (mx_open (DEV, "/missing/x", O_RDONLY) == -1, "open in a missing directory fails");
 
+  // ---- rmdir: the removed directory goes away, the one that contained it keeps . and .. ----
+  {
+    int before = count_entries ("/");
+    mx_mkdir (DEV, "/rmme", 0755);
+    mx_stat (DEV, "/", &st);
+    int root_links = st.st_nlink;
+    CHECK (count_entries ("/") == before + 1, "mkdir /rmme adds an entry to /");
+    CHECK (mx_rmdir (DEV, "/rmme", "/rmme") == 0 && !mx_file_exists (DEV, "/rmme"), "mx_rmdir removes the directory");
+    struct dir_entry e;
+    CHECK (count_entries ("/") == before, "/ has the same entries as before");
+    CHECK (mx_getdent (DEV, "/", 0, &e) == 0 && strequal ((char *)e.filename, ".") &&
+           mx_getdent (DEV, "/", 1, &e) == 0 && strequal ((char *)e.filename, ".."),
+           "/ still has its . and .. entries (the book's mx_rmdir used to unlink those of the parent)");
+    mx_stat (DEV, "/", &st);
+    CHECK (st.st_nlink == root_links - 1 || st.st_nlink == root_links,
+           "link count of / is consistent");
+  }
+
   // ---- a new file that gets the inode number of a deleted one must start empty ----
   {
     int other = mx_open (DEV, "/hello.c", O_RDONLY);       // some file must be open, otherwise mx_open skips the table lookup

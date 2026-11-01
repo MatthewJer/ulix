@@ -10905,6 +10905,23 @@ we've shown earlier:
 \vspace{-0.5mm}
 The return value of
 the system call can then be read from \register{EAX}. The following functions 
+On the ARM64 port the same convention is used with other registers: the system call number goes
+into [[x0]] (and the result comes back there), the arguments into [[x1]]--[[x5]], and the instruction is
+[[svc #0]]. The macro [[ARM64_SYSCALL_ASM]] hides that; the x86 code is selected with [[#if]]
+and stays exactly as shown.
+
+<<ulixlib macro definitions>>=
+#if !defined(__i386__)
+#define ARM64_SYSCALL_ASM(result, nr, a1, a2, a3, a4, a5) {                 \
+  register long x0 __asm__ ("x0") = (nr);  register long x1 __asm__ ("x1") = (a1);   \
+  register long x2 __asm__ ("x2") = (a2);  register long x3 __asm__ ("x3") = (a3);   \
+  register long x4 __asm__ ("x4") = (a4);  register long x5 __asm__ ("x5") = (a5);   \
+  __asm__ volatile ("svc #0" : "+r" (x0)                                    \
+                    : "r" (x1), "r" (x2), "r" (x3), "r" (x4), "r" (x5) : "memory"); \
+  (result) = (int)x0; }
+#endif
+@
+
 %nouse
 <<ulixlib function prototypes>>=
 inline int syscall4 (int eax, int ebx, int ecx, int edx);
@@ -10920,7 +10937,11 @@ functions such as [[open]], [[read]], [[write]] or [[fork]]:
 <<ulixlib function implementations>>=
 inline int syscall4 (int eax, int ebx, int ecx, int edx) {
   int result;
+#if defined(__i386__)
   asm ( "int $0x80" : "=a" (result) : "a" (eax), "b" (ebx), "c" (ecx), "d" (edx) );
+#else
+  ARM64_SYSCALL_ASM (result, eax, ebx, ecx, edx, 0, 0);
+#endif
   return result;
 }
 @ %def syscall4
@@ -10932,19 +10953,31 @@ The other functions work identically, just with less parameters which are stored
 <<ulixlib function implementations>>=
 inline int syscall3 (int eax, int ebx, int ecx) {
   int result;
+#if defined(__i386__)
   asm ( "int $0x80" : "=a" (result) : "a" (eax), "b" (ebx), "c" (ecx) );
+#else
+  ARM64_SYSCALL_ASM (result, eax, ebx, ecx, 0, 0, 0);
+#endif
   return result;
 }
 
 inline int syscall2 (int eax, int ebx) {
   int result;
+#if defined(__i386__)
   asm ( "int $0x80" : "=a" (result) : "a" (eax), "b" (ebx) );
+#else
+  ARM64_SYSCALL_ASM (result, eax, ebx, 0, 0, 0, 0);
+#endif
   return result;
 }
 
 inline int syscall1 (int eax) {
   int result;
+#if defined(__i386__)
   asm ( "int $0x80" : "=a" (result) : "a" (eax) );
+#else
+  ARM64_SYSCALL_ASM (result, eax, 0, 0, 0, 0, 0);
+#endif
   return result;
 }
 @ %def syscall1 syscall2 syscall3
@@ -11774,8 +11807,11 @@ woken up automatically.
 \enlargethispage{1cm}
 The return value of [[waitpid]] is the process ID of the terminated child ([[chpid]]) or $-1$ in case of an error. Since [[syscall_exit()]] has updated the [[exitcode]] field of the child's TCB, we can just read it.
 
+Many programs are not interested in the exit code and pass a null pointer as [[status]]
+(for example [[waitpid (pid, 0, 0)]]); writing through it would write to address 0.
+
 <<syscall functions>>=
-  *status = thread_table[chpid].exitcode;
+  if (status != 0)  *status = thread_table[chpid].exitcode;
   thread_table[chpid].used = false;  // finally remove child process
   eax_return (chpid);                // set the return value
 }
@@ -24103,7 +24139,9 @@ int mx_rmdir (int device, const char *fullpath, const char *path) {
   u_getcwd ((char*)cwd, 256);
   
   if (mx_directory_is_empty (device, path)) {
-    if (u_chdir (dir) == -1) { return -1; }
+    // . and .. are unlinked relative to the working directory, so we must be inside the directory
+    // that we remove (not in the directory that contains it: that one needs its . and ..)
+    if (u_chdir (abspath) == -1) { return -1; }
     if (u_unlink (".")      == -1) { u_chdir (cwd); return -1; }
     if (u_unlink ("..")     == -1) { u_chdir (cwd); return -1; }
     if (u_unlink (fullpath) == -1) { u_chdir (cwd); return -1; }
@@ -29441,10 +29479,29 @@ We have modified the [[print]] function so that it recognizes the [[%o]]
 (binary) format words and prints numbers with base 8 or base 2, respectively. 
 
 %BREAK BEFORE DEFINES
+The [[print]] function reads its arguments directly from the stack: on the x86 all arguments of a
+function call lie there, one 4-byte slot after the other, and [[varg]] points to the first one (the
+format string). Other processors pass arguments in registers, so the ARM64 port uses the standard
+[[va_arg]] mechanism instead; the macros below hide the difference and expand to exactly the
+expressions that you see in the x86 version.
+
 <<public [[printf]] implementation>>=
-static int print (char **out, int *varg) {
+#if defined(__i386__)
+#define PRINT_ARGS          int *
+#define PRINT_FORMAT(v)     (*(v)++)
+#define PRINT_NEXT_INT(v)   (*(v)++)
+#define PRINT_NEXT_PTR(v)   (*((char **)(v)++))
+#else
+struct print_args { __builtin_va_list ap; const char *format; };
+#define PRINT_ARGS          struct print_args *
+#define PRINT_FORMAT(v)     ((v)->format)
+#define PRINT_NEXT_INT(v)   (__builtin_va_arg ((v)->ap, int))
+#define PRINT_NEXT_PTR(v)   (__builtin_va_arg ((v)->ap, char *))
+#endif
+
+static int print (char **out, PRINT_ARGS varg) {
   register int width, pad; register int pc = 0;
-  register char *format = (char *)(*varg++); register char *s; char scr[2];
+  register char *format = (char *)PRINT_FORMAT (varg); register char *s; char scr[2];
   for (; *format != 0; ++format) {
     if (*format == '%') {
       ++format; width = pad = 0;
@@ -29456,16 +29513,16 @@ static int print (char **out, int *varg) {
         width *= 10;  width += *format - '0';
       }
       switch (*format) {
-        case 's': s = *((char **)varg++);
+        case 's': s = PRINT_NEXT_PTR (varg);
                   pc += prints (out, s?s:"(null)", width, pad);         continue;
-        case 'd': pc += printi (out, *varg++, 10, 1, width, pad, 'a');  continue;
-        case 'o': pc += printi (out, *varg++,  8, 0, width, pad, 'a');  continue;
-        case 'b': pc += printi (out, *varg++,  2, 0, width, pad, 'a');  continue;
-        case 'x': pc += printi (out, *varg++, 16, 0, width, pad, 'a');  continue;
-        case 'X': pc += printi (out, *varg++, 16, 0, width, pad, 'A');  continue;
-        case 'u': pc += printi (out, *varg++, 10, 0, width, pad, 'a');  continue;
+        case 'd': pc += printi (out, PRINT_NEXT_INT (varg), 10, 1, width, pad, 'a');  continue;
+        case 'o': pc += printi (out, PRINT_NEXT_INT (varg),  8, 0, width, pad, 'a');  continue;
+        case 'b': pc += printi (out, PRINT_NEXT_INT (varg),  2, 0, width, pad, 'a');  continue;
+        case 'x': pc += printi (out, PRINT_NEXT_INT (varg), 16, 0, width, pad, 'a');  continue;
+        case 'X': pc += printi (out, PRINT_NEXT_INT (varg), 16, 0, width, pad, 'A');  continue;
+        case 'u': pc += printi (out, PRINT_NEXT_INT (varg), 10, 0, width, pad, 'a');  continue;
         case 'c': // char are converted to int then pushed on the stack
-                  scr[0] = *varg++;  scr[1] = '\0';
+                  scr[0] = PRINT_NEXT_INT (varg);  scr[1] = '\0';
                   pc += prints (out, scr, width, pad);                  continue;
       }      
     } else {
@@ -29479,6 +29536,7 @@ static int print (char **out, int *varg) {
 @ %def print
 
 <<public [[printf]] implementation>>=
+#if defined(__i386__)
 int printf (const char *format, ...) {
   register int *varg = (int *)(&format); return print (0, varg);
 }
@@ -29486,6 +29544,23 @@ int printf (const char *format, ...) {
 int sprintf (char *out, const char *format, ...) {
   register int *varg = (int *)(&format); return print (&out, varg);
 }
+#else
+int printf (const char *format, ...) {
+  struct print_args pa;  pa.format = format;
+  __builtin_va_start (pa.ap, format);
+  int result = print (0, &pa);
+  __builtin_va_end (pa.ap);
+  return result;
+}
+
+int sprintf (char *out, const char *format, ...) {
+  struct print_args pa;  pa.format = format;
+  __builtin_va_start (pa.ap, format);
+  int result = print (&out, &pa);
+  __builtin_va_end (pa.ap);
+  return result;
+}
+#endif
 @ %def printf sprintf
 
 

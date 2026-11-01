@@ -1,10 +1,11 @@
+GENDIR = gen
 # Ulix ARM64 port, stage 2: bare-metal skeleton for qemu-system-aarch64 -M virt
 # Toolchain: brew install aarch64-elf-gcc aarch64-elf-binutils qemu
 CROSS ?= aarch64-elf-
 CC    = $(CROSS)gcc
 LD    = $(CROSS)ld
 OBJCOPY = $(CROSS)objcopy
-CFLAGS = -O0 -g -ffreestanding -nostdlib -fno-builtin -fno-stack-protector -mgeneral-regs-only -std=c99 -Wall
+CFLAGS = -I$(GENDIR) -O0 -g -ffreestanding -nostdlib -fno-builtin -fno-stack-protector -mgeneral-regs-only -std=c99 -Wall
 
 # Disk image: the Minix image of the x86 version plus the AArch64 user programs.
 # "-snapshot" keeps the file unmodified when running.
@@ -13,18 +14,31 @@ DISK ?= disk.img
 OBJS = start.o vectors.o irq.o mmu.o virtio.o minixfs.o elf.o ulix-port.o glue.o arch_thread.o arch_console.o \
        bookfs_test.o thread_test.o proc_test.o kmain.o
 
-all: ulix.elf ulix-console.elf $(DISK)
+all: ulix.elf ulix-console.elf ulix-shell.elf $(DISK) $(GENDIR)/disk_expected.h
 
-disk.img: ../bin-build/minixdata.img user/hello.elf user/cat.elf user/crash.elf user/forktest.elf user/sigtest.elf user/contest.elf tools/minix_add.py
+# the programs of lib-build/tools and init, compiled for AArch64 (see userland/Makefile)
+USERLAND_BIN = userland/build/bin
+
+userland/build/bin/init.elf: FORCE
+	$(MAKE) -C userland
+
+disk.img: $(wildcard userland/build/bin/*.elf) ../bin-build/minixdata.img user/hello.elf user/cat.elf user/crash.elf user/forktest.elf user/sigtest.elf user/contest.elf userland/build/bin/init.elf tools/minix_add.py
 	cp ../bin-build/minixdata.img $@
 	# two deliberately broken variants of hello.elf for the loader tests:
 	# e_machine = EM_386, and a code segment with flags RWX
 	python3 -c "d=bytearray(open('user/hello.elf','rb').read()); d[18]=3; d[19]=0; open('bad-arch.elf','wb').write(d)"
 	python3 -c "d=bytearray(open('user/hello.elf','rb').read()); d[68]=7; open('bad-wx.elf','wb').write(d)"
-	python3 tools/minix_add.py $@ --grow=4096 hello64=user/hello.elf cat64=user/cat.elf crash64=user/crash.elf forktest64=user/forktest.elf sigtest64=user/sigtest.elf contest64=user/contest.elf \
-		badarch64=bad-arch.elf badwx64=bad-wx.elf
+	python3 tools/minix_add.py $@ --grow=4096 --chmod=/tmp:1777 hello64=user/hello.elf cat64=user/cat.elf crash64=user/crash.elf forktest64=user/forktest.elf sigtest64=user/sigtest.elf contest64=user/contest.elf \
+		badarch64=bad-arch.elf badwx64=bad-wx.elf \
+		/init=$(USERLAND_BIN)/init.elf \
+		$$(for f in $(USERLAND_BIN)/*.elf; do n=$$(basename $$f .elf); [ $$n != init ] && echo /bin/$$n=$$f; done)
 
 # the user programs are rebuilt by their own Makefile whenever a source changed
+# size and checksum of files on the disk, computed by the independent Python parser
+$(GENDIR)/disk_expected.h: $(DISK) tools/disk_expected.py tools/minix_check.py
+	mkdir -p $(GENDIR)
+	python3 tools/disk_expected.py $(DISK) /init /bin/vi /hello.c /test.txt > $@
+
 user/%.elf: FORCE
 	$(MAKE) -C user
 
@@ -33,8 +47,17 @@ FORCE:
 ulix-console.elf: $(filter-out kmain.o,$(OBJS)) kmain-console.o ulix.ld
 	$(LD) -T ulix.ld -o $@ $(filter-out kmain.o,$(OBJS)) kmain-console.o
 
+kmain.o kmain-console.o kmain-shell.o: $(GENDIR)/disk_expected.h
+
 kmain-console.o: kmain.c ulix.h
 	$(CC) $(CFLAGS) -DCONSOLE_MODE -c -o $@ $<
+
+# ulix-shell.elf boots like the x86 kernel: it starts /init, which starts /bin/login and the shell
+ulix-shell.elf: $(filter-out kmain.o,$(OBJS)) kmain-shell.o ulix.ld
+	$(LD) -T ulix.ld -o $@ $(filter-out kmain.o,$(OBJS)) kmain-shell.o
+
+kmain-shell.o: kmain.c ulix.h
+	$(CC) $(CFLAGS) -DCONSOLE_MODE -DCONSOLE_PROGRAM='"/init"' -c -o $@ $<
 
 ulix.elf: $(OBJS) ulix.ld
 	$(LD) -T ulix.ld -o $@ $(OBJS)
@@ -42,7 +65,6 @@ ulix.elf: $(OBJS) ulix.ld
 # ---- kernel code taken from the book (ulix-book.nw) ----
 # notangle assembles declarations / globals / functions from the book's chunks; port.py
 # picks the functions listed in port.manifest.  The result is compiled unchanged.
-GENDIR = gen
 GENFILES = $(GENDIR)/ulix-decl.h $(GENDIR)/ulix-globals.c $(GENDIR)/ulix-functions.c $(GENDIR)/ulix-init.c
 
 $(GENFILES): ../ulix-book.nw ulix-arm64.nw
@@ -103,7 +125,12 @@ verify: ulix.elf $(DISK)
 console-test: ulix-console.elf $(DISK)
 	python3 tools/console_test.py ulix-console.elf $(DISK)
 
+# A complete session: init, login, shell and the programs of lib-build/tools
+shell-test: ulix-shell.elf $(DISK)
+	python3 tools/shell_test.py ulix-shell.elf $(DISK)
+
 clean:
 	$(MAKE) -C user clean
 	rm -rf gen
-	rm -f *.o ulix.elf ulix-console.elf disk.img disk-after.img verify.log bad-arch.elf bad-wx.elf
+	$(MAKE) -C userland clean
+	rm -f *.o ulix.elf ulix-console.elf ulix-shell.elf disk.img disk-after.img verify.log bad-arch.elf bad-wx.elf

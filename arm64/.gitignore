@@ -8,3 +8,5 @@ gen/
 disk-after.img
 verify.log
 ulix-console.elf
+ulix-shell.elf
+userland/build/

@@ -28,7 +28,7 @@ struct phdr {
 static int fail (const char *why) { printf ("exec: %s\n", why); return -1; }
 
 // returns 0 and the entry point on success; on failure the caller frees the address space
-int elf_load (u64 l0, u32 ino, u64 *entry) {
+int elf_load (u64 l0, u32 ino, u64 *entry, u64 *image_end) {
   static struct ehdr eh __attribute__ ((aligned (16)));
   static struct phdr ph __attribute__ ((aligned (16)));
   u32 fsize = minix_size (ino);
@@ -43,6 +43,7 @@ int elf_load (u64 l0, u32 ino, u64 *entry) {
                                                          return fail ("bad program header table");
 
   int entry_ok = 0;
+  u64 end = 0;
   for (int i = 0; i < eh.phnum; i++) {
     if (minix_read (ino, eh.phoff + i * sizeof ph, &ph, sizeof ph) != sizeof ph)
                                                          return fail ("cannot read program header");
@@ -56,6 +57,7 @@ int elf_load (u64 l0, u32 ino, u64 *entry) {
 
     u64 flags = (ph.flags & PF_X) ? PAGE_URX : (ph.flags & PF_W) ? PAGE_URW : PAGE_URO;
     u64 seg_end = ph.vaddr + ph.memsz, file_end = ph.vaddr + ph.filesz;
+    if (seg_end > end) end = seg_end;
     for (u64 p = ph.vaddr & ~(PAGE_SIZE - 1); p < seg_end; p += PAGE_SIZE) {
       u64 pa = alloc_frame ();                           // comes zeroed: this is the .bss part
       u64 a = p > ph.vaddr ? p : ph.vaddr;               // file bytes that land in this page
@@ -71,5 +73,6 @@ int elf_load (u64 l0, u32 ino, u64 *entry) {
   }
   if (!entry_ok) return fail ("entry point is not in an executable segment");
   *entry = eh.entry;
+  *image_end = end;
   return 0;
 }

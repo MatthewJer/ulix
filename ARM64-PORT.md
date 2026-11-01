@@ -320,3 +320,28 @@ Neu in `arm64/`:
 Ergebnis in qemu (EL1 und EL2, Legacy- und modernes virtio): **95 Prüfungen im Kernel, alle bestehen**; `make verify` 0 Probleme; `make console-test` 21 Prüfungen. x86: Von 353 Funktionen im Objekt unterscheiden sich genau die bewusst geänderten (`hexdump`, `mx_open`, `u_open`, `u_chdir` und die zwei Semaphor-Funktionen); der x86-Kernel bootet mit identischer Ausgabe.
 
 Offen: kein Erkennen von Escape-Sequenzen (Pfeiltasten), keine mehreren virtuellen Terminals (nur Terminal 0; der Rest der VT-Logik des Buchs entfällt), die Kernel-Shell zeigt keine Statuszeile; der Buffer Cache fehlt weiterhin.
+
+## 18. Schritt 6 der Kernel-Portierung: Das Userland des Buchs läuft (init, login, Shell, 60 Programme)
+
+Das System bootet jetzt wie das x86-Original: `/init` → `/bin/login` (automatische Anmeldung auf Terminal 1 und 2, Login mit Passwort auf den übrigen) → `/bin/sh`, und die Programme aus `lib-build/tools` laufen als AArch64-Binärdateien.
+
+**Aufbau (`arm64/userland/`):** `ulixlib` und `init` werden bei jedem Build aus dem Buch erzeugt, die 59 Programme aus `lib-build/tools/*.c` unverändert mit `aarch64-elf-gcc` übersetzt (`recurse.c` enthält x86-Assembler und entfällt; bei `swapper` ersetzt ein kleiner Platzhalter den Quelltext, es gibt keinen Swap), zusammen mit `init` 60 Programme. Das Linkerskript und der Startcode sind die aus Etappe 7. `make` baut daraus das Image `disk.img`: die ARM64-Programme ersetzen die x86-Programme in `/bin` und `/init` (Blöcke der alten Dateien werden freigegeben, `tools/minix_add.py` kann jetzt Verzeichnisse und Ersetzen). Zweites Kernel-Image `ulix-shell.elf` startet `/init`.
+
+**Änderungen am Buch** (x86-Bibliothek `.text` bit-identisch, Kernel nur an den Stellen, die Fehler korrigieren):
+- Die vier Systemaufruf-Funktionen der Benutzerbibliothek (`syscall1`..`syscall4`) haben einen ARM64-Zweig (`svc #0`, Nummer in `x0`, Argumente `x1`..`x5`).
+- `printf`/`sprintf` der Bibliothek lasen ihre Argumente direkt vom Stack (x86-Aufrufkonvention); über Makros (`PRINT_NEXT_INT` usw.) benutzt ARM64 jetzt `va_arg`, x86 behält dieselben Ausdrücke.
+- **Weitere Fehler im Buch korrigiert** (jeweils beim Testen aufgefallen):
+  1. `syscall_waitpid` schrieb durch den Status-Zeiger, auch wenn dieser 0 war (`login` ruft `waitpid (pid, 0, 0)`). Auf x86 überschreibt das stillschweigend die ersten Bytes des Programms bei Adresse 0, auf ARM64 stürzte der Kernel ab.
+  2. `mx_rmdir` wechselte in das **übergeordnete** Verzeichnis und löschte dort `.` und `..`, statt im zu löschenden Verzeichnis. Danach war das Elternverzeichnis leer. Neuer Test in `bookfs_test.c`.
+
+**Anpassungen an der einen Konsole:**
+- Zehn virtuelle Terminals des Buchs → eine UART: Ausgabe von Prozessen auf einem nicht sichtbaren Terminal wird je Terminal (4 KByte) gepuffert und beim Umschalten ausgegeben. **Strg-T und eine Ziffer** schaltet um (x86: Alt-1..0); nur Terminal 1 bekommt Eingabe-Interrupts zugeordnet, die Eingabepuffer sind je Terminal.
+- Die Mount-Tabelle des Buchs mountet drei Platten (`hda`, `hdb`, `fd1`); hier gibt es eine, `/tmp` und `/mnt` sind normale Verzeichnisse (`/tmp` mit Rechten 1777, auf x86 ist es eine eigene Platte).
+- Zusätzliche Systemaufrufe: `set_errno`, `getpsinfo`, `setpsname`, `isatty`, `mkdir`, `rmdir`, `readdir`, `truncate`, `ftruncate`, `link`, `symlink`, `readlink`, `diskfree`, `sync`, `setuid/setgid/seteuid/setegid`, `login`, `query_ids`, `chown`, `chmod`, `brk` (neue Heap-Verwaltung für 4-Level-Tabellen), `setterm`, `idle` (`wfi`), außerdem Platzhalter für den VGA-Bildschirm (`clrscr` per ANSI).
+- argv-Strings stehen jetzt 512 Byte unter dem Stack-Ende (wie auf x86), weil `ls` Zeichen an sein Argument anhängt.
+
+**Tests** (`make shell-test`, `make console-test`, `make verify`, Kerneltests): Der Shell-Test fährt eine vollständige Sitzung über die UART: Boot, Autologin, `ls`, `cat`, `cd`, `touch`, `cp`, `wc`, `grep`, `stat`, `mkdir`, `rm`, `rmdir`, Umleitung mit `>`, `ps`, `df`, `free`, `echo` mit Strg-C, Terminalwechsel auf Terminal 2 (Root-Shell, `ps`) und zurück, `exit`, erneutes Login mit Passwort. 61 Prüfungen im Shell-Test, 100 Kerneltests (EL1 und EL2), 21 im Konsolentest, `make verify` 0 Probleme. Die Erwartungswerte für Dateigrößen und Prüfsummen kommen beim Bauen vom unabhängigen Python-Parser (`gen/disk_expected.h`).
+
+x86: Von 353 Funktionen im Kernel-Objekt unterscheiden sich nur `hexdump`, `mx_open`, `mx_rmdir`, `syscall_waitpid`, `u_chdir`, `u_open` und die zwei Semaphor-Funktionen (alles Korrekturen); der x86-Kernel bootet mit identischer Ausgabe, der `.text`-Abschnitt der x86-Bibliothek ist unverändert.
+
+**Offen:** keine Pthreads (`thread`, `mutex`-Werkzeuge laufen nicht), kein Swap, keine VGA-Funktionen (`vi`, Cursor-Positionierung), `recurse` (x86-Assembler); das `ls`-Werkzeug zeigt keine Zeiten, da die Uhr nicht aus dem PL031 gelesen wird (Zeitstempel 0).

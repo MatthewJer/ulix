@@ -24,7 +24,7 @@ extern u64  new_user_l0 (void);
 extern void free_user_space (u64 l0_pa);
 extern int  map_page_in (u64 l0_pa, u64 va, u64 pa, u64 flags);
 extern void sync_icache (void *p, u64 len);
-extern int  elf_load (u64 l0, unsigned ino, u64 *entry);
+extern int  elf_load (u64 l0, unsigned ino, u64 *entry, u64 *image_end);
 extern unsigned minix_lookup (const char *path);
 extern int  minix_is_file (unsigned ino);
 extern u64  empty_l0_pa;
@@ -36,7 +36,13 @@ extern void exit_exception (void);
 static struct kctx kctx[MAX_THREADS];
 static void arch_syscalls_init (void);
 void syscall_sigreturn (context_t *r);
+void arch_syscall_clrscr (context_t *r);
+void arch_syscall_idle (context_t *r);
+void arch_syscall_ignore (context_t *r);
+void arch_syscall_free_frames (context_t *r);
+extern long frames_in_use;
 void syscall_readchar (context_t *r);
+void syscall_setterm (context_t *r);
 void syscall_handler (context_t *r);          // defined in the book without a prototype
 static u64 kstack_pa[MAX_THREADS];
 static addr_space_id kstack_as[MAX_THREADS];   // address space of the process the stack belongs to             // physical address of the thread's kernel stack, 0 = none
@@ -124,6 +130,7 @@ void arch_threads_init (void) {
   add_to_ready_queue (1);
   current_task = 1;
   next_pid = 3;                                // pids 1 (idle) and 2 (init) are protected by the book's kill()
+  current_mounts = 1;                          // the book mounts three disks; there is one: / (its /tmp and /mnt are plain directories)
   buffer_lock = get_new_lock ("buffer");       // the book creates it when it initializes the buffer cache
   scheduler_is_active = true;
   book_scheduler_on = 1;
@@ -263,7 +270,9 @@ static u64 build_user_stack (u64 l0, int argc, char **argv) {
     if (map_page_in (l0, USER_STACK_TOP - i * PAGE, pa, PAGE_URW) != 0) return 0;
   }
   byte *page = KVA (top_pa);
-  u64 base = USER_STACK_TOP - PAGE, sp = USER_STACK_TOP, ptrs[16];
+  // Leave some room above the strings: programs like ls append characters to their argv strings
+  // (the x86 kernel puts the arguments 512 bytes below the top of the stack, too).
+  u64 base = USER_STACK_TOP - PAGE, sp = USER_STACK_TOP - 512, ptrs[16];
   if (argc > 15) argc = 15;
   for (int i = argc - 1; i >= 0; i--) {
     int len = strlen (argv[i]) + 1;
@@ -401,13 +410,15 @@ int u_execv (char *filename, char *const argv[], memaddress *newstack) {
   unsigned ino = minix_lookup (filename);
   if (!ino || !minix_is_file (ino)) return -1;
 
-  u64 nl0 = new_user_l0 (), entry;
-  if (elf_load (nl0, ino, &entry) != 0) { free_user_space (nl0); return -1; }
+  u64 nl0 = new_user_l0 (), entry, image_end;
+  if (elf_load (nl0, ino, &entry, &image_end) != 0) { free_user_space (nl0); return -1; }
   u64 sp = build_user_stack (nl0, argc, kargv);
   if (!sp) { free_user_space (nl0); return -1; }
 
   u64 old = as_l0[current_as];                           // from here on there is no way back
   as_l0[current_as] = nl0;
+  address_spaces[current_as].memstart = 0x400000;
+  address_spaces[current_as].memend   = image_end;      // the program break starts behind the image
   arch_activate_as (current_as);
   free_user_space (old);
   *newstack = sp;
@@ -420,10 +431,12 @@ int arch_start_user (const char *path, int argc, char **argv) {
   if (!ino || !minix_is_file (ino)) { printf ("exec: %s: no such file\n", path); return -1; }
   int as = as_alloc ();
   if (as == -1) return -1;
-  u64 l0 = new_user_l0 (), entry;
+  u64 l0 = new_user_l0 (), entry, image_end = 0;
   as_l0[as] = l0;
   u64 sp = 0;
-  if (elf_load (l0, ino, &entry) == 0) sp = build_user_stack (l0, argc, argv);
+  if (elf_load (l0, ino, &entry, &image_end) == 0) sp = build_user_stack (l0, argc, argv);
+  address_spaces[as].memstart = 0x400000;
+  address_spaces[as].memend   = image_end;
   if (!sp) { destroy_address_space (as); return -1; }
 
   thread_id tid = register_new_tcb (as);
@@ -477,6 +490,39 @@ static void arch_syscalls_init (void) {
   install_syscall_handler (__NR_signal,    syscall_signal);
   install_syscall_handler (__NR_kill,      syscall_kill);
   install_syscall_handler (__NR_readchar,  syscall_readchar);
+  // file system, identities, process information (used by the programs in lib-build/tools)
+  install_syscall_handler (__NR_set_errno, syscall_set_errno);
+  install_syscall_handler (__NR_getpsinfo, syscall_getpsinfo);
+  install_syscall_handler (__NR_setpsname, syscall_setpsname);
+  install_syscall_handler (__NR_isatty,    syscall_isatty);
+  install_syscall_handler (__NR_mkdir,     syscall_mkdir);
+  install_syscall_handler (__NR_rmdir,     syscall_rmdir);
+  install_syscall_handler (__NR_readdir,   syscall_getdent);
+  install_syscall_handler (__NR_truncate,  syscall_truncate);
+  install_syscall_handler (__NR_ftruncate, syscall_ftruncate);
+  install_syscall_handler (__NR_link,      syscall_link);
+  install_syscall_handler (__NR_symlink,   syscall_symlink);
+  install_syscall_handler (__NR_readlink,  syscall_readlink);
+  install_syscall_handler (__NR_diskfree,  syscall_diskfree);
+  install_syscall_handler (__NR_sync,      syscall_sync);
+  install_syscall_handler (__NR_setuid32,  syscall_setuid);
+  install_syscall_handler (__NR_setgid32,  syscall_setgid);
+  install_syscall_handler (__NR_setreuid32, syscall_seteuid);
+  install_syscall_handler (__NR_setregid32, syscall_setegid);
+  install_syscall_handler (__NR_login,     syscall_login);
+  install_syscall_handler (__NR_query_ids, syscall_query_ids);
+  install_syscall_handler (__NR_chown,     syscall_chown);
+  install_syscall_handler (__NR_chmod,     syscall_chmod);
+  install_syscall_handler (__NR_brk,       syscall_sbrk);
+  // there is no VGA screen: these only exist so that programs written for it keep working
+  install_syscall_handler (__NR_idle,      arch_syscall_idle);
+  install_syscall_handler (__NR_clrscr,    arch_syscall_clrscr);
+  install_syscall_handler (__NR_setterm,   syscall_setterm);
+  install_syscall_handler (__NR_get_xy,    arch_syscall_ignore);
+  install_syscall_handler (__NR_set_xy,    arch_syscall_ignore);
+  install_syscall_handler (__NR_read_screen,  arch_syscall_ignore);
+  install_syscall_handler (__NR_write_screen, arch_syscall_ignore);
+  install_syscall_handler (__NR_get_free_frames, arch_syscall_free_frames);
   install_syscall_handler (ARCH_NR_SIGRETURN, syscall_sigreturn);
 }
 
@@ -523,4 +569,33 @@ void syscall_sigreturn (context_t *r) {
   saved.spsr = r->spsr;                                             // the saved state must stay EL0t
   if (saved.elr >= 0x80000000UL) saved.elr = 0, saved.ebx = (unsigned long)-1;
   *r = saved;
+}
+
+
+// ---- the heap: sbrk() ----
+// The book's u_sbrk() works on x86 page tables.  Here the heap starts at the end of the loaded image
+// (address_spaces[].memend) and grows upwards, one fresh frame per page; it cannot shrink.
+void *u_sbrk (int incr) {
+  addr_space_id as = current_as;
+  memaddress old = address_spaces[as].memend;
+  if (incr == 0) return (void *)old;
+  if (incr < 0) return (void *)-1;                       // shrinking is not supported
+  memaddress end = old + incr;
+  if (end > USER_STACK_TOP - 0x100000UL) return (void *)-1;     // keep 1 MByte below the stack
+  for (u64 va = (old + PAGE - 1) & ~(PAGE - 1); va < end; va += PAGE) {
+    if (map_page_in (as_l0[as], va, alloc_frame (), PAGE_URW) != 0) return (void *)-1;
+  }
+  address_spaces[as].memend = end;
+  return (void *)old;
+}
+
+
+// ---- system calls that exist for the VGA screen / the x86 frame table ----
+void arch_syscall_clrscr (context_t *r)  { printf ("\033[2J\033[H"); }       // ANSI: clear the terminal
+void arch_syscall_ignore (context_t *r)  { r->eax = 0; }
+void arch_syscall_free_frames (context_t *r) { r->eax = 32768 - frames_in_use; }   // 128 MByte of RAM
+
+// the idle system call: wait for the next interrupt (x86: sti; hlt; cli)
+void arch_syscall_idle (context_t *r) {
+  __asm__ volatile ("msr daifclr, #2; wfi; msr daifset, #2" ::: "memory");
 }

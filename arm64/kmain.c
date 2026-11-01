@@ -1,6 +1,7 @@
 // Ulix ARM64 -- kernel entry, PL011 console, minimal printf
 
 #include "ulix.h"
+#include "disk_expected.h"       // sizes and checksums of files on the disk, from the independent Python parser
 
 
 #define UART0_BASE  (KERNEL_VA + 0x09000000UL)   // PL011 on qemu "virt", via the linear map
@@ -163,13 +164,13 @@ static void disk_test (void) {
   // reference values computed on the host from the same image with an independent parser
   u32 size, sum;
   sum = file_sum ("/hello.c", &size);
-  CHECK (size == 316 && sum == 22888, "/hello.c: 316 bytes, checksum matches");
+  CHECK (size == EXPECT_HELLO_C_SIZE && sum == EXPECT_HELLO_C_SUM, "/hello.c: size and checksum match");
   sum = file_sum ("/test.txt", &size);
-  CHECK (size == 1680 && sum == 82026, "/test.txt: two zones, checksum matches");
+  CHECK (size == EXPECT_TEST_TXT_SIZE && sum == EXPECT_TEST_TXT_SUM, "/test.txt: two zones, size and checksum match");
   sum = file_sum ("/init", &size);
-  CHECK (size == 8192 && sum == 592953, "/init: 8 KByte (uses the indirect zone), checksum matches");
+  CHECK (size == EXPECT_INIT_SIZE && sum == EXPECT_INIT_SUM && size > 7 * 1024, "/init: more than 7 KByte (indirect zone), checksum matches");
   sum = file_sum ("/bin/vi", &size);
-  CHECK (size == 25348 && sum == 1364660, "/bin/vi: 25 KByte through a subdirectory, checksum matches");
+  CHECK (size == EXPECT_BIN_VI_SIZE && sum == EXPECT_BIN_VI_SUM && size > 7 * 1024, "/bin/vi: through a subdirectory, checksum matches");
 
   u8 text[64];
   long got = minix_read (minix_lookup ("/hello.c"), 0, text, 40);
@@ -192,8 +193,11 @@ static void console_main (void) {
   arch_threads_init ();
   console_irq_init ();
   printf ("console ready (Ctrl-C: end the running program, Ctrl-]: kernel shell)\n");
-  char *argv[] = { "contest64", 0 };
-  arch_start_user ("/contest64", 1, argv);
+#ifndef CONSOLE_PROGRAM
+#define CONSOLE_PROGRAM "/contest64"
+#endif
+  char *argv[] = { CONSOLE_PROGRAM, 0 };
+  arch_start_user (CONSOLE_PROGRAM, 1, argv);
   for (;;) __asm__ volatile ("wfi");
 }
 #endif

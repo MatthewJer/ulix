@@ -44,11 +44,42 @@ void writeblock (int device, int blockno, char *buffer) {
 // ---- buffer cache: not ported yet (it needs the thread table and mutexes of the book) ----
 int buffer_read (int dev, int blockno, char *block)                      { return -1; }  // "not cached"
 int buffer_write (int dev, int blockno, char *block, char dirtyflag)     { return 0; }
+void buffer_sync (boolean lock_buffer) { }                                             // nothing is cached
 boolean buffer_contains (int dev, int blockno)                           { return 0; }
 
 // ---- console output: the book's kputch() writes to the VGA text screen; here it is the UART ----
 extern void putch (char c);
-void kputch (byte c) { putch ((char)c); }
+
+// There is one physical console (the UART), but the book has ten virtual terminals. Output of a process
+// whose terminal is not the visible one is kept in a buffer per terminal and shown when the user
+// switches to it (Ctrl-T followed by 1..9 or 0; on the x86 this is Alt-1..0 and the screen contents are kept).
+#define VT_BUF 4096
+static char vt_out[10][VT_BUF];
+static int  vt_len[10];
+
+void kputch (byte c) {
+  if (scheduler_is_active && current_task > 1) {
+    int t = thread_table[current_task].terminal;
+    if (t != cur_vt && t >= 0 && t < 10) {
+      if (vt_len[t] == VT_BUF) {                         // full: drop the oldest half
+        for (int i = 0; i < VT_BUF / 2; i++) vt_out[t][i] = vt_out[t][i + VT_BUF / 2];
+        vt_len[t] = VT_BUF / 2;
+      }
+      vt_out[t][vt_len[t]++] = c;
+      return;
+    }
+  }
+  putch ((char)c);
+}
+
+// make terminal n the visible one and show what its processes have written meanwhile
+void arch_vt_switch (int n) {
+  if (n < 0 || n > 9 || n == cur_vt) return;
+  cur_vt = n;
+  printf ("\n[terminal %d]\n", n + 1);
+  for (int i = 0; i < vt_len[n]; i++) putch (vt_out[n][i]);
+  vt_len[n] = 0;
+}
 
 // ---- the x86 status line at the bottom of the VGA screen does not exist here ----
 void _set_statusline (char *text, int offset) { }

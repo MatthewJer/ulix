@@ -63,7 +63,7 @@ long minix_read (u32 ino, u32 offset, void *buf, u32 len);
 int  minix_readdir (u32 dir, void (*fn)(u32 ino, const char *name, void *arg), void *arg);
 
 // elf.c
-int  elf_load (u64 l0, u32 ino, u64 *entry);
+int  elf_load (u64 l0, u32 ino, u64 *entry, u64 *image_end);
 
 // kmain.c
 void capture_start (void);

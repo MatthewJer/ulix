@@ -67,7 +67,15 @@ static void console_interrupt (void) {
   u_kill (target_pid, SIGKILL);
 }
 
+void arch_vt_switch (int n);
+
 void arch_console_input (unsigned char c) {
+  static int vt_prefix = 0;                  // after Ctrl-T the next digit selects a terminal
+  if (vt_prefix) {
+    vt_prefix = 0;
+    if (c >= '0' && c <= '9') { arch_vt_switch ((c - '0' + 9) % 10); return; }   // like Alt-1..Alt-0 of the book
+  }
+  if (c == 0x14) { vt_prefix = 1; return; }                                       // Ctrl-T
   if (c == '\r') c = '\n';
   if (c == 0x7f) c = 0x08;
   if (c == 0x03) { console_interrupt (); return; }

@@ -85,7 +85,7 @@ int proc_test (void) {
   capture_start ();
   CHECK (arch_start_user ("/badarch64", 1, crash_argv) == -1, "ELF with e_machine = x86 is refused");
   CHECK (arch_start_user ("/badwx64", 1, crash_argv) == -1, "ELF with a writable+executable segment is refused");
-  CHECK (arch_start_user ("/init", 1, crash_argv) == -1, "flat x86 binary /init is refused");
+  CHECK (arch_start_user ("/ascii.txt", 1, crash_argv) == -1, "another text file (/ascii.txt) is refused");
   CHECK (arch_start_user ("/hello.c", 1, crash_argv) == -1, "text file is refused");
   CHECK (arch_start_user ("/nonexistent", 1, crash_argv) == -1, "missing file is refused");
   capture_stop (&out);
