@@ -51,6 +51,8 @@ void printf (const char *fmt, ...) {
   __builtin_va_end (ap);
 }
 
+extern void irq_init (void);
+
 void kmain (void) {
   u64 el;
   __asm__ volatile ("mrs %0, CurrentEL" : "=r" (el));
@@ -58,5 +60,17 @@ void kmain (void) {
   printf ("Running at EL%d, sizeof(void*) = %d, sizeof(long) = %d\n",
           (int)(el >> 2), (int)sizeof (void *), (int)sizeof (long));
   printf ("kmain at 0x%lx\n", (u64)kmain);
+  irq_init ();
+  extern volatile u64 ticks;
+  u64 last = 0;
+  while (ticks < 300) {                  // 3 seconds
+    __asm__ volatile ("wfi");
+    if (ticks / 100 != last / 100) printf ("tick %lu (%lu s)\n", ticks, ticks / 100);
+    last = ticks;
+  }
+  printf ("testing synchronous exceptions: svc #0 (returns), then brk #0 (halts)\n");
+  __asm__ volatile ("svc #0");
+  printf ("back from svc\n");
+  __asm__ volatile ("brk #0");
   for (;;) __asm__ volatile ("wfe");
 }

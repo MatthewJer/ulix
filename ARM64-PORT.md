@@ -96,3 +96,14 @@ Neues Verzeichnis `arm64/` (bewusst noch außerhalb des Literate-Programming-Que
 - `Makefile`: `make` und `make run` (`qemu-system-aarch64 -M virt -cpu cortex-a72`).
 
 Getestet: Start sowohl bei EL1 (Standard) als auch bei EL2 (`virtualization=on`); Ausgabe zeigt EL1, `sizeof(void*) = 8`. Noch nicht vorhanden: Exceptions, Timer, MMU (Etappen 3–4). Der Linker warnt vor einem RWX-Segment, das ist bis zur MMU-Etappe unkritisch.
+
+## 7. Status Etappe 3 (Exceptions, GIC, Timer)
+
+In `arm64/`:
+
+- `vectors.S`: Exception-Vektortabelle (16 Einträge, `VBAR_EL1`), sichert x0–x30, `ELR`, `SPSR` in einem 272-Byte-Frame und ruft `exc_handler (frame, kind)`; Rückkehr per `eret`. Ersetzt die x86-IDT samt `iret`-Frames.
+- `irq.c`: GICv2 (Distributor `0x08000000`, CPU-Interface `0x08010000` auf qemu `virt`) ersetzt den 8259-PIC; der Generic Timer (`CNTP_TVAL/CTL`, PPI 30, 62,5 MHz in qemu) ersetzt den PIT und tickt mit 100 Hz wie `HZ` im x86-Kernel. `svc #0` (EC 0x15) wird als Syscall-Einstieg erkannt und kehrt zurück; alle anderen synchronen Exceptions geben ESR/FAR/ELR aus und halten an.
+
+Getestet in qemu (`virt`, Cortex-A72): 3 Timer-Sekunden mit je 100 Ticks (`wfi`-Schleife), `svc #0` kehrt zurück, `brk #0` landet im Handler mit EC=0x3c.
+
+Nicht getestet/vorhanden: FP/SIMD-Register werden im Frame nicht gesichert (Kernel baut mit `-mgeneral-regs-only`); Exceptions aus EL0 und eigener Stack je Kontext kommen mit den Prozessen (Etappe 5); GICv3 (nötig für `-M virt,gic-version=3` und echte Hardware) fehlt; SMP wird nicht benutzt.
