@@ -8,8 +8,9 @@ extern void printf (const char *fmt, ...);
 extern char vectors[];
 
 // ---- GICv2 on qemu "virt" ------------------------------------------------
-#define GICD_BASE   0x08000000UL
-#define GICC_BASE   0x08010000UL
+#define KERNEL_VA   0xFFFF000000000000UL
+#define GICD_BASE   (KERNEL_VA + 0x08000000UL)
+#define GICC_BASE   (KERNEL_VA + 0x08010000UL)
 #define GICD_CTLR       (*(volatile u32 *)(GICD_BASE + 0x000))
 #define GICD_ISENABLER(n) (*(volatile u32 *)(GICD_BASE + 0x100 + 4*(n)))
 #define GICD_IPRIORITYR(n)(*(volatile u32 *)(GICD_BASE + 0x400 + 4*(n)))
@@ -50,6 +51,9 @@ static void timer_init (int hz) {
 }
 
 // ---- exception entry -----------------------------------------------------
+volatile int expect_fault = 0, faults = 0;
+volatile u64 fault_esr, fault_far;
+
 struct frame { u64 x[31]; u64 elr; u64 spsr; };
 
 void exc_handler (struct frame *f, int kind) {
@@ -68,6 +72,11 @@ void exc_handler (struct frame *f, int kind) {
   u64 esr, far;
   __asm__ volatile ("mrs %0, esr_el1" : "=r" (esr));
   __asm__ volatile ("mrs %0, far_el1" : "=r" (far));
+  if (expect_fault && kind == 0 && (esr >> 26) == 0x25) {   // data abort from the MMU test
+    fault_esr = esr; fault_far = far; faults++;
+    f->elr += 4;                                             // skip the faulting instruction
+    return;
+  }
   if (kind == 0 && (esr >> 26) == 0x15) {   // SVC from AArch64: syscall entry later
     printf ("SVC #%u at 0x%lx\n", (u32)(esr & 0xffff), f->elr - 4);
     return;

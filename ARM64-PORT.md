@@ -107,3 +107,20 @@ In `arm64/`:
 Getestet in qemu (`virt`, Cortex-A72): 3 Timer-Sekunden mit je 100 Ticks (`wfi`-Schleife), `svc #0` kehrt zurück, `brk #0` landet im Handler mit EC=0x3c.
 
 Nicht getestet/vorhanden: FP/SIMD-Register werden im Frame nicht gesichert (Kernel baut mit `-mgeneral-regs-only`); Exceptions aus EL0 und eigener Stack je Kontext kommen mit den Prozessen (Etappe 5); GICv3 (nötig für `-M virt,gic-version=3` und echte Hardware) fehlt; SMP wird nicht benutzt.
+
+## 8. Status Etappe 4 (MMU und Paging)
+
+Der Kernel läuft jetzt in der oberen Adresshälfte (`TTBR1_EL1`), virtuelle Adresse = `0xFFFF000000000000` + physische Adresse. Das entspricht der Rolle von `0xC0000000` (Kernel) und `0xD0000000` (lineares RAM-Fenster) auf x86.
+
+- `ulix.ld`: VMA `0xFFFF000040080000`, LMA `0x40080000`; Einstieg über `_start_phys` (qemu springt bei ausgeschalteter MMU an die physische Adresse).
+- `start.S`: baut mit PC-relativem Code (`adr`) Boot-Tabellen (4 KB-Granule, 48 Bit, 1-GB-Blöcke: Geräte `0–1 GB` als Device-nGnRnE, RAM `1–2 GB` als Normal-WB) für `TTBR1` und eine Identity-Map für `TTBR0`, setzt `MAIR/TCR/TTBR` und `SCTLR` (M, C, I), springt auf die hohe Adresse, setzt Stack, löscht `.bss`. `IPS` wird aus `ID_AA64MMFR0_EL1` übernommen.
+- `mmu.c`: Frame-Allocator (Bump-Pointer + Free-List, Frames kommen zeroed), `map_page`/`unmap_page` über 4 Tabellenebenen (legt fehlende Tabellen an, lehnt Doppel-Mapping und Block-Kollisionen ab, TLB-Invalidierung beim Unmap), `virt_to_phys` über die `AT`-Instruktion (Gegenstück zu `mmu_p`), `drop_identity_map` (`EPD0`).
+- Treiber (`kmain.c`, `irq.c`) greifen auf PL011 und GIC jetzt über die lineare Abbildung zu (`KERNEL_VA + 0x09000000` usw.).
+
+Test in qemu (Cortex-A72, 128 MB, EL1 und EL2-Start): Map/Unmap, AT-Übersetzung, Schreiben über Mapping sichtbar im linearen Fenster, Doppel-Map abgelehnt, Lesen einer ungemappten Seite → Translation Fault Level 3 (FAR korrekt), Schreiben auf RO-Seite → Permission Fault Level 3, Frame-Wiederverwendung. Alle 10 Prüfungen bestehen.
+
+Offen und bewusst nicht gemacht:
+- RAM-Größe ist noch fest (128 MB); soll später aus dem Device Tree kommen.
+- Der ganze Kernel liegt in einem RWX-1-GB-Block; Trennung in `.text` (RX), `.rodata` (RO), `.data` (RW, NX) auf 4-KB-Seiten fehlt.
+- `TTBR0` ist leer; benutzerseitige Adressräume (`address_spaces[]`, ASIDs, Kopie des Kernel-Teils entfällt, da `TTBR1` global ist) kommen in Etappe 5.
+- Kein Copy-on-Write, kein Swap (x86-Ulix hat beides): diese Teile des Buches müssen auf die neue Seitentabellen-API umgeschrieben werden.
