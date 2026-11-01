@@ -10,7 +10,7 @@ SECTIONS
 {
   . = KERNEL_VA + KERNEL_PA;
   .text   : AT(ADDR(.text) - KERNEL_VA)   { *(.text.boot) *(.text*) }
-  .rodata : AT(ADDR(.rodata) - KERNEL_VA) { *(.rodata*) }
+  .rodata : AT(ADDR(.rodata) - KERNEL_VA) { *(.rodata*) *(.user_prog) }
   .data   : AT(ADDR(.data) - KERNEL_VA)   { *(.data*) }
   . = ALIGN(4096);
   .pgtbl  : AT(ADDR(.pgtbl) - KERNEL_VA)  { *(.pgtbl) }

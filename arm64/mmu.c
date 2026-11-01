@@ -1,17 +1,10 @@
 // Ulix ARM64 -- physical frame allocator and 4-level page table code
 // (replaces the x86 2-level page directory / page table code and KMAP/KMAPD)
 
-typedef unsigned long u64;
-typedef unsigned int  u32;
+#include "ulix.h"
 
-extern void printf (const char *fmt, ...);
 extern u64 kernel_l0[512];
 extern char __kernel_end[];
-
-#define KERNEL_VA   0xFFFF000000000000UL
-#define KVA(pa)     ((void *)(KERNEL_VA + (u64)(pa)))
-#define PA(va)      ((u64)(va) - KERNEL_VA)
-#define PAGE_SIZE   4096UL
 
 #define RAM_START   0x40000000UL
 #define RAM_SIZE    (128UL * 1024 * 1024)   // TODO: read from the device tree (like MEM_SIZE on x86)
@@ -19,6 +12,7 @@ extern char __kernel_end[];
 // ---- frame allocator: bump pointer first, free list for released frames ----
 static u64 next_free;                       // physical address
 static u64 free_list = 0;                   // singly linked through the frames themselves
+long frames_in_use = 0;
 
 void frames_init (void) {
   next_free = (PA (__kernel_end) + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
@@ -31,45 +25,46 @@ static void zero_page (void *p) {
   for (int i = 0; i < PAGE_SIZE / 8; i++) q[i] = 0;
 }
 
+static u64 bump (void) {
+  if (next_free + PAGE_SIZE > RAM_START + RAM_SIZE) { printf ("out of memory\n"); for (;;) ; }
+  u64 pa = next_free;
+  next_free += PAGE_SIZE;
+  return pa;
+}
+
 u64 alloc_frame (void) {                    // returns a zeroed frame (physical address)
   u64 pa;
   if (free_list) {
     pa = free_list;
     free_list = *(u64 *)KVA (pa);
   } else {
-    if (next_free + PAGE_SIZE > RAM_START + RAM_SIZE) { printf ("out of memory\n"); for (;;) ; }
-    pa = next_free;
-    next_free += PAGE_SIZE;
+    pa = bump ();
   }
   zero_page (KVA (pa));
+  frames_in_use++;
   return pa;
+}
+
+u64 alloc_frames_contig (int n) {           // only the bump area is contiguous
+  u64 first = bump ();
+  zero_page (KVA (first));
+  for (int i = 1; i < n; i++) zero_page (KVA (bump ()));
+  frames_in_use += n;
+  return first;
 }
 
 void free_frame (u64 pa) {
   *(u64 *)KVA (pa) = free_list;
   free_list = pa;
+  frames_in_use--;
 }
 
 // ---- page tables ----
-#define PTE_VALID   0x1UL
-#define PTE_TABLE   0x3UL
-#define PTE_PAGE    0x3UL                   // level 3: bits[1:0] = 11
-#define PTE_ATTR(n) ((u64)(n) << 2)
-#define PTE_RO      (1UL << 7)              // AP[2]: read-only at EL1
-#define PTE_SH      (3UL << 8)
-#define PTE_AF      (1UL << 10)
-#define PTE_PXN     (1UL << 53)
-#define PTE_UXN     (1UL << 54)
-#define PTE_ADDR    0x0000FFFFFFFFF000UL
-
-#define PAGE_RW     (PTE_PAGE | PTE_ATTR (1) | PTE_SH | PTE_AF | PTE_PXN | PTE_UXN)
-#define PAGE_RO     (PAGE_RW | PTE_RO)
-
 #define IDX(va, lvl) (((va) >> (39 - 9 * (lvl))) & 511)
 
 // returns pointer to the level-3 entry for va; creates missing tables if 'create'
-static u64 *walk (u64 va, int create) {
-  u64 *table = kernel_l0;
+static u64 *walk (u64 *l0, u64 va, int create) {
+  u64 *table = l0;
   for (int lvl = 0; lvl < 3; lvl++) {
     u64 *e = &table[IDX (va, lvl)];
     if (!(*e & PTE_VALID)) {
@@ -83,16 +78,20 @@ static u64 *walk (u64 va, int create) {
   return &table[IDX (va, 3)];
 }
 
-int map_page (u64 va, u64 pa, u64 flags) {
-  u64 *e = walk (va, 1);
+int map_page_in (u64 l0_pa, u64 va, u64 pa, u64 flags) {
+  u64 *e = walk (KVA (l0_pa), va, 1);
   if (!e || (*e & PTE_VALID)) return -1;
   *e = (pa & PTE_ADDR) | flags;
   __asm__ volatile ("dsb ishst; isb");
   return 0;
 }
 
+int map_page (u64 va, u64 pa, u64 flags) {
+  return map_page_in (PA (kernel_l0), va, pa, flags);
+}
+
 u64 unmap_page (u64 va) {                   // returns the physical address that was mapped
-  u64 *e = walk (va, 0);
+  u64 *e = walk (kernel_l0, va, 0);
   if (!e || !(*e & PTE_VALID)) return 0;
   u64 pa = *e & PTE_ADDR;
   *e = 0;
@@ -108,10 +107,38 @@ u64 virt_to_phys (u64 va) {
   return (par & PTE_ADDR) | (va & 0xfff);
 }
 
-// the identity map is only needed during boot; later TTBR0 will hold user address spaces
-void drop_identity_map (void) {
+// ---- user address spaces (TTBR0) ----
+u64 empty_l0_pa;
+
+// The boot identity map is only needed until we run at the high address. From now on
+// TTBR0 belongs to user processes; the kernel itself lives in TTBR1.
+void user_mm_init (void) {
+  empty_l0_pa = alloc_frame ();
   u64 tcr;
   __asm__ volatile ("mrs %0, tcr_el1" : "=r" (tcr));
-  tcr |= (1UL << 7);                        // EPD0: no walks through TTBR0
-  __asm__ volatile ("msr tcr_el1, %0; tlbi vmalle1; dsb nsh; isb" :: "r" (tcr));
+  tcr &= ~(1UL << 7);                       // EPD0 = 0: walk TTBR0 again
+  __asm__ volatile ("msr ttbr0_el1, %0; msr tcr_el1, %1; tlbi vmalle1; dsb nsh; isb"
+                    :: "r" (empty_l0_pa), "r" (tcr));
+}
+
+u64 new_user_l0 (void) { return alloc_frame (); }
+
+static void free_table (u64 pa, int lvl) {
+  u64 *t = KVA (pa);
+  for (int i = 0; i < 512; i++) {
+    u64 e = t[i];
+    if (!(e & PTE_VALID)) continue;
+    if (lvl < 3) free_table (e & PTE_ADDR, lvl + 1);
+    else         free_frame (e & PTE_ADDR);
+  }
+  free_frame (pa);
+}
+
+void free_user_space (u64 l0_pa) { free_table (l0_pa, 0); }
+
+// make freshly written code visible to instruction fetch
+void sync_icache (void *p, u64 len) {
+  u64 a = (u64)p & ~63UL;
+  for (; a < (u64)p + len; a += 64) __asm__ volatile ("dc cvau, %0" :: "r" (a) : "memory");
+  __asm__ volatile ("dsb ish; ic ialluis; dsb ish; isb");
 }

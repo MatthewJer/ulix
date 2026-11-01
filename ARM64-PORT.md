@@ -124,3 +124,16 @@ Offen und bewusst nicht gemacht:
 - Der ganze Kernel liegt in einem RWX-1-GB-Block; Trennung in `.text` (RX), `.rodata` (RO), `.data` (RW, NX) auf 4-KB-Seiten fehlt.
 - `TTBR0` ist leer; benutzerseitige Adressräume (`address_spaces[]`, ASIDs, Kopie des Kernel-Teils entfällt, da `TTBR1` global ist) kommen in Etappe 5.
 - Kein Copy-on-Write, kein Swap (x86-Ulix hat beides): diese Teile des Buches müssen auf die neue Seitentabellen-API umgeschrieben werden.
+
+## 9. Status Etappe 5 (Prozesse, Syscalls, EL0)
+
+Neu in `arm64/` (gemeinsame Definitionen jetzt in `ulix.h`):
+
+- `mmu.c`: Adressräume pro Prozess (`TTBR0`): `new_user_l0`, `map_page_in` (beliebige Wurzeltabelle), `free_user_space` (gibt Tabellen und Datenframes rekursiv frei), `sync_icache` (D-Cache säubern, I-Cache invalidieren nach dem Kopieren von Code), `user_mm_init` (leere `TTBR0`, `EPD0` wieder aus). Seitenflags `PAGE_URX` (Code, EL0-lesbar/ausführbar) und `PAGE_URW` (Stack, nie ausführbar). Zähler `frames_in_use` für den Leck-Test.
+- `sched.c`: Tasks mit eigenem Kernel-Stack (4 Seiten) und eigenem Adressraum; Round-Robin-Scheduler; `cpu_switch` (in `vectors.S`) sichert x19–x30, SP und `SP_EL0`. Neue Prozesse starten über einen vorbereiteten Frame auf ihrem Kernel-Stack und `eret` nach EL0. ASID = PID, daher kein TLB-Flush beim Wechsel. Der Idle-Task (Slot 0) ist der Boot-Thread und räumt Zombies ab, da ein Prozess seinen eigenen Kernel-Stack nicht freigeben kann.
+- `irq.c`: Syscalls per `svc #0` (`x8` = Nummer, `x0–x2` Argumente): `write`, `getpid`, `yield`, `exit`. Benutzerzeiger werden nie direkt dereferenziert: Seite für Seite mit `AT` übersetzt und über das lineare Fenster gelesen. Fehler im EL0-Code (Data/Instruction Abort) töten nur den Prozess. Der Timer-Interrupt beendet nach 10 ms die Zeitscheibe (`schedule_preempt`), nachdem er per `EOIR` quittiert wurde.
+- `user.S`: zwei EL0-Programme (positionsunabhängig): „Hello“ (5 Runden `write` mit Busy-Loop) und „bad“ (liest Kernel-Speicher).
+
+Test in qemu (Cortex-A72, EL1- und EL2-Start): zwei Hello-Prozesse laufen verzahnt (Wechsel durch Timer-Preemption, 12–14 von 16–18 Kontextwechseln), der böse Prozess wird mit EC=0x24 / Permission Fault Level 1 beendet und der Kernel läuft weiter, alle drei werden abgeräumt, `frames_in_use` ist danach wieder auf dem Ausgangswert (kein Leck). Zusammen mit den Tests aus Etappe 4: alle Prüfungen bestehen.
+
+Offen: der Kernel ist nicht präemptiv (Interrupts bleiben im Handler maskiert; das reicht, solange Syscalls kurz sind); kein `fork`/`exec`/`wait`, keine Signale, kein ELF-Loader; die User-Programme sind handgeschriebener Assembler im Kernel-Image (Etappe 7: AArch64-ELF laden). Der Code ist bewusst eine neue, kleine Implementierung der Ulix-Konzepte (Task, Adressraum, Syscall) und noch nicht die portierte Ulix-Prozessverwaltung aus `ulix-book.nw` (Thread-Tabelle, `fork`, Signale, Semaphore); diese aufzusetzen ist der Hauptteil von Etappe 5b.

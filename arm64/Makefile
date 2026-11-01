@@ -8,8 +8,8 @@ CFLAGS = -O0 -g -ffreestanding -nostdlib -fno-builtin -fno-stack-protector -mgen
 
 all: ulix.elf
 
-ulix.elf: start.o vectors.o irq.o mmu.o kmain.o ulix.ld
-	$(LD) -T ulix.ld -o $@ start.o vectors.o irq.o mmu.o kmain.o
+ulix.elf: start.o vectors.o irq.o mmu.o sched.o user.o kmain.o ulix.ld
+	$(LD) -T ulix.ld -o $@ start.o vectors.o irq.o mmu.o sched.o user.o kmain.o
 
 %.o: %.S
 	$(CC) $(CFLAGS) -c -o $@ $<

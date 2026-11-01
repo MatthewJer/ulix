@@ -1,10 +1,8 @@
-// Ulix ARM64 -- first kernel code: PL011 console and a minimal printf
+// Ulix ARM64 -- kernel entry, PL011 console, minimal printf
 
-typedef unsigned long      u64;
-typedef unsigned int       u32;
-typedef unsigned char      u8;
+#include "ulix.h"
 
-#define KERNEL_VA   0xFFFF000000000000UL
+
 #define UART0_BASE  (KERNEL_VA + 0x09000000UL)   // PL011 on qemu "virt", via the linear map
 #define UART_DR     (*(volatile u32 *)(UART0_BASE + 0x00))
 #define UART_FR     (*(volatile u32 *)(UART0_BASE + 0x18))
@@ -52,49 +50,16 @@ void printf (const char *fmt, ...) {
   __builtin_va_end (ap);
 }
 
-extern void irq_init (void);
-extern void drop_identity_map (void);
-extern void frames_init (void);
-extern u64  alloc_frame (void);
-extern void free_frame (u64 pa);
-extern int  map_page (u64 va, u64 pa, u64 flags);
-extern u64  unmap_page (u64 va);
-extern u64  virt_to_phys (u64 va);
-#define KVA(pa)   ((void *)(KERNEL_VA + (u64)(pa)))
-#define PAGE_RW   ((3UL) | (1UL << 2) | (3UL << 8) | (1UL << 10) | (1UL << 53) | (1UL << 54))
-#define PAGE_RO   (PAGE_RW | (1UL << 7))
 
-void kmain (void) {
-  u64 el;
-  __asm__ volatile ("mrs %0, CurrentEL" : "=r" (el));
-  printf ("Ulix-arm64 (work in progress)\n");
-  printf ("Running at EL%d, sizeof(void*) = %d, sizeof(long) = %d\n",
-          (int)(el >> 2), (int)sizeof (void *), (int)sizeof (long));
-  printf ("kmain at 0x%lx\n", (u64)kmain);
-  irq_init ();
-  extern volatile u64 ticks;
-  u64 last = 0;
-  while (ticks < 300) {                  // 3 seconds
-    __asm__ volatile ("wfi");
-    if (ticks / 100 != last / 100) printf ("tick %lu (%lu s)\n", ticks, ticks / 100);
-    last = ticks;
-  }
-  printf ("testing synchronous exceptions: svc #0\n");
-  __asm__ volatile ("svc #0");
-  printf ("back from svc\n");
+extern volatile u64 ticks;
 
-  // ---- stage 4: MMU ----
-  drop_identity_map ();
-  printf ("MMU on, running at 0x%lx (upper half), identity map dropped\n", (u64)kmain);
-  frames_init ();
+#define CHECK(cond, msg) do { if (cond) printf ("  ok:   %s\n", msg); \
+                              else { printf ("  FAIL: %s\n", msg); fails++; } } while (0)
 
+static int fails = 0;
+
+static void mmu_selftest (void) {
   const u64 va = 0xFFFF008000000000UL;           // not covered by the boot map
-  extern volatile int expect_fault, faults;
-  extern volatile u64 fault_esr, fault_far;
-  int fails = 0;
-  #define CHECK(cond, msg) do { if (cond) printf ("  ok:   %s\n", msg); \
-                                else { printf ("  FAIL: %s\n", msg); fails++; } } while (0)
-
   u64 pa = alloc_frame ();
   CHECK (map_page (va, pa, PAGE_RW) == 0, "map_page (RW)");
   CHECK (virt_to_phys (va + 0x123) == pa + 0x123, "AT translation matches");
@@ -119,7 +84,49 @@ void kmain (void) {
   unmap_page (va);
   free_frame (pa);
   CHECK (alloc_frame () == pa, "freed frame is reused (and zeroed)");
+  free_frame (pa);
+}
 
-  printf (fails ? "MMU test: %d FAILED\n" : "MMU test: all passed\n", fails);
+static void process_test (void) {
+  long frames_before = frames_in_use;
+  printf ("starting 3 user processes: hello 1, hello 2, bad\n");
+  int p1 = task_create_user (user_hello_start, user_hello_end, 1);
+  int p2 = task_create_user (user_hello_start, user_hello_end, 2);
+  int p3 = task_create_user (user_bad_start,   user_bad_end,   0);
+  CHECK (p1 == 1 && p2 == 2 && p3 == 3, "three processes created with pids 1, 2, 3");
+
+  while (tasks_live ()) {                         // idle loop
+    tasks_reap ();
+    if (tasks_live ()) __asm__ volatile ("wfi");
+  }
+  tasks_reap ();
+
+  CHECK (sys_write_calls == 10, "10 write syscalls from the two hello processes");
+  CHECK (procs_killed == 1, "bad process killed by the kernel (permission fault), kernel survived");
+  CHECK (tasks_reaped == 3, "all three processes reaped");
+  CHECK (preemptions >= 1, "a running process was preempted by the timer interrupt");
+  printf ("  info: %d context switches (%d by timer), %lu timer ticks\n", context_switches, preemptions, ticks);
+  CHECK (frames_in_use == frames_before, "no frame leaked: address spaces and kernel stacks freed");
+}
+
+void kmain (void) {
+  u64 el;
+  __asm__ volatile ("mrs %0, CurrentEL" : "=r" (el));
+  printf ("Ulix-arm64 (work in progress)\n");
+  printf ("Running at EL%d, sizeof(void*) = %d, kmain at 0x%lx (upper half)\n",
+          (int)(el >> 2), (int)sizeof (void *), (u64)kmain);
+  irq_init ();
+  __asm__ volatile ("svc #0");                    // kernel-mode svc: handler just reports it
+
+  frames_init ();
+  user_mm_init ();                                // TTBR0 is now free for user processes
+  printf ("MMU self-test:\n");
+  mmu_selftest ();
+
+  sched_init ();
+  printf ("process test:\n");
+  process_test ();
+
+  printf (fails ? "RESULT: %d check(s) FAILED\n" : "RESULT: all checks passed\n", fails);
   for (;;) __asm__ volatile ("wfe");
 }

@@ -1,14 +1,11 @@
-// Ulix ARM64 -- exceptions, GICv2 and the ARM generic timer
-// (replace IDT, 8259 PIC and 8253 PIT of the x86 version)
+// Ulix ARM64 -- exceptions, GICv2, the ARM generic timer, system calls
+// (replace IDT, 8259 PIC, 8253 PIT and the int 0x80 handler of the x86 version)
 
-typedef unsigned long u64;
-typedef unsigned int  u32;
+#include "ulix.h"
 
-extern void printf (const char *fmt, ...);
 extern char vectors[];
 
 // ---- GICv2 on qemu "virt" ------------------------------------------------
-#define KERNEL_VA   0xFFFF000000000000UL
 #define GICD_BASE   (KERNEL_VA + 0x08000000UL)
 #define GICC_BASE   (KERNEL_VA + 0x08010000UL)
 #define GICD_CTLR       (*(volatile u32 *)(GICD_BASE + 0x000))
@@ -50,39 +47,77 @@ static void timer_init (int hz) {
   __asm__ volatile ("msr cntp_ctl_el0, %0" :: "r" (1UL));    // enable, unmasked
 }
 
+// ---- system calls ---------------------------------------------------------
+int sys_write_calls = 0;
+
+static long sys_write (u64 fd, u64 buf, u64 len) {
+  if (fd != 1 || len > 256 || buf < USER_MIN || buf + len > USER_MAX) return -1;
+  // never touch user pointers directly: translate page by page and read via the linear map
+  for (u64 i = 0; i < len; ) {
+    u64 pa = virt_to_phys (buf + i);
+    if (!pa) return -1;
+    u64 n = PAGE_SIZE - ((buf + i) & 0xfff);
+    if (n > len - i) n = len - i;
+    char *p = KVA (pa);
+    for (u64 k = 0; k < n; k++) putch (p[k]);
+    i += n;
+  }
+  sys_write_calls++;
+  return len;
+}
+
+static void syscall (struct frame *f) {
+  switch (f->x[8]) {
+    case 1:  f->x[0] = sys_write (f->x[0], f->x[1], f->x[2]);  break;
+    case 2:  f->x[0] = task_pid ();                            break;
+    case 3:  f->x[0] = 0; schedule ();                         break;
+    case 4:  task_exit ();
+    default: f->x[0] = (u64)-1;                                break;
+  }
+}
+
 // ---- exception entry -----------------------------------------------------
-volatile int expect_fault = 0, faults = 0;
+volatile int expect_fault = 0, faults = 0, procs_killed = 0;
 volatile u64 fault_esr, fault_far;
 
-struct frame { u64 x[31]; u64 elr; u64 spsr; };
-
 void exc_handler (struct frame *f, int kind) {
-  if (kind == 1) {                       // IRQ
+  int from_user = (f->spsr & 0xf) == 0;     // M[3:0] == EL0t
+
+  if (kind == 1) {                          // IRQ
     u32 iar = GICC_IAR;
     u32 irq = iar & 0x3ff;
-    if (irq == IRQ_TIMER) {
-      ticks++;
-      timer_reload ();
-    } else if (irq < 1020) {
-      printf ("spurious IRQ %u\n", irq);
+    if (irq < 1020) {
+      if (irq == IRQ_TIMER) { ticks++; timer_reload (); }
+      else printf ("spurious IRQ %u\n", irq);
+      GICC_EOIR = iar;
     }
-    if (irq < 1020) GICC_EOIR = iar;
+    if (irq == IRQ_TIMER) schedule_preempt ();   // time slice over (10 ms)
     return;
   }
+
   u64 esr, far;
   __asm__ volatile ("mrs %0, esr_el1" : "=r" (esr));
   __asm__ volatile ("mrs %0, far_el1" : "=r" (far));
-  if (expect_fault && kind == 0 && (esr >> 26) == 0x25) {   // data abort from the MMU test
+  u32 ec = esr >> 26;
+
+  if (kind == 0 && ec == 0x15) {            // SVC from AArch64
+    if (from_user) { syscall (f); return; }
+    printf ("SVC #%u at 0x%lx (from the kernel)\n", (u32)(esr & 0xffff), f->elr - 4);
+    return;
+  }
+  if (expect_fault && !from_user && kind == 0 && ec == 0x25) {  // data abort from a kernel self-test
     fault_esr = esr; fault_far = far; faults++;
-    f->elr += 4;                                             // skip the faulting instruction
+    f->elr += 4;                            // skip the faulting instruction
     return;
   }
-  if (kind == 0 && (esr >> 26) == 0x15) {   // SVC from AArch64: syscall entry later
-    printf ("SVC #%u at 0x%lx\n", (u32)(esr & 0xffff), f->elr - 4);
-    return;
+  if (from_user && kind == 0) {             // user mistake: kill the process, not the kernel
+    printf ("[kernel] process %d killed: EC=0x%x ESR=0x%lx FAR=0x%lx ELR=0x%lx\n",
+            task_pid (), ec, esr, far, f->elr);
+    procs_killed++;
+    task_exit ();
   }
-  printf ("\n*** EXCEPTION kind=%d ESR=0x%lx (EC=0x%x) FAR=0x%lx ELR=0x%lx\n",
-          kind, esr, (u32)(esr >> 26), far, f->elr);
+  printf ("\n*** KERNEL EXCEPTION kind=%d ESR=0x%lx (EC=0x%x) FAR=0x%lx ELR=0x%lx\n",
+          kind, esr, ec, far, f->elr);
   for (;;) __asm__ volatile ("wfe");
 }
 
@@ -91,5 +126,5 @@ void irq_init (void) {
   gic_init ();
   gic_enable (IRQ_TIMER);
   timer_init (HZ);
-  __asm__ volatile ("msr daifclr, #2");  // unmask IRQs
+  __asm__ volatile ("msr daifclr, #2");     // unmask IRQs
 }
