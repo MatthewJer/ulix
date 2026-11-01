@@ -10,9 +10,12 @@ endif
 
 ifeq ($(UNAME_S),Darwin)
   OS=MacOS
-  LD=/usr/cross/bin/i586-elf-ld
-  CC=/usr/cross/bin/i586-elf-gcc
-  OBJDUMP=/usr/cross/bin/i586-elf-objdump
+  # Cross toolchain: override with CROSS=... (e.g. make CROSS=/usr/cross/bin/i586-elf-)
+  # Default: Homebrew's i686-elf-gcc / i686-elf-binutils
+  CROSS?=i686-elf-
+  LD=$(CROSS)ld
+  CC=$(CROSS)gcc
+  OBJDUMP=$(CROSS)objdump
   CFLAGS=-O0 -m32 -march=i586
 endif
 
@@ -38,17 +41,21 @@ extract:
 	# notangle -L -Rprintf.c $(TEXSRC_FILE) > printf.c
 	notangle -Rstart.asm $(TEXSRC_FILE) > start.asm
 	notangle -Rulix.ld $(TEXSRC_FILE) > ulix.ld
-	notangle -L -Rmodule.c $(TEXSRC_MODULE_FILE) > module.c
-	notangle -L -Rmodule.h $(TEXSRC_MODULE_FILE) > module.h
+	# module sources are optional: bachelorarbeit.nw is not part of the repository,
+	# the checked-in module.c / module.h are used instead
+	if [ -f $(TEXSRC_MODULE_FILE) ]; then \
+	  notangle -L -Rmodule.c $(TEXSRC_MODULE_FILE) > module.c; \
+	  notangle -L -Rmodule.h $(TEXSRC_MODULE_FILE) > module.h; \
+	fi
 
 parse:
 	mv ulix.c ulix.c.pre
-	./assembler-parser.py ulix.c.pre ulix.c
+	python3 ./assembler-parser.py ulix.c.pre ulix.c
 	sed -ie "s/SCRIPTBUILDDATE/`date`/" ulix.c
 
 asm:
 	mv module.c module.c.pre
-	./assembler-parser.py module.c.pre module.c
+	python3 ./assembler-parser.py module.c.pre module.c
 	$(ASM) $(ASMFLAGS) -o start.o start.asm
 
 compile:

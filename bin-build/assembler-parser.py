@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python3
 
 """
 This Parser replaces Code of the following form:
@@ -91,8 +91,8 @@ def process (line):
     
   return line
 
-infile  = file (infilename,  "r")
-outfile = file (outfilename, "w");
+infile  = open (infilename,  "r")
+outfile = open (outfilename, "w")
 
 EndOfLoop = False
 
