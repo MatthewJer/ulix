@@ -7576,12 +7576,37 @@ We define the [[context_t]] structure so that it matches the way in
 which we set up the stack in the assembler part of the handler:
 
 <<public type definitions>>=
+#if defined(__i386__)
 typedef struct {
   unsigned int gs, fs, es, ds;
   unsigned int edi, esi, ebp, esp, ebx, edx, ecx, eax;
   unsigned int int_no, err_code;
   unsigned int eip, cs, eflags, useresp, ss;
 } context_t;
+#else
+// AArch64: the register frame that the exception entry code saves on the kernel stack.
+// The members carry the names of the x86 registers that play the same role, so that the
+// system call handlers (r->ebx, r->eax, ...) work unchanged.  The convention mirrors the
+// x86 one: the system call number is passed in x0 (eax) and the result comes back there;
+// the arguments are in x1..x5 (ebx, ecx, edx, esi, edi); ELR is the program counter (eip)
+// and SP_EL0 the user stack pointer (useresp).
+typedef struct {
+  union { unsigned long x0; unsigned long eax; };
+  union { unsigned long x1; unsigned long ebx; };
+  union { unsigned long x2; unsigned long ecx; };
+  union { unsigned long x3; unsigned long edx; };
+  union { unsigned long x4; unsigned long esi; };
+  union { unsigned long x5; unsigned long edi; };
+  unsigned long x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18;
+  unsigned long x19, x20, x21, x22, x23, x24, x25, x26, x27, x28;
+  union { unsigned long x29; unsigned long ebp; };
+  unsigned long x30;
+  union { unsigned long elr; unsigned long eip; };
+  union { unsigned long spsr; unsigned long eflags; };
+  union { unsigned long sp_el0; unsigned long useresp; unsigned long esp; };
+  unsigned long pad[2];                 // keeps the frame size a multiple of 16 bytes
+} context_t;
+#endif
 @ %def context_t
 
 

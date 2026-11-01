@@ -3,7 +3,7 @@
 
 int main (int argc, char **argv) {
   if (argc < 2) { printf ("usage: cat FILE\n"); return 2; }
-  int fd = open (argv[1]);
+  int fd = open (argv[1], 0);
   if (fd < 0) { printf ("cat: cannot open %s\n", argv[1]); return 1; }
   char buf[200];
   long n, total = 0;

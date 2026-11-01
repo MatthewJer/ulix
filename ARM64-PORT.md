@@ -256,3 +256,29 @@ Neu in `arm64/`:
 Ergebnis in qemu (EL1 und EL2): **91 Prüfungen, alle bestehen**; `make verify` (Dateisystem-Schreibtests auf dem Image, Host-Kontrolle) weiterhin ohne Probleme.
 
 Bekannte Lücken: Der Buffer Cache des Buchs ist noch nicht eingebunden (die Schreib-Durchreichung in `glue.c` bleibt); das Umschalten zwischen **Adressräumen** (TTBR0/ASID in `arch_context_switch`) fehlt, weil alle Test-Threads im Kernel-Adressraum laufen; Signale und der Aufräum-Code für Kernel-Stacks aus dem Scheduler sind auf ARM64 noch nicht vorhanden. Die einfache Prozessverwaltung aus Etappe 5 läuft daneben weiter (der Timer wählt, welcher Scheduler gerade aktiv ist), bis `fork`/`exec` aus dem Buch (Schritt 3) sie ablösen.
+
+## 15. Schritt 3 der Kernel-Portierung: Syscalls, fork, exec, wait auf ARM64
+
+Der Syscall-Dispatcher des Buchs (`syscall_handler`, `install_syscall_handler`) und die Systemaufrufe `exit`, `fork`, `read`, `write`, `open`, `close`, `waitpid`, `execve`, `unlink`, `chdir`, `lseek`, `getpid`, `getppid`, `gettid`, `resign`, `stat`, `getcwd`, `get_errno` laufen jetzt auf ARM64. Die erste, vereinfachte Prozessverwaltung aus Etappe 5 (`sched.c`, handgeschriebene Assembler-Programme, eigene Syscall-Schicht) ist **entfernt**; ihre Tests laufen in neuer Form über den Code des Buchs.
+
+**Syscall-ABI** (spiegelt die x86-Konvention des Buchs): `svc #0`, Syscall-Nummer in `x0` und Ergebnis ebenfalls in `x0`, Argumente in `x1`–`x5`. Die Nummern sind die `__NR_*` des Buchs. Der ARM64-`context_t` im Buch trägt die x86-Registernamen als Alias (`eax`=`x0`, `ebx`=`x1`, …, `eip`=`ELR`, `useresp`=`SP_EL0`), dadurch laufen `r->ebx`, `eax_return(...)` und `r->eax = …` im Buch unverändert. Dafür sichert der Exception-Eintritt jetzt zusätzlich `SP_EL0` im Frame (288 Byte).
+
+Neu in `arm64/arch_thread.c` (plattformabhängiger Ersatz für das, was das Buch für x86 mit 2-stufigem Paging und Kernel-Stacks im Benutzer-Adressraum macht, aber mit denselben Namen und Datenstrukturen):
+- Adressräume: `address_spaces[]` des Buchs, dazu die TTBR0-Wurzel je Adressraum; `destroy_address_space` (verlässt den Adressraum zuerst), Wechsel im Kontextwechsel-Hook (TLB-Flush bei jedem Wechsel; ASIDs kämen später).
+- `u_fork`: kopiert alle Seiten des Elternprozesses (wie das Buch, ohne Copy-on-Write), kopiert das TCB, öffnet Dateien neu (`u_reopen`), legt für das Kind einen Kernel-Stack mit Kopie des Exception-Frames an (`fork` liefert dort 0), trägt es in die Ready-Queue ein.
+- `u_execv`: kopiert die Argumente in den Kernel, lädt das ELF64-Programm in neue Tabellen (der Loader aus Etappe 7), baut `[argc][argv]` auf dem neuen Stack, schaltet um und gibt den alten Adressraum frei; bei Fehlern bleibt der alte erhalten.
+- `arch_start_user`: startet den ersten Prozess aus einer Datei (der Kernel spielt den Elternteil; Elternprozess 1 = Idle, damit der Scheduler ihn ohne `waitpid` entsorgt).
+- Fehler im Benutzercode (zum Beispiel Schreiben auf die Code-Seite) beenden den Prozess über das `syscall_exit` des Buchs mit Status -1.
+
+Änderungen am Buch (alle x86-neutral): `context_t` für ARM64 (neben dem x86-Typ in `#if`).
+
+User-Seite (`arm64/user/`): `ulib.h` benutzt die ABI des Buchs und hat jetzt `fork`, `waitpid`, `execv`, `getppid`, `lseek`, `yield`; `crt0.S` liest `argc/argv` vom Stack; neues Testprogramm `forktest`.
+
+Tests in qemu (EL1 und EL2, modernes virtio): **89 Prüfungen im Kernel plus 25 innerhalb der Benutzerprogramme, alle bestehen.** Neu: `fork` mit getrennten Adressräumen (Schreiben im Kind ändert das Elternteil nicht), Exit-Status über `waitpid`, `fork`+`exec` von `/hello64` mit Argumenten, drei Kinder laufen abwechselnd, ein abstürzendes Kind wird beendet und der Elternprozess läuft weiter (Status -1), `execv` einer fehlenden Datei liefert -1, Enkelprozess, kein Frame verloren. `make verify` (Host-Prüfung des Images) weiterhin 0 Probleme.
+
+x86-Nachweis: Von 353 Funktionen im x86-Objekt unterscheiden sich weiterhin nur die zwei bewusst korrigierten Semaphor-Funktionen; der x86-Kernel bootet in `qemu-system-i386` mit identischer Ausgabe.
+
+Offen / bekannte Lücken:
+- Kein Copy-on-Write und kein `brk`/`sbrk` (Heap) für Benutzerprogramme; `write` meldet wegen eines Fehlers im Buch (`u_write` fällt nach der Ausgabe auf STDOUT/STDERR in `default: return -1`) immer -1 zurück, die Ausgabe selbst funktioniert.
+- Das Buch dereferenziert Benutzerzeiger direkt (wie auf x86). Auf ARM64 funktioniert das, weil TTBR0 aktiv ist, aber ein ungültiger Zeiger in einem Systemaufruf würde den Kernel anhalten.
+- Signale, Pipes, pthreads, Terminals und die Kernel-Shell fehlen noch; der Buffer Cache ist weiter nicht eingebunden.

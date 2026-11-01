@@ -4,7 +4,7 @@
 
         .macro  vector kind
         .balign 128
-        sub     sp, sp, #272
+        sub     sp, sp, #288
         stp     x0,  x1,  [sp, #0]
         mov     x0, #\kind
         b       save_and_call
@@ -55,6 +55,8 @@ save_and_call:
         mrs     x2, spsr_el1
         stp     x30, x1,  [sp, #240]
         str     x2,       [sp, #256]
+        mrs     x3, sp_el0
+        str     x3,       [sp, #264]
         mov     x1, x0              // kind
         mov     x0, sp              // frame
         bl      exc_handler
@@ -64,6 +66,8 @@ exit_exception:                     // also the first "return" of every new proc
         ldp     x30, x1,  [sp, #240]
         msr     elr_el1, x1
         msr     spsr_el1, x2
+        ldr     x3,       [sp, #264]
+        msr     sp_el0, x3
         ldp     x28, x29, [sp, #224]
         ldp     x26, x27, [sp, #208]
         ldp     x24, x25, [sp, #192]
@@ -79,7 +83,7 @@ exit_exception:                     // also the first "return" of every new proc
         ldp     x4,  x5,  [sp, #32]
         ldp     x2,  x3,  [sp, #16]
         ldp     x0,  x1,  [sp, #0]
-        add     sp, sp, #272
+        add     sp, sp, #288
         eret
 
 // void cpu_switch (struct ctx *old, struct ctx *new)  -- kernel context switch.

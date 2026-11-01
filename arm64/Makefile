@@ -12,20 +12,20 @@ DISK ?= disk.img
 
 all: ulix.elf $(DISK)
 
-disk.img: ../bin-build/minixdata.img user/hello.elf user/cat.elf user/crash.elf tools/minix_add.py
+disk.img: ../bin-build/minixdata.img user/hello.elf user/cat.elf user/crash.elf user/forktest.elf tools/minix_add.py
 	cp ../bin-build/minixdata.img $@
 	# two deliberately broken variants of hello.elf for the loader tests:
 	# e_machine = EM_386, and a code segment with flags RWX
 	python3 -c "d=bytearray(open('user/hello.elf','rb').read()); d[18]=3; d[19]=0; open('bad-arch.elf','wb').write(d)"
 	python3 -c "d=bytearray(open('user/hello.elf','rb').read()); d[68]=7; open('bad-wx.elf','wb').write(d)"
-	python3 tools/minix_add.py $@ --grow=4096 hello64=user/hello.elf cat64=user/cat.elf crash64=user/crash.elf \
+	python3 tools/minix_add.py $@ --grow=4096 hello64=user/hello.elf cat64=user/cat.elf crash64=user/crash.elf forktest64=user/forktest.elf \
 		badarch64=bad-arch.elf badwx64=bad-wx.elf
 
 user/%.elf:
 	$(MAKE) -C user
 
-ulix.elf: start.o vectors.o irq.o mmu.o sched.o user.o virtio.o minixfs.o elf.o ulix-port.o glue.o arch_thread.o bookfs_test.o thread_test.o kmain.o ulix.ld
-	$(LD) -T ulix.ld -o $@ start.o vectors.o irq.o mmu.o sched.o user.o virtio.o minixfs.o elf.o ulix-port.o glue.o arch_thread.o bookfs_test.o thread_test.o kmain.o
+ulix.elf: start.o vectors.o irq.o mmu.o virtio.o minixfs.o elf.o ulix-port.o glue.o arch_thread.o bookfs_test.o thread_test.o proc_test.o kmain.o ulix.ld
+	$(LD) -T ulix.ld -o $@ start.o vectors.o irq.o mmu.o virtio.o minixfs.o elf.o ulix-port.o glue.o arch_thread.o bookfs_test.o thread_test.o proc_test.o kmain.o
 
 # ---- kernel code taken from the book (ulix-book.nw) ----
 # notangle assembles declarations / globals / functions from the book's chunks; port.py
@@ -56,6 +56,9 @@ arch_thread.o: arch_thread.c $(GENFILES) $(GENDIR)/ulix-api.h
 
 thread_test.o: thread_test.c $(GENFILES) $(GENDIR)/ulix-api.h
 	$(CC) $(BOOKFLAGS) -Dhash=thread_unused_hash -c -o $@ $<
+
+proc_test.o: proc_test.c $(GENFILES) $(GENDIR)/ulix-api.h
+	$(CC) $(BOOKFLAGS) -Dhash=proc_unused_hash -c -o $@ $<
 
 # the book defines hash() inside its prototype chunk; rename it here so it is only linked once
 glue.o: glue.c $(GENFILES) $(GENDIR)/ulix-api.h

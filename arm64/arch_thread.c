@@ -9,8 +9,8 @@
 // (or in user mode, later), so the queues of the book need no further locking.
 
 #include "ulix-api.h"
+#include "arch_pte.h"
 
-typedef unsigned long u64;
 #define KVA(pa)  ((void *)(0xFFFF000000000000UL + (u64)(pa)))
 #define PA(va)   ((u64)(va) - 0xFFFF000000000000UL)
 
@@ -19,11 +19,23 @@ struct kctx { u64 x19_x28[10]; u64 x29, x30, sp, sp_el0; };      // layout known
 extern void cpu_switch (struct kctx *old, struct kctx *new);
 extern u64  alloc_frames_contig (int n);
 extern void free_frame (u64 pa);
+extern u64  alloc_frame (void);
+extern u64  new_user_l0 (void);
+extern void free_user_space (u64 l0_pa);
+extern int  map_page_in (u64 l0_pa, u64 va, u64 pa, u64 flags);
+extern void sync_icache (void *p, u64 len);
+extern int  elf_load (u64 l0, unsigned ino, u64 *entry);
+extern unsigned minix_lookup (const char *path);
+extern int  minix_is_file (unsigned ino);
+extern u64  empty_l0_pa;
+extern void exit_exception (void);
 
 #define KSTACK_PAGES_ARCH 4
 #define PAGE 4096UL
 
 static struct kctx kctx[MAX_THREADS];
+static void arch_syscalls_init (void);
+void syscall_handler (context_t *r);          // defined in the book without a prototype
 static u64 kstack_pa[MAX_THREADS];             // physical address of the thread's kernel stack, 0 = none
 int book_scheduler_on = 0;                     // irq.c asks this before calling the book's scheduler
 
@@ -31,9 +43,20 @@ int book_scheduler_on = 0;                     // irq.c asks this before calling
 
 int arch_switch_count = 0;
 
+static u64 as_l0[MAX_ADDR_SPACES];             // physical address of the TTBR0 root table of each address space
+
+// Make an address space the active one.  The ASID is always 0, so the TLB is flushed on every
+// switch (simple and correct; per-process ASIDs would avoid the flush).
+static void arch_activate_as (addr_space_id id) {
+  current_as = id;
+  __asm__ volatile ("msr ttbr0_el1, %0; isb; tlbi vmalle1; dsb nsh; isb" :: "r" (as_l0[id]) : "memory");
+}
+
 void arch_context_switch (TCB *t_old, TCB *t_new, context_t *r) {
   arch_switch_count++;
   current_task = t_new->tid;
+  if (t_old->addr_space != t_new->addr_space || current_as != t_new->addr_space)
+    arch_activate_as (t_new->addr_space);
   cpu_switch (&kctx[t_old->tid], &kctx[t_new->tid]);
 }
 
@@ -85,6 +108,9 @@ void arch_threads_init (void) {
   thread_table[0].prev = 0;
   thread_table[0].next = 0;
   address_spaces[1].status = AS_USED;          // address space 1 = the kernel (no user pages)
+  as_l0[1] = empty_l0_pa;
+  current_as = 1;
+  arch_syscalls_init ();
   TCB *idle = &thread_table[1];
   idle->used = true;
   idle->tid = idle->pid = 1;
@@ -145,4 +171,251 @@ int arch_threads_reap (void) {
   }
   irq_restore (flags);
   return n;
+}
+
+
+// =====================================================================================
+// Processes: address spaces, fork, exec, first process, system calls
+// (the x86 versions of these functions live in the book; here they are written for the
+// 4-level AArch64 page tables, but keep the same names and data structures)
+// =====================================================================================
+
+#define USER_STACK_TOP    0x80000000UL
+#define USER_STACK_PAGES  4
+typedef char assert_context_size[(sizeof (context_t) == 288) ? 1 : -1];   // must match vectors.S
+
+static int as_alloc (void) {
+  for (int id = 2; id < MAX_ADDR_SPACES; id++) {
+    if (address_spaces[id].status == AS_FREE) {
+      memset (&address_spaces[id], 0, sizeof (address_space));
+      address_spaces[id].status    = AS_USED;
+      address_spaces[id].pid       = -1;
+      address_spaces[id].refcount  = 1;
+      address_spaces[id].stacksize = USER_STACK_PAGES * PAGE;
+      as_l0[id] = 0;
+      return id;
+    }
+  }
+  return -1;
+}
+
+// the book calls this from syscall_exit(); we may be running in the address space that is destroyed
+void destroy_address_space (addr_space_id id) {
+  if (id < 2 || address_spaces[id].status == AS_FREE) return;
+  if (current_as == id) arch_activate_as (1);        // leave it first: TTBR0 = empty table
+  if (as_l0[id]) free_user_space (as_l0[id]);
+  as_l0[id] = 0;
+  address_spaces[id].status = AS_FREE;
+}
+
+// copy every mapped page of a user address space (no copy-on-write, like the book's fork)
+static int clone_level (u64 old_pa, u64 new_l0, int lvl, u64 va_prefix) {
+  u64 *t = KVA (old_pa);
+  for (int i = 0; i < 512; i++) {
+    u64 e = t[i];
+    if (!(e & PTE_VALID)) continue;
+    u64 va = va_prefix | ((u64)i << (39 - 9 * lvl));
+    if (lvl < 3) {
+      if (clone_level (e & PTE_ADDR, new_l0, lvl + 1, va) < 0) return -1;
+    } else {
+      u64 pa = alloc_frame ();
+      u64 *src = KVA (e & PTE_ADDR), *dst = KVA (pa);
+      for (int k = 0; k < (int)(PAGE / 8); k++) dst[k] = src[k];
+      if (!(e & PTE_UXN)) sync_icache (dst, PAGE);          // executable page: make the copy fetchable
+      if (map_page_in (new_l0, va, pa, e & ~PTE_ADDR) != 0) { free_frame (pa); return -1; }
+    }
+  }
+  return 0;
+}
+
+// Map the user stack and build  [argc][argv]  at its top, with the argument strings and the
+// argv array above it.  The start code (crt0) loads argc and argv from there.
+// Returns the initial user stack pointer, 0 on error.
+static u64 build_user_stack (u64 l0, int argc, char **argv) {
+  u64 top_pa = 0;
+  for (int i = 1; i <= USER_STACK_PAGES; i++) {
+    u64 pa = alloc_frame ();
+    if (i == 1) top_pa = pa;
+    if (map_page_in (l0, USER_STACK_TOP - i * PAGE, pa, PAGE_URW) != 0) return 0;
+  }
+  byte *page = KVA (top_pa);
+  u64 base = USER_STACK_TOP - PAGE, sp = USER_STACK_TOP, ptrs[16];
+  if (argc > 15) argc = 15;
+  for (int i = argc - 1; i >= 0; i--) {
+    int len = strlen (argv[i]) + 1;
+    sp -= len;
+    if (sp < base + 512) return 0;                       // arguments too long
+    memcpy (page + (sp - base), argv[i], len);
+    ptrs[i] = sp;
+  }
+  sp &= ~15UL;
+  sp -= ((argc + 1) * 8 + 15) & ~15UL;
+  u64 *av = (u64 *)(page + (sp - base));
+  for (int i = 0; i < argc; i++) av[i] = ptrs[i];
+  av[argc] = 0;
+  u64 argv_va = sp;
+  sp -= 16;
+  u64 *top = (u64 *)(page + (sp - base));
+  top[0] = argc;
+  top[1] = argv_va;
+  return sp;
+}
+
+// kernel stack for a user process with a prepared exception frame: the first switch to the
+// thread "returns" through exit_exception (vectors.S) into user mode
+static void kstack_for_process (thread_id tid, const context_t *frame) {
+  if (kstack_pa[tid]) {
+    for (int k = 0; k < KSTACK_PAGES_ARCH; k++) free_frame (kstack_pa[tid] + k * PAGE);
+  }
+  kstack_pa[tid] = alloc_frames_contig (KSTACK_PAGES_ARCH);
+  u64 top = (u64)KVA (kstack_pa[tid]) + KSTACK_PAGES_ARCH * PAGE;
+  context_t *f = (context_t *)(top - sizeof (context_t));
+  *f = *frame;
+  struct kctx *c = &kctx[tid];
+  for (int i = 0; i < 10; i++) c->x19_x28[i] = 0;
+  c->x29 = 0;
+  c->x30 = (u64)exit_exception;
+  c->sp  = (u64)f;
+  c->sp_el0 = f->sp_el0;
+}
+
+static void tcb_init_process (TCB *t, thread_id tid, thread_id ppid, const char *name) {
+  addr_space_id as = t->addr_space;
+  memset (t, 0, sizeof (TCB));
+  t->used = true;
+  t->addr_space = as;
+  t->tid = t->pid = tid;
+  t->ppid = ppid;
+  t->terminal = 0;
+  memcpy (t->cwd, "/", 2);
+  for (int i = 0; name[i] && i < 20; i++) t->cmdline[i] = name[i];
+  t->files[0] = DEV_STDIN;  t->files[1] = DEV_STDOUT;  t->files[2] = DEV_STDERR;
+  for (int i = 3; i < MAX_PFD; i++) t->files[i] = -1;
+}
+
+// ---- fork ----
+int u_fork (context_t *r) {
+  thread_id old_tid = current_task;
+  addr_space_id old_as = current_as;
+
+  int new_as = as_alloc ();
+  if (new_as == -1) return -1;
+  u64 nl0 = new_user_l0 ();
+  as_l0[new_as] = nl0;
+  if (clone_level (as_l0[old_as], nl0, 0, 0) < 0) { destroy_address_space (new_as); return -1; }
+  address_spaces[new_as].memstart = address_spaces[old_as].memstart;
+  address_spaces[new_as].memend   = address_spaces[old_as].memend;
+
+  thread_id new_tid = register_new_tcb (new_as);
+  if (new_tid == -1) { destroy_address_space (new_as); return -1; }
+
+  TCB *t_old = &thread_table[old_tid];
+  TCB *t_new = &thread_table[new_tid];
+  *t_new = *t_old;                        // copy the complete TCB, then fix it up (like the book)
+  t_new->used       = true;
+  t_new->state      = TSTATE_FORK;
+  t_new->tid        = new_tid;
+  t_new->addr_space = new_as;
+  t_new->pid        = new_tid;
+  t_new->ppid       = old_tid;
+  for (int pfd = 0; pfd < MAX_PFD; pfd++) {
+    int gfd = t_old->files[pfd];
+    t_new->files[pfd] = (gfd >= 0) ? u_reopen (gfd) : gfd;
+  }
+
+  context_t child = *r;                   // the child continues exactly where the parent is ...
+  child.eax = 0;                         // ... but fork() returns 0 there
+  kstack_for_process (new_tid, &child);
+  add_to_ready_queue (new_tid);           // state becomes READY
+  return new_tid;                         // in the parent, fork() returns the child's PID
+}
+
+// ---- exec: load a new program into a fresh address space and switch to it ----
+int u_execv (char *filename, char *const argv[], memaddress *newstack) {
+  static char kargs[2048];
+  char *kargv[16];
+  int argc = 0, pos = 0;
+  for (; argv && argv[argc] && argc < 15; argc++) {      // argv lives in the old address space
+    int len = strlen (argv[argc]) + 1;
+    if (pos + len > (int)sizeof kargs) return -1;
+    memcpy (kargs + pos, argv[argc], len);
+    kargv[argc] = kargs + pos;
+    pos += len;
+  }
+  unsigned ino = minix_lookup (filename);
+  if (!ino || !minix_is_file (ino)) return -1;
+
+  u64 nl0 = new_user_l0 (), entry;
+  if (elf_load (nl0, ino, &entry) != 0) { free_user_space (nl0); return -1; }
+  u64 sp = build_user_stack (nl0, argc, kargv);
+  if (!sp) { free_user_space (nl0); return -1; }
+
+  u64 old = as_l0[current_as];                           // from here on there is no way back
+  as_l0[current_as] = nl0;
+  arch_activate_as (current_as);
+  free_user_space (old);
+  *newstack = sp;
+  return (int)entry;
+}
+
+// ---- start a first process from a file (the kernel plays the role of its parent) ----
+int arch_start_user (const char *path, int argc, char **argv) {
+  unsigned ino = minix_lookup (path);
+  if (!ino || !minix_is_file (ino)) { printf ("exec: %s: no such file\n", path); return -1; }
+  int as = as_alloc ();
+  if (as == -1) return -1;
+  u64 l0 = new_user_l0 (), entry;
+  as_l0[as] = l0;
+  u64 sp = 0;
+  if (elf_load (l0, ino, &entry) == 0) sp = build_user_stack (l0, argc, argv);
+  if (!sp) { destroy_address_space (as); return -1; }
+
+  thread_id tid = register_new_tcb (as);
+  if (tid == -1) { destroy_address_space (as); return -1; }
+  tcb_init_process (&thread_table[tid], tid, 1, path + (path[0] == '/'));   // parent: idle, nobody waits
+  context_t f;
+  memset (&f, 0, sizeof f);
+  f.elr = entry;
+  f.spsr = 0;                             // EL0t, interrupts enabled
+  f.sp_el0 = sp;
+  kstack_for_process (tid, &f);
+  u64 flags = irq_save ();
+  add_to_ready_queue (tid);
+  irq_restore (flags);
+  return tid;
+}
+
+// ---- system calls: the book's dispatcher, called from the exception handler ----
+void book_syscall (void *frame) {
+  syscall_handler ((context_t *)frame);
+}
+
+int book_current_pid (void) { return thread_table[current_task].pid; }
+
+// a user process did something illegal: end it like exit(-1) does
+void book_user_fault (void *frame) {
+  context_t *r = frame;
+  r->ebx = (unsigned long)-1;
+  syscall_exit (r);
+}
+
+static void arch_syscalls_init (void) {
+  install_syscall_handler (__NR_exit,      syscall_exit);
+  install_syscall_handler (__NR_fork,      syscall_fork);
+  install_syscall_handler (__NR_read,      syscall_read);
+  install_syscall_handler (__NR_write,     syscall_write);
+  install_syscall_handler (__NR_open,      syscall_open);
+  install_syscall_handler (__NR_close,     syscall_close);
+  install_syscall_handler (__NR_waitpid,   syscall_waitpid);
+  install_syscall_handler (__NR_execve,    syscall_execv);
+  install_syscall_handler (__NR_unlink,    syscall_unlink);
+  install_syscall_handler (__NR_chdir,     syscall_chdir);
+  install_syscall_handler (__NR_lseek,     syscall_lseek);
+  install_syscall_handler (__NR_getpid,    syscall_getpid);
+  install_syscall_handler (__NR_gettid,    syscall_gettid);
+  install_syscall_handler (__NR_getppid,   syscall_getppid);
+  install_syscall_handler (__NR_resign,    syscall_resign);
+  install_syscall_handler (__NR_stat,      syscall_stat);
+  install_syscall_handler (__NR_getcwd,    syscall_getcwd);
+  install_syscall_handler (__NR_get_errno, syscall_get_errno);
 }

@@ -46,6 +46,10 @@ int buffer_read (int dev, int blockno, char *block)                      { retur
 int buffer_write (int dev, int blockno, char *block, char dirtyflag)     { return 0; }
 boolean buffer_contains (int dev, int blockno)                           { return 0; }
 
+// ---- console output: the book's kputch() writes to the VGA text screen; here it is the UART ----
+extern void putch (char c);
+void kputch (byte c) { putch ((char)c); }
+
 // ---- diagnostics ----
 int debug_printf (const char *format, ...) { return 0; }                 // debugging output off
 

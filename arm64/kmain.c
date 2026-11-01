@@ -123,7 +123,7 @@ static void disk_test (void) {
   CHECK (minix_mount () == 0, "Minix file system mounted");
   int n = 0;
   minix_readdir (1, count_cb, &n);
-  CHECK (n == 21, "root directory has 21 entries (16 from x86 Ulix + 5 AArch64 files)");
+  CHECK (n == 22, "root directory has 22 entries (16 from x86 Ulix + 6 AArch64 files)");
   n = 0;
   minix_readdir (minix_lookup ("/bin"), count_cb, &n);
   CHECK (n == 63, "/bin has 63 entries");
@@ -146,110 +146,6 @@ static void disk_test (void) {
   printf ("  info: /hello.c starts with: %s\n", text);
 }
 
-static int count_in (const char *hay, const char *needle) {
-  int n = 0, nl = 0;
-  while (needle[nl]) nl++;
-  for (int i = 0; hay[i]; i++) {
-    int j = 0;
-    while (j < nl && hay[i + j] == needle[j]) j++;
-    if (j == nl) n++;
-  }
-  return n;
-}
-
-// start a program from the disk, wait until everything has exited, return its pid
-static int run_elf (const char *path, int argc, const char *const *argv) {
-  int pid = task_create_elf (path, argc, argv);
-  if (pid < 0) return pid;
-  while (tasks_live ()) {
-    tasks_reap ();
-    if (tasks_live ()) __asm__ volatile ("wfi");
-  }
-  tasks_reap ();
-  return pid;
-}
-
-static void elf_test (void) {
-  long frames_before = frames_in_use;
-  char *out;
-  int pid;
-
-  const char *hello_argv[] = { "hello64", "foo", "bar" };
-  capture_start ();
-  pid = run_elf ("/hello64", 3, hello_argv);
-  capture_stop (&out);
-  CHECK (pid > 0 && task_exit_code (pid) == 0, "/hello64 ran and reported 0 failed checks (exit status 0)");
-  CHECK (count_in (out, "hello from an AArch64 ELF") == 1 && count_in (out, "argv[2]=bar") == 1,
-         "program output reached the console, argv visible");
-  CHECK (count_in (out, "user ok:") == 7 && count_in (out, "user FAIL") == 0,
-         "7 checks inside the program passed: .data, .bss, .rodata, stack, argv");
-
-  const char *cat_argv[] = { "cat64", "/hello.c" };
-  capture_start ();
-  pid = run_elf ("/cat64", 2, cat_argv);
-  capture_stop (&out);
-  CHECK (pid > 0 && task_exit_code (pid) == 0 && count_in (out, "-- 316 bytes") == 1 &&
-         count_in (out, "#include \"../ulixlib.h\"") == 1,
-         "/cat64 /hello.c: open/read/close syscalls deliver the 316-byte file");
-
-  cat_argv[1] = "/test.txt";
-  capture_start ();
-  pid = run_elf ("/cat64", 2, cat_argv);
-  capture_stop (&out);
-  CHECK (task_exit_code (pid) == 0 && count_in (out, "-- 1680 bytes") == 1,
-         "/cat64 /test.txt: file spanning two zones, read in several chunks");
-
-  cat_argv[1] = "/nonexistent";
-  capture_start ();
-  pid = run_elf ("/cat64", 2, cat_argv);
-  capture_stop (&out);
-  CHECK (task_exit_code (pid) == 1 && count_in (out, "cannot open") == 1, "open of a missing file fails cleanly");
-
-  const char *crash_argv[] = { "crash64" };
-  int killed = procs_killed;
-  capture_start ();
-  pid = run_elf ("/crash64", 1, crash_argv);
-  capture_stop (&out);
-  CHECK (procs_killed == killed + 1 && task_exit_code (pid) == -1 && count_in (out, "not reached") == 0,
-         "write to the read-only code page kills the process (W^X enforced)");
-
-  capture_start ();
-  CHECK (task_create_elf ("/badarch64", 1, crash_argv) == -1, "ELF with e_machine = x86 is refused");
-  capture_stop (&out);
-  CHECK (count_in (out, "not an AArch64 executable") == 1, "  ... with the right reason");
-  capture_start ();
-  CHECK (task_create_elf ("/badwx64", 1, crash_argv) == -1, "ELF with a writable+executable segment is refused");
-  capture_stop (&out);
-  CHECK (count_in (out, "writable and executable") == 1, "  ... with the right reason");
-  CHECK (task_create_elf ("/init", 1, crash_argv) == -1, "flat x86 binary /init is refused (no ELF header)");
-  CHECK (task_create_elf ("/hello.c", 1, crash_argv) == -1, "text file is refused (no ELF header)");
-  CHECK (task_create_elf ("/nonexistent", 1, crash_argv) == -1, "missing file is refused");
-  CHECK (tasks_live () == 0 && frames_in_use == frames_before,
-         "no frame leaked after 6 runs and 5 refused loads");
-}
-
-static void process_test (void) {
-  long frames_before = frames_in_use;
-  printf ("starting 3 user processes: hello 1, hello 2, bad\n");
-  int p1 = task_create_user (user_hello_start, user_hello_end, 1);
-  int p2 = task_create_user (user_hello_start, user_hello_end, 2);
-  int p3 = task_create_user (user_bad_start,   user_bad_end,   0);
-  CHECK (p1 == 1 && p2 == 2 && p3 == 3, "three processes created with pids 1, 2, 3");
-
-  while (tasks_live ()) {                         // idle loop
-    tasks_reap ();
-    if (tasks_live ()) __asm__ volatile ("wfi");
-  }
-  tasks_reap ();
-
-  CHECK (sys_write_calls == 10, "10 write syscalls from the two hello processes");
-  CHECK (procs_killed == 1, "bad process killed by the kernel (permission fault), kernel survived");
-  CHECK (tasks_reaped == 3, "all three processes reaped");
-  CHECK (preemptions >= 1, "a running process was preempted by the timer interrupt");
-  printf ("  info: %d context switches (%d by timer), %lu timer ticks\n", context_switches, preemptions, ticks);
-  CHECK (frames_in_use == frames_before, "no frame leaked: address spaces and kernel stacks freed");
-}
-
 void kmain (void) {
   u64 el;
   __asm__ volatile ("mrs %0, CurrentEL" : "=r" (el));
@@ -267,19 +163,16 @@ void kmain (void) {
   printf ("disk test:\n");
   disk_test ();
 
-  sched_init ();
   printf ("book file system test (mx_* from ulix-book.nw):\n");
   extern int bookfs_test (void);
   fails += bookfs_test ();
 
-  printf ("process test:\n");
-  process_test ();
-  printf ("ELF test:\n");
-  elf_test ();
-
-  printf ("thread test (scheduler, queues, mutexes, semaphores from ulix-book.nw):\n");
+  printf ("thread and process tests (book scheduler, system calls, fork, exec):\n");
   extern int thread_test (void);
+  extern int proc_test (void);
   fails += thread_test ();
+  printf ("process test (fork, exec, waitpid, files, faults):\n");
+  fails += proc_test ();
 
   printf (fails ? "RESULT: %d check(s) FAILED\n" : "RESULT: all checks passed\n", fails);
   for (;;) __asm__ volatile ("wfe");

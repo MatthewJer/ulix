@@ -6,30 +6,43 @@ typedef unsigned long u64;
 typedef unsigned int  u32;
 typedef unsigned char u8;
 
+// System call ABI (the same convention as the x86 version of Ulix, with the registers renamed):
+// svc #0; x0 = system call number (afterwards: the result), x1..x5 = arguments.
+// The numbers are those of the book (__NR_* in ulix-book.nw).
 static inline long syscall3 (long nr, long a, long b, long c) {
-  register long x8 __asm__ ("x8") = nr;
-  register long x0 __asm__ ("x0") = a;
-  register long x1 __asm__ ("x1") = b;
-  register long x2 __asm__ ("x2") = c;
-  __asm__ volatile ("svc #0" : "+r" (x0) : "r" (x8), "r" (x1), "r" (x2) : "memory");
-  return x0;
+  register long x0 __asm__ ("x0") = nr;
+  register long x1 __asm__ ("x1") = a;
+  register long x2 __asm__ ("x2") = b;
+  register long x3 __asm__ ("x3") = c;
+  __asm__ volatile ("svc #0" : "+r" (x0) : "r" (x1), "r" (x2), "r" (x3) : "memory");
+  return (int)x0;                          // the kernel returns 32-bit values
 }
 
-#define SYS_write   1
-#define SYS_getpid  2
-#define SYS_yield   3
-#define SYS_exit    4
-#define SYS_open    5
-#define SYS_read    6
-#define SYS_close   7
+#define SYS_exit     1
+#define SYS_fork     2
+#define SYS_read     3
+#define SYS_write    4
+#define SYS_open     5
+#define SYS_close    6
+#define SYS_waitpid  7
+#define SYS_execve  11
+#define SYS_lseek   19
+#define SYS_getpid  20
+#define SYS_getppid 64
+#define SYS_resign  66
 
-static inline long write (int fd, const void *buf, u64 n) { return syscall3 (SYS_write, fd, (long)buf, n); }
+static inline long write (int fd, const void *buf, u64 n)  { return syscall3 (SYS_write, fd, (long)buf, n); }
 static inline int  getpid (void)                           { return syscall3 (SYS_getpid, 0, 0, 0); }
-static inline void yield (void)                            { syscall3 (SYS_yield, 0, 0, 0); }
+static inline int  getppid (void)                          { return syscall3 (SYS_getppid, 0, 0, 0); }
+static inline void yield (void)                            { syscall3 (SYS_resign, 0, 0, 0); }
 static inline void exit (int code)                         { syscall3 (SYS_exit, code, 0, 0); for (;;) ; }
-static inline int  open (const char *path)                 { return syscall3 (SYS_open, (long)path, 0, 0); }
+static inline int  fork (void)                             { return syscall3 (SYS_fork, 0, 0, 0); }
+static inline int  waitpid (int pid, int *status, int opt) { return syscall3 (SYS_waitpid, pid, (long)status, opt); }
+static inline int  execv (const char *path, char *const argv[]) { return syscall3 (SYS_execve, (long)path, (long)argv, 0); }
+static inline int  open (const char *path, int flags)      { return syscall3 (SYS_open, (long)path, flags, 0); }
 static inline long read (int fd, void *buf, u64 n)         { return syscall3 (SYS_read, fd, (long)buf, n); }
 static inline int  close (int fd)                          { return syscall3 (SYS_close, fd, 0, 0); }
+static inline int  lseek (int fd, int off, int whence)     { return syscall3 (SYS_lseek, fd, off, whence); }
 
 int  strlen (const char *s);
 int  strcmp (const char *a, const char *b);
