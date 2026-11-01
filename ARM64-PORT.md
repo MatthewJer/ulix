@@ -235,3 +235,24 @@ Ergebnis in qemu (Cortex-A72, EL1 und EL2, Legacy- und modernes virtio): **79 Pr
 Zwei Eigenheiten des Buchs, die ich beim Testen gelernt habe (keine Portierungsfehler): `mx_getdent` liefert auch unbelegte 32-Byte-Slots (Inode 0), und `mx_mkdir` prüft nicht, ob das Verzeichnis schon existiert (das macht `u_mkdir` eine Ebene höher); ein zweiter `mx_mkdir` auf einen vorhandenen Pfad würde das Dateisystem beschädigen.
 
 Nächster Schritt (Schritt 2 aus Abschnitt 12): Thread-Tabelle (TCB) und Scheduler des Buchs statt der vereinfachten aus Etappe 5; dann fallen Buffer-Cache-Stubs und Durchschreib-`writeblock` weg.
+
+## 14. Schritt 2 der Kernel-Portierung: Thread-Code des Buchs läuft auf ARM64
+
+Aus dem Buch laufen jetzt auch **Scheduler, Ready- und Blocked-Queues, `block`/`deblock`, Mutexe (`mutex_lock/unlock`, `get_new_lock`) und Kernel-Semaphore** auf ARM64 (zusammen 98 Funktionen und 23 Globals in der Auswahl). Die Kernel-Threads schalten über den Kontextwechsel aus Etappe 5 um.
+
+Änderungen am Buch (alle x86-neutral, geprüft):
+- `<<scheduler implementation>>`: Der Kontextwechsel (ESP/EBP, CR3, TSS, `iret` für neue Threads) sowie die Blöcke „Signale prüfen“ und „alte Kernel-Stacks freigeben“ stehen jetzt in `#if defined(__i386__)`; sonst ruft der Scheduler `arch_context_switch()`.
+- `<<resign>>`: x86 behält `int 0x80` (Syscall 66), andere Architekturen rufen `arch_resign()`.
+- Prototypen von `arch_resign` und `arch_context_switch` unter `#if !defined(__i386__)`.
+- **Fehlerkorrektur im Buch:** `wait_semaphore` und `signal_semaphore` arbeiteten auf einer **Kopie** des Semaphors (`kl_semaphore sem = kl_semaphore_table[sid]`). Zähler und Warteschlange wurden nur in der Kopie auf dem Stack verändert, die Semaphore haben auf x86 daher nie funktioniert (der Kernel benutzt sie nirgends, nur die Mutexe, deshalb fiel es nicht auf). Jetzt wird mit einem Zeiger gearbeitet, im Text steht eine Anmerkung dazu.
+
+Nachweis, dass x86 unverändert bleibt: Nach den Scheduler-/`resign`-Änderungen ist der `.text`-Abschnitt weiterhin bit-identisch. Nach der Semaphor-Korrektur unterscheiden sich von 353 Funktionen genau die beiden korrigierten (Vergleich der Disassembly mit normalisierten Adressen), und der x86-Kernel bootet in `qemu-system-i386` mit identischer Ausgabe.
+
+Neu in `arm64/`:
+- `arch_thread.c`: Plattformseite der Threads. Jeder Thread hat einen eigenen Kernel-Stack (4 Seiten); `arch_context_switch` ruft `cpu_switch` (Callee-saved-Register, SP, `SP_EL0`). `arch_threads_init` macht den Boot-Thread zum Idle-Thread 1 der Ready-Queue, `arch_thread_create` startet Kernel-Threads (Eltern-ID 1, damit der Scheduler Zombies selbst abräumt), `arch_threads_reap` gibt Stacks beendeter Threads frei. Wie auf x86 läuft Kernelcode mit maskierten Interrupts, dadurch sind die Queues des Buchs ohne weitere Sperren sicher; der Timer wechselt Threads nur, wenn er den Idle-Thread im `wfi` trifft (später auch im User-Modus).
+- `thread_test.c`: 3 Threads erhöhen einen Zähler unter einem Mutex und geben die CPU **innerhalb** des kritischen Abschnitts ab (erwartet genau 450, nie mehr als ein Thread im Abschnitt, 1352 Kontextwechsel); Erzeuger/Verbraucher mit zwei Semaphoren über einen 4-Slot-Puffer (60 Elemente, Reihenfolge und Summe korrekt); ein Thread, der auf ein Semaphor wartet und von einem anderen geweckt wird; Zombie-Aufräumen und Frame-Bilanz.
+- `tools/port.py` erzeugt zusätzlich `gen/ulix-api.h` mit `extern`-Deklarationen aller ausgewählten Globals, damit die Plattformdateien auf die Buch-Variablen zugreifen können.
+
+Ergebnis in qemu (EL1 und EL2): **91 Prüfungen, alle bestehen**; `make verify` (Dateisystem-Schreibtests auf dem Image, Host-Kontrolle) weiterhin ohne Probleme.
+
+Bekannte Lücken: Der Buffer Cache des Buchs ist noch nicht eingebunden (die Schreib-Durchreichung in `glue.c` bleibt); das Umschalten zwischen **Adressräumen** (TTBR0/ASID in `arch_context_switch`) fehlt, weil alle Test-Threads im Kernel-Adressraum laufen; Signale und der Aufräum-Code für Kernel-Stacks aus dem Scheduler sind auf ARM64 noch nicht vorhanden. Die einfache Prozessverwaltung aus Etappe 5 läuft daneben weiter (der Timer wählt, welcher Scheduler gerade aktiv ist), bis `fork`/`exec` aus dem Buch (Schritt 3) sie ablösen.

@@ -24,8 +24,8 @@ disk.img: ../bin-build/minixdata.img user/hello.elf user/cat.elf user/crash.elf 
 user/%.elf:
 	$(MAKE) -C user
 
-ulix.elf: start.o vectors.o irq.o mmu.o sched.o user.o virtio.o minixfs.o elf.o ulix-port.o glue.o bookfs_test.o kmain.o ulix.ld
-	$(LD) -T ulix.ld -o $@ start.o vectors.o irq.o mmu.o sched.o user.o virtio.o minixfs.o elf.o ulix-port.o glue.o bookfs_test.o kmain.o
+ulix.elf: start.o vectors.o irq.o mmu.o sched.o user.o virtio.o minixfs.o elf.o ulix-port.o glue.o arch_thread.o bookfs_test.o thread_test.o kmain.o ulix.ld
+	$(LD) -T ulix.ld -o $@ start.o vectors.o irq.o mmu.o sched.o user.o virtio.o minixfs.o elf.o ulix-port.o glue.o arch_thread.o bookfs_test.o thread_test.o kmain.o
 
 # ---- kernel code taken from the book (ulix-book.nw) ----
 # notangle assembles declarations / globals / functions from the book's chunks; port.py
@@ -39,8 +39,8 @@ $(GENFILES): ../ulix-book.nw ulix-arm64.nw
 	  notangle -L -R$$r ../ulix-book.nw ulix-arm64.nw 2>/dev/null | sed 's/^#line .*//' > $(GENDIR)/$$r; \
 	done
 
-$(GENDIR)/ulix-port.c: $(GENFILES) port.manifest tools/port.py
-	python3 tools/port.py $(GENDIR) port.manifest $@
+$(GENDIR)/ulix-port.c $(GENDIR)/ulix-api.h: $(GENFILES) port.manifest tools/port.py
+	python3 tools/port.py $(GENDIR) port.manifest $(GENDIR)/ulix-port.c
 
 BOOKFLAGS = -std=gnu99 -O0 -g -ffreestanding -nostdlib -nostdinc -fno-builtin -fno-stack-protector \
             -mgeneral-regs-only -Wall -Wno-unused -Wno-pointer-sign -I$(GENDIR)
@@ -48,11 +48,17 @@ BOOKFLAGS = -std=gnu99 -O0 -g -ffreestanding -nostdlib -nostdinc -fno-builtin -f
 ulix-port.o: $(GENDIR)/ulix-port.c
 	$(CC) $(BOOKFLAGS) -c -o $@ $<
 
-bookfs_test.o: bookfs_test.c $(GENFILES)
+bookfs_test.o: bookfs_test.c $(GENFILES) $(GENDIR)/ulix-api.h
 	$(CC) $(BOOKFLAGS) -Dhash=bookfs_unused_hash -c -o $@ $<
 
+arch_thread.o: arch_thread.c $(GENFILES) $(GENDIR)/ulix-api.h
+	$(CC) $(BOOKFLAGS) -Dhash=arch_unused_hash -c -o $@ $<
+
+thread_test.o: thread_test.c $(GENFILES) $(GENDIR)/ulix-api.h
+	$(CC) $(BOOKFLAGS) -Dhash=thread_unused_hash -c -o $@ $<
+
 # the book defines hash() inside its prototype chunk; rename it here so it is only linked once
-glue.o: glue.c $(GENFILES)
+glue.o: glue.c $(GENFILES) $(GENDIR)/ulix-api.h
 	$(CC) $(BOOKFLAGS) -Dhash=glue_unused_hash -c -o $@ $<
 
 %.o: %.S

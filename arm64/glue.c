@@ -2,7 +2,7 @@
 // and the ARM64 drivers.  Everything here replaces something that is hardware specific in
 // the x86 version of the kernel.
 
-#include "ulix-decl.h"          // the book's types, constants and prototypes (generated)
+#include "ulix-api.h"          // the book's types, constants and prototypes (generated)
 
 extern int  blk_read  (unsigned long sector, void *buf, unsigned nsectors);
 extern int  blk_write (unsigned long sector, void *buf, unsigned nsectors);

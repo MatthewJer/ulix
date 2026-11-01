@@ -2135,6 +2135,14 @@ Since \UlixI{} can be (and has been) used for Bachelor's or Master's thesis
 projects, we provide a mechanism to integrate the OS code with a module that is
 implemented by the student; during kernel initialization we will call the
 <<function prototypes>>=
+#if !defined(__i386__)
+// provided by the platform code of the port (see the arm64 directory)
+void arch_resign (void);
+void arch_context_switch (TCB *t_old, TCB *t_new, context_t *r);
+#endif
+@
+
+<<function prototypes>>=
 extern void initialize_module ();
 @ %def initialize_module
 function which may perform further initialization tasks.
@@ -11800,10 +11808,14 @@ install_syscall_handler (__NR_resign, syscall_resign);
 When we want to resign from inside kernel code, we simply use the following [[<<resign>>]] code chunk which explicitly makes the system call:
 %nouse
 <<resign>>=
+#if defined(__i386__)
 asm {
   mov eax, 66;   // System Call no. 66
   int 0x80;      // Make the System Call
 }
+#else
+arch_resign ();  // platform code: give up the CPU (ARM64 port)
+#endif
 @ and user mode processes can do the same by calling this [[resign()]] function that we supply as part of the library:
 %nouse
 <<ulixlib function prototypes>>=
@@ -14338,11 +14350,25 @@ debug_printf ("SCHED: enter find next\n");
 <<scheduler: find next process and set [[t_new]]>>
 debug_printf ("SCHED: leave find next\n");
 if (t_new != t_old) { 
+#if defined(__i386__)
   <<scheduler: context switch>> 
+#else
+  arch_context_switch (t_old, t_new, r);   // platform code (ARM64 port)
+#endif
 }
+#if defined(__i386__)
 <<scheduler: check pending signals>> // see chapter on signals
 <<scheduler: free old kernel stacks>>  // if there are any 
+#endif
 @
+
+\noindent
+Everything from the search for the next process on is independent of the processor, but the
+context switch itself is not: it swaps stack pointers, page directory and TSS of the x86
+CPU, and the signal and kernel-stack code below it depends on the page table format. The
+\texttt{\#if} lines keep this x86 code unchanged and let other ports (the ARM64 port in
+the [[arm64/]] directory) plug in their own [[arch_context_switch()]].
+
 
 \noindent
 We will implement the code chunk [[<<scheduler: check pending signals>>]] in
@@ -18167,13 +18193,17 @@ check, a condition [[counter < 1]] would not be correct.
 Note that we mark the body of the implementations of $P$ and $V$ as critical sections. To see why, you should explore the case of interrupts happening after the counter manipulation and the test of the counter value (or solve exercise~\ref{ex:semaphore:critical:section}). Since semaphores are synchronization techniques on a higher level of abstraction than hardware mechanisms, it would also be counter-intuitive if we could implement them without referring to \emph{any} lower-level synchronization primitive.
 
 \black
+Note that [[sem]] must be a \emph{pointer} to the table entry: with a plain
+[[kl_semaphore]] variable the structure would be copied, and the counter and the blocked
+queue would be modified in the copy on the stack instead of in the semaphore table.
+
 <<function implementations>>=
 void wait_semaphore (kl_semaphore_id sid) {
-  kl_semaphore sem = <<semaphore structure with identifier [[sid]]>>;
+  kl_semaphore *sem = &<<semaphore structure with identifier [[sid]]>>;
   <<begin critical section in kernel>>
-  sem.counter--;
-  if (sem.counter < 0) {
-    block (&sem.bq, TSTATE_LOCKED);
+  sem->counter--;
+  if (sem->counter < 0) {
+    block (&sem->bq, TSTATE_LOCKED);
     debug_printf ("sem_LOCK going to call resign()\n");  // REMOVE_DEBUGGING_CODE
     <<resign>>
   }
@@ -18192,11 +18222,11 @@ this thread if there is one.
 
 <<function implementations>>=
 void signal_semaphore (kl_semaphore_id sid) {
-  kl_semaphore sem = <<semaphore structure with identifier [[sid]]>>;
+  kl_semaphore *sem = &<<semaphore structure with identifier [[sid]]>>;
   <<begin critical section in kernel>>
-  sem.counter++;
-  if (sem.counter < 1) {
-    blocked_queue *bq = &(sem.bq);
+  sem->counter++;
+  if (sem->counter < 1) {
+    blocked_queue *bq = &(sem->bq);
     thread_id head = bq->next;
     if (head != 0) {
       deblock (head, bq);

@@ -4,6 +4,8 @@
 #include "ulix.h"
 
 extern char vectors[];
+extern int  book_scheduler_on;
+extern void book_timer_tick (void);
 
 // ---- GICv2 on qemu "virt" ------------------------------------------------
 #define GICD_BASE   (KERNEL_VA + 0x08000000UL)
@@ -134,7 +136,10 @@ void exc_handler (struct frame *f, int kind) {
       else printf ("spurious IRQ %u\n", irq);
       GICC_EOIR = iar;
     }
-    if (irq == IRQ_TIMER) schedule_preempt ();   // time slice over (10 ms)
+    if (irq == IRQ_TIMER) {                  // time slice over (10 ms)
+      if (book_scheduler_on) book_timer_tick ();   // the book's scheduler (thread tests)
+      else                   schedule_preempt ();  // simple scheduler of the user process tests
+    }
     return;
   }
 

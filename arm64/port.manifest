@@ -55,3 +55,31 @@ function devmajor
 function devminor
 function readblock
 function writeblock_raw
+
+# threads: ready/blocked queues, scheduler, mutexes and kernel semaphores
+function scheduler
+function block
+function deblock
+function add_to_ready_queue
+function remove_from_ready_queue
+function add_to_blocked_queue
+function remove_from_blocked_queue
+function front_of_blocked_queue
+function initialize_blocked_queue
+function mutex_lock
+function mutex_try_lock
+function mutex_unlock
+function get_new_semaphore
+function release_semaphore
+function wait_semaphore
+function signal_semaphore
+function get_new_lock
+global t_new
+global kl_semaphore_table
+global next_kl_semaphore
+global kernel_locks
+global system_ticks
+global paging_lock
+global swapper_lock
+global waitpid_queue
+global address_spaces

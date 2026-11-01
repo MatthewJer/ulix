@@ -274,9 +274,12 @@ void kmain (void) {
 
   printf ("process test:\n");
   process_test ();
-
   printf ("ELF test:\n");
   elf_test ();
+
+  printf ("thread test (scheduler, queues, mutexes, semaphores from ulix-book.nw):\n");
+  extern int thread_test (void);
+  fails += thread_test ();
 
   printf (fails ? "RESULT: %d check(s) FAILED\n" : "RESULT: all checks passed\n", fails);
   for (;;) __asm__ volatile ("wfe");

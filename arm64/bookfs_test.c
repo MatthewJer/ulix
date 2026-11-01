@@ -2,7 +2,7 @@
 // (mx_open, mx_read, mx_write, ...) on top of the virtio disk.  The results are checked here
 // and, for the files that stay on the disk, once more on the host by tools/minix_check.py.
 
-#include "ulix-decl.h"
+#include "ulix-api.h"
 
 #define DEV DEV_HDA
 
