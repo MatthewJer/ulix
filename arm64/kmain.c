@@ -8,7 +8,13 @@
 #define UART_FR     (*(volatile u32 *)(UART0_BASE + 0x18))
 #define UART_FR_TXFF (1 << 5)
 
+static char cap_buf[8192];
+static int  cap_len = 0, cap_on = 0;
+void capture_start (void) { cap_len = 0; cap_on = 1; }
+int  capture_stop (char **text) { cap_on = 0; cap_buf[cap_len] = 0; *text = cap_buf; return cap_len; }
+
 void putch (char c) {
+  if (cap_on && cap_len < (int)sizeof cap_buf - 1) cap_buf[cap_len++] = c;
   if (c == '\n') putch ('\r');
   while (UART_FR & UART_FR_TXFF) ;
   UART_DR = c;
@@ -116,7 +122,7 @@ static void disk_test (void) {
   CHECK (minix_mount () == 0, "Minix file system mounted");
   int n = 0;
   minix_readdir (1, count_cb, &n);
-  CHECK (n == 16, "root directory has 16 entries");
+  CHECK (n == 21, "root directory has 21 entries (16 from x86 Ulix + 5 AArch64 files)");
   n = 0;
   minix_readdir (minix_lookup ("/bin"), count_cb, &n);
   CHECK (n == 63, "/bin has 63 entries");
@@ -137,6 +143,88 @@ static void disk_test (void) {
   long got = minix_read (minix_lookup ("/hello.c"), 0, text, 40);
   text[got > 0 ? got : 0] = 0;
   printf ("  info: /hello.c starts with: %s\n", text);
+}
+
+static int count_in (const char *hay, const char *needle) {
+  int n = 0, nl = 0;
+  while (needle[nl]) nl++;
+  for (int i = 0; hay[i]; i++) {
+    int j = 0;
+    while (j < nl && hay[i + j] == needle[j]) j++;
+    if (j == nl) n++;
+  }
+  return n;
+}
+
+// start a program from the disk, wait until everything has exited, return its pid
+static int run_elf (const char *path, int argc, const char *const *argv) {
+  int pid = task_create_elf (path, argc, argv);
+  if (pid < 0) return pid;
+  while (tasks_live ()) {
+    tasks_reap ();
+    if (tasks_live ()) __asm__ volatile ("wfi");
+  }
+  tasks_reap ();
+  return pid;
+}
+
+static void elf_test (void) {
+  long frames_before = frames_in_use;
+  char *out;
+  int pid;
+
+  const char *hello_argv[] = { "hello64", "foo", "bar" };
+  capture_start ();
+  pid = run_elf ("/hello64", 3, hello_argv);
+  capture_stop (&out);
+  CHECK (pid > 0 && task_exit_code (pid) == 0, "/hello64 ran and reported 0 failed checks (exit status 0)");
+  CHECK (count_in (out, "hello from an AArch64 ELF") == 1 && count_in (out, "argv[2]=bar") == 1,
+         "program output reached the console, argv visible");
+  CHECK (count_in (out, "user ok:") == 7 && count_in (out, "user FAIL") == 0,
+         "7 checks inside the program passed: .data, .bss, .rodata, stack, argv");
+
+  const char *cat_argv[] = { "cat64", "/hello.c" };
+  capture_start ();
+  pid = run_elf ("/cat64", 2, cat_argv);
+  capture_stop (&out);
+  CHECK (pid > 0 && task_exit_code (pid) == 0 && count_in (out, "-- 316 bytes") == 1 &&
+         count_in (out, "#include \"../ulixlib.h\"") == 1,
+         "/cat64 /hello.c: open/read/close syscalls deliver the 316-byte file");
+
+  cat_argv[1] = "/test.txt";
+  capture_start ();
+  pid = run_elf ("/cat64", 2, cat_argv);
+  capture_stop (&out);
+  CHECK (task_exit_code (pid) == 0 && count_in (out, "-- 1680 bytes") == 1,
+         "/cat64 /test.txt: file spanning two zones, read in several chunks");
+
+  cat_argv[1] = "/nonexistent";
+  capture_start ();
+  pid = run_elf ("/cat64", 2, cat_argv);
+  capture_stop (&out);
+  CHECK (task_exit_code (pid) == 1 && count_in (out, "cannot open") == 1, "open of a missing file fails cleanly");
+
+  const char *crash_argv[] = { "crash64" };
+  int killed = procs_killed;
+  capture_start ();
+  pid = run_elf ("/crash64", 1, crash_argv);
+  capture_stop (&out);
+  CHECK (procs_killed == killed + 1 && task_exit_code (pid) == -1 && count_in (out, "not reached") == 0,
+         "write to the read-only code page kills the process (W^X enforced)");
+
+  capture_start ();
+  CHECK (task_create_elf ("/badarch64", 1, crash_argv) == -1, "ELF with e_machine = x86 is refused");
+  capture_stop (&out);
+  CHECK (count_in (out, "not an AArch64 executable") == 1, "  ... with the right reason");
+  capture_start ();
+  CHECK (task_create_elf ("/badwx64", 1, crash_argv) == -1, "ELF with a writable+executable segment is refused");
+  capture_stop (&out);
+  CHECK (count_in (out, "writable and executable") == 1, "  ... with the right reason");
+  CHECK (task_create_elf ("/init", 1, crash_argv) == -1, "flat x86 binary /init is refused (no ELF header)");
+  CHECK (task_create_elf ("/hello.c", 1, crash_argv) == -1, "text file is refused (no ELF header)");
+  CHECK (task_create_elf ("/nonexistent", 1, crash_argv) == -1, "missing file is refused");
+  CHECK (tasks_live () == 0 && frames_in_use == frames_before,
+         "no frame leaked after 6 runs and 5 refused loads");
 }
 
 static void process_test (void) {
@@ -181,6 +269,9 @@ void kmain (void) {
   sched_init ();
   printf ("process test:\n");
   process_test ();
+
+  printf ("ELF test:\n");
+  elf_test ();
 
   printf (fails ? "RESULT: %d check(s) FAILED\n" : "RESULT: all checks passed\n", fails);
   for (;;) __asm__ volatile ("wfe");

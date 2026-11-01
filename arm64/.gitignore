@@ -1,2 +1,6 @@
 *.o
 ulix.elf
+disk.img
+user/*.o
+user/*.elf
+bad-*.elf

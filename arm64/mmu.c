@@ -107,6 +107,18 @@ u64 virt_to_phys (u64 va) {
   return (par & PTE_ADDR) | (va & 0xfff);
 }
 
+// Translate a pointer that came from user space. Only the user range is accepted, and for
+// writes the page must really be writable. The kernel then accesses the data through the
+// linear map and never dereferences user pointers itself.
+u64 user_to_phys (u64 va, int write) {
+  if (va < USER_MIN || va >= USER_MAX) return 0;
+  u64 par;
+  if (write) __asm__ volatile ("at s1e1w, %1; isb; mrs %0, par_el1" : "=r" (par) : "r" (va));
+  else       __asm__ volatile ("at s1e1r, %1; isb; mrs %0, par_el1" : "=r" (par) : "r" (va));
+  if (par & 1) return 0;
+  return (par & PTE_ADDR) | (va & 0xfff);
+}
+
 // ---- user address spaces (TTBR0) ----
 u64 empty_l0_pa;
 

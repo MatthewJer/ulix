@@ -51,10 +51,10 @@ static void timer_init (int hz) {
 int sys_write_calls = 0;
 
 static long sys_write (u64 fd, u64 buf, u64 len) {
-  if (fd != 1 || len > 256 || buf < USER_MIN || buf + len > USER_MAX) return -1;
+  if ((fd != 1 && fd != 2) || len > 256 || buf < USER_MIN || buf + len > USER_MAX) return -1;
   // never touch user pointers directly: translate page by page and read via the linear map
   for (u64 i = 0; i < len; ) {
-    u64 pa = virt_to_phys (buf + i);
+    u64 pa = user_to_phys (buf + i, 0);
     if (!pa) return -1;
     u64 n = PAGE_SIZE - ((buf + i) & 0xfff);
     if (n > len - i) n = len - i;
@@ -66,12 +66,55 @@ static long sys_write (u64 fd, u64 buf, u64 len) {
   return len;
 }
 
+static long sys_open (u64 path_va) {
+  char path[64];
+  int n = 0;
+  for (; n < 63; n++) {                     // copy the string byte by byte through the checked translation
+    u64 pa = user_to_phys (path_va + n, 0);
+    if (!pa) return -1;
+    path[n] = *(char *)KVA (pa);
+    if (!path[n]) break;
+  }
+  if (n == 63) return -1;
+  u32 ino = minix_lookup (path);
+  if (!ino || !minix_is_file (ino)) return -1;
+  return task_fd_open (ino);
+}
+
+static long sys_read (u64 fd, u64 buf, u64 len) {
+  static u8 kbuf[1024] __attribute__ ((aligned (16)));
+  struct file *f = task_fd_get (fd);
+  if (!f || len > 4096) return -1;
+  long total = 0;
+  while ((u64)total < len) {
+    u32 chunk = len - total < sizeof kbuf ? len - total : sizeof kbuf;
+    long r = minix_read (f->ino, f->off, kbuf, chunk);
+    if (r < 0) return -1;
+    for (long k = 0; k < r; ) {             // copy out, page by page, to writable user pages only
+      u64 pa = user_to_phys (buf + total + k, 1);
+      if (!pa) return total ? total : -1;
+      u64 n = PAGE_SIZE - ((buf + total + k) & 0xfff);
+      if (n > (u64)(r - k)) n = r - k;
+      u8 *dst = KVA (pa);
+      for (u64 j = 0; j < n; j++) dst[j] = kbuf[k + j];
+      k += n;
+    }
+    f->off += r;
+    total += r;
+    if (r < chunk) break;                   // end of file
+  }
+  return total;
+}
+
 static void syscall (struct frame *f) {
   switch (f->x[8]) {
     case 1:  f->x[0] = sys_write (f->x[0], f->x[1], f->x[2]);  break;
     case 2:  f->x[0] = task_pid ();                            break;
     case 3:  f->x[0] = 0; schedule ();                         break;
-    case 4:  task_exit ();
+    case 4:  task_exit ((int)f->x[0]);
+    case 5:  f->x[0] = sys_open (f->x[0]);                     break;
+    case 6:  f->x[0] = sys_read (f->x[0], f->x[1], f->x[2]);   break;
+    case 7:  f->x[0] = task_fd_close ((int)f->x[0]);           break;
     default: f->x[0] = (u64)-1;                                break;
   }
 }
@@ -114,7 +157,7 @@ void exc_handler (struct frame *f, int kind) {
     printf ("[kernel] process %d killed: EC=0x%x ESR=0x%lx FAR=0x%lx ELR=0x%lx\n",
             task_pid (), ec, esr, far, f->elr);
     procs_killed++;
-    task_exit ();
+    task_exit (-1);
   }
   printf ("\n*** KERNEL EXCEPTION kind=%d ESR=0x%lx (EC=0x%x) FAR=0x%lx ELR=0x%lx\n",
           kind, esr, ec, far, f->elr);

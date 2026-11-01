@@ -33,6 +33,7 @@ typedef unsigned char u8;
 #define PAGE_RW     (PTE_PAGE | PTE_ATTR (1) | PTE_SH | PTE_AF | PTE_PXN | PTE_UXN)
 #define PAGE_RO     (PAGE_RW | PTE_RO)
 #define PAGE_URX    (PTE_PAGE | PTE_ATTR (1) | PTE_SH | PTE_AF | PTE_AP_USER | PTE_RO | PTE_PXN)
+#define PAGE_URO    (PTE_PAGE | PTE_ATTR (1) | PTE_SH | PTE_AF | PTE_AP_USER | PTE_RO | PTE_PXN | PTE_UXN)
 #define PAGE_URW    (PTE_PAGE | PTE_ATTR (1) | PTE_SH | PTE_AF | PTE_AP_USER | PTE_PXN | PTE_UXN)
 
 // register frame pushed by the exception vectors (see vectors.S)
@@ -59,6 +60,7 @@ int  map_page (u64 va, u64 pa, u64 flags);                   // kernel (TTBR1)
 int  map_page_in (u64 l0_pa, u64 va, u64 pa, u64 flags);     // any address space
 u64  unmap_page (u64 va);
 u64  virt_to_phys (u64 va);
+u64  user_to_phys (u64 va, int write);      // checked translation of a user pointer, 0 = refused
 void user_mm_init (void);
 extern u64 empty_l0_pa;
 u64  new_user_l0 (void);
@@ -71,17 +73,33 @@ u64  blk_capacity (void);
 int  blk_read  (u64 sector, void *buf, u32 nsectors);
 int  blk_write (u64 sector, void *buf, u32 nsectors);
 int  minix_mount (void);
+int  minix_is_file (u32 ino);
 u32  minix_lookup (const char *path);
 u32  minix_size (u32 ino);
 long minix_read (u32 ino, u32 offset, void *buf, u32 len);
 int  minix_readdir (u32 dir, void (*fn)(u32 ino, const char *name, void *arg), void *arg);
+
+// elf.c
+int  elf_load (u64 l0, u32 ino, u64 *entry);
+
+// kmain.c
+void capture_start (void);
+int  capture_stop (char **text);            // returns length, text is NUL-terminated
 
 // sched.c
 void sched_init (void);
 int  task_create_user (const void *code_start, const void *code_end, u64 arg);
 void schedule (void);
 void schedule_preempt (void);
-void task_exit (void) __attribute__ ((noreturn));
+void task_exit (int code) __attribute__ ((noreturn));
+int  task_create_elf (const char *path, int argc, const char *const *argv);
+int  task_exit_code (int pid);
+
+#define MAX_FDS 8
+struct file { u32 ino, off; };              // ino == 0: slot unused
+int  task_fd_open (u32 ino);
+struct file *task_fd_get (int fd);
+int  task_fd_close (int fd);
 int  task_pid (void);
 int  tasks_live (void);
 void tasks_reap (void);

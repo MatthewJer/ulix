@@ -149,3 +149,19 @@ Neu in `arm64/`:
 Getestet in qemu (Cortex-A72, EL1- und EL2-Start, Transport v1 und v2): Gerät gefunden, Kapazität 2880 Sektoren, Superblock-Magic 0x2478, Lesen hinter das Plattenende wird abgelehnt, Schreiben und Zurücklesen identisch, Mount, Verzeichniszahlen (`/` 16 Einträge, `/bin` 63), unbekannter Pfad, Dateigrößen und Prüfsummen von `/hello.c`, `/test.txt`, `/init` (nutzt die indirekte Zone) und `/bin/vi` (25 KByte, Unterverzeichnis). Die Referenzwerte stammen aus einem unabhängigen Python-Parser auf dem Host. Insgesamt 30 Prüfungen, alle bestehen, inklusive der Tests der Etappen 4 und 5.
 
 Bewusst offen: Treiber arbeitet per Polling (kein Interrupt, kein Schlafenlegen); DMA ohne Cache-Wartung, was nur auf kohärenten Plattformen wie qemu stimmt; nur eine Anfrage gleichzeitig; Dateisystem ist schreibgeschützt und ohne Puffercache; es gibt noch keine `open/read/close`-Syscalls und kein VFS (die Mount-Tabelle, `/dev`, `/tmp` und Swap aus dem Buch fehlen).
+
+## 11. Status Etappe 7 (ELF-Loader und AArch64-Userland)
+
+Neu in `arm64/`:
+
+- `user/`: Freestanding-Userland für AArch64 (`crt0.S`, `ulib.c/.h` mit Syscall-Wrappern und `printf`, Linkerskript `user.ld` mit je einem `PT_LOAD` pro Rechteklasse auf eigener 4-KB-Seite) und drei Programme: `hello` (prüft sich selbst: `.data`, `.bss` über drei Seiten, `.rodata`, Rekursion auf dem Stack, `argc/argv`; Exit-Status = Zahl fehlgeschlagener Checks), `cat` (`open/read/close`) und `crash` (schreibt auf die eigene Code-Seite). Gebaut ohne FP/SIMD, da der Kernel diese Register beim Kontextwechsel nicht sichert.
+- `elf.c`: ELF64-Loader (`ET_EXEC`, `EM_AARCH64`). Prüft Header, Segmentgrenzen und Dateigröße, bildet die Segmente seitenweise ein (R+X → Code, R → read-only, R+W → Daten/BSS, BSS kommt aus genullten Frames), lehnt W+X-Segmente ab (W^X), prüft, dass der Einstiegspunkt in einem ausführbaren Segment liegt, und räumt bei Fehlern wieder auf.
+- `sched.c`: `task_create_elf (path, argc, argv)` legt Adressraum, Stack (4 Seiten) und `argc/argv` auf dem Stack an (`x0 = argc`, `x1 = argv`), pro Prozess eine Dateideskriptor-Tabelle (8 Einträge), Exit-Codes pro PID.
+- `irq.c`: neue Syscalls `open`, `read`, `close`; `write` auch für fd 2. Benutzerzeiger gehen durch `user_to_phys` (`AT S1E1R/W`): nur User-Bereich, beim Schreiben muss die Seite wirklich beschreibbar sein.
+- `tools/minix_add.py`: Host-Werkzeug, das Dateien in das Wurzelverzeichnis eines Minix-v2-Images schreibt (auf macOS gibt es kein `mkfs.minix`/Mount). `make` erzeugt damit `disk.img` aus dem x86-Image plus Programme; das Original unter `bin-build/` bleibt unberührt. Dabei werden zwei absichtlich kaputte ELF-Varianten (falsche Architektur, RWX-Segment) für die Loader-Tests angelegt.
+
+Test in qemu (EL1 und EL2): 45 Prüfungen, alle bestehen. Neu geprüft: Programme starten von der Platte und laufen mit korrektem `argv`; die 7 Selbsttests in `hello`; `cat` liest 316 Byte bzw. 1680 Byte (zwei Zonen) korrekt, fehlende Datei liefert Fehlercode 1; `crash` wird mit Permission Fault getötet und der Kernel läuft weiter; ELF mit falscher Architektur, W+X-Segment, flaches x86-Binary, Textdatei und fehlende Datei werden abgelehnt (jeweils mit der richtigen Begründung); danach ist kein Frame verloren.
+
+Bewusst offen: kein `fork`/`exec`/`wait`/`spawn` aus dem User-Modus (Programme startet nur der Kernel); `write` ist auf 256 Byte pro Aufruf begrenzt; keine dynamischen Bibliotheken, kein `brk`/`mmap`; Fehler beim Kopieren von Benutzerzeigern in `sys_open` sind pro Byte statt pro Seite (langsam, aber korrekt).
+
+Damit ist die in Abschnitt 4 beschriebene Etappenfolge 1–7 abgeschlossen. Was fehlt, ist der eigentliche Ulix-Kernel aus `ulix-book.nw` (siehe Abschnitt 1 und 9): Thread-Tabelle, `fork`/`exec`/`wait`, Signale, Semaphore, VFS, Terminals, Swap, Copy-on-Write und die Rückführung in das Literate-Programming-Dokument.

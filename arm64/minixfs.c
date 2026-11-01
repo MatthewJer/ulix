@@ -138,3 +138,8 @@ u32 minix_lookup (const char *path) {
   }
   return cur;
 }
+
+int minix_is_file (u32 ino_nr) {
+  struct inode ino;
+  return get_inode (ino_nr, &ino) == 0 && (ino.mode & 0170000) == 0100000;
+}
