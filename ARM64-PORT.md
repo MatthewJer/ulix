@@ -85,3 +85,14 @@ Erledigt und getestet auf macOS/arm64 (Homebrew: `noweb nasm mtools i686-elf-gcc
 - Nicht geprüft: Tastatur/VGA-Interaktion, Userland-Programme in den Shells, `make pdf`.
 - `notangle` meldet weiterhin "undefined chunk name"-Warnungen und Exit-Code 2 (Buchfehler, schon im Original per `; true` ignoriert).
 - Das Repo enthält erzeugte Dateien (`ulix.c`, `*.o`, `ulix.bin`, `*.img`); ein Build im Verzeichnis ändert sie. Ich habe in einer Kopie gebaut.
+
+## 6. Status Etappe 2 (Bare-Metal-Skelett)
+
+Neues Verzeichnis `arm64/` (bewusst noch außerhalb des Literate-Programming-Quelltexts `ulix-book.nw`; die Übernahme ins Buch kommt, wenn die Struktur steht):
+
+- `start.S`: Boot auf Core 0 (andere Kerne parken), Abstieg EL2 → EL1, FP/SIMD an, Stack, `.bss` löschen, Sprung nach `kmain`.
+- `ulix.ld`: Ladeadresse `0x40080000` (RAM-Start von qemu `virt` + Kernel-Offset).
+- `kmain.c`: PL011-UART (`0x09000000`) als Konsole, kleines `printf` (`%s %c %d %u %x`, `l`, Breite/0-Padding).
+- `Makefile`: `make` und `make run` (`qemu-system-aarch64 -M virt -cpu cortex-a72`).
+
+Getestet: Start sowohl bei EL1 (Standard) als auch bei EL2 (`virtualization=on`); Ausgabe zeigt EL1, `sizeof(void*) = 8`. Noch nicht vorhanden: Exceptions, Timer, MMU (Etappen 3–4). Der Linker warnt vor einem RWX-Segment, das ist bis zur MMU-Etappe unkritisch.
