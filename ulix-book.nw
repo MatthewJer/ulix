@@ -2311,11 +2311,19 @@ which of the commands turns the interrupts on or off) we provide
 code chunks for them:
 
 <<disable interrupts>>=
+#if defined(__i386__)
 asm ("cli");    // clear interrupt flag
+#else
+__asm__ volatile ("msr daifset, #2" ::: "memory");   // AArch64: mask IRQs
+#endif
 @
 
 <<enable interrupts>>=
+#if defined(__i386__)
 asm ("sti");    // set interrupt flag
+#else
+__asm__ volatile ("msr daifclr, #2" ::: "memory");   // AArch64: unmask IRQs
+#endif
 @
 
 
@@ -20576,11 +20584,13 @@ If these return an error code (instead of a file descriptor), the result
 is just forwarded to the caller of [[u_open]].
 
 In case that the file to open is a \emph{symbolic link}\marginnote{symbolic link}, we need to follow the
-link. We do this by reading the link file and using the path found there: 
+link. We do this by reading the link file and using the path found there. (The [[stat]] structure must be
+initialized: for a file that does not exist yet---for example when [[O_CREAT]] is used---[[u_stat]] fails and
+does not touch it, and uninitialized stack contents could make the file look like a symbolic link.) 
 
 <<[[u_open]]: handle symlink>>=
-struct stat st;
-char link[256];
+struct stat st = { 0 };    // stays all zero if the file does not exist (u_stat then fails and
+char link[256];            // leaves it alone): not a link; random stack contents could look like one
 u_stat (abspath, &st);
 if (((st.st_mode & S_IFLNK) == S_IFLNK) && (open_link == FOLLOW_LINK)) {
   // open_ (how?), read_, then u_open (symlink)
@@ -21519,7 +21529,7 @@ int u_chdir (const char *path) {
   // get_dev_and_path (abspath, &device, &fs, (char*)&localpath);  // OLD!!    // REMOVE_DEBUGGING_CODE
 
   // check if abspath is directory
-  struct stat st;
+  struct stat st = { 0 };   // (stays zero if abspath does not exist)
   u_stat (abspath, &st);
   // if (mx_file_is_directory (device, localpath)) {   // REMOVE_DEBUGGING_CODE
   if ((st.st_mode & S_IFDIR) == S_IFDIR) {
@@ -22924,7 +22934,7 @@ if (ext_ino == -1) {
 }
 @
 
-In [[int_ino]] we will store the index into the internal inode table. The file may already be open, because another process (or even the same one) opened it earlier. In that case a valid internal inode is in place and can be recycled; otherwise we create a fresh one. We find out if the file is open by checking the [[ino]] and [[device]] fields of all our [[mx_inodes]] array entries.
+In [[int_ino]] we will store the index into the internal inode table. The file may already be open, because another process (or even the same one) opened it earlier. In that case a valid internal inode is in place and can be recycled; otherwise we create a fresh one. We find out if the file is open by checking the [[ino]] and [[device]] fields of all our [[mx_inodes]] array entries. Only entries that are in use ([[refcount > 0]]) count: [[mx_close]] leaves [[ino]] and [[device]] of a closed entry untouched, and if a new file later gets the same inode number (after the old file was deleted), it must not be mistaken for the old one and inherit its cached size and zone numbers.
   
 <<[[mx_open]]>>=
 short file_already_open = false;
@@ -22936,7 +22946,8 @@ if (count_open_files == 0) {
   int_ino = 0;      // first file to be opened
 } else {
   for (i = 0; i < MAX_INT_INODES; i++) {
-    if (mx_inodes[i].ino == ext_ino && mx_inodes[i].device == device) {
+    if (mx_inodes[i].refcount > 0 &&
+        mx_inodes[i].ino == ext_ino && mx_inodes[i].device == device) {
       // same inode number and same device: this is the same file!
       file_already_open = true;
       int_ino = i;
@@ -29695,7 +29706,7 @@ void ksh_command_inode () {
   int res = mx_read_inode (dev, ino, &in);
   printf ("mx_read_inode(%d, %d) returns %d\n", dev, ino, res);
   if (res != 0) {
-    hexdump ((uint)&in, (uint)&in+sizeof(struct minix2_inode));
+    hexdump ((memaddress)&in, (memaddress)&in+sizeof(struct minix2_inode));
     printf ("size: %d, blocks: ", in.i_size);
     for (int i = 0; i < 10; i++) printf ("%d, ", in.i_zone[i]); printf ("\n");
   }
@@ -29710,7 +29721,7 @@ void ksh_command_lsof () {
     struct int_minix2_inode *inode = mx_status[i].int_inode;
     if (inode != NULL) {
       printf ("mfd=%d inode-addr=%08x size=%d\n", 
-              i, (unsigned int)inode, inode->i_size);
+              i, (memaddress)inode, inode->i_size);
     }
   }
 }
@@ -29922,19 +29933,19 @@ void printbitsandhex (uint i) { printf ("%032b %08X", i, i); };
 
 %nouse
 <<function prototypes>>=
-void hexdump (uint startval, uint endval);
+void hexdump (memaddress startval, memaddress endval);
 @
 
 <<function implementations>>=
-void hexdump (uint startval, uint endval) {
-  for (uint i=startval; i < endval; i+=16) {
-    printf ("%08x  ", i);                   // address
-    for (int j = i;  j < i+16;  j++) {      // hex values
+void hexdump (memaddress startval, memaddress endval) {
+  for (memaddress i=startval; i < endval; i+=16) {
+    printf ("%08x  ", i);                   // address (low 32 bits)
+    for (memaddress j = i;  j < i+16;  j++) {      // hex values
       printf ("%02x ", (byte)PEEK(j));
       if (j==i+7) printf (" ");
     };
     printf (" ");
-    for (int j = i;  j < i+16;  j++) {      // characters
+    for (memaddress j = i;  j < i+16;  j++) {      // characters
       char z = PEEK(j);
       if ((z>=32) && (z<127)) {
         printf ("%c", PEEK(j));

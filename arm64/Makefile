@@ -10,15 +10,18 @@ CFLAGS = -O0 -g -ffreestanding -nostdlib -fno-builtin -fno-stack-protector -mgen
 # "-snapshot" keeps the file unmodified when running.
 DISK ?= disk.img
 
-all: ulix.elf $(DISK)
+OBJS = start.o vectors.o irq.o mmu.o virtio.o minixfs.o elf.o ulix-port.o glue.o arch_thread.o arch_console.o \
+       bookfs_test.o thread_test.o proc_test.o kmain.o
 
-disk.img: ../bin-build/minixdata.img user/hello.elf user/cat.elf user/crash.elf user/forktest.elf user/sigtest.elf tools/minix_add.py
+all: ulix.elf ulix-console.elf $(DISK)
+
+disk.img: ../bin-build/minixdata.img user/hello.elf user/cat.elf user/crash.elf user/forktest.elf user/sigtest.elf user/contest.elf tools/minix_add.py
 	cp ../bin-build/minixdata.img $@
 	# two deliberately broken variants of hello.elf for the loader tests:
 	# e_machine = EM_386, and a code segment with flags RWX
 	python3 -c "d=bytearray(open('user/hello.elf','rb').read()); d[18]=3; d[19]=0; open('bad-arch.elf','wb').write(d)"
 	python3 -c "d=bytearray(open('user/hello.elf','rb').read()); d[68]=7; open('bad-wx.elf','wb').write(d)"
-	python3 tools/minix_add.py $@ --grow=4096 hello64=user/hello.elf cat64=user/cat.elf crash64=user/crash.elf forktest64=user/forktest.elf sigtest64=user/sigtest.elf \
+	python3 tools/minix_add.py $@ --grow=4096 hello64=user/hello.elf cat64=user/cat.elf crash64=user/crash.elf forktest64=user/forktest.elf sigtest64=user/sigtest.elf contest64=user/contest.elf \
 		badarch64=bad-arch.elf badwx64=bad-wx.elf
 
 # the user programs are rebuilt by their own Makefile whenever a source changed
@@ -27,18 +30,24 @@ user/%.elf: FORCE
 
 FORCE:
 
-ulix.elf: start.o vectors.o irq.o mmu.o virtio.o minixfs.o elf.o ulix-port.o glue.o arch_thread.o bookfs_test.o thread_test.o proc_test.o kmain.o ulix.ld
-	$(LD) -T ulix.ld -o $@ start.o vectors.o irq.o mmu.o virtio.o minixfs.o elf.o ulix-port.o glue.o arch_thread.o bookfs_test.o thread_test.o proc_test.o kmain.o
+ulix-console.elf: $(filter-out kmain.o,$(OBJS)) kmain-console.o ulix.ld
+	$(LD) -T ulix.ld -o $@ $(filter-out kmain.o,$(OBJS)) kmain-console.o
+
+kmain-console.o: kmain.c ulix.h
+	$(CC) $(CFLAGS) -DCONSOLE_MODE -c -o $@ $<
+
+ulix.elf: $(OBJS) ulix.ld
+	$(LD) -T ulix.ld -o $@ $(OBJS)
 
 # ---- kernel code taken from the book (ulix-book.nw) ----
 # notangle assembles declarations / globals / functions from the book's chunks; port.py
 # picks the functions listed in port.manifest.  The result is compiled unchanged.
 GENDIR = gen
-GENFILES = $(GENDIR)/ulix-decl.h $(GENDIR)/ulix-globals.c $(GENDIR)/ulix-functions.c
+GENFILES = $(GENDIR)/ulix-decl.h $(GENDIR)/ulix-globals.c $(GENDIR)/ulix-functions.c $(GENDIR)/ulix-init.c
 
 $(GENFILES): ../ulix-book.nw ulix-arm64.nw
 	mkdir -p $(GENDIR)
-	for r in ulix-decl.h ulix-globals.c ulix-functions.c; do \
+	for r in ulix-decl.h ulix-globals.c ulix-functions.c ulix-init.c; do \
 	  notangle -L -R$$r ../ulix-book.nw ulix-arm64.nw 2>/dev/null | sed 's/^#line .*//' > $(GENDIR)/$$r; \
 	done
 
@@ -56,6 +65,9 @@ bookfs_test.o: bookfs_test.c $(GENFILES) $(GENDIR)/ulix-api.h
 
 arch_thread.o: arch_thread.c $(GENFILES) $(GENDIR)/ulix-api.h
 	$(CC) $(BOOKFLAGS) -Dhash=arch_unused_hash -c -o $@ $<
+
+arch_console.o: arch_console.c $(GENFILES) $(GENDIR)/ulix-api.h
+	$(CC) $(BOOKFLAGS) -Dhash=console_unused_hash -c -o $@ $<
 
 thread_test.o: thread_test.c $(GENFILES) $(GENDIR)/ulix-api.h
 	$(CC) $(BOOKFLAGS) -Dhash=thread_unused_hash -c -o $@ $<
@@ -87,7 +99,11 @@ verify: ulix.elf $(DISK)
 	grep -E "FAIL|RESULT" verify.log; true
 	python3 tools/minix_check.py disk-after.img --files | grep -E "keep|d1/|inodes|leaked|PROBLEM"
 
+# Interactive console test: types into the UART of a second kernel image and checks the answers
+console-test: ulix-console.elf $(DISK)
+	python3 tools/console_test.py ulix-console.elf $(DISK)
+
 clean:
 	$(MAKE) -C user clean
 	rm -rf gen
-	rm -f *.o ulix.elf disk.img disk-after.img verify.log bad-arch.elf bad-wx.elf
+	rm -f *.o ulix.elf ulix-console.elf disk.img disk-after.img verify.log bad-arch.elf bad-wx.elf

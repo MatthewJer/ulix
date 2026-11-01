@@ -56,11 +56,42 @@ void _set_statusline (char *text, int offset) { }
 // ---- diagnostics ----
 int debug_printf (const char *format, ...) { return 0; }                 // debugging output off
 
-// ---- console input for the book's u_read(): one character from the PL011 UART ----
-#define UART_BASE   (0xffff000000000000UL + 0x09000000UL)
+// ---- console input for the book's u_read(): the readchar system call, called from the kernel ----
+// (on the x86 u_read() executes int 0x80 with system call 525; syscall_readchar blocks the
+// process in keyboard_queue until the UART interrupt delivers a character)
+void syscall_readchar (context_t *r);
 unsigned int arch_readchar (void) {
-  volatile unsigned int *fr = (volatile unsigned int *)(UART_BASE + 0x18);
-  volatile unsigned int *dr = (volatile unsigned int *)(UART_BASE + 0x00);
-  while (*fr & (1 << 4)) __asm__ volatile ("wfe");       // RXFE: receive FIFO empty
-  return *dr & 0xff;
+  context_t r;
+  memset (&r, 0, sizeof r);
+  syscall_readchar (&r);
+  return (unsigned int)r.ebx;
 }
+
+// =====================================================================================
+// Kernel shell: the book's kernel_shell() and ksh_run_command() are used unchanged; the commands
+// that are about x86 hardware (VGA status line, 2-level page tables, the x86 frame table, ...)
+// have these replacements.
+// =====================================================================================
+extern void putch (char c);
+extern unsigned long alloc_frame (void);
+extern void free_frame (unsigned long pa);
+extern long frames_in_use;
+
+void vt_clrscr (void)        { printf ("\033[2J\033[H"); }              // ANSI: clear the terminal
+void statusline_red (void)   { }
+void statusline_blue (void)  { }
+void set_statusline (char *text) { }
+
+void ksh_command_test (void)  { printf ("test: not available on AArch64\n"); }
+void ksh_command_div0 (void)  { printf ("div0: an integer division by zero does not trap on AArch64\n"); }
+void ksh_command_mem (void)   { printf ("frames in use: %ld (%ld KByte)\n", frames_in_use, frames_in_use * 4); }
+void ksh_print_page_table (void) { printf ("mem: the x86 page table dump does not exist on AArch64; try 'mem2'\n"); }
+void ksh_command_hexdump (void) { hexdump ((memaddress)ksh_command_hexdump, (memaddress)ksh_command_hexdump + 128); }
+
+uint request_new_frame (void) {
+  frames_in_use += 0;                                                     // (the allocator counts the frame itself)
+  return (uint)(alloc_frame () >> 12);                                    // frame number = physical address / 4096
+}
+void *request_new_page (void)  { return (void *)PHYSICAL (alloc_frame ()); }
+void *request_new_pages (int n) { void *p = 0; for (int i = 0; i < n; i++) p = request_new_page (); return p; }
+void release_page_range (uint first, uint last) { printf ("rp: not available on AArch64\n"); }

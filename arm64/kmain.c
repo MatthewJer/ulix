@@ -20,41 +20,72 @@ void putch (char c) {
   UART_DR = c;
 }
 
-static void puts_ (const char *s) { while (*s) putch (*s++); }
+// ---- formatted output: one formatter for printf (console) and sprintf (memory) ----
+struct sink { char *buf; int n; };                 // buf == 0: write to the console
 
-static void putnum (u64 v, int base, int width, char pad) {
-  char buf[32]; int n = 0;
-  do { buf[n++] = "0123456789abcdef"[v % base]; v /= base; } while (v);
-  while (width > n) { putch (pad); width--; }
-  while (n) putch (buf[--n]);
+static void emit (struct sink *s, char c) {
+  if (s->buf) s->buf[s->n++] = c;
+  else        putch (c);
 }
 
-// supports %s %c %d %u %x %lx %% with optional 0-padding / width
-int printf (const char *fmt, ...) {
-  __builtin_va_list ap;
-  __builtin_va_start (ap, fmt);
+static void emit_padded (struct sink *s, const char *text, int len, int width, int left, char pad) {
+  if (!left) for (int i = len; i < width; i++) emit (s, pad);
+  for (int i = 0; i < len; i++) emit (s, text[i]);
+  if (left)  for (int i = len; i < width; i++) emit (s, ' ');
+}
+
+static void emit_num (struct sink *s, u64 v, int base, int neg, int width, int left, char pad) {
+  char t[32]; int n = 0;
+  do { t[n++] = "0123456789abcdef"[v % base]; v /= base; } while (v);
+  if (neg) t[n++] = '-';
+  char r[32];
+  for (int i = 0; i < n; i++) r[i] = t[n - 1 - i];
+  emit_padded (s, r, n, width, left, pad);
+}
+
+// supports %s %c %d %u %x %p %% with the flags '-' and '0', a width, and the length modifier 'l'
+static void vformat (struct sink *s, const char *fmt, __builtin_va_list ap) {
   for (; *fmt; fmt++) {
-    if (*fmt != '%') { putch (*fmt); continue; }
+    if (*fmt != '%') { emit (s, *fmt); continue; }
     fmt++;
-    char pad = ' '; int width = 0, lng = 0;
-    if (*fmt == '0') { pad = '0'; fmt++; }
+    char pad = ' '; int width = 0, lng = 0, left = 0;
+    for (;; fmt++) { if (*fmt == '-') left = 1; else if (*fmt == '0') pad = '0'; else break; }
     while (*fmt >= '0' && *fmt <= '9') width = width * 10 + (*fmt++ - '0');
-    if (*fmt == 'l') { lng = 1; fmt++; }
+    while (*fmt == 'l') { lng = 1; fmt++; }
     switch (*fmt) {
-      case 's': puts_ (__builtin_va_arg (ap, const char *)); break;
-      case 'c': putch ((char)__builtin_va_arg (ap, int)); break;
-      case 'd': {
-        long v = lng ? __builtin_va_arg (ap, long) : __builtin_va_arg (ap, int);
-        if (v < 0) { putch ('-'); v = -v; }
-        putnum (v, 10, width, pad); break; }
-      case 'u': putnum (lng ? __builtin_va_arg (ap, u64) : __builtin_va_arg (ap, u32), 10, width, pad); break;
-      case 'x': putnum (lng ? __builtin_va_arg (ap, u64) : __builtin_va_arg (ap, u32), 16, width, pad); break;
-      case '%': putch ('%'); break;
-      default:  putch ('%'); putch (*fmt); break;
+      case 's': { const char *t = __builtin_va_arg (ap, const char *); if (!t) t = "(null)";
+                  int len = 0; while (t[len]) len++;
+                  emit_padded (s, t, len, width, left, ' '); break; }
+      case 'c': { char c = (char)__builtin_va_arg (ap, int); emit_padded (s, &c, 1, width, left, ' '); break; }
+      case 'd': { long v = lng ? __builtin_va_arg (ap, long) : __builtin_va_arg (ap, int);
+                  emit_num (s, v < 0 ? -(u64)v : (u64)v, 10, v < 0, width, left, pad); break; }
+      case 'u': emit_num (s, lng ? __builtin_va_arg (ap, u64) : __builtin_va_arg (ap, u32), 10, 0, width, left, pad); break;
+      case 'x': emit_num (s, lng ? __builtin_va_arg (ap, u64) : __builtin_va_arg (ap, u32), 16, 0, width, left, pad); break;
+      case 'p': emit_num (s, __builtin_va_arg (ap, u64), 16, 0, width, left, pad); break;
+      case '%': emit (s, '%'); break;
+      case 0:   return;
+      default:  emit (s, '%'); emit (s, *fmt); break;
     }
   }
+}
+
+int printf (const char *fmt, ...) {
+  struct sink s = { 0, 0 };
+  __builtin_va_list ap;
+  __builtin_va_start (ap, fmt);
+  vformat (&s, fmt, ap);
   __builtin_va_end (ap);
   return 0;
+}
+
+int sprintf (char *out, const char *fmt, ...) {
+  struct sink s = { out, 0 };
+  __builtin_va_list ap;
+  __builtin_va_start (ap, fmt);
+  vformat (&s, fmt, ap);
+  __builtin_va_end (ap);
+  out[s.n] = 0;
+  return s.n;
 }
 
 
@@ -123,7 +154,7 @@ static void disk_test (void) {
   CHECK (minix_mount () == 0, "Minix file system mounted");
   int n = 0;
   minix_readdir (1, count_cb, &n);
-  CHECK (n == 23, "root directory has 23 entries (16 from x86 Ulix + 7 AArch64 files)");
+  CHECK (n == 24, "root directory has 24 entries (16 from x86 Ulix + 8 AArch64 files)");
   n = 0;
   minix_readdir (minix_lookup ("/bin"), count_cb, &n);
   CHECK (n == 63, "/bin has 63 entries");
@@ -146,6 +177,27 @@ static void disk_test (void) {
   printf ("  info: /hello.c starts with: %s\n", text);
 }
 
+#ifdef CONSOLE_MODE
+// Interactive mode (ulix-console.elf): no test suites. The kernel starts /contest64 and then
+// waits; the UART is the console. Ctrl-C ends the foreground process, Ctrl-] opens the kernel shell.
+extern void console_irq_init (void);
+extern void arch_threads_init (void);
+extern int  arch_start_user (const char *path, int argc, char **argv);
+
+static void console_main (void) {
+  frames_init ();
+  user_mm_init ();
+  blk_init ();
+  minix_mount ();
+  arch_threads_init ();
+  console_irq_init ();
+  printf ("console ready (Ctrl-C: end the running program, Ctrl-]: kernel shell)\n");
+  char *argv[] = { "contest64", 0 };
+  arch_start_user ("/contest64", 1, argv);
+  for (;;) __asm__ volatile ("wfi");
+}
+#endif
+
 void kmain (void) {
   u64 el;
   __asm__ volatile ("mrs %0, CurrentEL" : "=r" (el));
@@ -153,6 +205,9 @@ void kmain (void) {
   printf ("Running at EL%d, sizeof(void*) = %d, kmain at 0x%lx (upper half)\n",
           (int)(el >> 2), (int)sizeof (void *), (u64)kmain);
   irq_init ();
+#ifdef CONSOLE_MODE
+  console_main ();
+#endif
   __asm__ volatile ("svc #0");                    // kernel-mode svc: handler just reports it
 
   frames_init ();

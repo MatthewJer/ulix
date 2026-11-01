@@ -10,6 +10,8 @@ extern void book_syscall (void *frame);
 extern void book_user_fault (void *frame);
 extern int  book_current_pid (void);
 extern void arch_signal_check (void *frame);
+extern void uart_rx_irq (void);
+extern void uart_rx_enable (void);
 
 // ---- GICv2 on qemu "virt" ------------------------------------------------
 #define GICD_BASE   (KERNEL_VA + 0x08000000UL)
@@ -23,6 +25,7 @@ extern void arch_signal_check (void *frame);
 #define GICC_EOIR       (*(volatile u32 *)(GICC_BASE + 0x010))
 
 #define IRQ_TIMER   30      // EL1 physical timer = PPI 14 = INTID 30
+#define IRQ_UART    33      // PL011 UART0 = SPI 1 = INTID 33
 
 static void gic_enable (int irq) {
   GICD_IPRIORITYR (irq / 4) &= ~(0xffU << ((irq % 4) * 8));   // highest priority
@@ -63,11 +66,11 @@ void exc_handler (struct frame *f, int kind) {
   if (kind == 1) {                          // IRQ
     u32 iar = GICC_IAR;
     u32 irq = iar & 0x3ff;
-    if (irq < 1020) {
-      if (irq == IRQ_TIMER) { ticks++; timer_reload (); }
-      else printf ("spurious IRQ %u\n", irq);
-      GICC_EOIR = iar;
-    }
+    if (irq < 1020) GICC_EOIR = iar;        // acknowledge first: nested interrupts must be possible
+                                            // (the kernel shell waits for keys inside the UART handler)
+    if (irq == IRQ_TIMER) { ticks++; timer_reload (); }
+    else if (irq == IRQ_UART) { if (book_scheduler_on) uart_rx_irq (); }
+    else if (irq < 1020) printf ("spurious IRQ %u\n", irq);
     if (irq == IRQ_TIMER && book_scheduler_on) book_timer_tick ();   // time slice over (10 ms)
     if (from_user && book_scheduler_on) arch_signal_check (f);       // deliver pending signals
     return;
@@ -97,6 +100,12 @@ void exc_handler (struct frame *f, int kind) {
   printf ("\n*** KERNEL EXCEPTION kind=%d ESR=0x%lx (EC=0x%x) FAR=0x%lx ELR=0x%lx\n",
           kind, esr, ec, far, f->elr);
   for (;;) __asm__ volatile ("wfe");
+}
+
+// receive interrupts of the UART (console input), enabled once the book's thread data structures exist
+void console_irq_init (void) {
+  uart_rx_enable ();
+  gic_enable (IRQ_UART);
 }
 
 void irq_init (void) {

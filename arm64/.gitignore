@@ -7,3 +7,4 @@ bad-*.elf
 gen/
 disk-after.img
 verify.log
+ulix-console.elf

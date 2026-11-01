@@ -13,6 +13,25 @@
 <<public elementary type definitions>>
 <<type definitions>>  <<public type definitions>>
 <<function prototypes>>  <<public function prototypes>>
+<<ARM64 additional prototypes>>
+@
+
+The kernel shell of the book calls a few functions that are specific to the x86 hardware (VGA status
+line, 2-level page tables, the x86 frame table).  The book prototypes them only in the files that
+define them, so the ARM64 build declares its replacements (see [[glue.c]]) here:
+
+<<ARM64 additional prototypes>>=
+void ksh_command_test (void);
+void ksh_command_div0 (void);
+void ksh_command_mem (void);
+void ksh_command_hexdump (void);
+void ksh_print_page_table (void);
+void vt_clrscr (void);
+void statusline_red (void);
+void statusline_blue (void);
+void set_statusline (char *text);
+uint request_new_frame (void);
+void release_page_range (uint first, uint last);
 @
 
 <<ulix-globals.c>>=
@@ -21,4 +40,13 @@
 
 <<ulix-functions.c>>=
 <<function implementations>>  <<public function implementations>>
+@
+
+The initialization code that the x86 [[main()]] runs is also written in chunks of the book; the parts
+that do not touch the hardware are reused as they are:
+
+<<ulix-init.c>>=
+void arch_setup_keyboard (void) {
+  <<setup keyboard>>
+}
 @

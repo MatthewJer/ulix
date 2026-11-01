@@ -70,7 +70,7 @@ int bookfs_test (void) {
          "mx_stat: regular file, 316 bytes");
   CHECK (mx_stat (DEV, "/bin", &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR, "mx_stat: /bin is a directory");
   CHECK (mx_stat (DEV, "/nonexistent", &st) == -1, "mx_stat: missing file");
-  CHECK (count_entries ("/") == 23, "mx_getdent: / has 23 used entries (16 from x86 Ulix + 7 AArch64 files)");
+  CHECK (count_entries ("/") == 24, "mx_getdent: / has 24 used entries (16 from x86 Ulix + 8 AArch64 files)");
   CHECK (count_entries ("/bin") == 63, "mx_getdent: /bin has 63 entries");
   CHECK (mx_file_exists (DEV, "/bin/vi") && mx_file_is_directory (DEV, "/bin") &&
          !mx_file_is_directory (DEV, "/bin/vi"), "mx_file_exists / mx_file_is_directory");
@@ -139,6 +139,26 @@ int bookfs_test (void) {
   CHECK (mx_mkdir (DEV, "/d1/sub", 0755) == 0 && mx_file_is_directory (DEV, "/d1/sub"), "nested directory /d1/sub");
   // (mx_mkdir itself does not check whether the directory exists; u_mkdir above it does)
   CHECK (mx_open (DEV, "/missing/x", O_RDONLY) == -1, "open in a missing directory fails");
+
+  // ---- a new file that gets the inode number of a deleted one must start empty ----
+  {
+    int other = mx_open (DEV, "/hello.c", O_RDONLY);       // some file must be open, otherwise mx_open skips the table lookup
+    mfd = mx_open (DEV, "/reuse1.bin", O_CREAT | O_RDWR);
+    write_pattern (mfd, 5000, 1000);
+    mx_stat (DEV, "/reuse1.bin", &st);
+    int first_ino = st.st_ino;
+    mx_close (mfd);
+    mx_unlink (DEV, "/reuse1.bin");
+    mfd = mx_open (DEV, "/reuse2.bin", O_CREAT | O_RDWR);
+    mx_stat (DEV, "/reuse2.bin", &st);
+    int second_ino = st.st_ino;
+    int size_now = mx_lseek (mfd, 0, SEEK_END);
+    mx_close (mfd);
+    mx_unlink (DEV, "/reuse2.bin");
+    mx_close (other);
+    CHECK (second_ino == first_ino, "the second file reuses the inode number of the deleted one");
+    CHECK (size_now == 0, "... and starts with size 0 (no stale cached inode of the old file)");
+  }
 
   // ---- block accounting: only keep.bin, d1, inner.txt and d1/sub may remain ----
   int free1 = free_blocks ();

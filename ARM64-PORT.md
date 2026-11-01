@@ -298,3 +298,25 @@ Offen / bekannte Lücken:
 Test (`user/sigtest.c`, alle 8 Prüfungen laufen im Benutzerprogramm): Ein Handler unterbricht eine Rechnung mit vielen Registern 8 Millionen Schleifendurchläufe lang, das Ergebnis ist trotzdem exakt, und der Handler lief mehrfach (vor dem ersten Befehl und mitten in der Rechnung); `SIG_IGN` stört nicht; ohne Handler tötet `SIGTERM` den Prozess (Meldung des Buchs); `SIGSTOP` hält einen Prozess an (kein Fortschritt in einer Logdatei), `SIGCONT` setzt fort, `SIGKILL` beendet sofort. Ergebnis in qemu (EL1 und EL2, modernes virtio): **93 Prüfungen im Kernel, alle bestehen**; `make verify` ohne Probleme. x86: Von 353 Funktionen unterscheiden sich weiterhin nur die zwei korrigierten Semaphor-Funktionen, der x86-Kernel bootet mit identischer Ausgabe.
 
 Bekannte Eigenheiten des Buchs, die ich nicht geändert habe: `kill` auf einen blockierten Elternprozess lässt dessen später endende Kinder als Zombies zurück (`u_kill` setzt Kinder nicht um); `SIGKILL` setzt `used = false` sofort, ein folgendes `waitpid` meldet -1.
+
+## 17. Schritt 5 der Kernel-Portierung: Konsole über die UART und Kernel-Shell
+
+Die Konsole läuft jetzt über die PL011-UART. Alles hinter dem Eingabepuffer ist Code des Buchs: `syscall_readchar` (blockiert den Prozess in `keyboard_queue`), `kgetch`, `kreadline`, `kernel_shell`, `ksh_run_command` und die Shell-Befehle `uname`, `ps`, `queues`, `locks`, `lsof`, `inode`, `time`, `listas`, `longhelp`, `help`, `enable`/`disable`.
+
+Neu in `arm64/`:
+- `arch_console.c`: Der UART-Empfangsinterrupt (GIC-Nummer 33) ersetzt den Tastaturinterrupt des x86-Kernels. Er wandelt Zeichen um (Enter → `\n`, DEL → `\b`), schreibt sie in den Eingabepuffer des Terminals (`terminals[cur_vt]`) und weckt wartende Prozesse, wie `keyboard_handler` im Buch. **Strg-C** beendet den Vordergrundprozess (dieselbe Suche wie im Buch, `u_kill(..., SIGKILL)`), **Strg-]** hält den Scheduler an und startet die Kernel-Shell (x86: Shift-Esc). Die Initialisierung der Puffer kommt direkt aus dem Chunk `<<setup keyboard>>` des Buchs (`ulix-arm64.nw` hat dafür eine eigene Wurzel `ulix-init.c`).
+- `glue.c`: Ersatz für Befehle, die x86-Hardware betreffen (`mem`, `test`, `div0`, `hexdump` auf einer Kernel-Adresse, `gf`/`gp` über den ARM64-Frame-Allocator), `vt_clrscr` als ANSI-Sequenz; `arch_readchar` ruft jetzt `syscall_readchar` auf (blockierend), statt die UART abzufragen.
+- `kmain.c`: Ein einheitlicher Formatierer für `printf` und `sprintf` (zusätzlich `-` zum Linksbündigen, Breite für Strings, `%p`); zweites Kernel-Image `ulix-console.elf` (`-DCONSOLE_MODE`): startet `/contest64` und wartet auf Eingabe.
+- `irq.c`: Interrupts werden jetzt **vor** der Bearbeitung quittiert, damit die Kernel-Shell innerhalb des UART-Interrupts weitere Zeichen empfangen kann.
+- `tools/console_test.py` + `make console-test`: spielt Terminal. Es startet qemu mit der UART an einem TCP-Port, tippt Zeichen einzeln und prüft die Antworten: Zeile eingeben und per Echo zurückbekommen, Backspace, Strg-C (`Killed`), dann Strg-], Kernel-Shell mit allen Befehlen oben, ein unbekannter Befehl, `exit` und kein Kernel-Fehler. 21 Prüfungen bestehen.
+
+Änderungen am Buch (alle für x86 unverändert im Verhalten):
+- `<<enable interrupts>>` und `<<disable interrupts>>` sind prozessorabhängig (`sti`/`cli` auf x86, `msr daifclr/daifset` auf ARM64); `hexdump` und zwei Aufrufe nehmen `memaddress` statt `uint` (Adressen bleiben auf 64 Bit vollständig).
+- **Drei Fehler im Buch korrigiert** (gefunden durch Tests, jeweils mit Nachweis):
+  1. `u_open` und `u_chdir` rufen `u_stat` auf und ignorieren das Ergebnis; existiert die Datei noch nicht (zum Beispiel bei `O_CREAT`), blieb `struct stat` uninitialisiert, und der Stackinhalt entschied, ob die Datei wie ein Symlink behandelt wird. Ergebnis war zum Beispiel, dass `open("/progress.txt", O_CREAT)` das Wurzelverzeichnis öffnete. Jetzt `struct stat st = { 0 }`. (Das Symptom tauchte erst auf, nachdem sich durch eine zusätzliche Programmdatei der Stackinhalt geändert hatte: Fehler, der auf x86 genauso lauern kann.)
+  2. `mx_open` hielt einen **geschlossenen** Eintrag der internen Inode-Tabelle für „schon offen“, wenn dessen Inode-Nummer übereinstimmte (`mx_close` löscht `ino`/`device` nicht). Bekam eine neue Datei die Nummer einer gelöschten, erbte sie deren alte Größe und Zonen. Jetzt zählt nur ein Eintrag mit `refcount > 0`. Test in `bookfs_test.c`: ohne die Korrektur schlägt „... starts with size 0“ fehl, mit ihr besteht er.
+  3. (aus Schritt 2) Semaphore arbeiteten auf einer Kopie.
+
+Ergebnis in qemu (EL1 und EL2, Legacy- und modernes virtio): **95 Prüfungen im Kernel, alle bestehen**; `make verify` 0 Probleme; `make console-test` 21 Prüfungen. x86: Von 353 Funktionen im Objekt unterscheiden sich genau die bewusst geänderten (`hexdump`, `mx_open`, `u_open`, `u_chdir` und die zwei Semaphor-Funktionen); der x86-Kernel bootet mit identischer Ausgabe.
+
+Offen: kein Erkennen von Escape-Sequenzen (Pfeiltasten), keine mehreren virtuellen Terminals (nur Terminal 0; der Rest der VT-Logik des Buchs entfällt), die Kernel-Shell zeigt keine Statuszeile; der Buffer Cache fehlt weiterhin.

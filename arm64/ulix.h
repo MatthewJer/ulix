@@ -25,6 +25,7 @@ struct frame { u64 x[31]; u64 elr; u64 spsr; u64 sp_el0; u64 pad[2]; };   // 288
 // console
 void putch (char c);
 int printf (const char *fmt, ...);
+int sprintf (char *out, const char *fmt, ...);
 
 // irq.c
 void irq_init (void);

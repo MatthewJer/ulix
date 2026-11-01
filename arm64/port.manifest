@@ -128,3 +128,31 @@ global keyboard_queue
 global floppy_queue
 global harddisk_queue
 global serial_disk_queue
+
+# console / kernel shell (input comes from the UART, see arch_console.c)
+function kernel_shell
+function ksh_run_command
+function kreadline
+function kgetch
+function kputs
+function ksh_command_uname
+function ksh_command_ps
+function ksh_command_queues
+function ksh_command_locks
+function ksh_command_inode
+function ksh_command_lsof
+function ksh_command_longhelp
+function ksh_command_time
+function hexdump
+function syscall_readchar
+function list_address_spaces
+global terminals
+global cur_vt
+global system_kbd_pos
+global system_kbd_lastread
+global system_kbd_count
+global LANG_GERMAN
+function list_address_space
+function ksh_print_queue
+global state_names
+global buffer_lock

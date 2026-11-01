@@ -36,6 +36,7 @@ extern void exit_exception (void);
 static struct kctx kctx[MAX_THREADS];
 static void arch_syscalls_init (void);
 void syscall_sigreturn (context_t *r);
+void syscall_readchar (context_t *r);
 void syscall_handler (context_t *r);          // defined in the book without a prototype
 static u64 kstack_pa[MAX_THREADS];
 static addr_space_id kstack_as[MAX_THREADS];   // address space of the process the stack belongs to             // physical address of the thread's kernel stack, 0 = none
@@ -122,6 +123,8 @@ void arch_threads_init (void) {
   memcpy (idle->cmdline, "idle", 5);
   add_to_ready_queue (1);
   current_task = 1;
+  next_pid = 3;                                // pids 1 (idle) and 2 (init) are protected by the book's kill()
+  buffer_lock = get_new_lock ("buffer");       // the book creates it when it initializes the buffer cache
   scheduler_is_active = true;
   book_scheduler_on = 1;
 }
@@ -331,6 +334,21 @@ static void tcb_init_process (TCB *t, thread_id tid, thread_id ppid, const char 
   for (int i = 3; i < MAX_PFD; i++) t->files[i] = -1;
 }
 
+// Translate a virtual address of an address space to a physical one (the book's mmu() for the x86
+// page tables); 0 if the address is not mapped.  Used by the kernel shell command 'listas'.
+memaddress mmu (addr_space_id as, memaddress vaddr) {
+  if (vaddr >= 0xFFFF000000000000UL) return vaddr - 0xFFFF000000000000UL;    // linear map of the kernel
+  if (as < 1 || !as_l0[as]) return 0;
+  u64 *t = KVA (as_l0[as]);
+  for (int lvl = 0; lvl < 4; lvl++) {
+    u64 e = t[(vaddr >> (39 - 9 * lvl)) & 511];
+    if (!(e & PTE_VALID)) return 0;
+    if (lvl == 3) return (e & PTE_ADDR) | (vaddr & 0xfff);
+    t = KVA (e & PTE_ADDR);
+  }
+  return 0;
+}
+
 // ---- fork ----
 int u_fork (context_t *r) {
   thread_id old_tid = current_task;
@@ -458,6 +476,7 @@ static void arch_syscalls_init (void) {
   install_syscall_handler (__NR_get_errno, syscall_get_errno);
   install_syscall_handler (__NR_signal,    syscall_signal);
   install_syscall_handler (__NR_kill,      syscall_kill);
+  install_syscall_handler (__NR_readchar,  syscall_readchar);
   install_syscall_handler (ARCH_NR_SIGRETURN, syscall_sigreturn);
 }
 
