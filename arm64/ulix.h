@@ -41,7 +41,7 @@ struct frame { u64 x[31]; u64 elr; u64 spsr; };
 
 // console
 void putch (char c);
-void printf (const char *fmt, ...);
+int printf (const char *fmt, ...);
 
 // irq.c
 void irq_init (void);

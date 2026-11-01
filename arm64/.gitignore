@@ -4,3 +4,6 @@ disk.img
 user/*.o
 user/*.elf
 bad-*.elf
+gen/
+disk-after.img
+verify.log

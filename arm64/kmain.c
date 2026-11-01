@@ -30,7 +30,7 @@ static void putnum (u64 v, int base, int width, char pad) {
 }
 
 // supports %s %c %d %u %x %lx %% with optional 0-padding / width
-void printf (const char *fmt, ...) {
+int printf (const char *fmt, ...) {
   __builtin_va_list ap;
   __builtin_va_start (ap, fmt);
   for (; *fmt; fmt++) {
@@ -54,6 +54,7 @@ void printf (const char *fmt, ...) {
     }
   }
   __builtin_va_end (ap);
+  return 0;
 }
 
 
@@ -108,7 +109,7 @@ static void count_cb (u32 ino, const char *name, void *arg) { (*(int *)arg)++; }
 static void disk_test (void) {
   static u8 a[1024] __attribute__ ((aligned (16))), b[1024] __attribute__ ((aligned (16)));
   CHECK (blk_init () == 0, "virtio-blk device found and initialised");
-  CHECK (blk_capacity () == 2880, "capacity is 2880 sectors (1440 KByte image)");
+  CHECK (blk_capacity () == 8192, "capacity is 8192 sectors (4 MByte: x86 image grown by tools/minix_add.py)");
 
   CHECK (blk_read (2, a, 2) == 0 && a[16] == 0x78 && a[17] == 0x24, "superblock read, Minix v2 magic 0x2478");
   CHECK (blk_read (blk_capacity (), a, 1) == -1, "read beyond the end of the disk is rejected");
@@ -267,6 +268,10 @@ void kmain (void) {
   disk_test ();
 
   sched_init ();
+  printf ("book file system test (mx_* from ulix-book.nw):\n");
+  extern int bookfs_test (void);
+  fails += bookfs_test ();
+
   printf ("process test:\n");
   process_test ();
 

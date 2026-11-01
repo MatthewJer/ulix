@@ -165,3 +165,73 @@ Test in qemu (EL1 und EL2): 45 Prüfungen, alle bestehen. Neu geprüft: Programm
 Bewusst offen: kein `fork`/`exec`/`wait`/`spawn` aus dem User-Modus (Programme startet nur der Kernel); `write` ist auf 256 Byte pro Aufruf begrenzt; keine dynamischen Bibliotheken, kein `brk`/`mmap`; Fehler beim Kopieren von Benutzerzeigern in `sys_open` sind pro Byte statt pro Seite (langsam, aber korrekt).
 
 Damit ist die in Abschnitt 4 beschriebene Etappenfolge 1–7 abgeschlossen. Was fehlt, ist der eigentliche Ulix-Kernel aus `ulix-book.nw` (siehe Abschnitt 1 und 9): Thread-Tabelle, `fork`/`exec`/`wait`, Signale, Semaphore, VFS, Terminals, Swap, Copy-on-Write und die Rückführung in das Literate-Programming-Dokument.
+
+## 12. Bestandsaufnahme des eigentlichen Ulix-Kernels (`ulix.c`, 8 897 Zeilen)
+
+Grundlage: `notangle -Rulix.c` aus dem Buch, dann Funktionen gezählt (269 Funktionen, 4 800 Zeilen; die übrigen rund 4 100 Zeilen sind Strukturen, Konstanten, Makros, Globals und Tabellen) und der Code testweise mit `aarch64-elf-gcc -fsyntax-only -Wall -Wextra` übersetzt. Die Einteilung unten ist **heuristisch** (Suche nach x86-typischen Namen), keine manuelle Prüfung jeder Funktion.
+
+**Gute Nachricht:** Der Kernel-Code übersetzt für AArch64 **ohne einen einzigen Fehler** (die 31 Inline-Assembler-Blöcke prüft der Compiler im Modus `-fsyntax-only` nicht; sie müssen ohnehin von Hand ersetzt werden). Es bleiben 205 Warnungen, davon 153 echte 64-Bit-Probleme (97× Integer → Zeiger, 56× Zeiger → Integer) und 40× `pointer-sign`.
+
+### Ursachen der 64-Bit-Probleme
+
+- Fast alles geht auf **eine** Definition zurück: `typedef unsigned int memaddress;` (Zeile 584). Auf `unsigned long` umgestellt verschwindet der Großteil der Warnungen. Dazu `size_t` (derzeit `int`).
+- 63 der 153 Treffer liegen in Makros und Globals außerhalb von Funktionen, der Rest verteilt sich auf 53 Stellen (zum Beispiel `syscall_open` 13×, `ksh_command_test` 9×).
+- `ulong`/`unsigned long` werden an wenigen Stellen als 32-Bit-Wert benutzt (Signalmasken, `unixtime`, GDT/IDT-Hilfen). Auf AArch64 sind sie 64 Bit breit; das ist für die Maskenfelder egal, für On-Disk-Strukturen müsste es geprüft werden (die Minix-Strukturen aus Etappe 6 sind bereits mit festen Breiten umgesetzt).
+
+### Was wohin gehört (Funktionszeilen)
+
+| Bereich | Fkt. | Zeilen | Einschätzung |
+|---|---|---|---|
+| Minix-Dateisystem (`mx_*`) | 30 | 743 | fast unverändert übernehmbar; ist nur über `blk_read/blk_write` mit der Platte verbunden |
+| Syscall-Rümpfe (`u_*`) | 35 | 660 | größtenteils portabel; `u_fork` und `u_kill` brauchen Adressraum-/Frame-Anpassung |
+| Syscalls (`syscall_*`) | 36 | 533 | Dispatcher und Registerzugriff neu (`regs->eax` → `frame->x[0]`), Rümpfe meist übernehmbar |
+| Kernel-Shell (`ksh_*`) | 10 | 351 | portabel, hängt an Konsole und Tastatur |
+| Adressräume/Paging | 19 | 417 | **neu schreiben** auf `map_page_in`/`free_user_space` (Etappen 4/5): 2-stufiges x86-Paging, Swap (`page_out`) und Copy-on-Write müssen auf 4-stufige Tabellen |
+| Threads/Scheduler | 11 | 262 | Logik übernehmbar, Kontextwechsel und Stack-Frames neu (Etappe 5 hat die Bausteine) |
+| Konsole/VT/Tastatur | 26 | 411 | **ersetzen** durch UART (zehn virtuelle Terminals und VGA-Text entfallen oder werden auf eine serielle Konsole abgebildet) |
+| Floppy/IDE/Disk | 22 | 398 | **entfällt** (virtio-blk aus Etappe 6 ersetzt es) |
+| Interrupts/Timer/Uhr (GDT/IDT/PIC/TSS) | 9 | 164 | **entfällt** (Etappe 3), `unixtime` bleibt; Uhr kommt aus PL031 statt CMOS |
+| Übrige (Pipes, Signale, Hilfsfunktionen) | 71 | 861 | meist portabel; Signalzustellung (Rücksprung-Trampolin, Frame manipulieren) ist x86-spezifisch |
+
+Grob: etwa 55 % der Funktionszeilen enthalten nichts Architekturspezifisches und müssen nur mit dem neuen `memaddress` neu übersetzt werden. Rund 35 % berühren x86-Register, Segmente oder Paging und müssen angepasst werden. Etwa 10 % sind Hardware-Treiber, die durch die bereits geschriebenen ersetzt werden.
+
+### Benutzerseite
+
+- `lib-build/`: `ulixlib.c` (570 Zeilen), `init.c`, `orig-sh.c` (824 Zeilen, die Shell) und rund 60 kleine Programme in `lib-build/tools/`. Sie werden bisher mit `i586-elf-gcc` gebaut und rufen den Kernel über `int 0x80`. Für AArch64 müssen die Syscall-Stubs auf `svc #0` (Nummer in `x8`) umgestellt und alles mit dem neuen Linkerskript `user.ld` gebaut werden (das Format steht seit Etappe 7).
+- Die Syscall-**Nummern** und Strukturen (zum Beispiel `getpsinfo`, `stat`) müssen zwischen Kernel und Bibliothek identisch bleiben; die kommen aus demselben Buch, das hilft.
+
+### Realistische Reihenfolge für die Portierung
+
+1. `memaddress` auf 64 Bit, Kernel-Code in `arm64/` einbinden, zunächst nur die portablen Bereiche (Minix inkl. Schreiben, `dev_*`, Pipes, Signalstrukturen). Ziel: Dateisystem-Tests aus dem Buch laufen auf der virtio-Platte.
+2. Prozess-/Thread-Tabelle (TCB) und Scheduler aus dem Buch statt der vereinfachten aus Etappe 5; `fork` mit Adressraum-Kopie (`as_*`) auf den neuen Seitentabellen.
+3. Syscall-Dispatcher auf `svc` mit der Syscall-Tabelle aus dem Buch; Signale; Semaphore/Mutex.
+4. Konsole: UART statt VGA/Tastatur, `kernel_shell` darauf.
+5. Userland neu bauen (`ulixlib`, `init`, `sh`, Werkzeuge) und `init` von der Platte starten.
+6. Optionale Teile: Swap und Copy-on-Write auf 4-KB-Seiten, mehrere Terminals.
+7. Ergebnis zurück in `ulix-book.nw` als Literate-Programm (neue Kapitel für ARM64) und Dokumentation.
+
+**Einschätzung:** Es ist weniger als befürchtet, aber nicht wenig. Die Hardware-Schicht (Etappen 1–7) ist erledigt; der portable Kern ist überschaubar und übersetzt schon. Der Aufwand liegt bei den rund 1 600 Zeilen mit x86-Paging-, Register- und Prozesskontext-Bezug, dem Userland und dem Debugging des Zusammenspiels. Eine seriöse Stundenangabe kann ich nicht geben; im Umfang ist das ungefähr so viel wie die bisherigen sieben Etappen zusammen, und die schwierigsten Stellen (`fork`, Swap, Signale) kommen erst noch.
+
+## 13. Schritt 1 der Kernel-Portierung: Buchcode läuft auf ARM64 (Dateisystem lesen und schreiben)
+
+**Randbedingung: der x86-32-Bit-Build bleibt erhalten.** Alle Änderungen am Buch (`ulix-book.nw`) sind deshalb architekturneutral oder per `#if defined(__i386__)` getrennt. Nachweis nach jeder Buchänderung: `.text` der x86-Objektdatei ist **bit-identisch** zur Baseline (gleicher MD5 des `.text`-Abschnitts, gleiche Größen von text/data/bss), und der x86-Kernel bootet in `qemu-system-i386` mit identischer Ausgabe.
+
+Änderungen am Buch:
+- `memaddress` ist jetzt `__UINTPTR_TYPE__` (x86: `unsigned int`, AArch64: `unsigned long`), `size_t` ist `__PTRDIFF_TYPE__` (x86: `int`, AArch64: `long`). Das beseitigt den Großteil der 153 Zeiger/Integer-Warnungen aus Abschnitt 12; im übernommenen Code bleiben null Cast-Warnungen.
+- `PHYSICAL(x)` (RAM-Fenster) hat auf AArch64 die Basis `0xFFFF000000000000`.
+- Der Aufruf des eigenen Syscalls `readchar` in `u_read` steckt jetzt im Makro `READCHAR_SYSCALL`: x86 expandiert zum selben Assembler wie zuvor, andere Architekturen rufen `arch_readchar()`.
+
+Neu in `arm64/` (der Kernel-Code des Buchs wird **nicht kopiert**, sondern bei jedem Build neu aus dem Buch erzeugt):
+- `ulix-arm64.nw`: noweb-Wurzelchunks, die die Chunks des Buchs (Konstanten, Makros, Typen, Prototypen, globale Variablen, Funktionen) wiederverwenden: `notangle -Rulix-decl.h ../ulix-book.nw ulix-arm64.nw`.
+- `tools/port.py` + `port.manifest`: wählen einzelne Funktionen und Globals aus; aktuell 77 Funktionen und 14 Globals: das komplette Minix-Dateisystem `mx_*`, die Hilfsfunktionen (`splitpath`, `relpath_to_abspath`, String-/Speicherfunktionen), die Blockschicht (`readblock`, `writeblock_raw`) und die darüberliegende Geräte-/VFS-Schicht (`u_open`, `u_read`, `u_stat`, `u_close`, `u_unlink`, `u_chdir`, `u_getcwd`, `dev_*`, `check_access`, `get_dev_and_path`).
+- `glue.c`: plattformabhängiger Ersatz: `readblock_hd/writeblock_hd` über virtio-blk, `dev_size`, Stubs für Floppy und seriellen Datenträger, `arch_readchar` über die UART.
+- **Bekannte Lücke:** Der Pufferspeicher (Buffer Cache) des Buchs ist noch nicht portiert (er braucht Thread-Tabelle und Mutexe). `writeblock` schreibt deshalb in `glue.c` sofort durch auf die Platte (das Buch speichert nur im Cache und lässt später schreiben). Sobald der Scheduler des Buchs läuft, entfallen `glue.c`-Stubs und `writeblock` wieder zugunsten der Buchversionen (nur `port.manifest` ändern).
+- `bookfs_test.c`: Tests des Buchcodes auf der virtio-Platte: Lesen der x86-Dateien (Größe, Prüfsumme), Anlegen/Schreiben/Lesen/Überschreiben (40 000 Byte über die indirekte Zone), `lseek`, `ftruncate`, `unlink`, 300 000 Byte über die doppelt indirekte Zone, `mkdir` (auch verschachtelt), Hardlinks mit Link-Zähler, und die Block-Bilanz: nach dem Löschen aller Hilfsdateien stimmt die Zahl freier Blöcke exakt mit dem Bedarf der übrig gebliebenen Dateien überein.
+- `tools/minix_check.py` und `make verify`: Der Test läuft auf einer Kopie des Images **ohne** `-snapshot`; danach prüft ein unabhängiges Python-Programm das veränderte Image (Verzeichnisbaum, Inode- und Zonen-Bitmaps, Link-Zähler, verwaiste Zonen/Inodes) und vergleicht den Inhalt von `/keep.bin` byteweise mit dem erwarteten Muster. Ergebnis: 0 Probleme, 0 verwaiste Zonen oder Inodes. Das Skript hat dabei auch das Hilfsprogramm `minix_add.py` und das Original-x86-Image geprüft (beide in Ordnung).
+- `minix_add.py --grow=N` vergrößert das Test-Image (Dateisystem von 1440 auf 4096 Zonen = 4 MByte), damit Schreibtests mit Platz laufen; `disk.img` ist damit 4 MByte groß.
+
+Ergebnis in qemu (Cortex-A72, EL1 und EL2, Legacy- und modernes virtio): **79 Prüfungen, alle bestehen**, einschließlich der Tests der Etappen 4 bis 7.
+
+Zwei Eigenheiten des Buchs, die ich beim Testen gelernt habe (keine Portierungsfehler): `mx_getdent` liefert auch unbelegte 32-Byte-Slots (Inode 0), und `mx_mkdir` prüft nicht, ob das Verzeichnis schon existiert (das macht `u_mkdir` eine Ebene höher); ein zweiter `mx_mkdir` auf einen vorhandenen Pfad würde das Dateisystem beschädigen.
+
+Nächster Schritt (Schritt 2 aus Abschnitt 12): Thread-Tabelle (TCB) und Scheduler des Buchs statt der vereinfachten aus Etappe 5; dann fallen Buffer-Cache-Stubs und Durchschreib-`writeblock` weg.

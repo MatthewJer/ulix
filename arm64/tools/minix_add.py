@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Add files to the root directory of a Minix v2 image (14- or 30-character names).
 
-usage: minix_add.py IMAGE NAME=HOSTFILE [NAME=HOSTFILE ...]
+usage: minix_add.py IMAGE [--grow=ZONES] NAME=HOSTFILE [NAME=HOSTFILE ...]
+
+--grow enlarges the file system to ZONES zones first (more room for write tests).
 
 Needed because mkfs.minix / a Minix mount are not available on macOS.  Supports files up to
 7 direct + 256 indirect zones (263 KByte), which is plenty for the AArch64 user programs.
@@ -11,6 +13,9 @@ import struct, sys, time
 ZONE = 1024
 
 def main(image, specs):
+    grow = 0
+    if specs and specs[0].startswith('--grow='):
+        grow = int(specs[0][7:]); specs = specs[1:]
     d = bytearray(open(image, 'rb').read())
     ninodes, nz16, imap_b, zmap_b, first, logz, maxsize, magic, state, nzones = \
         struct.unpack('<HHHHHHIHHI', d[1024:1048])
@@ -18,6 +23,16 @@ def main(image, specs):
         sys.exit('not a Minix v2 image with 1 KByte zones (magic 0x%x)' % magic)
     dsize, nlen = (32, 30) if magic == 0x2478 else (16, 14)
     imap_off, zmap_off = 2 * ZONE, (2 + imap_b) * ZONE
+    if grow:
+        if grow < nzones or grow - first + 1 > zmap_b * ZONE * 8:
+            sys.exit('cannot grow to %d zones' % grow)
+        d.extend(bytes(grow * ZONE - len(d)))
+        for z in range(nzones, grow):                  # new zones are free: clear their bitmap bits
+            n = z - first + 1
+            d[zmap_off + n // 8] &= ~(1 << (n % 8))
+        struct.pack_into('<I', d, 1024 + 20, grow)
+        print('grown from %d to %d zones' % (nzones, grow))
+        nzones = grow
     ino_off = (2 + imap_b + zmap_b) * ZONE
 
     def bit(base, n): return d[base + n // 8] >> (n % 8) & 1

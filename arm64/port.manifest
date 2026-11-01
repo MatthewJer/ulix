@@ -1,0 +1,57 @@
+# Pieces of the Ulix kernel (ulix-book.nw) that are compiled unchanged for ARM64.
+# "function NAME" / "global NAME"; a trailing * matches a prefix.
+
+# Minix file system
+function mx_*
+function count_zeros
+
+# globals used by the file system code
+global mx_inodes
+global mx_status
+global count_open_files
+global count_int_inodes
+global system_time
+global thread_table
+global current_task
+global current_mounts
+global mount_table
+global fs_names
+
+# helpers used by the file system code
+function fileblocktozone
+function findZeroBitAndSet
+function relpath_to_abspath
+function splitpath
+function str*
+function mem*
+
+# VFS layer that mx_rmdir calls through the system call functions
+function u_open
+function u_close
+function u_unlink
+function u_chdir
+function u_getcwd
+global scheduler_is_active
+
+# generic file access layer above the file system (descriptors, permissions, devices)
+function check_access
+function get_dev_and_path
+function set_errno
+function dev_open
+function dev_close
+function u_read
+function u_stat
+global startup_errno
+global dev_directory
+global dev_status
+function check_perms
+function dev_read
+function dev_stat
+function split_mountpoint
+
+# block layer: device number -> driver dispatch (the buffer cache is not used yet, see glue.c)
+function makedev
+function devmajor
+function devminor
+function readblock
+function writeblock_raw

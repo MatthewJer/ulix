@@ -1,0 +1,24 @@
+% Ulix ARM64 -- noweb root chunks that reuse the chunks of ../ulix-book.nw.
+% notangle -Rulix-decl.h ../ulix-book.nw ulix-arm64.nw   (both files are needed)
+%
+% The book assembles ulix.c from a fixed sequence of chunks (constants, macros, types,
+% prototypes, global variables, function implementations).  The ARM64 port takes the
+% declarations unchanged, so that every function taken from the book sees exactly the
+% same types and constants as on x86, and picks single function implementations from
+% the implementation chunks (see tools/port.py and port.manifest).
+
+<<ulix-decl.h>>=
+<<constants>>  <<public constants>>
+<<macro definitions>>  <<public macro definitions>>
+<<public elementary type definitions>>
+<<type definitions>>  <<public type definitions>>
+<<function prototypes>>  <<public function prototypes>>
+@
+
+<<ulix-globals.c>>=
+<<global variables>>
+@
+
+<<ulix-functions.c>>=
+<<function implementations>>  <<public function implementations>>
+@

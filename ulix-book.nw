@@ -2214,18 +2214,22 @@ typedef unsigned short       uint16_t;
 typedef unsigned int         uint32_t;
 typedef unsigned long long   uint64_t;
 
-typedef int                    size_t;
+typedef __PTRDIFF_TYPE__       size_t;   // int on x86 (32 bit), long on AArch64
 typedef unsigned int             uint;   // short names for "unsigned int",
 typedef unsigned long           ulong;   // "unsigned long" and
 typedef unsigned long long  ulonglong;   // "unsigned long long" (64 bit)
 @ %def uint8_t uint16_t uint32_t uint64_t uint size_t ulong ulonglong
 
 \noindent
-Memory addresses in our code are always 32 bits wide since \UlixI{} is a 32-bit
-operating system. We introduce an address type:
+Memory addresses in our code are as wide as a pointer: 32 bits on the x86
+version of \UlixI{}, which is a 32-bit operating system, and 64 bits when the
+same source is compiled for AArch64. We introduce an address type, and let the
+compiler pick the right width: [[__UINTPTR_TYPE__]] is a predefined macro of
+[[gcc]] that expands to [[unsigned int]] on a 32-bit x86 target (so the x86
+code is unchanged) and to [[unsigned long]] on AArch64:
 
 <<public elementary type definitions>>=
-typedef unsigned int       memaddress;
+typedef __UINTPTR_TYPE__   memaddress;
 @ %def memaddress
 
 
@@ -6229,7 +6233,11 @@ a macro [[PHYSICAL]] that will translate an address from the first
 64 MByte to the \hexaddr{D000.0000} \dots \hexaddr{D3FF.FFFF} range:
 
 <<macro definitions>>=
+#if defined(__i386__)
 #define PHYSICAL(x) ((x)+0xd0000000)
+#else
+#define PHYSICAL(x) ((x)+0xffff000000000000UL)   // AArch64: linear map in the upper half
+#endif
 @ %def PHYSICAL
 
 Now that we can access all of the physical addresses (including
@@ -20678,6 +20686,29 @@ install_syscall_handler (__NR_readchar, syscall_readchar);
 
 Reading from standard output or standard error is not allowed and causes an error. Also there are no pipes in this \UlixI{} version, but the idea is to let the kernel create an internal buffer for each pipe and associate two negative file descriptors with it.
 
+The kernel reads a character by calling its own [[readchar]] system call; how a
+system call is invoked depends on the processor, so we hide it in the macro
+[[READCHAR_SYSCALL]]. On the x86 it is the software interrupt [[int 0x80]] with the
+system call number in [[eax]] and the result in [[ebx]]. On other architectures
+(the ARM64 port) the platform code provides the function [[arch_readchar]].
+
+<<macro definitions>>=
+#if defined(__i386__)
+#define READCHAR_SYSCALL(u)  __asm__ ("\
+        .intel_syntax noprefix; \
+        mov eax, 525; \
+        int 0x80; \
+        mov %0, ebx; \
+        .att_syntax"                 \
+        :                            \
+        "=r"(u)                      \
+      )
+#else
+extern unsigned int arch_readchar (void);
+#define READCHAR_SYSCALL(u)  ((u) = arch_readchar ())
+#endif
+@ %def READCHAR_SYSCALL
+
 <<read: standard I/O and pipes>>=
 byte c = 0;
 unsigned int u;
@@ -20685,15 +20716,7 @@ switch (fd) {
   case DEV_STDIN: 
     for (int i = 0;  i < nbyte;  i++) {
       // read_ one character from the keyboard
-      __asm__ ("\
-        .intel_syntax noprefix; \
-        mov eax, 525; \
-        int 0x80; \
-        mov %0, ebx; \
-        .att_syntax"
-        :
-        "=r"(u)
-      );
+      READCHAR_SYSCALL (u);
       c = (byte) u;
       ((byte*) buf)[i] = c;
     };
