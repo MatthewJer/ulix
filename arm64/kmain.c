@@ -87,6 +87,58 @@ static void mmu_selftest (void) {
   free_frame (pa);
 }
 
+static u32 file_sum (const char *path, u32 *size_out) {
+  static u8 buf[32768] __attribute__ ((aligned (16)));
+  u32 ino = minix_lookup (path), sum = 0;
+  if (!ino) { *size_out = 0; return 0; }
+  long n = minix_read (ino, 0, buf, sizeof buf);
+  *size_out = n < 0 ? 0 : n;
+  for (long i = 0; i < n; i++) sum += buf[i];
+  return sum;
+}
+
+static void count_cb (u32 ino, const char *name, void *arg) { (*(int *)arg)++; }
+
+static void disk_test (void) {
+  static u8 a[1024] __attribute__ ((aligned (16))), b[1024] __attribute__ ((aligned (16)));
+  CHECK (blk_init () == 0, "virtio-blk device found and initialised");
+  CHECK (blk_capacity () == 2880, "capacity is 2880 sectors (1440 KByte image)");
+
+  CHECK (blk_read (2, a, 2) == 0 && a[16] == 0x78 && a[17] == 0x24, "superblock read, Minix v2 magic 0x2478");
+  CHECK (blk_read (blk_capacity (), a, 1) == -1, "read beyond the end of the disk is rejected");
+
+  for (int i = 0; i < 1024; i++) a[i] = (u8)(i * 7 + 3);
+  CHECK (blk_write (2800, a, 2) == 0 && blk_read (2800, b, 2) == 0, "write 2 sectors and read them back");
+  int same = 1;
+  for (int i = 0; i < 1024; i++) if (a[i] != b[i]) same = 0;
+  CHECK (same, "read-back data identical (disk is run with -snapshot, image file stays untouched)");
+
+  CHECK (minix_mount () == 0, "Minix file system mounted");
+  int n = 0;
+  minix_readdir (1, count_cb, &n);
+  CHECK (n == 16, "root directory has 16 entries");
+  n = 0;
+  minix_readdir (minix_lookup ("/bin"), count_cb, &n);
+  CHECK (n == 63, "/bin has 63 entries");
+  CHECK (minix_lookup ("/nonexistent") == 0, "unknown path not found");
+
+  // reference values computed on the host from the same image with an independent parser
+  u32 size, sum;
+  sum = file_sum ("/hello.c", &size);
+  CHECK (size == 316 && sum == 22888, "/hello.c: 316 bytes, checksum matches");
+  sum = file_sum ("/test.txt", &size);
+  CHECK (size == 1680 && sum == 82026, "/test.txt: two zones, checksum matches");
+  sum = file_sum ("/init", &size);
+  CHECK (size == 8192 && sum == 592953, "/init: 8 KByte (uses the indirect zone), checksum matches");
+  sum = file_sum ("/bin/vi", &size);
+  CHECK (size == 25348 && sum == 1364660, "/bin/vi: 25 KByte through a subdirectory, checksum matches");
+
+  u8 text[64];
+  long got = minix_read (minix_lookup ("/hello.c"), 0, text, 40);
+  text[got > 0 ? got : 0] = 0;
+  printf ("  info: /hello.c starts with: %s\n", text);
+}
+
 static void process_test (void) {
   long frames_before = frames_in_use;
   printf ("starting 3 user processes: hello 1, hello 2, bad\n");
@@ -122,6 +174,9 @@ void kmain (void) {
   user_mm_init ();                                // TTBR0 is now free for user processes
   printf ("MMU self-test:\n");
   mmu_selftest ();
+
+  printf ("disk test:\n");
+  disk_test ();
 
   sched_init ();
   printf ("process test:\n");

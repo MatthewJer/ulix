@@ -137,3 +137,15 @@ Neu in `arm64/` (gemeinsame Definitionen jetzt in `ulix.h`):
 Test in qemu (Cortex-A72, EL1- und EL2-Start): zwei Hello-Prozesse laufen verzahnt (Wechsel durch Timer-Preemption, 12–14 von 16–18 Kontextwechseln), der böse Prozess wird mit EC=0x24 / Permission Fault Level 1 beendet und der Kernel läuft weiter, alle drei werden abgeräumt, `frames_in_use` ist danach wieder auf dem Ausgangswert (kein Leck). Zusammen mit den Tests aus Etappe 4: alle Prüfungen bestehen.
 
 Offen: der Kernel ist nicht präemptiv (Interrupts bleiben im Handler maskiert; das reicht, solange Syscalls kurz sind); kein `fork`/`exec`/`wait`, keine Signale, kein ELF-Loader; die User-Programme sind handgeschriebener Assembler im Kernel-Image (Etappe 7: AArch64-ELF laden). Der Code ist bewusst eine neue, kleine Implementierung der Ulix-Konzepte (Task, Adressraum, Syscall) und noch nicht die portierte Ulix-Prozessverwaltung aus `ulix-book.nw` (Thread-Tabelle, `fork`, Signale, Semaphore); diese aufzusetzen ist der Hauptteil von Etappe 5b.
+
+## 10. Status Etappe 6 (Massenspeicher: virtio-blk + Minix)
+
+Neu in `arm64/`:
+
+- `virtio.c`: virtio-mmio-Blocktreiber (Polling) für die qemu-`virt`-Maschine, sucht das Gerät in den 32 MMIO-Slots ab `0x0a000000`, unterstützt Legacy-Transport (Version 1, qemu-Standard) und modernen Transport (Version 2). Eine Virtqueue mit 8 Einträgen, jede Anfrage ist eine Kette aus Header, Daten und Statusbyte. Schnittstelle: `blk_read/blk_write (sector, buf, n)`, `blk_capacity`. Das ersetzt IDE-PIO und den Floppy-DMA-Treiber des x86-Kernels (gleiche Aufgabe, Sektoren lesen/schreiben).
+- `minixfs.c`: Minix-v2-Dateisystem (nur lesend) auf dem Blockgerät, 14- und 30-Zeichen-Namen, direkte, einfach und doppelt indirekte Zonen, Pfadauflösung (`minix_lookup`), `minix_read`, `minix_readdir`. Das ist dasselbe On-Disk-Format wie bei x86-Ulix, `bin-build/minixdata.img` wird unverändert verwendet.
+- `Makefile`: `make run` startet qemu mit `-snapshot` und dem Image als virtio-Platte (`DISK=` überschreibbar). Mit `-snapshot` landen Schreibzugriffe nur im Zwischenspeicher, die Image-Datei im Repo bleibt unverändert (geprüft: `git status` bleibt sauber).
+
+Getestet in qemu (Cortex-A72, EL1- und EL2-Start, Transport v1 und v2): Gerät gefunden, Kapazität 2880 Sektoren, Superblock-Magic 0x2478, Lesen hinter das Plattenende wird abgelehnt, Schreiben und Zurücklesen identisch, Mount, Verzeichniszahlen (`/` 16 Einträge, `/bin` 63), unbekannter Pfad, Dateigrößen und Prüfsummen von `/hello.c`, `/test.txt`, `/init` (nutzt die indirekte Zone) und `/bin/vi` (25 KByte, Unterverzeichnis). Die Referenzwerte stammen aus einem unabhängigen Python-Parser auf dem Host. Insgesamt 30 Prüfungen, alle bestehen, inklusive der Tests der Etappen 4 und 5.
+
+Bewusst offen: Treiber arbeitet per Polling (kein Interrupt, kein Schlafenlegen); DMA ohne Cache-Wartung, was nur auf kohärenten Plattformen wie qemu stimmt; nur eine Anfrage gleichzeitig; Dateisystem ist schreibgeschützt und ohne Puffercache; es gibt noch keine `open/read/close`-Syscalls und kein VFS (die Mount-Tabelle, `/dev`, `/tmp` und Swap aus dem Buch fehlen).

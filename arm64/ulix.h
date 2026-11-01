@@ -65,6 +65,17 @@ u64  new_user_l0 (void);
 void free_user_space (u64 l0_pa);
 void sync_icache (void *p, u64 len);
 
+// virtio.c, minixfs.c
+int  blk_init (void);
+u64  blk_capacity (void);
+int  blk_read  (u64 sector, void *buf, u32 nsectors);
+int  blk_write (u64 sector, void *buf, u32 nsectors);
+int  minix_mount (void);
+u32  minix_lookup (const char *path);
+u32  minix_size (u32 ino);
+long minix_read (u32 ino, u32 offset, void *buf, u32 len);
+int  minix_readdir (u32 dir, void (*fn)(u32 ino, const char *name, void *arg), void *arg);
+
 // sched.c
 void sched_init (void);
 int  task_create_user (const void *code_start, const void *code_end, u64 arg);
