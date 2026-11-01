@@ -70,7 +70,7 @@ int bookfs_test (void) {
          "mx_stat: regular file, 316 bytes");
   CHECK (mx_stat (DEV, "/bin", &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR, "mx_stat: /bin is a directory");
   CHECK (mx_stat (DEV, "/nonexistent", &st) == -1, "mx_stat: missing file");
-  CHECK (count_entries ("/") == 22, "mx_getdent: / has 22 used entries (16 from x86 Ulix + 6 AArch64 files)");
+  CHECK (count_entries ("/") == 23, "mx_getdent: / has 23 used entries (16 from x86 Ulix + 7 AArch64 files)");
   CHECK (count_entries ("/bin") == 63, "mx_getdent: /bin has 63 entries");
   CHECK (mx_file_exists (DEV, "/bin/vi") && mx_file_is_directory (DEV, "/bin") &&
          !mx_file_is_directory (DEV, "/bin/vi"), "mx_file_exists / mx_file_is_directory");

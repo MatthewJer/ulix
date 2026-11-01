@@ -9,6 +9,7 @@ extern void book_timer_tick (void);
 extern void book_syscall (void *frame);
 extern void book_user_fault (void *frame);
 extern int  book_current_pid (void);
+extern void arch_signal_check (void *frame);
 
 // ---- GICv2 on qemu "virt" ------------------------------------------------
 #define GICD_BASE   (KERNEL_VA + 0x08000000UL)
@@ -68,6 +69,7 @@ void exc_handler (struct frame *f, int kind) {
       GICC_EOIR = iar;
     }
     if (irq == IRQ_TIMER && book_scheduler_on) book_timer_tick ();   // time slice over (10 ms)
+    if (from_user && book_scheduler_on) arch_signal_check (f);       // deliver pending signals
     return;
   }
 
@@ -77,7 +79,7 @@ void exc_handler (struct frame *f, int kind) {
   u32 ec = esr >> 26;
 
   if (kind == 0 && ec == 0x15) {            // SVC from AArch64
-    if (from_user) { book_syscall (f); return; }       // the book's system call dispatcher
+    if (from_user) { book_syscall (f); arch_signal_check (f); return; }       // the book's system call dispatcher
     printf ("SVC #%u at 0x%lx (from the kernel)\n", (u32)(esr & 0xffff), f->elr - 4);
     return;
   }

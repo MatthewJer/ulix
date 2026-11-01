@@ -9250,10 +9250,10 @@ void syscall_sbrk (context_t *r) {
 install_syscall_handler (__NR_brk, syscall_sbrk);
 @
 
-This is the first of many appearances of a code pattern: Most system call handlers set [[r->eax]] in order to provide a return value and then leave the function with [[r->eax]]. To simplify our code we will provide a macro [[eax_return]]\index{eax\_return macro@\texttt{eax\_return} macro}\index{system call!passing the return value via EAX} which combines these two activities and also performs the type cast to an unsigned integer:
+This is the first of many appearances of a code pattern: Most system call handlers set [[r->eax]] in order to provide a return value and then leave the function with [[r->eax]]. To simplify our code we will provide a macro [[eax_return]]\index{eax\_return macro@\texttt{eax\_return} macro}\index{system call!passing the return value via EAX} which combines these two activities and also performs the type cast to an unsigned integer of the width of an address (so that pointers and negative numbers survive on a 64-bit processor, too):
 
 <<macro definitions>>=
-#define eax_return(retval) { r->eax = (unsigned int)((retval)); return; }
+#define eax_return(retval) { r->eax = (memaddress)((retval)); return; }
 @ %def eax_return
 
 With this macro we can rewrite [[syscall_sbrk]] like this:

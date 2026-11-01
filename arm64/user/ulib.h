@@ -29,6 +29,8 @@ static inline long syscall3 (long nr, long a, long b, long c) {
 #define SYS_lseek   19
 #define SYS_getpid  20
 #define SYS_getppid 64
+#define SYS_kill    37
+#define SYS_signal  48
 #define SYS_resign  66
 
 static inline long write (int fd, const void *buf, u64 n)  { return syscall3 (SYS_write, fd, (long)buf, n); }
@@ -41,6 +43,18 @@ static inline int  waitpid (int pid, int *status, int opt) { return syscall3 (SY
 static inline int  execv (const char *path, char *const argv[]) { return syscall3 (SYS_execve, (long)path, (long)argv, 0); }
 static inline int  open (const char *path, int flags)      { return syscall3 (SYS_open, (long)path, flags, 0); }
 static inline long read (int fd, void *buf, u64 n)         { return syscall3 (SYS_read, fd, (long)buf, n); }
+typedef void (*sighandler_t) (int);
+#define SIG_DFL ((sighandler_t)0)
+#define SIG_IGN ((sighandler_t)1)
+#define SIG_ERR ((sighandler_t)-1)
+#define SIGKILL   9
+#define SIGTERM  15
+#define SIGSTOP  17
+#define SIGCONT  19
+#define SIGUSR1  30
+#define SIGUSR2  31
+static inline sighandler_t signal (int sig, sighandler_t f) { return (sighandler_t)syscall3 (SYS_signal, sig, (long)f, 0); }
+static inline int  kill (int pid, int sig)                  { return syscall3 (SYS_kill, pid, sig, 0); }
 static inline int  close (int fd)                          { return syscall3 (SYS_close, fd, 0, 0); }
 static inline int  lseek (int fd, int off, int whence)     { return syscall3 (SYS_lseek, fd, off, whence); }
 

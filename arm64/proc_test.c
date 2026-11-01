@@ -104,6 +104,16 @@ int proc_test (void) {
   CHECK (count_in (out, "worker 2 round 2") == 1 && count_in (out, "child: pid") == 1, "children printed their lines");
   CHECK (live_threads () == 0, "all processes are gone");
 
+  // signals: handler with exact register restore, SIG_IGN, default action, SIGSTOP/SIGCONT/SIGKILL
+  char *sig_argv[] = { "sigtest64", 0 };
+  capture_start ();
+  pid = run ("/sigtest64", 1, sig_argv);
+  capture_stop (&out);
+  CHECK (pid > 0 && thread_table[pid].exitcode == 0, "/sigtest64 finished with exit status 0 (no failed checks)");
+  CHECK (count_in (out, "user FAIL") == 0 && count_in (out, "user ok:") == 8, "all 8 signal checks passed");
+  CHECK (count_in (out, "Replacing signal 15") == 1, "the book's kill() turned SIGTERM into SIGKILL (no handler)");
+  CHECK (live_threads () == 0, "no process is left, also not the ones killed by signals");
+
   arch_threads_reap ();
   CHECK (frames_in_use == frames_before, "no frame leaked: address spaces and kernel stacks freed");
   return fails;

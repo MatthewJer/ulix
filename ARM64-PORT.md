@@ -282,3 +282,19 @@ Offen / bekannte Lücken:
 - Kein Copy-on-Write und kein `brk`/`sbrk` (Heap) für Benutzerprogramme; `write` meldet wegen eines Fehlers im Buch (`u_write` fällt nach der Ausgabe auf STDOUT/STDERR in `default: return -1`) immer -1 zurück, die Ausgabe selbst funktioniert.
 - Das Buch dereferenziert Benutzerzeiger direkt (wie auf x86). Auf ARM64 funktioniert das, weil TTBR0 aktiv ist, aber ein ungültiger Zeiger in einem Systemaufruf würde den Kernel anhalten.
 - Signale, Pipes, pthreads, Terminals und die Kernel-Shell fehlen noch; der Buffer Cache ist weiter nicht eingebunden.
+
+## 16. Schritt 4 der Kernel-Portierung: Signale (und: Pipes gibt es nicht)
+
+**Pipes:** Die Suche im gesamten Repository ergab, dass x86-Ulix **keine Pipes benutzt**: es gibt kein `pipe()` im Kernel (das Buch schreibt selbst „pipes have not been implemented in this version“), keinen Werkzeug-Quelltext mit Pipes und im Shell-Quelltext (`lib-build/tools/sh.c`) kein `|`. Die Shell kann Umleitungen (`<`, `>`, `>>`, `2>`), und zwar über `close(1)` + `open(datei)` (der neue Deskriptor belegt den freien Platz), also ohne `dup2`; von `dup2` existiert nur die Nummer 63, ein Handler ist nicht installiert. Das läuft mit dem bereits portierten Dateisystem- und VFS-Code. Pipes werden deshalb nicht nachgebaut (neue Funktion ohne Nutzer).
+
+**Signale** aus dem Buch (`u_signal`, `u_kill`, `syscall_signal`, `syscall_kill`: Standardaktion, `SIG_IGN`, `SIGSTOP`/`SIGCONT`/`SIGKILL`, Pending-Bits) laufen unverändert. Neu auf ARM64 ist nur die Zustellung an den Benutzercode (im Buch steht sie im Scheduler und manipuliert den x86-Stack):
+- `arch_signal_check`: wird am Ende jeder Exception aus dem User-Modus aufgerufen (Systemaufruf und Timer-Interrupt). Es sichert den **gesamten** unterbrochenen Registerrahmen auf dem User-Stack, ruft den Handler wie eine C-Funktion (`x0` = Signalnummer) und setzt das Link-Register auf eine Trampolin-Seite.
+- Trampolin-Seite (`0x7FFF0000`, in jedem Adressraum): `movz x0,#600; svc #0`. Der neue Systemaufruf `sigreturn` (Nummer 600, nur ARM64) stellt den gesicherten Rahmen wieder her; Status-Register und Rücksprungadresse werden dabei geprüft (der Prozess bleibt in EL0).
+- Beim ersten Eintritt eines neuen Prozesses in den User-Modus wird ebenfalls geprüft: Ein Signal, das vor dem ersten Lauf eintraf, wird dort zugestellt. Den Fehler (Signal blieb für immer ausstehend, weil ein schnelles Kind nie eine Exception hatte) habe ich über einen Test gefunden.
+- Ein von einem anderen Prozess mit `SIGKILL` beendeter Prozess läuft nie durch `syscall_exit`; sein Adressraum wird jetzt beim Aufräumen der Kernel-Stacks freigegeben (kein Speicherverlust).
+
+Änderung am Buch: `eax_return` castet auf `memaddress` statt `unsigned int` (x86 identisch, auf ARM64 bleiben Zeiger und negative Werte erhalten; hatte zwei echte 64-Bit-Warnungen in `syscall_signal` gezeigt).
+
+Test (`user/sigtest.c`, alle 8 Prüfungen laufen im Benutzerprogramm): Ein Handler unterbricht eine Rechnung mit vielen Registern 8 Millionen Schleifendurchläufe lang, das Ergebnis ist trotzdem exakt, und der Handler lief mehrfach (vor dem ersten Befehl und mitten in der Rechnung); `SIG_IGN` stört nicht; ohne Handler tötet `SIGTERM` den Prozess (Meldung des Buchs); `SIGSTOP` hält einen Prozess an (kein Fortschritt in einer Logdatei), `SIGCONT` setzt fort, `SIGKILL` beendet sofort. Ergebnis in qemu (EL1 und EL2, modernes virtio): **93 Prüfungen im Kernel, alle bestehen**; `make verify` ohne Probleme. x86: Von 353 Funktionen unterscheiden sich weiterhin nur die zwei korrigierten Semaphor-Funktionen, der x86-Kernel bootet mit identischer Ausgabe.
+
+Bekannte Eigenheiten des Buchs, die ich nicht geändert habe: `kill` auf einen blockierten Elternprozess lässt dessen später endende Kinder als Zombies zurück (`u_kill` setzt Kinder nicht um); `SIGKILL` setzt `used = false` sofort, ein folgendes `waitpid` meldet -1.

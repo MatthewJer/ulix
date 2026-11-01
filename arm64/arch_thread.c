@@ -35,8 +35,10 @@ extern void exit_exception (void);
 
 static struct kctx kctx[MAX_THREADS];
 static void arch_syscalls_init (void);
+void syscall_sigreturn (context_t *r);
 void syscall_handler (context_t *r);          // defined in the book without a prototype
-static u64 kstack_pa[MAX_THREADS];             // physical address of the thread's kernel stack, 0 = none
+static u64 kstack_pa[MAX_THREADS];
+static addr_space_id kstack_as[MAX_THREADS];   // address space of the process the stack belongs to             // physical address of the thread's kernel stack, 0 = none
 int book_scheduler_on = 0;                     // irq.c asks this before calling the book's scheduler
 
 // ---- hooks called from the book ----
@@ -164,6 +166,11 @@ int arch_threads_reap (void) {
   u64 flags = irq_save ();
   for (thread_id tid = 2; tid < MAX_THREADS; tid++) {
     if (kstack_pa[tid] && !thread_table[tid].used) {
+      // a process killed by another one (u_kill) never ran syscall_exit: free its address space here
+      addr_space_id as = kstack_as[tid];
+      if (as >= 2 && address_spaces[as].status == AS_USED && address_spaces[as].pid == (int)tid)
+        destroy_address_space (as);
+      kstack_as[tid] = 0;
       for (int k = 0; k < KSTACK_PAGES_ARCH; k++) free_frame (kstack_pa[tid] + k * PAGE);
       kstack_pa[tid] = 0;
       n++;
@@ -231,8 +238,22 @@ static int clone_level (u64 old_pa, u64 new_l0, int lvl, u64 va_prefix) {
 // Map the user stack and build  [argc][argv]  at its top, with the argument strings and the
 // argv array above it.  The start code (crt0) loads argc and argv from there.
 // Returns the initial user stack pointer, 0 on error.
+#define SIGPAGE_VA   0x7FFF0000UL            // the "signal trampoline" page, mapped in every process
+#define ARCH_NR_SIGRETURN 600                // AArch64 only: return from a signal handler
+
+static int map_sigpage (u64 l0) {
+  u64 pa = alloc_frame ();
+  unsigned int *code = KVA (pa);
+  code[0] = 0xD2800000 | ((ARCH_NR_SIGRETURN & 0xffff) << 5);   // movz x0, #600
+  code[1] = 0xD4000001;                      // svc #0
+  code[2] = 0xD503201F;                      // nop (never reached: sigreturn does not come back)
+  sync_icache (code, PAGE);
+  return map_page_in (l0, SIGPAGE_VA, pa, PAGE_URX);
+}
+
 static u64 build_user_stack (u64 l0, int argc, char **argv) {
   u64 top_pa = 0;
+  if (map_sigpage (l0) != 0) return 0;
   for (int i = 1; i <= USER_STACK_PAGES; i++) {
     u64 pa = alloc_frame ();
     if (i == 1) top_pa = pa;
@@ -261,9 +282,26 @@ static u64 build_user_stack (u64 l0, int argc, char **argv) {
   return sp;
 }
 
+// The first switch to a new process does not come from an exception, so the check for pending
+// signals at the end of the exception handler is not run.  A signal that was sent before the
+// process ever ran (typically to a freshly forked child) would stay pending, so the first
+// "return" goes through this stub: sp points to the prepared exception frame.
+void process_first_return (void);
+void arch_signal_check (context_t *f);
+__asm__ (
+  ".text\n"
+  ".global process_first_return\n"
+  "process_first_return:\n"
+  "  mov x0, sp\n"
+  "  bl  arch_signal_check\n"
+  "  b   exit_exception\n"
+);
+
 // kernel stack for a user process with a prepared exception frame: the first switch to the
 // thread "returns" through exit_exception (vectors.S) into user mode
 static void kstack_for_process (thread_id tid, const context_t *frame) {
+  kstack_as[tid] = thread_table[tid].addr_space;
+  address_spaces[kstack_as[tid]].pid = tid;        // marks who owns the address space (see arch_threads_reap)
   if (kstack_pa[tid]) {
     for (int k = 0; k < KSTACK_PAGES_ARCH; k++) free_frame (kstack_pa[tid] + k * PAGE);
   }
@@ -274,7 +312,7 @@ static void kstack_for_process (thread_id tid, const context_t *frame) {
   struct kctx *c = &kctx[tid];
   for (int i = 0; i < 10; i++) c->x19_x28[i] = 0;
   c->x29 = 0;
-  c->x30 = (u64)exit_exception;
+  c->x30 = (u64)process_first_return;
   c->sp  = (u64)f;
   c->sp_el0 = f->sp_el0;
 }
@@ -418,4 +456,52 @@ static void arch_syscalls_init (void) {
   install_syscall_handler (__NR_stat,      syscall_stat);
   install_syscall_handler (__NR_getcwd,    syscall_getcwd);
   install_syscall_handler (__NR_get_errno, syscall_get_errno);
+  install_syscall_handler (__NR_signal,    syscall_signal);
+  install_syscall_handler (__NR_kill,      syscall_kill);
+  install_syscall_handler (ARCH_NR_SIGRETURN, syscall_sigreturn);
+}
+
+
+// ---- signals ----
+// The book's scheduler delivers a signal by pushing the signal number and the old EIP on the user
+// stack and jumping to the handler; the handler "returns" to the interrupted code and all
+// registers are lost.  Here the whole interrupted register frame is saved on the user stack, the
+// handler is called like a C function (x0 = signal number) with the link register pointing to a
+// small trampoline page that calls sigreturn, which restores the frame.
+extern u64 user_to_phys (u64 va, int write);
+
+void arch_signal_check (context_t *f) {
+  TCB *t = &thread_table[current_task];
+  if (!t->sig_pending || f->elr >= 0x80000000UL) return;            // nothing pending / not in user mode
+  for (int signo = 0; signo < 32; signo++) {
+    if (!(t->sig_pending & (1UL << signo))) continue;
+    t->sig_pending &= ~(1UL << signo);
+    sighandler_t h = t->sighandlers[signo];
+    if (h == SIG_DFL || h == SIG_IGN) return;                       // cannot happen (u_kill filters them)
+    u64 sp = (f->sp_el0 - sizeof (context_t)) & ~15UL;
+    if (!user_to_phys (sp, 1) || !user_to_phys (sp + sizeof (context_t) - 1, 1)) {
+      printf ("[kernel] no room on the stack of process %d for signal %d\n", t->pid, signo);
+      f->ebx = (unsigned long)-1;
+      syscall_exit (f);                                             // does not return
+    }
+    *(context_t *)sp = *f;                                          // save the interrupted state
+    f->elr    = (u64)h;
+    f->eax    = signo;                                              // x0: argument of the handler
+    f->x30    = SIGPAGE_VA;                                         // the handler returns to the trampoline
+    f->sp_el0 = sp;
+    return;                                                         // one signal at a time
+  }
+}
+
+// sigreturn: the user stack pointer points to the saved frame
+void syscall_sigreturn (context_t *r) {
+  u64 sp = r->sp_el0;
+  if ((sp & 15) || !user_to_phys (sp, 0) || !user_to_phys (sp + sizeof (context_t) - 1, 0)) {
+    r->ebx = (unsigned long)-1;
+    syscall_exit (r);
+  }
+  context_t saved = *(context_t *)sp;
+  saved.spsr = r->spsr;                                             // the saved state must stay EL0t
+  if (saved.elr >= 0x80000000UL) saved.elr = 0, saved.ebx = (unsigned long)-1;
+  *r = saved;
 }

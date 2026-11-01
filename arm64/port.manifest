@@ -118,3 +118,13 @@ global current_as
 function dev_lseek
 function dev_write
 function get_errno
+
+# signals (delivery to user mode is platform code: arch_signal_check / sigreturn in arch_thread.c)
+function u_signal
+function u_kill
+function syscall_signal
+function syscall_kill
+global keyboard_queue
+global floppy_queue
+global harddisk_queue
+global serial_disk_queue

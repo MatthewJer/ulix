@@ -50,6 +50,9 @@ boolean buffer_contains (int dev, int blockno)                           { retur
 extern void putch (char c);
 void kputch (byte c) { putch ((char)c); }
 
+// ---- the x86 status line at the bottom of the VGA screen does not exist here ----
+void _set_statusline (char *text, int offset) { }
+
 // ---- diagnostics ----
 int debug_printf (const char *format, ...) { return 0; }                 // debugging output off
 

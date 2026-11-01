@@ -12,17 +12,20 @@ DISK ?= disk.img
 
 all: ulix.elf $(DISK)
 
-disk.img: ../bin-build/minixdata.img user/hello.elf user/cat.elf user/crash.elf user/forktest.elf tools/minix_add.py
+disk.img: ../bin-build/minixdata.img user/hello.elf user/cat.elf user/crash.elf user/forktest.elf user/sigtest.elf tools/minix_add.py
 	cp ../bin-build/minixdata.img $@
 	# two deliberately broken variants of hello.elf for the loader tests:
 	# e_machine = EM_386, and a code segment with flags RWX
 	python3 -c "d=bytearray(open('user/hello.elf','rb').read()); d[18]=3; d[19]=0; open('bad-arch.elf','wb').write(d)"
 	python3 -c "d=bytearray(open('user/hello.elf','rb').read()); d[68]=7; open('bad-wx.elf','wb').write(d)"
-	python3 tools/minix_add.py $@ --grow=4096 hello64=user/hello.elf cat64=user/cat.elf crash64=user/crash.elf forktest64=user/forktest.elf \
+	python3 tools/minix_add.py $@ --grow=4096 hello64=user/hello.elf cat64=user/cat.elf crash64=user/crash.elf forktest64=user/forktest.elf sigtest64=user/sigtest.elf \
 		badarch64=bad-arch.elf badwx64=bad-wx.elf
 
-user/%.elf:
+# the user programs are rebuilt by their own Makefile whenever a source changed
+user/%.elf: FORCE
 	$(MAKE) -C user
+
+FORCE:
 
 ulix.elf: start.o vectors.o irq.o mmu.o virtio.o minixfs.o elf.o ulix-port.o glue.o arch_thread.o bookfs_test.o thread_test.o proc_test.o kmain.o ulix.ld
 	$(LD) -T ulix.ld -o $@ start.o vectors.o irq.o mmu.o virtio.o minixfs.o elf.o ulix-port.o glue.o arch_thread.o bookfs_test.o thread_test.o proc_test.o kmain.o
