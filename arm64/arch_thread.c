@@ -41,9 +41,9 @@ void arch_resign (void);
 int arch_threads_reap (void);
 void syscall_sigreturn (context_t *r);
 void arch_clock_init (void);
-void arch_syscall_clrscr (context_t *r);
+void syscall_read_screen (context_t *r);          // the book defines these without prototypes
+void syscall_write_screen (context_t *r);
 void arch_syscall_idle (context_t *r);
-void arch_syscall_ignore (context_t *r);
 extern long frames_in_use;
 void syscall_readchar (context_t *r);
 void syscall_setterm (context_t *r);
@@ -707,14 +707,14 @@ static void arch_syscalls_init (void) {
   install_syscall_handler (__NR_pthread_mutex_trylock, arch_syscall_mutex_trylock);
   install_syscall_handler (__NR_pthread_mutex_unlock,  arch_syscall_mutex_unlock);
   install_syscall_handler (__NR_pthread_mutex_destroy, arch_syscall_mutex_destroy);
-  // there is no VGA screen: these only exist so that programs written for it keep working
+  // the screen functions: terminals with a model of the VGA text screen, shown on the serial console (arch_vt.c)
   install_syscall_handler (__NR_idle,      arch_syscall_idle);
-  install_syscall_handler (__NR_clrscr,    arch_syscall_clrscr);
+  install_syscall_handler (__NR_clrscr,    syscall_clrscr);
   install_syscall_handler (__NR_setterm,   syscall_setterm);
-  install_syscall_handler (__NR_get_xy,    arch_syscall_ignore);
-  install_syscall_handler (__NR_set_xy,    arch_syscall_ignore);
-  install_syscall_handler (__NR_read_screen,  arch_syscall_ignore);
-  install_syscall_handler (__NR_write_screen, arch_syscall_ignore);
+  install_syscall_handler (__NR_get_xy,    syscall_get_xy);
+  install_syscall_handler (__NR_set_xy,    syscall_set_xy);
+  install_syscall_handler (__NR_read_screen,  syscall_read_screen);
+  install_syscall_handler (__NR_write_screen, syscall_write_screen);
   install_syscall_handler (__NR_page_out,        syscall_page_out);
   install_syscall_handler (__NR_get_free_frames, syscall_get_free_frames);
   install_syscall_handler (__NR_free_a_frame,    syscall_free_a_frame);
@@ -786,8 +786,6 @@ void *u_sbrk (int incr) {
 
 
 // ---- system calls that exist for the VGA screen / the x86 frame table ----
-void arch_syscall_clrscr (context_t *r)  { printf ("\033[2J\033[H"); }       // ANSI: clear the terminal
-void arch_syscall_ignore (context_t *r)  { r->eax = 0; }
 
 // the idle system call: wait for the next interrupt (x86: sti; hlt; cli)
 void arch_syscall_idle (context_t *r) {

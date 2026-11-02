@@ -35,6 +35,11 @@ static inline long syscall3 (long nr, long a, long b, long c) {
 #define SYS_signal  48
 #define SYS_resign  66
 #define SYS_gettid  21
+#define SYS_clrscr      512
+#define SYS_get_xy      513
+#define SYS_set_xy      514
+#define SYS_read_screen 515
+#define SYS_write_screen 516
 #define SYS_page_out    508
 #define SYS_free_a_frame 510
 #define SYS_pthread_create 506
@@ -83,6 +88,12 @@ static inline int  mutex_destroy (int *m)                   { return syscall3 (S
 
 static inline int  page_out (void *addr)                    { return syscall3 (SYS_page_out, (long)addr >> 12, 0, 0); }
 static inline void free_a_frame (void)                      { syscall3 (SYS_free_a_frame, 0, 0, 0); }
+
+static inline void clrscr (void)                            { syscall3 (SYS_clrscr, 0, 0, 0); }
+static inline void get_xy (char *x, char *y)                { syscall3 (SYS_get_xy, (long)x, (long)y, 0); }
+static inline void set_xy (char x, char y)                  { syscall3 (SYS_set_xy, x, y, 0); }
+static inline void read_screen (char *buf)                  { syscall3 (SYS_read_screen, (long)buf, 0, 0); }
+static inline void write_screen (char *buf)                 { syscall3 (SYS_write_screen, (long)buf, 0, 0); }
 
 int  strlen (const char *s);
 int  strcmp (const char *a, const char *b);

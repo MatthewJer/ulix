@@ -74,7 +74,7 @@ try:
     run('stat h2', r'size:\s+316', 'stat shows size 316', P)
     run('stat h2', r'mtime:\s+1[7-9]\d{8}', 'the new file has a current modification time', P)
     run('mkdir d', r'', 'mkdir d', P)
-    run('ls', r'f1.*h2.*d/', 'ls shows f1, h2 and d/', P)
+    run('ls', r'(?s)f1.*h2.*d/', 'ls shows f1, h2 and d/', P)
     run('wc h2 > out', r'', 'output redirection with >', P)
     run('cat out', r'316', 'the redirected output is in the file', P)
     run('rm h2', r'unlink returns 0', 'rm h2', P)
@@ -97,10 +97,9 @@ try:
     expect(PROMPT, 'prompt is back after Ctrl-C')
 
     # a second terminal (Ctrl-T 2 = Alt-2): the root login runs there, and its output was kept
-    send('\\x142'); expect(r'\[terminal 2\]', 'Ctrl-T 2 switches to terminal 2')
-    expect(r'root@ulix\[\d+\]:/root# ', 'root has a shell there (prompt ends with #)')
+    send('\\x142'); expect(r'root@ulix\[\d+\]:/root# ', 'Ctrl-T 2 switches to terminal 2: its screen is painted, with the prompt of the root shell')
     send('ps\\r'); expect(r'tty1.*/bin/sh', 'ps on terminal 2 works')
-    send('\\x141'); expect(r'\[terminal 1\]', 'Ctrl-T 1 switches back')
+    send('\\x141'); expect(PROMPT, 'Ctrl-T 1 switches back: the screen of the first shell is painted again')
     send('\\r'); expect(PROMPT, 'the first shell still works')
 
     # log out and log in again with a password (typed, not echoed)
@@ -108,6 +107,12 @@ try:
     send('esser\\r'); expect(r'Password: ', 'login asks for the password')
     send('xyz\\r');   expect(PROMPT, 'the password "xyz" is accepted, a new shell starts')
     run('pwd', r'/home/esser', 'pwd', PROMPT)
+    # vi: the editor of lib-build/tools uses clrscr, set_xy, printf and ureadchar (screen functions of the book)
+    send('vi /hello.c\\r'); expect(r'DONE READING', 'vi reads the file')
+    expect(r'\x1b\[\d+;\d+H[^\x1b]*#include', 'vi paints the first line of the file at the top of the screen')
+    send('x'); expect(r'DELETE_C', 'vi command mode: x (delete character) is shown in line 24')
+    send(':'); send('q!\\r'); expect(r'quit!', 'vi: :q! ends the editor')
+    expect(PROMPT, 'the shell is back after vi')
     pump(0.5)
     if b'EXCEPTION' in log or b'killed:' in log: print('  FAIL: kernel exception or killed process'); fails += 1
     else: print('  ok:   no kernel exception, no process killed by a fault')

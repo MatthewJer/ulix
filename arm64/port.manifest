@@ -159,6 +159,13 @@ function syscall_readchar
 function list_address_spaces
 global terminals
 global cur_vt
+global vt
+function vt_scroll_mem
+function syscall_clrscr
+function syscall_get_xy
+function syscall_set_xy
+function syscall_read_screen
+function syscall_write_screen
 global system_kbd_pos
 global system_kbd_lastread
 global system_kbd_count

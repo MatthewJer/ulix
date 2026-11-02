@@ -22,8 +22,11 @@ is still missing compared with the x86 build, most important first. Background a
       exist and grows with the pages written (the 4 MByte disk has no room for the book's 64 MByte file). Pages that are
       shared after `fork` (copy-on-write) are never paged out. Test: `swaptest64` (pages out, kernel access to paged-out
       pages, fork, `free_a_frame`).
-- [ ] **VGA-only functions**: `read_screen`, `write_screen`, `get_xy`, `set_xy`, cursor positioning. The tool
-      `vi` does not work as an editor. Could be emulated with ANSI escape codes plus a screen copy in the kernel.
+- [x] **VGA-only functions**: `read_screen`, `write_screen`, `get_xy`, `set_xy`, `clrscr` and the output of `kputch` work like
+      in the book on a model of the screen (`vt[]`, 80 x 24 characters with color attribute, cursor), see `arch_vt.c`.
+      The serial console is the "screen": set_xy, clrscr, write_screen and switching terminals repaint it with ANSI
+      sequences (cursor positioning, colors, a scroll region of 24 lines). The book's `vi` works. Differences: there is no
+      status line (line 25), and the console must understand ANSI sequences.
 - [ ] **Kernel shell commands for x86 hardware**: `test`, `div0`, `rp` are placeholders. (`mem` now dumps the
       4-level tables of the current address space.)
 - [ ] `recurse` (in `lib-build/tools`) contains x86 assembler and is skipped.
@@ -40,8 +43,7 @@ is still missing compared with the x86 build, most important first. Background a
 - [x] Kernel stacks of finished processes are freed at the next `fork` (`arch_threads_reap`), and per-process
       ASIDs replace the TLB flush at address space switches (needs 16-bit ASIDs, else the old flush is used).
 - [ ] Interrupt-driven virtio (`virtio.c` polls) and more than one request at a time.
-- [ ] Output of a terminal that is not visible is kept in 4 KByte per terminal (`glue.c`); the x86 version keeps
-      the whole screen.
+- [x] Output of a terminal that is not visible is kept as its screen (24 lines, like on the x86), not in a 4 KByte buffer.
 
 ## Book and documentation
 

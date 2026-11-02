@@ -134,6 +134,18 @@ int proc_test (void) {
   CHECK (swap_used == 0, "the swap file entries of the finished processes are released");
   CHECK (live_threads () == 0, "no process is left");
 
+  // screen functions: clrscr, set_xy, get_xy, read_screen, write_screen, wrapping, scrolling
+  char *scr_argv[] = { "screentest64", 0 };
+  capture_start ();
+  pid = run ("/screentest64", 1, scr_argv);
+  capture_stop (&out);
+  CHECK (pid > 0 && thread_table[pid].exitcode == 0, "/screentest64 finished with exit status 0 (no failed checks)");
+  CHECK (count_in (out, "user FAIL") == 0 && count_in (out, "user ok:") == 9, "all 9 screen checks passed");
+  CHECK ((vt[0].mem[(3 * 80 + 2) * 2] == 'D') && (vt[0].mem[(3 * 80 + 5) * 2] == 'E') && vt[0].x == 6 && vt[0].y == 3,
+         "the terminal model of the kernel holds the final screen: DONE at column 2 of line 3, cursor behind it");
+  CHECK (count_in (out, "\033[") > 0, "the visible terminal was repainted on the console with ANSI sequences");
+  CHECK (live_threads () == 0, "no process is left");
+
   // signals: handler with exact register restore, SIG_IGN, default action, SIGSTOP/SIGCONT/SIGKILL
   char *sig_argv[] = { "sigtest64", 0 };
   capture_start ();
