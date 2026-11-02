@@ -49,12 +49,18 @@ function dev_read
 function dev_stat
 function split_mountpoint
 
-# block layer: device number -> driver dispatch (the buffer cache is not used yet, see glue.c)
+# block layer: device number -> driver dispatch, and the buffer cache of the book
 function makedev
 function devmajor
 function devminor
 function readblock
 function writeblock_raw
+function writeblock
+function buffer_read
+function buffer_write
+function buffer_sync
+function buffer_contains
+global buffer_cache
 
 # threads: ready/blocked queues, scheduler, mutexes and kernel semaphores
 function scheduler

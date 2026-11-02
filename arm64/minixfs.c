@@ -25,8 +25,11 @@ static struct sb sb;
 static u64 inode_table_block;
 static int dirent_size, name_len;
 
+// through the buffer cache of the book, so that blocks that were written but not synced yet are seen
+extern void readblock (int device, int blockno, char *buffer);
 static int read_zone (u32 zone, void *buf) {
-  return blk_read ((u64)zone * (ZONE_SIZE / 512), buf, ZONE_SIZE / 512);
+  readblock (0x300, zone, buf);                // DEV_HDA; (a failing read is not reported by readblock)
+  return 0;
 }
 
 int minix_mount (void) {

@@ -10,9 +10,10 @@ is still missing compared with the x86 build, most important first. Background a
       share the address space, the refcount keeps it alive until the last thread has gone; no `pthread_join`).
       Tests: `thtest64` (kernel tests) and the book's `thread 1` in the shell test. The user programs are now
       built with `-O0` like on the x86 (with `-O1`, `thread` never leaves its wait loop on plain globals).
-- [ ] **Buffer cache of the book** (`buffer_read`, `buffer_write`, `buffer_sync`, the flush logic). Today
-      `writeblock` writes through (`glue.c`). Needs: periodic flush (timer task or thread), `sync` at exit/shutdown,
-      and the tests that look at the disk image from outside (`make verify`) must call `sync` first.
+- [x] **Buffer cache of the book**: `buffer_read`, `buffer_write`, `buffer_sync`, `buffer_contains` and `writeblock`
+      are the book's code (512 blocks, dirty flag, least-often-used replacement). Like on the x86 the blocks go to
+      the disk with `sync` (or when the cache is full); the book has no periodic flush either. The kernel's own
+      Minix reader (`minixfs.c`) goes through the cache, too. Tests call `buffer_sync` before `make verify`.
 - [ ] **Swap** (`page_out`, swapper process, page replacement counters). Depends on a frame table with
       reference counts (exists since copy-on-write) and a reverse mapping from frame to page table entries.
       `/bin/swapper` is only a placeholder.

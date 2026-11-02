@@ -127,6 +127,16 @@ void arch_thread_exit (void) {
   for (;;) __asm__ volatile ("wfe");
 }
 
+// the book's buffer cache initialization
+void arch_buffer_init (void) {
+  memset (buffer_cache, 0, sizeof (buffer_cache));
+  for (int i = 0; i < BUFFER_CACHE_SIZE; i++) {
+    buffer_cache[i].blockno = buffer_cache[i].dev = -1;
+    buffer_cache[i].dirty = 0;
+  }
+  buffer_lock = get_new_lock ("disk buffer");
+}
+
 // the boot thread becomes thread 1, the idle thread of the book
 void arch_threads_init (void) {
   for (int i = 0; i < MAX_THREADS; i++) { thread_table[i].used = false; }
@@ -148,7 +158,7 @@ void arch_threads_init (void) {
   next_pid = 3;                                // pids 1 (idle) and 2 (init) are protected by the book's kill()
   arch_clock_init ();                          // system_start_time from the real-time clock
   current_mounts = 1;                          // the book mounts three disks; there is one: / (its /tmp and /mnt are plain directories)
-  buffer_lock = get_new_lock ("buffer");       // the book creates it when it initializes the buffer cache
+  arch_buffer_init ();
   scheduler_is_active = true;
   book_scheduler_on = 1;
 }

@@ -32,20 +32,8 @@ long dev_size (int dev) {
   return 0;
 }
 
-// ---- writeblock(): the book only stores the block in its buffer cache and lets a flusher thread
-// write it to disk later.  Until the cache (it needs the thread table and mutexes) is ported,
-// every block is written through to the disk immediately.
-void writeblock_raw (int device, int blockno, char *buffer, char flag);   // from the book
-
-void writeblock (int device, int blockno, char *buffer) {
-  writeblock_raw (device, blockno, buffer, DONT_UPDATE_BUF);
-}
-
-// ---- buffer cache: not ported yet (it needs the thread table and mutexes of the book) ----
-int buffer_read (int dev, int blockno, char *block)                      { return -1; }  // "not cached"
-int buffer_write (int dev, int blockno, char *block, char dirtyflag)     { return 0; }
-void buffer_sync (boolean lock_buffer) { }                                             // nothing is cached
-boolean buffer_contains (int dev, int blockno)                           { return 0; }
+// The buffer cache (buffer_read, buffer_write, buffer_sync, writeblock, ...) is the code of the book.
+// Blocks are written to the disk by buffer_sync (the sync system call, or when the cache is full).
 
 // ---- console output: the book's kputch() writes to the VGA text screen; here it is the UART ----
 extern void putch (char c);

@@ -233,6 +233,8 @@ void kmain (void) {
   printf ("process test (fork, exec, waitpid, files, faults):\n");
   fails += proc_test ();
 
+  extern void buffer_sync (int);
+  buffer_sync (1);                                // write what the tests changed (make verify looks at the image)
   printf (fails ? "RESULT: %d check(s) FAILED\n" : "RESULT: all checks passed\n", fails);
   for (;;) __asm__ volatile ("wfe");
 }

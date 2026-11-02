@@ -27,6 +27,11 @@ static long write_pattern (int mfd, unsigned n, unsigned chunk) {
 }
 
 // compare file contents with the pattern, return the number of bytes that were read
+static int same_bytes (const char *a, const char *b, int n) {
+  for (int i = 0; i < n; i++) if (a[i] != b[i]) return 0;
+  return 1;
+}
+
 static long verify_pattern (int mfd, unsigned n) {
   unsigned done = 0;
   while (done < n) {
@@ -53,7 +58,11 @@ static int count_entries (const char *dir) {
   return used;
 }
 
+extern void arch_buffer_init (void);
+
 int bookfs_test (void) {
+  arch_buffer_init ();                    // the threads are not up yet, but the file system needs the buffer cache:
+  scheduler_is_active = true;             // (the book's buffer functions do nothing before the scheduler runs)
   struct stat st;
   fails = 0;
   int mfd;
@@ -186,5 +195,25 @@ int bookfs_test (void) {
   printf ("  info: %d free blocks after (expected %d fewer than before)\n", free1, expected);
   CHECK (free0 - free1 == expected, "free block count matches exactly what the remaining files need");
 
+  // test of the buffer cache: until buffer_sync the disk still has the old contents of a block
+  {
+    static char blk_a[1024], blk_b[1024], on_disk[1024];
+#define same(x, y) (same_bytes ((x), (y), 1024))
+    for (int i = 0; i < 1024; i++) blk_a[i] = (char)(i * 7 + 1);
+    readblock_hd (0, 2700, blk_b);                                // the original block, directly from the disk
+    memcpy (on_disk, blk_b, 1024);
+    writeblock (DEV_HDA, 2700, blk_a);
+    readblock_hd (0, 2700, blk_b);
+    CHECK (same (blk_b, on_disk), "buffer cache: writeblock does not touch the disk yet");
+    readblock (DEV_HDA, 2700, blk_b);
+    CHECK (same (blk_b, blk_a) && buffer_contains (DEV_HDA, 2700), "buffer cache: readblock returns the new data from the cache");
+    buffer_sync (1);
+    readblock_hd (0, 2700, blk_b);
+    CHECK (same (blk_b, blk_a), "buffer_sync writes the dirty block to the disk");
+    writeblock (DEV_HDA, 2700, on_disk);                          // put the original block back
+  }
+
+  buffer_sync (1);                                                // the disk image is checked from outside afterwards (make verify)
+  scheduler_is_active = false;            // thread_test starts the scheduler properly
   return fails;
 }
