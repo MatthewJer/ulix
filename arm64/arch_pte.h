@@ -14,6 +14,7 @@ typedef unsigned long u64;
 #define PTE_RO      (1UL << 7)              // AP[2]: read-only
 #define PTE_SH      (3UL << 8)
 #define PTE_AF      (1UL << 10)
+#define PTE_NG      (1UL << 11)             // not global: the TLB entry is tagged with the ASID (user pages only)
 #define PTE_PXN     (1UL << 53)
 #define PTE_UXN     (1UL << 54)
 #define PTE_COW     (1UL << 55)             // software bit (ignored by the hardware): copy-on-write page
@@ -21,9 +22,9 @@ typedef unsigned long u64;
 
 #define PAGE_RW     (PTE_PAGE | PTE_ATTR (1) | PTE_SH | PTE_AF | PTE_PXN | PTE_UXN)
 #define PAGE_RO     (PAGE_RW | PTE_RO)
-#define PAGE_URX    (PTE_PAGE | PTE_ATTR (1) | PTE_SH | PTE_AF | PTE_AP_USER | PTE_RO | PTE_PXN)
-#define PAGE_URO    (PTE_PAGE | PTE_ATTR (1) | PTE_SH | PTE_AF | PTE_AP_USER | PTE_RO | PTE_PXN | PTE_UXN)
-#define PAGE_URW    (PTE_PAGE | PTE_ATTR (1) | PTE_SH | PTE_AF | PTE_AP_USER | PTE_PXN | PTE_UXN)
+#define PAGE_URX    (PTE_NG | PTE_PAGE | PTE_ATTR (1) | PTE_SH | PTE_AF | PTE_AP_USER | PTE_RO | PTE_PXN)
+#define PAGE_URO    (PTE_NG | PTE_PAGE | PTE_ATTR (1) | PTE_SH | PTE_AF | PTE_AP_USER | PTE_RO | PTE_PXN | PTE_UXN)
+#define PAGE_URW    (PTE_NG | PTE_PAGE | PTE_ATTR (1) | PTE_SH | PTE_AF | PTE_AP_USER | PTE_PXN | PTE_UXN)
 
 
 #endif

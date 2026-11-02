@@ -90,9 +90,12 @@ int thread_test (void) {
 
   counter_lock = get_new_lock ("counter");
   CHECK (counter_lock != NULL, "get_new_lock");
+  // (interrupts masked: a timer tick between two creates would start the first worker early and make the check flaky)
+  __asm__ volatile ("msr daifset, #2" ::: "memory");
   for (int i = 0; i < 3; i++) arch_thread_create (counter_worker, 0, "counter");
   CHECK (live_threads () == 3 && thread_table[1].next == 2, "3 worker threads are in the ready queue");
   int switches0 = arch_switch_count;
+  __asm__ volatile ("msr daifclr, #2" ::: "memory");
   run_until_done ();
   CHECK (counter == 3 * ROUNDS, "mutex: counter is exactly 3 * 150 although threads yield inside the critical section");
   CHECK (max_in_critical == 1, "mutex: never more than one thread inside the critical section");

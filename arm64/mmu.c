@@ -134,6 +134,7 @@ u64 user_to_phys (u64 va, int write) {
 
 // ---- user address spaces (TTBR0) ----
 u64 empty_l0_pa;
+int asid_16bit = 0;                         // 1: the CPU has 16-bit ASIDs, address space switches need no TLB flush
 
 // The boot identity map is only needed until we run at the high address. From now on
 // TTBR0 belongs to user processes; the kernel itself lives in TTBR1.
@@ -142,6 +143,9 @@ void user_mm_init (void) {
   u64 tcr;
   __asm__ volatile ("mrs %0, tcr_el1" : "=r" (tcr));
   tcr &= ~(1UL << 7);                       // EPD0 = 0: walk TTBR0 again
+  u64 mmfr0;
+  __asm__ volatile ("mrs %0, id_aa64mmfr0_el1" : "=r" (mmfr0));
+  if (((mmfr0 >> 4) & 15) == 2) { tcr |= 1UL << 36; asid_16bit = 1; }   // TCR.AS: 16-bit ASIDs (one per address space)
   __asm__ volatile ("msr ttbr0_el1, %0; msr tcr_el1, %1; tlbi vmalle1; dsb nsh; isb"
                     :: "r" (empty_l0_pa), "r" (tcr));
 }

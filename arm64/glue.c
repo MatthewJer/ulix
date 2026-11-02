@@ -115,8 +115,9 @@ void set_statusline (char *text) { }
 
 void ksh_command_test (void)  { printf ("test: not available on AArch64\n"); }
 void ksh_command_div0 (void)  { printf ("div0: an integer division by zero does not trap on AArch64\n"); }
+void arch_dump_as (addr_space_id as);
 void ksh_command_mem (void)   { printf ("frames in use: %ld (%ld KByte)\n", frames_in_use, frames_in_use * 4); }
-void ksh_print_page_table (void) { printf ("mem: the x86 page table dump does not exist on AArch64; try 'mem2'\n"); }
+void ksh_print_page_table (void) { arch_dump_as (current_as); }      // 4-level tables of the current address space
 void ksh_command_hexdump (void) { hexdump ((memaddress)ksh_command_hexdump, (memaddress)ksh_command_hexdump + 128); }
 
 uint request_new_frame (void) {

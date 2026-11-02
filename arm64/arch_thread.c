@@ -57,11 +57,22 @@ int arch_switch_count = 0;
 
 static u64 as_l0[MAX_ADDR_SPACES];             // physical address of the TTBR0 root table of each address space
 
-// Make an address space the active one.  The ASID is always 0, so the TLB is flushed on every
-// switch (simple and correct; per-process ASIDs would avoid the flush).
+// Make an address space the active one.  Every address space uses its own number as ASID and its user
+// pages are non-global, so the TLB is not flushed on a switch.  A CPU without 16-bit ASIDs falls back to
+// ASID 0 and a flush on every switch.
+extern int asid_16bit;
+
+static void asid_flush (addr_space_id id) {             // forget all TLB entries of one address space
+  if (asid_16bit) __asm__ volatile ("dsb ishst; tlbi aside1is, %0; dsb ish; isb" :: "r" ((u64)id << 48) : "memory");
+  else            __asm__ volatile ("dsb ishst; tlbi vmalle1is; dsb ish; isb" ::: "memory");
+}
+
 static void arch_activate_as (addr_space_id id) {
   current_as = id;
-  __asm__ volatile ("msr ttbr0_el1, %0; isb; tlbi vmalle1; dsb nsh; isb" :: "r" (as_l0[id]) : "memory");
+  if (asid_16bit)
+    __asm__ volatile ("msr ttbr0_el1, %0; isb" :: "r" (as_l0[id] | ((u64)id << 48)) : "memory");
+  else
+    __asm__ volatile ("msr ttbr0_el1, %0; isb; tlbi vmalle1; dsb nsh; isb" :: "r" (as_l0[id]) : "memory");
 }
 
 void arch_context_switch (TCB *t_old, TCB *t_new, context_t *r) {
@@ -224,7 +235,7 @@ static int as_alloc (void) {
 void destroy_address_space (addr_space_id id) {
   if (id < 2 || address_spaces[id].status == AS_FREE) return;
   if (current_as == id) arch_activate_as (1);        // leave it first: TTBR0 = empty table
-  if (as_l0[id]) free_user_space (as_l0[id]);
+  if (as_l0[id]) { asid_flush (id); free_user_space (as_l0[id]); }
   as_l0[id] = 0;
   address_spaces[id].status = AS_FREE;
 }
@@ -371,8 +382,38 @@ memaddress mmu (addr_space_id as, memaddress vaddr) {
   return 0;
 }
 
+// Kernel shell command 'mem': list the mapped ranges of an address space, merged where the pages are
+// contiguous in virtual address and have the same flags.
+static void dump_level (u64 table_pa, int lvl, u64 prefix, u64 *run_start, u64 *run_end, u64 *run_flags, int *pages) {
+  u64 *t = KVA (table_pa);
+  for (int i = 0; i < 512; i++) {
+    u64 e = t[i];
+    if (!(e & PTE_VALID)) continue;
+    u64 va = prefix | ((u64)i << (39 - 9 * lvl));
+    if (lvl < 3) { dump_level (e & PTE_ADDR, lvl + 1, va, run_start, run_end, run_flags, pages); continue; }
+    u64 fl = e & (PTE_RO | PTE_UXN | PTE_PXN | PTE_COW | PTE_AP_USER);
+    if (*run_end == va && *run_flags == fl && *run_end != 0) { *run_end = va + PAGE; (*pages)++; continue; }
+    if (*run_end) printf ("  %08lx-%08lx  %s%s%s%s  %d page(s)\n", *run_start, *run_end,
+                          (*run_flags & PTE_AP_USER) ? "u" : "-", "r", (*run_flags & PTE_RO) ? "-" : "w",
+                          (*run_flags & PTE_UXN) ? "-" : "x", *pages);
+    *run_start = va; *run_end = va + PAGE; *run_flags = fl; *pages = 1;
+  }
+}
+
+void arch_dump_as (addr_space_id as) {
+  if (as < 1 || !as_l0[as]) { printf ("address space %d has no page table\n", (int)as); return; }
+  u64 s = 0, e = 0, f = 0; int pages = 0;
+  printf ("address space %d (ASID %d), root table at %lx\n", (int)as, asid_16bit ? (int)as : 0, as_l0[as]);
+  dump_level (as_l0[as], 0, 0, &s, &e, &f, &pages);
+  if (e) printf ("  %08lx-%08lx  %s%s%s%s  %d page(s)\n", s, e, (f & PTE_AP_USER) ? "u" : "-", "r",
+                 (f & PTE_RO) ? "-" : "w", (f & PTE_UXN) ? "-" : "x", pages);
+  else   printf ("  (no user pages)\n");
+}
+
 // ---- fork ----
+int arch_threads_reap (void);
 int u_fork (context_t *r) {
+  arch_threads_reap ();                   // free the kernel stacks of processes that have ended
   thread_id old_tid = current_task;
   addr_space_id old_as = current_as;
 
@@ -434,6 +475,7 @@ int u_execv (char *filename, char *const argv[], memaddress *newstack) {
   as_l0[current_as] = nl0;
   address_spaces[current_as].memstart = 0x400000;
   address_spaces[current_as].memend   = image_end;      // the program break starts behind the image
+  asid_flush (current_as);                               // entries of the old program must not survive
   arch_activate_as (current_as);
   free_user_space (old);
   *newstack = sp;

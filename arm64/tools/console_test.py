@@ -70,7 +70,7 @@ try:
     send(b'\x1d')                        # Ctrl-]  -> kernel shell
     expect('Ulix Kernel Shell')
     for cmd, answer in [('uname', 'Ulix'), ('ps', 'idle'), ('queues', 'keyboard:'), ('time', 're:\\d+'),
-                        ('hexdump', 're:[0-9a-f]{8}  [0-9a-f]{2} [0-9a-f]{2} [0-9a-f]{2} '), ('gf', 'New frame ID'), ('mem2', 'frames in use'),
+                        ('hexdump', 're:[0-9a-f]{8}  [0-9a-f]{2} [0-9a-f]{2} [0-9a-f]{2} '), ('gf', 'New frame ID'), ('mem2', 'frames in use'), ('mem', 'root table at'),
                         ('listas', 'kernel'), ('bogus', 'no such command'), ('help', 'Commands:')]:
         send(cmd.encode() + b'\r')
         expect(answer)
