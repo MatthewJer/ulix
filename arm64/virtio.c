@@ -4,6 +4,8 @@
 // Supports the legacy (version 1) and the modern (version 2) MMIO transport.
 
 #include "ulix.h"
+#include "plat.h"
+#include "gic.h"
 
 #define VIRTIO_BASE     (KERNEL_VA + 0x0a000000UL)   // 32 slots of 0x200 bytes
 #define VIRTIO_SLOTS    32
@@ -61,14 +63,29 @@ static u64 capacity = 0;                    // in sectors
 static u32  rd (int off)          { return *(volatile u32 *)(dev + off); }
 static void wr (int off, u32 v)   { *(volatile u32 *)(dev + off) = v; }
 
+// Cache maintenance for DMA: a device that is not cache coherent reads and writes main memory only.  Before it reads
+// something the CPU wrote, the data cache lines are cleaned; before the CPU reads what the device wrote, they are
+// cleaned and invalidated.  This is done always: on a coherent system it only costs a little time.
+static void cache_clean (const void *p, u64 len) {
+  for (u64 a = (u64)p & ~63UL; a < (u64)p + len; a += 64) __asm__ volatile ("dc cvac, %0" :: "r" (a) : "memory");
+  __asm__ volatile ("dsb sy" ::: "memory");
+}
+static void cache_flush_inval (const void *p, u64 len) {
+  for (u64 a = (u64)p & ~63UL; a < (u64)p + len; a += 64) __asm__ volatile ("dc civac, %0" :: "r" (a) : "memory");
+  __asm__ volatile ("dsb sy" ::: "memory");
+}
+
+int blk_irq = 0;                            // interrupt number of the device (0: none known)
 u64 blk_capacity (void) { return capacity; }
 
 int blk_init (void) {
-  for (int i = 0; i < VIRTIO_SLOTS; i++) {
-    volatile u8 *s = (volatile u8 *)(VIRTIO_BASE + i * VIRTIO_SLOT_SZ);
+  int slots = plat.nvirtio ? plat.nvirtio : VIRTIO_SLOTS;                      // without a device tree: the 32 slots of qemu virt
+  for (int i = 0; i < slots; i++) {
+    volatile u8 *s = (volatile u8 *)(plat.nvirtio ? KERNEL_VA + plat.virtio[i] : VIRTIO_BASE + i * VIRTIO_SLOT_SZ);
     if (*(volatile u32 *)(s + R_MAGIC) == 0x74726976 && *(volatile u32 *)(s + R_DEVICE_ID) == 2) {
       dev = s;
-      printf ("virtio: block device in MMIO slot %d (transport version %u)\n", i, rd (R_VERSION));
+      if (plat.nvirtio) blk_irq = plat.virtio_irq[i];
+      printf ("virtio: block device in MMIO slot %d (transport version %u, interrupt %d)\n", i, rd (R_VERSION), blk_irq);
       break;
     }
   }
@@ -110,11 +127,19 @@ int blk_init (void) {
   req_pa = alloc_frame ();
   capacity = rd (R_CONFIG) | ((u64)rd (R_CONFIG + 4) << 32);
   printf ("virtio: disk with %lu sectors (%lu KByte)\n", capacity, capacity / 2);
+  if (blk_irq) gic_enable (blk_irq);        // transfers can be waited for with a sleeping process (see glue.c)
   return 0;
 }
 
 // one request = 3 descriptors: header (device reads), data, status byte (device writes)
-static int blk_request (int type, u64 sector, void *buf, u32 nsectors) {
+// A request is submitted, the device works on it, and later the CPU finds it in the used ring.  The block driver
+// glue (glue.c) lets a process sleep in between and wakes it from the interrupt; blk_read and blk_write poll.
+#define R_INTERRUPT_STATUS 0x060
+#define R_INTERRUPT_ACK    0x064
+
+static void *cur_buf;  static u32 cur_len;  static int cur_type;
+
+int blk_submit (int type, u64 sector, void *buf, u32 nsectors) {
   if (!dev || sector + nsectors > capacity) return -1;
   u32 *hdr = KVA (req_pa);
   volatile u8 *status = (volatile u8 *)KVA (req_pa + 16);
@@ -133,11 +158,38 @@ static int blk_request (int type, u64 sector, void *buf, u32 nsectors) {
   __asm__ volatile ("dmb ish" ::: "memory");
   avail->idx++;
   __asm__ volatile ("dmb ish" ::: "memory");
+  cur_buf = buf;  cur_len = nsectors * 512UL;  cur_type = type;
+  cache_clean ((const void *)desc, sizeof (struct desc) * QSIZE);               // everything the device reads
+  cache_clean ((const void *)avail, sizeof (struct avail));
+  cache_clean (hdr, 16);
+  if (type == VIRTIO_BLK_T_OUT) cache_clean (buf, cur_len);
+  else                          cache_flush_inval (buf, cur_len);                // (no dirty line may be written back over the data later)
+  cache_flush_inval ((const void *)status, 1);
   wr (R_QUEUE_NOTIFY, 0);
+  return 0;
+}
 
-  while (used->idx == used_seen) __asm__ volatile ("dmb ish" ::: "memory");   // polling
+int blk_done (void) {                       // has the device finished the request?
+  cache_flush_inval ((const void *)used, sizeof (struct used));
+  return used->idx != used_seen;
+}
+
+int blk_finish (void) {                     // 0 = request done and successful
+  volatile u8 *status = (volatile u8 *)KVA (req_pa + 16);
   used_seen++;
+  if (cur_type == VIRTIO_BLK_T_IN) cache_flush_inval (cur_buf, cur_len);       // see the data the device wrote
+  cache_flush_inval ((const void *)status, 1);
   return *status == 0 ? 0 : -1;
+}
+
+void blk_irq_ack (void) {                   // in the interrupt handler: the device stops signalling
+  if (dev) wr (R_INTERRUPT_ACK, rd (R_INTERRUPT_STATUS));
+}
+
+static int blk_request (int type, u64 sector, void *buf, u32 nsectors) {
+  if (blk_submit (type, sector, buf, nsectors) != 0) return -1;
+  while (!blk_done ()) __asm__ volatile ("dmb ish" ::: "memory");              // polling
+  return blk_finish ();
 }
 
 int blk_read  (u64 sector, void *buf, u32 n) { return blk_request (VIRTIO_BLK_T_IN,  sector, buf, n); }

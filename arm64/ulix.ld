@@ -20,4 +20,5 @@ SECTIONS
   . = ALIGN(4096);
   __bss_end = .;
   __kernel_end = .;
+  __image_size = __kernel_end - (KERNEL_VA + KERNEL_PA);
 }

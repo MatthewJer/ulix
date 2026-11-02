@@ -14,25 +14,51 @@
 #define D_PXN       (1 << 53)
 #define D_UXN       (1 << 54)
 
-        .section .text.boot
-        .global _start
-_start:
-        mrs     x0, mpidr_el1
-        and     x0, x0, #0xff
-        cbnz    x0, park
-
-        // drop from EL2 to EL1 if we were started there
+        // Drop from EL2 to EL1 if we were started there; continue at 'target'.
+        // EL1 may use the physical timer and the GICv3 system registers (ICC_SRE_EL2: SRE, DFB, DIB, Enable).
+        .macro  drop_to_el1 target
         mrs     x0, CurrentEL
         lsr     x0, x0, #2
         cmp     x0, #2
-        b.ne    at_el1
+        b.ne    \target
         mov     x0, #(1 << 31)          // HCR_EL2.RW: EL1 is AArch64
         msr     hcr_el2, x0
-        mov     x0, #0x3c5              // SPSR: EL1h, DAIF masked
+        mov     x0, #3                  // CNTHCTL_EL2: EL1 may use the physical counter and timer
+        msr     cnthctl_el2, x0
+        msr     cntvoff_el2, xzr
+        mrs     x0, id_aa64pfr0_el1
+        ubfx    x0, x0, #24, #4         // GIC system register interface present?
+        cbz     x0, 9f
+        mov     x0, #0xf
+        msr     S3_4_C12_C9_5, x0       // ICC_SRE_EL2
+        isb
+9:      mov     x0, #0x3c5              // SPSR: EL1h, DAIF masked
         msr     spsr_el2, x0
-        adr     x0, at_el1
+        adr     x0, \target
         msr     elr_el2, x0
         eret
+        .endm
+
+        .section .text.boot
+        .global _start
+_start:
+        // The image starts with the header of the Linux arm64 boot protocol, so that boot loaders (qemu with a
+        // flat image, U-Boot, ...) pass the address of the device tree in x0.
+        b       start_main
+        .long   0
+        .quad   0x80000                 // text_offset: the image is loaded at RAM start + 512 KByte
+        .quad   __image_size            // image_size (with .bss)
+        .quad   0x2                     // flags: little endian, 4 KByte pages
+        .quad   0, 0, 0
+        .long   0x644d5241              // magic "ARM\x64"
+        .long   0
+start_main:
+        mrs     x1, mpidr_el1
+        and     x1, x1, #0xff
+        cbnz    x1, park
+        adr     x1, boot_dtb            // qemu passes the address of the device tree in x0
+        str     x0, [x1]
+        drop_to_el1 at_el1
 
 at_el1:
         mov     x0, #(3 << 20)          // enable FP/SIMD
@@ -89,10 +115,54 @@ at_el1:
         ldr     x0, =high_entry         // absolute (link-time) high address
         br      x0
 
+        // ---- secondary CPUs: started by PSCI CPU_ON with the MMU off; x0 = CPU number (context ID)
+        .global secondary_entry
+secondary_entry:
+        mov     x19, x0
+        drop_to_el1 sec_at_el1
+sec_at_el1:
+        mov     x0, #(3 << 20)          // enable FP/SIMD
+        msr     cpacr_el1, x0
+        isb
+        ldr     x0, =0xff00
+        msr     mair_el1, x0
+        adr     x1, secondary_tcr       // the boot CPU's TCR_EL1 (saved after it set everything up)
+        ldr     x0, [x1]
+        msr     tcr_el1, x0
+        adr     x4, pg_t0_l0            // the boot identity map is still there
+        adr     x1, pg_t1_l0
+        msr     ttbr0_el1, x4
+        msr     ttbr1_el1, x1
+        isb
+        tlbi    vmalle1
+        dsb     nsh
+        isb
+        mrs     x0, sctlr_el1
+        orr     x0, x0, #(1 << 0)
+        orr     x0, x0, #(1 << 2)
+        orr     x0, x0, #(1 << 12)
+        msr     sctlr_el1, x0
+        isb
+        ldr     x0, =sec_high
+        br      x0
+
         .text
+sec_high:
+        ldr     x0, =secondary_stacks
+        mov     x1, #0x4000
+        add     x2, x19, #1
+        madd    x0, x1, x2, x0
+        mov     sp, x0
+        msr     tpidr_el1, x19          // CPU number
+        mov     x0, x19
+        bl      secondary_main
+1:      wfe
+        b       1b
+
 high_entry:
         ldr     x0, =stack_top
         mov     sp, x0
+        msr     tpidr_el1, xzr          // CPU number 0
         ldr     x0, =__bss_start
         ldr     x1, =__bss_end
 1:      cmp     x0, x1
@@ -111,9 +181,21 @@ pg_t0_l1:  .skip 4096
         .global kernel_l0
 kernel_l0:
 pg_t1_l0:  .skip 4096
+        .global kernel_l1
+kernel_l1:
 pg_t1_l1:  .skip 4096
+
+        .data
+        .balign 8
+        .global boot_dtb
+boot_dtb:       .quad 0                 // address of the device tree blob (from x0 at entry)
+        .global secondary_tcr
+secondary_tcr:  .quad 0
 
         .section .bss
         .balign 16
+        .global secondary_stacks
+secondary_stacks:
+        .skip 8 * 0x4000                // 16 KByte for each of up to 8 CPUs (CPU n uses the n-th block from the start + 1)
         .skip 0x4000
 stack_top:

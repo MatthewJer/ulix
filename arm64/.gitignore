@@ -11,3 +11,5 @@ ulix-console.elf
 ulix-shell.elf
 userland/build/
 check-el*.log
+*.bin
+machine.log

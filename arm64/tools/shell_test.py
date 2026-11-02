@@ -5,14 +5,15 @@ programs in lib-build/tools), logs out, logs in again with a password and switch
 
 usage: shell_test.py KERNEL.elf DISK.img
 """
-import re, socket, subprocess, sys, time
+import os, re, shlex, socket, subprocess, sys, time
 
 kernel, disk = sys.argv[1:3]
 PORT = 45125
-qemu = subprocess.Popen(['qemu-system-aarch64', '-M', 'virt', '-cpu', 'cortex-a72', '-m', '128', '-display', 'none',
+# QEMU_M (machine), QEMU_MEM (MByte) and QEMU_EXTRA (further arguments, e.g. '-smp 4') select another configuration
+qemu = subprocess.Popen(['qemu-system-aarch64', '-M', os.environ.get('QEMU_M', 'virt'), '-cpu', 'cortex-a72', '-m', os.environ.get('QEMU_MEM', '128'), '-display', 'none',
                          '-monitor', 'none', '-kernel', kernel, '-snapshot',
                          '-drive', 'file=%s,format=raw,if=none,id=hd0' % disk, '-device', 'virtio-blk-device,drive=hd0',
-                         '-serial', 'tcp:127.0.0.1:%d,server=on,wait=on' % PORT],
+                         '-serial', 'tcp:127.0.0.1:%d,server=on,wait=on' % PORT] + shlex.split(os.environ.get('QEMU_EXTRA', '')),
                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 sock = None
 for _ in range(100):
@@ -108,6 +109,10 @@ try:
     send('xyz\\r');   expect(PROMPT, 'the password "xyz" is accepted, a new shell starts')
     run('pwd', r'/home/esser', 'pwd', PROMPT)
     # vi: the editor of lib-build/tools uses clrscr, set_xy, printf and ureadchar (screen functions of the book)
+    # the stack of a process grows by itself: the book's recurse recurses until Ctrl-C
+    send('recurse\\r'); expect(r'recursing: level = 2000,', 'recurse: 2000 levels deep (the stack grows page by page)', timeout=60)
+    send('\\x03'); expect(r'Killed', 'Ctrl-C ends recurse')
+    expect(PROMPT, 'the shell is back after recurse')
     send('vi /hello.c\\r'); expect(r'DONE READING', 'vi reads the file')
     expect(r'\x1b\[\d+;\d+H[^\x1b]*#include', 'vi paints the first line of the file at the top of the screen')
     send('x'); expect(r'DELETE_C', 'vi command mode: x (delete character) is shown in line 24')
@@ -120,6 +125,10 @@ try:
     send('/badptr64\\r'); expect(r'KERNEL EXCEPTION', 'a bad pointer in a system call is a kernel exception')
     expect(r'Ulix Kernel Shell', 'the kernel shell is started, as on the x86')
     send('uname\\r'); expect(r'Ulix', 'the kernel shell works (uname)')
+    send('test\\r'); expect(r'root table of the AS', 'kernel shell: test shows the page table data')
+    send('rp\\r'); expect(r'releasing page range', 'kernel shell: rp releases a page range')
+    send('div0\\r'); expect(r'KERNEL EXCEPTION', 'kernel shell: div0 raises the exception like on the x86')
+    expect(r'Ulix Kernel Shell', 'and ends in the kernel shell again')
 finally:
     qemu.kill()
 print('shell test: %s' % ('all passed' if not fails else '%d FAILED' % fails))

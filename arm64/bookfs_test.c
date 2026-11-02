@@ -79,12 +79,13 @@ int bookfs_test (void) {
          "mx_stat: regular file, 316 bytes");
   CHECK (mx_stat (DEV, "/bin", &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR, "mx_stat: /bin is a directory");
   CHECK (mx_stat (DEV, "/nonexistent", &st) == -1, "mx_stat: missing file");
-  CHECK (count_entries ("/") == 29, "mx_getdent: / has 29 used entries (16 from x86 Ulix + 13 AArch64 files)");
+  CHECK (count_entries ("/") == 30, "mx_getdent: / has 30 used entries (16 from x86 Ulix + 14 AArch64 files)");
   CHECK (count_entries ("/bin") == 63, "mx_getdent: /bin has 63 entries");
   CHECK (mx_file_exists (DEV, "/bin/vi") && mx_file_is_directory (DEV, "/bin") &&
          !mx_file_is_directory (DEV, "/bin/vi"), "mx_file_exists / mx_file_is_directory");
 
   int free0 = free_blocks ();
+  struct stat root0;  mx_stat (DEV, "/", &root0);                                   // size of the root directory
   printf ("  info: %d free blocks before the write tests\n", free0);
 
   // ---- create and write a file that stays on the disk (checked on the host later) ----
@@ -189,9 +190,11 @@ int bookfs_test (void) {
 
   // ---- block accounting: only keep.bin, d1, inner.txt and d1/sub may remain ----
   int free1 = free_blocks ();
+  struct stat root1;  mx_stat (DEV, "/", &root1);
   int expected = (40000 + 1023) / 1024 + 1                 // keep.bin: data + indirect block
                + 1 + 1                                      // /d1 and /d1/sub: one directory block each
-               + 1;                                         // inner.txt
+               + 1                                          // inner.txt
+               + ((root1.st_size + 1023) / 1024 - (root0.st_size + 1023) / 1024);   // the root directory needs another block when it is full
   printf ("  info: %d free blocks after (expected %d fewer than before)\n", free1, expected);
   CHECK (free0 - free1 == expected, "free block count matches exactly what the remaining files need");
 

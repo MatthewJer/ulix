@@ -10,14 +10,52 @@ extern unsigned long blk_capacity (void);
 
 // ---- block devices: the book's readblock() calls these two for /dev/hda, /dev/hdb ----
 // A block is 1 KByte = 2 sectors of 512 bytes (HD_SECSIZE).  The only disk is the virtio disk.
+// Like the IDE driver of the book, a process that reads or writes a block takes hd_lock, starts the transfer and goes
+// to sleep in harddisk_queue; the interrupt of the device wakes it up (hd_interrupt).  Without a running scheduler,
+// for the idle thread (the tests, the boot code) and without a known interrupt the driver polls instead.
+extern int  blk_submit (int type, unsigned long sector, void *buf, unsigned nsectors);
+extern int  blk_done (void);
+extern int  blk_finish (void);
+extern void blk_irq_ack (void);
+extern int  blk_irq;
+extern unsigned long blk_capacity (void);
+void arch_resign (void);
+
+int hd_sleeps = 0, hd_interrupts = 0;        // statistics, checked by the tests
+
+static int hd_transfer (int type, int blockno, char *buffer) {
+  int sleep_ok = scheduler_is_active && blk_irq && current_task > 1;       // (thread 1 is the idle thread and must not sleep)
+  if (hd_lock == NULL) hd_lock = get_new_lock ("hd");
+  if (current_task > 1) mutex_lock (hd_lock);
+    hd_direction = (type == 0) ? HD_OP_READ : HD_OP_WRITE;
+    int r = blk_submit (type, (unsigned long)blockno * 2, buffer, 2);
+    if (r == 0) {
+      while (!blk_done ()) {
+        if (sleep_ok) { hd_sleeps++; block (&harddisk_queue, TSTATE_WAITHD); arch_resign (); }
+      }
+      r = blk_finish ();
+    }
+    hd_direction = HD_OP_NONE;
+  if (current_task > 1) mutex_unlock (hd_lock);
+  return r;
+}
+
 void readblock_hd (int hd, int blockno, char *buffer) {
   if (hd != 0) return;
-  blk_read ((unsigned long)blockno * 2, buffer, 2);
+  hd_transfer (0, blockno, buffer);
 }
 
 void writeblock_hd (int hd, int blockno, char *buffer) {
   if (hd != 0) return;
-  blk_write ((unsigned long)blockno * 2, buffer, 2);
+  hd_transfer (1, blockno, buffer);
+}
+
+// the interrupt handler of the disk: acknowledge, wake up the process that waits for the transfer
+void hd_interrupt (void) {
+  blk_irq_ack ();
+  hd_interrupts++;
+  thread_id t = front_of_blocked_queue (harddisk_queue);
+  if (t) deblock (t, &harddisk_queue);
 }
 
 // There is no floppy controller and no serial disk on this platform.
@@ -68,8 +106,11 @@ void statusline_red (void)   { }
 void statusline_blue (void)  { }
 void set_statusline (char *text) { }
 
-void ksh_command_test (void)  { printf ("test: not available on AArch64\n"); }
-void ksh_command_div0 (void)  { printf ("div0: an integer division by zero does not trap on AArch64\n"); }
+void arch_ksh_test (void);
+void ksh_command_test (void)  { arch_ksh_test (); }
+// An integer division by zero does not trap on AArch64 (the result is 0), so the fault that the x86 command
+// provokes is raised by hand (a breakpoint instruction); like on the x86 it ends in the kernel shell.
+void ksh_command_div0 (void)  { printf ("div0: AArch64 divides by zero without a fault; raising the exception by hand\n"); __asm__ volatile ("brk #0"); }
 void arch_dump_as (addr_space_id as);
 void ksh_command_mem (void)   { printf ("frames in use: %ld (%ld KByte)\n", frames_in_use, frames_in_use * 4); }
 void ksh_print_page_table (void) { arch_dump_as (current_as); }      // 4-level tables of the current address space
@@ -81,4 +122,3 @@ uint request_new_frame (void) {
 }
 void *request_new_page (void)  { return (void *)PHYSICAL (alloc_frame ()); }
 void *request_new_pages (int n) { void *p = 0; for (int i = 0; i < n; i++) p = request_new_page (); return p; }
-void release_page_range (uint first, uint last) { printf ("rp: not available on AArch64\n"); }

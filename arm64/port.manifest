@@ -86,6 +86,8 @@ global next_kl_semaphore
 global kernel_locks
 global system_ticks
 global paging_lock
+global hd_lock
+global hd_direction
 function write_swap_page
 function read_swap_page
 global swap_fd
@@ -161,6 +163,7 @@ global terminals
 global cur_vt
 global vt
 function vt_scroll_mem
+function release_page_range
 function syscall_clrscr
 function syscall_get_xy
 function syscall_set_xy

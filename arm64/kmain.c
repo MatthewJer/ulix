@@ -1,10 +1,12 @@
 // Ulix ARM64 -- kernel entry, PL011 console, minimal printf
 
 #include "ulix.h"
+#include "plat.h"
 #include "disk_expected.h"       // sizes and checksums of files on the disk, from the independent Python parser
 
 
-#define UART0_BASE  (KERNEL_VA + 0x09000000UL)   // PL011 on qemu "virt", via the linear map
+u64 uart_base = 0x09000000UL;                // PL011 (physical address; the device tree may say something else)
+#define UART0_BASE  (KERNEL_VA + uart_base)
 #define UART_DR     (*(volatile u32 *)(UART0_BASE + 0x00))
 #define UART_FR     (*(volatile u32 *)(UART0_BASE + 0x18))
 #define UART_FR_TXFF (1 << 5)
@@ -155,7 +157,7 @@ static void disk_test (void) {
   CHECK (minix_mount () == 0, "Minix file system mounted");
   int n = 0;
   minix_readdir (1, count_cb, &n);
-  CHECK (n == 29, "root directory has 29 entries (16 from x86 Ulix + 13 AArch64 files)");
+  CHECK (n == 30, "root directory has 30 entries (16 from x86 Ulix + 14 AArch64 files)");
   n = 0;
   minix_readdir (minix_lookup ("/bin"), count_cb, &n);
   CHECK (n == 63, "/bin has 63 entries");
@@ -200,16 +202,29 @@ static void console_main (void) {
   arch_start_user (CONSOLE_PROGRAM, 1, argv);
   extern void arch_next_pid_is_2 (void);
   arch_next_pid_is_2 ();                           // on the x86 the first fork of the first process (login's swapper) gets PID 2
-  for (;;) __asm__ volatile ("wfi");
+  extern void arch_idle (void);
+  for (;;) arch_idle ();
 }
 #endif
 
+extern void smp_boot_init (void);
+extern void platform_map (void);
+
 void kmain (void) {
   u64 el;
+  smp_boot_init ();                                // this CPU takes the kernel lock (smp.c)
+  dt_init (boot_dtb);                              // what is where: from the device tree of the boot loader
+  uart_base = plat.uart;
+  platform_map ();
   __asm__ volatile ("mrs %0, CurrentEL" : "=r" (el));
   printf ("Ulix-arm64 (work in progress)\n");
   printf ("Running at EL%d, sizeof(void*) = %d, kmain at 0x%lx (upper half)\n",
           (int)(el >> 2), (int)sizeof (void *), (u64)kmain);
+  if (plat.dt_ok)
+    printf ("Device tree: %d MByte RAM at 0x%lx, %d CPU(s), GICv%d, %d virtio device(s)\n", (int)(plat.ram_size >> 20), plat.ram_base,
+            plat.ncpus, plat.gic_version, plat.nvirtio);
+  else
+    printf ("No device tree: using the defaults of the qemu virt machine\n");
   irq_init ();
 #ifdef CONSOLE_MODE
   console_main ();
@@ -235,6 +250,8 @@ void kmain (void) {
   printf ("process test (fork, exec, waitpid, files, faults):\n");
   fails += proc_test ();
 
+  extern void smp_print_stats (void);
+  smp_print_stats ();
   extern void buffer_sync (int);
   buffer_sync (1);                                // write what the tests changed (make verify looks at the image)
   printf (fails ? "RESULT: %d check(s) FAILED\n" : "RESULT: all checks passed\n", fails);

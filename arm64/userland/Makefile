@@ -15,8 +15,7 @@ BOOK     = ../../ulix-book.nw
 TOOLSRC  = ../../lib-build/tools
 BUILD    = build
 
-# recurse.c contains x86 inline assembler (it demonstrates stack growth of an x86 process).
-SKIP     = recurse
+SKIP     =
 TOOLS    = $(filter-out $(SKIP),$(patsubst $(TOOLSRC)/%.c,%,$(wildcard $(TOOLSRC)/*.c)))
 
 # GCC 4.4 accepted a lot that current compilers reject (return without value, missing types);
@@ -47,6 +46,12 @@ $(BUILD)/crt0.o: ../user/crt0.S
 $(BUILD)/tools/%.c: $(TOOLSRC)/%.c $(BUILD)/ulixlib.h
 	mkdir -p $(BUILD)/tools
 	cp $< $@
+
+# recurse.c reads the stack pointer with x86 inline assembler ("mov %esp"); the only change for AArch64 is the register name
+$(BUILD)/tools/recurse.c: $(TOOLSRC)/recurse.c $(BUILD)/ulixlib.h
+	mkdir -p $(BUILD)/tools
+	sed 's/asm volatile ("mov %%esp, %0" : "=r"(x))/asm volatile ("mov %x0, sp" : "=r"(x))/' $< > $@
+	grep -q 'mov %x0, sp' $@
 
 $(BUILD)/tools/%.o: $(BUILD)/tools/%.c
 	$(CC) $(CFLAGS) -c -o $@ $<

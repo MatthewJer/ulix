@@ -6,7 +6,8 @@
 
 #include "ulix-api.h"
 
-#define RTC_DR  (*(volatile unsigned int *)(0xffff000000000000UL + 0x09010000UL))   // data register: seconds
+extern unsigned long plat_rtc (void);                                          // from the device tree
+#define RTC_DR  (*(volatile unsigned int *)(0xffff000000000000UL + plat_rtc ()))     // data register: seconds
 
 void arch_clock_init (void) {
   system_start_time = RTC_DR;

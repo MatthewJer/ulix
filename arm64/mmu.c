@@ -2,21 +2,43 @@
 // (replaces the x86 2-level page directory / page table code and KMAP/KMAPD)
 
 #include "ulix.h"
+#include "plat.h"
 
 extern u64 kernel_l0[512];
 extern int arch_cow_fault (u64 va);
 extern int arch_user_fault (u64 va);
 extern char __kernel_end[];
 
-#define RAM_START   0x40000000UL
-#define RAM_SIZE    (128UL * 1024 * 1024)   // TODO: read from the device tree (like MEM_SIZE on x86)
+#define MAX_RAM     (2UL << 30)             // the table of frame reference counts has room for 2 GByte
+#define RAM_START   (plat.ram_base)         // from the device tree
+#define RAM_SIZE    (plat.ram_size)
 
 // ---- frame allocator: bump pointer first, free list for released frames ----
 static u64 next_free;                       // physical address
-static unsigned short frame_refs[RAM_SIZE / PAGE_SIZE];     // how many page table entries use a frame (COW)
+static unsigned short frame_refs[MAX_RAM / PAGE_SIZE];     // how many page table entries use a frame (COW)
 #define REFS(pa)  frame_refs[((pa) - RAM_START) / PAGE_SIZE]
 static u64 free_list = 0;                   // singly linked through the frames themselves
 long frames_in_use = 0;
+
+u64 arch_ram_frames (void) { return plat.ram_size / PAGE_SIZE; }
+
+// The kernel map (TTBR1) covers the first GByte of RAM and of devices from the boot code; the others are added
+// as 1 GByte blocks: all RAM, and the GByte of each device that the device tree names.
+extern u64 kernel_l1[512];
+static void map_block (u64 pa, int device) {
+  u64 i = pa >> 30;
+  if (i >= 512 || (kernel_l1[i] & 1)) return;
+  kernel_l1[i] = (i << 30) | 1 | (device ? (PTE_ATTR (0) | PTE_AF | PTE_PXN | PTE_UXN) : (PTE_ATTR (1) | PTE_SH | PTE_AF));
+}
+
+void platform_map (void) {
+  if (plat.ram_size > MAX_RAM) { printf ("RAM: using %lu of %lu MByte\n", MAX_RAM >> 20, plat.ram_size >> 20); plat.ram_size = MAX_RAM; }
+  for (u64 pa = plat.ram_base & ~((1UL << 30) - 1); pa < plat.ram_base + plat.ram_size; pa += 1UL << 30) map_block (pa, 0);
+  map_block (plat.gicd, 1);  map_block (plat.gicc, 1);  map_block (plat.gicr, 1);  map_block (plat.gicr + plat.gicr_size, 1);
+  map_block (plat.uart, 1);  map_block (plat.rtc, 1);
+  for (int i = 0; i < plat.nvirtio; i++) map_block (plat.virtio[i], 1);
+  __asm__ volatile ("dsb ishst; tlbi vmalle1is; dsb ish; isb" ::: "memory");
+}
 
 void frames_init (void) {
   next_free = (PA (__kernel_end) + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
@@ -186,6 +208,7 @@ void sync_icache (void *p, u64 len) {
 int cow_fault (u64 l0_pa, u64 va) {
   if (va < USER_MIN || va >= USER_MAX) return 0;
   u64 *e = walk (KVA (l0_pa), va & ~(PAGE_SIZE - 1), 0);
+  if (e && (*e & PTE_VALID) && !(*e & PTE_RO)) return 1;   // writable already: a thread on another CPU copied the page first
   if (!e || !(*e & PTE_VALID) || !(*e & PTE_COW)) return 0;
   u64 old = *e & PTE_ADDR, flags = *e & ~(PTE_ADDR | PTE_RO | PTE_COW);
   if (REFS (old) == 1) {                                   // the last user: just make it writable again

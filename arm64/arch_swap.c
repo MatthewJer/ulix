@@ -32,6 +32,7 @@ extern void free_frame (u64 pa);
 extern int  frame_refcount (u64 pa);
 extern int  asid_16bit;
 extern long frames_in_use;
+extern u64  arch_ram_frames (void);
 
 unsigned int mmu_p (addr_space_id id, unsigned int pageno) { return (unsigned int)-1; }        // the book's swap functions call it when no frame number is given
 
@@ -71,6 +72,17 @@ static int swap_index (int as, int pageno) {
 }
 
 // ---- page_out and page_in ----
+// The swap file has one file position for everybody, and a process that waits for the disk lets others run: one
+// transfer at a time.
+static lock swap_io_lock = NULL;
+static int swap_io_enter (void) {
+  if (current_task <= 1) return 0;
+  if (!swap_io_lock) swap_io_lock = get_new_lock ("swap io");
+  mutex_lock (swap_io_lock);
+  return 1;
+}
+static void swap_io_leave (int locked) { if (locked) mutex_unlock (swap_io_lock); }
+
 int page_out (int as, int pageno) {
   u64 l0 = arch_as_l0 (as), va = (u64)pageno << 12;
   if (!l0 || swap_fd == -1 || va < USER_LO || va >= USER_HI) return -1;
@@ -78,12 +90,17 @@ int page_out (int as, int pageno) {
   if (!e || !(*e & PTE_VALID)) return -1;                  // fail: page not found
   u64 pa = *e & PTE_ADDR;
   if (frame_refcount (pa) != 1) return -1;                 // shared with another process (copy-on-write)
-  if (write_swap_page (as, pageno, (int)(pa >> 12)) != 0) return -1;
+  int l = swap_io_enter ();
+  e = pte_of (l0, va);                                     // (the tables may have changed while we waited)
+  if (!e || !(*e & PTE_VALID) || (*e & PTE_ADDR) != pa) { swap_io_leave (l); return -1; }
+  if (write_swap_page (as, pageno, (int)(pa >> 12)) != 0) { swap_io_leave (l); return -1; }
   int index = swap_index (as, pageno);
   if (index < 0 || u_lseek (swap_fd, 0, SEEK_END) < (index + 1) * (int)PAGE) {   // the disk is full
     if (index >= 0) paging[index].used = false;
+    swap_io_leave (l);
     return -1;
   }
+  swap_io_leave (l);
   *e = (*e & ~PTE_VALID) | PTE_SWAPPED;                    // mark page non-present and paged-out
   flush_page (as, va);
   free_frame (pa);                                         // the frame is free again
@@ -97,7 +114,16 @@ int page_in (int as, int pageno) {
   if (!e || (*e & PTE_VALID) || !(*e & PTE_SWAPPED)) return -1;      // fail: page was not paged out
   if (swap_index (as, pageno) < 0) return -1;
   u64 pa = alloc_frame ();                                 // reserve a frame
+  int l = swap_io_enter ();
+  e = pte_of (l0, va);
+  if (!e || (*e & PTE_VALID)) {                            // somebody else brought the page back while we waited
+    swap_io_leave (l);  free_frame (pa);
+    return (e && (*e & PTE_VALID)) ? 0 : -1;
+  }
   read_swap_page (as, pageno, (int)(pa >> 12));
+  swap_io_leave (l);
+  e = pte_of (l0, va);
+  if (!e || (*e & PTE_VALID)) { free_frame (pa); return (e && (*e & PTE_VALID)) ? 0 : -1; }
   *e = pa | ((*e & ~(PTE_ADDR | PTE_SWAPPED)) | PTE_VALID | PTE_AF);
   __asm__ volatile ("dsb ishst; isb" ::: "memory");
   return 0;
@@ -105,15 +131,46 @@ int page_in (int as, int pageno) {
 
 // Fault handler part of the book: "check if page was paged out".  Also resolves the access flag faults.
 // Returns 1 if the instruction can be repeated.
+// The user mode stack grows by a page when the program touches the page just below it ("page fault handler:
+// enlarge user mode stack" of the book; the stack is limited to 64 MByte and must not run into the heap).
+#define USER_STACK_TOP   0x80000000UL
+#define MAX_STACK        (64UL << 20)
+extern int map_page_in (u64 l0_pa, u64 va, u64 pa, u64 flags);
+
+static int grow_stack (u64 l0, u64 va) {
+  address_space *as = &address_spaces[current_as];
+  u64 bottom = USER_STACK_TOP - as->stacksize;
+  if (va > USER_STACK_TOP || va + PAGE < bottom) return 0;                  // not just below the stack
+  if (as->stacksize >= MAX_STACK || bottom - PAGE < as->memend + PAGE) return 0;
+  if (map_page_in (l0, bottom - PAGE, alloc_frame (), PAGE_URW) != 0) return 0;
+  as->stacksize += PAGE;
+  return 1;
+}
+
 int arch_user_fault (u64 va) {
   if (va < USER_LO || va >= USER_HI) return 0;
   u64 l0 = arch_as_l0 (current_as);
   if (!l0) return 0;
   u64 *e = pte_of (l0, va);
-  if (!e) return 0;
-  if (!(*e & PTE_VALID)) return (*e & PTE_SWAPPED) && page_in (current_as, va >> 12) == 0;
-  if (!(*e & PTE_AF)) { *e |= PTE_AF; flush_page (current_as, va); return 1; }
-  return 0;
+  if (!e || (!(*e & PTE_VALID) && !(*e & PTE_SWAPPED))) return grow_stack (l0, va);
+  if (!(*e & PTE_VALID)) return page_in (current_as, va >> 12) == 0;
+  if (!(*e & PTE_AF)) *e |= PTE_AF;
+  flush_page (current_as, va);
+  return 1;     // (if the entry is fine already, another thread of the process on another CPU was faster: just repeat the access)
+}
+
+// release_page of the book: take a page out of the current address space and free its frame (used by the
+// kernel shell command rp through release_page_range, which is the book's)
+void release_page (unsigned int pageno) {
+  u64 l0 = arch_as_l0 (current_as), va = (u64)pageno << 12;
+  if (!l0 || va < USER_LO || va >= USER_HI) return;
+  u64 *e = pte_of (l0, va);
+  if (!e || !(*e & (PTE_VALID | PTE_SWAPPED))) return;                     // no such page
+  u64 pa = *e & PTE_ADDR;
+  int present = (*e & PTE_VALID) != 0;
+  *e = 0;
+  flush_page (current_as, va);
+  if (present) free_frame (pa);
 }
 
 // ---- page replacement: counters ----
@@ -194,7 +251,7 @@ void syscall_free_a_frame (context_t *r) {
 // the swapper blocks on swapper_lock, which the timer releases every 0.1 seconds
 void syscall_get_free_frames (context_t *r) {
   mutex_lock (swapper_lock);
-  eax_return (32768 - frames_in_use);                      // 128 MByte of RAM
+  eax_return ((long)arch_ram_frames () - frames_in_use);
 }
 
 // timer tasks of the book that concern paging; called from the timer interrupt

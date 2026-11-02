@@ -1,11 +1,11 @@
 # AArch64 user programs for Ulix. Freestanding, no FP/SIMD (the kernel does not save those registers).
 CROSS ?= aarch64-elf-
 CC     = $(CROSS)gcc
-CFLAGS = -O1 -g0 -ffreestanding -nostdlib -fno-builtin -fno-stack-protector -fno-pic \
+CFLAGS = -mno-outline-atomics -O1 -g0 -ffreestanding -nostdlib -fno-builtin -fno-stack-protector -fno-pic \
          -mgeneral-regs-only -std=gnu99 -Wall
 LDFLAGS = -nostdlib -static -z max-page-size=4096 -z noexecstack -T user.ld
 
-PROGS = hello.elf cat.elf crash.elf forktest.elf sigtest.elf contest.elf cowtest.elf thtest.elf badptr.elf swaptest.elf screentest.elf
+PROGS = hello.elf cat.elf crash.elf forktest.elf sigtest.elf contest.elf cowtest.elf thtest.elf badptr.elf swaptest.elf screentest.elf stacktest.elf
 
 all: $(PROGS)
 

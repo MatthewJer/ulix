@@ -14,7 +14,7 @@
 #define KVA(pa)  ((void *)(0xFFFF000000000000UL + (u64)(pa)))
 #define PA(va)   ((u64)(va) - 0xFFFF000000000000UL)
 
-struct kctx { u64 x19_x28[10]; u64 x29, x30, sp, sp_el0; };      // layout known to cpu_switch
+struct kctx { u64 x19_x28[10]; u64 x29, x30, sp, sp_el0; int depth; };      // layout known to cpu_switch (depth: for C only)
 
 extern void cpu_switch (struct kctx *old, struct kctx *new);
 extern u64  alloc_frames_contig (int n);
@@ -36,6 +36,15 @@ extern void exit_exception (void);
 #define PAGE 4096UL
 
 static struct kctx kctx[MAX_THREADS];
+static struct kctx idle_kctx[8];               // every CPU has its own idle context: thread 1 of the book is the idle thread of the CPU that runs it
+extern int  smp_cpu (void);
+extern void smp_boot_init (void), smp_start (void), smp_unmark (void), smp_stop_others (void), smp_count_switch (void);
+extern int  smp_running_elsewhere (thread_id t);
+extern int  bkl_depth (void);
+extern void bkl_set_depth (int d);
+extern void bkl_unlock (void);
+extern void arch_idle (void);
+static struct kctx *ctx_of (thread_id t) { return t == 1 ? &idle_kctx[smp_cpu ()] : &kctx[t]; }
 static void arch_syscalls_init (void);
 void arch_resign (void);
 int arch_threads_reap (void);
@@ -74,6 +83,18 @@ static void asid_flush (addr_space_id id) {             // forget all TLB entrie
   else            __asm__ volatile ("dsb ishst; tlbi vmalle1is; dsb ish; isb" ::: "memory");
 }
 
+// make TTBR0 of this CPU match the address space the book thinks is current (another CPU may have replaced the
+// page tables of an address space with exec)
+void arch_sync_ttbr0 (void) {
+  addr_space_id id = current_as;
+  if (id < 1 || id >= MAX_ADDR_SPACES || !as_l0[id]) return;
+  u64 want = asid_16bit ? (as_l0[id] | ((u64)id << 48)) : as_l0[id], cur;
+  __asm__ volatile ("mrs %0, ttbr0_el1" : "=r" (cur));
+  if (cur == want) return;
+  if (asid_16bit) __asm__ volatile ("msr ttbr0_el1, %0; isb" :: "r" (want) : "memory");
+  else            __asm__ volatile ("msr ttbr0_el1, %0; isb; tlbi vmalle1; dsb nsh; isb" :: "r" (want) : "memory");
+}
+
 static void arch_activate_as (addr_space_id id) {
   current_as = id;
   if (asid_16bit)
@@ -87,7 +108,12 @@ void arch_context_switch (TCB *t_old, TCB *t_new, context_t *r) {
   current_task = t_new->tid;
   if (t_old->addr_space != t_new->addr_space || current_as != t_new->addr_space)
     arch_activate_as (t_new->addr_space);
-  cpu_switch (&kctx[t_old->tid], &kctx[t_new->tid]);
+  smp_count_switch ();
+  smp_unmark ();                                // threads of other CPUs are selectable again (see smp.c)
+  struct kctx *o = ctx_of (t_old->tid), *n = ctx_of (t_new->tid);
+  o->depth = bkl_depth ();                      // the kernel lock count belongs to the context, not to the CPU
+  bkl_set_depth (n->depth);
+  cpu_switch (o, n);
 }
 
 static inline u64 irq_save (void) {
@@ -108,7 +134,7 @@ void arch_resign (void) {
 }
 
 void book_timer_tick (void) {                  // called by the timer interrupt, interrupts are masked
-  arch_paging_timer_tasks ();                  // page replacement counters, release of the swapper
+  if (smp_cpu () == 0) arch_paging_timer_tasks ();    // page replacement counters, release of the swapper (once per tick)
   scheduler (0, SCHED_SRC_TIMER);
 }
 
@@ -168,6 +194,7 @@ void arch_threads_init (void) {
   scheduler_is_active = true;
   arch_swap_init ();                           // the book opens /tmp/swap when the system starts
   book_scheduler_on = 1;
+  smp_start ();                                // the other CPUs
 }
 
 // start a kernel thread running entry (arg); returns the thread ID or -1
@@ -182,6 +209,7 @@ int arch_thread_create (void (*entry)(void *), void *arg, const char *name) {
   kstack_pa[tid] = alloc_frames_contig (KSTACK_PAGES_ARCH);
   u64 top = (u64)KVA (kstack_pa[tid]) + KSTACK_PAGES_ARCH * PAGE;
   struct kctx *c = &kctx[tid];
+  c->depth = 1;                                // runs with the kernel lock, like the thread that starts it
   for (int i = 0; i < 10; i++) c->x19_x28[i] = 0;
   c->x19_x28[0] = (u64)entry;                  // x19
   c->x19_x28[1] = (u64)arg;                    // x20
@@ -209,7 +237,7 @@ int arch_threads_reap (void) {
   int n = 0;
   u64 flags = irq_save ();
   for (thread_id tid = 2; tid < MAX_THREADS; tid++) {
-    if (kstack_pa[tid] && !thread_table[tid].used) {
+    if (kstack_pa[tid] && !thread_table[tid].used && !smp_running_elsewhere (tid)) {
       // a process killed by another one (u_kill) never ran syscall_exit: free its address space here
       addr_space_id as = kstack_as[tid];
       if (as >= 2 && address_spaces[as].status == AS_USED && address_spaces[as].pid == (int)tid)
@@ -299,7 +327,7 @@ int arch_cow_fault (u64 va) {
 // Map the user stack and build  [argc][argv]  at its top, with the argument strings and the
 // argv array above it.  The start code (crt0) loads argc and argv from there.
 // Returns the initial user stack pointer, 0 on error.
-#define SIGPAGE_VA   0x7FFF0000UL            // the "signal trampoline" page, mapped in every process
+#define SIGPAGE_VA   0x7BFF0000UL            // the "signal trampoline" page, mapped in every process (below the biggest stack, see arch_swap.c)
 #define ARCH_NR_SIGRETURN 600                // AArch64 only: return from a signal handler
 
 static int map_sigpage (u64 l0) {
@@ -351,12 +379,13 @@ static u64 build_user_stack (u64 l0, int argc, char **argv) {
 // "return" goes through this stub: sp points to the prepared exception frame.
 void process_first_return (void);
 void arch_signal_check (context_t *f);
+void arch_process_first (context_t *f) { arch_signal_check (f); bkl_unlock (); }   // the new process leaves the kernel
 __asm__ (
   ".text\n"
   ".global process_first_return\n"
   "process_first_return:\n"
   "  mov x0, sp\n"
-  "  bl  arch_signal_check\n"
+  "  bl  arch_process_first\n"
   "  b   exit_exception\n"
 );
 
@@ -374,6 +403,7 @@ static void kstack_for_process (thread_id tid, const context_t *frame, int owns_
   context_t *f = (context_t *)(top - sizeof (context_t));
   *f = *frame;
   struct kctx *c = &kctx[tid];
+  c->depth = 1;
   for (int i = 0; i < 10; i++) c->x19_x28[i] = 0;
   c->x29 = 0;
   c->x30 = (u64)process_first_return;
@@ -438,6 +468,26 @@ void arch_dump_as (addr_space_id as) {
   else   printf ("  (no user pages)\n");
 }
 
+// Kernel shell command 'test': the page table data of the current address space (the x86 version shows
+// current_pd, current_pt and the frame table).
+extern u64 arch_ram_frames (void);
+void arch_ksh_test (void) {
+  u64 ttbr0, ttbr1;
+  __asm__ volatile ("mrs %0, ttbr0_el1; mrs %1, ttbr1_el1" : "=r" (ttbr0), "=r" (ttbr1));
+  printf ("current address space:      %d (ASID %d)\n", (int)current_as, asid_16bit ? (int)current_as : 0);
+  printf ("TTBR0_EL1 (user tables):    %016lx\n", ttbr0);
+  printf ("TTBR1_EL1 (kernel tables):  %016lx\n", ttbr1);
+  u64 l0 = as_l0[current_as];
+  printf ("root table of the AS:       %lx (size %d bytes)\n", l0, (int)PAGE);
+  if (l0) {
+    u64 *t = KVA (l0);
+    int used = 0;
+    for (int i = 0; i < 512; i++) if (t[i] & PTE_VALID) used++;
+    printf ("level 0 entries in use:     %d, first entry: %016lx\n", used, t[0]);
+  }
+  printf ("frames in use:              %ld of %lu\n", frames_in_use, arch_ram_frames ());
+}
+
 // ---- fork ----
 int arch_threads_reap (void);
 int u_fork (context_t *r) {
@@ -450,8 +500,9 @@ int u_fork (context_t *r) {
   u64 nl0 = new_user_l0 ();
   as_l0[new_as] = nl0;
   int cloned = clone_level (as_l0[old_as], nl0, 0, 0);
-  __asm__ volatile ("dsb ishst; tlbi vmalle1; dsb ish; isb" ::: "memory");   // the parent's pages are read-only now
+  __asm__ volatile ("dsb ishst; tlbi vmalle1is; dsb ish; isb" ::: "memory");   // the parent's pages are read-only now (on all CPUs)
   if (cloned < 0) { destroy_address_space (new_as); return -1; }
+  address_spaces[new_as].stacksize = address_spaces[old_as].stacksize;     // (the stack may have grown)
   address_spaces[new_as].memstart = address_spaces[old_as].memstart;
   address_spaces[new_as].memend   = address_spaces[old_as].memend;
 
@@ -480,7 +531,26 @@ int u_fork (context_t *r) {
 }
 
 // ---- exec: load a new program into a fresh address space and switch to it ----
+// A process that waits for the disk (see glue.c) lets others run in the middle of loading a program.  The loader
+// (u_execv, elf_load and the Minix reader) uses static buffers, so only one process may load a program at a time.
+static lock exec_lock = NULL;
+static int exec_locked_enter (void) {
+  if (current_task <= 1) return 0;                    // the idle thread never waits
+  if (!exec_lock) exec_lock = get_new_lock ("exec");
+  mutex_lock (exec_lock);
+  return 1;
+}
+static void exec_locked_leave (int locked) { if (locked) mutex_unlock (exec_lock); }
+
+static int u_execv_loading (char *filename, char *const argv[], memaddress *newstack);
 int u_execv (char *filename, char *const argv[], memaddress *newstack) {
+  int l = exec_locked_enter ();
+  int r = u_execv_loading (filename, argv, newstack);
+  exec_locked_leave (l);
+  return r;
+}
+
+static int u_execv_loading (char *filename, char *const argv[], memaddress *newstack) {
   static char kargs[2048];
   char *kargv[16];
   int argc = 0, pos = 0;
@@ -501,8 +571,10 @@ int u_execv (char *filename, char *const argv[], memaddress *newstack) {
 
   u64 old = as_l0[current_as];                           // from here on there is no way back
   as_l0[current_as] = nl0;
+  address_spaces[current_as].stacksize = USER_STACK_PAGES * PAGE;       // a new program starts with a small stack
   address_spaces[current_as].memstart = 0x400000;
   address_spaces[current_as].memend   = image_end;      // the program break starts behind the image
+  if (address_spaces[current_as].refcount > 1) smp_stop_others ();   // threads of this program on other CPUs must leave user mode first
   arch_swap_release_as (current_as);                     // the old program's pages in the swap file
   asid_flush (current_as);                               // entries of the old program must not survive
   arch_activate_as (current_as);
@@ -512,7 +584,15 @@ int u_execv (char *filename, char *const argv[], memaddress *newstack) {
 }
 
 // ---- start a first process from a file (the kernel plays the role of its parent) ----
+static int arch_start_user_loading (const char *path, int argc, char **argv);
 int arch_start_user (const char *path, int argc, char **argv) {
+  int l = exec_locked_enter ();
+  int r = arch_start_user_loading (path, argc, argv);
+  exec_locked_leave (l);
+  return r;
+}
+
+static int arch_start_user_loading (const char *path, int argc, char **argv) {
   unsigned ino = minix_lookup (path);
   if (!ino || !minix_is_file (ino)) { printf ("exec: %s: no such file\n", path); return -1; }
   int as = as_alloc ();
@@ -776,7 +856,7 @@ void *u_sbrk (int incr) {
   if (incr == 0) return (void *)old;
   if (incr < 0) return (void *)-1;                       // shrinking is not supported
   memaddress end = old + incr;
-  if (end > USER_STACK_TOP - 0x100000UL) return (void *)-1;     // keep 1 MByte below the stack
+  if (end > SIGPAGE_VA - 0x100000UL) return (void *)-1;      // the heap stays below the trampoline page and the stack (which may grow to 64 MByte)
   for (u64 va = (old + PAGE - 1) & ~(PAGE - 1); va < end; va += PAGE) {
     if (map_page_in (as_l0[as], va, alloc_frame (), PAGE_URW) != 0) return (void *)-1;
   }
@@ -789,5 +869,5 @@ void *u_sbrk (int incr) {
 
 // the idle system call: wait for the next interrupt (x86: sti; hlt; cli)
 void arch_syscall_idle (context_t *r) {
-  __asm__ volatile ("msr daifclr, #2; wfi; msr daifset, #2" ::: "memory");
+  arch_idle ();
 }

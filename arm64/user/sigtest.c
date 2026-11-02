@@ -7,7 +7,9 @@ static int fails = 0;
                            else { printf ("  user FAIL: %s\n", msg); fails++; } } while (0)
 
 static volatile int got = 0, last_signal = 0;
-static void handler (int sig) { got++; last_signal = sig; }
+// (atomic: on several CPUs the signals can arrive faster than a handler runs, so that handlers interrupt each other; a
+// plain got++ would then lose counts. An exception return clears the exclusive monitor, so the loop of the atomic add retries.)
+static void handler (int sig) { __sync_fetch_and_add (&got, 1); last_signal = sig; }
 
 // some arithmetic that uses many registers: any register lost across a signal changes the result
 static unsigned __attribute__ ((noinline)) work (int n) {

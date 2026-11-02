@@ -4,6 +4,7 @@
 #include "ulix-api.h"
 
 extern void arch_threads_init (void);
+extern void arch_idle (void);
 extern int  arch_thread_create (void (*entry)(void *), void *arg, const char *name);
 extern int  arch_threads_reap (void);
 extern void arch_resign (void);
@@ -24,7 +25,7 @@ static int live_threads (void) {
 // which makes the scheduler switch to the ready worker threads
 static void run_until_done (void) {
   while (live_threads () > 0) {
-    __asm__ volatile ("wfi");
+    arch_idle ();
   }
 }
 

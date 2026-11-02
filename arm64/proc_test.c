@@ -5,6 +5,7 @@
 
 extern int  arch_start_user (const char *path, int argc, char **argv);
 extern int  arch_threads_reap (void);
+extern void arch_idle (void);
 extern void capture_start (void);
 extern int  capture_stop (char **text);
 extern long frames_in_use;
@@ -34,7 +35,7 @@ static int live_threads (void) {
 static int run (const char *path, int argc, char **argv) {
   int pid = arch_start_user (path, argc, argv);
   if (pid < 0) return pid;
-  while (live_threads () > 0) __asm__ volatile ("wfi");
+  while (live_threads () > 0) arch_idle ();
   return pid;
 }
 
@@ -145,6 +146,29 @@ int proc_test (void) {
          "the terminal model of the kernel holds the final screen: DONE at column 2 of line 3, cursor behind it");
   CHECK (count_in (out, "\033[") > 0, "the visible terminal was repainted on the console with ANSI sequences");
   CHECK (live_threads () == 0, "no process is left");
+
+  // the book's thread program: 3 threads and a mutex, the main thread waits for two of them in a loop
+  {
+    char *thr_argv[] = { "thread", "1", 0 };
+    int thr_pid = run ("/bin/thread", 2, thr_argv);
+    CHECK (thr_pid > 0 && thread_table[thr_pid].exitcode == 0 && live_threads () == 0,
+           "the book's /bin/thread 1 (3 threads, mutex) finishes: all threads are gone");
+  }
+
+  // stack growth
+  char *stk_argv[] = { "stacktest64", 0 };
+  int killed_before = procs_killed;
+  capture_start ();
+  pid = run ("/stacktest64", 1, stk_argv);
+  capture_stop (&out);
+  CHECK (pid > 0 && thread_table[pid].exitcode == 0, "/stacktest64 finished with exit status 0 (no failed checks)");
+  CHECK (count_in (out, "user FAIL") == 0 && count_in (out, "user ok:") == 4, "all 4 stack checks passed");
+  CHECK (procs_killed == killed_before + 1, "exactly one process was killed: the one that touched memory far below its stack");
+  CHECK (live_threads () == 0, "no process is left");
+
+  // the disk: processes that read and write sleep until the interrupt of the device wakes them up
+  extern int hd_sleeps, hd_interrupts;
+  CHECK (hd_sleeps > 0 && hd_interrupts > 0, "disk transfers of processes were interrupt driven (they slept and were woken by the device)");
 
   // signals: handler with exact register restore, SIG_IGN, default action, SIGSTOP/SIGCONT/SIGKILL
   char *sig_argv[] = { "sigtest64", 0 };

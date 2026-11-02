@@ -12,7 +12,8 @@
 
 #include "ulix-api.h"
 
-#define UART_BASE   (0xffff000000000000UL + 0x09000000UL)
+extern unsigned long uart_base;
+#define UART_BASE   (0xffff000000000000UL + uart_base)
 #define UART_DR     (*(volatile unsigned int *)(UART_BASE + 0x00))
 #define UART_FR     (*(volatile unsigned int *)(UART_BASE + 0x18))
 #define UART_IMSC   (*(volatile unsigned int *)(UART_BASE + 0x38))
@@ -20,6 +21,8 @@
 #define UART_FR_RXFE (1 << 4)
 
 void kernel_shell (void);
+extern void irq_uart_to_cpu (int cpu);
+extern int smp_cpu (void);
 
 #include "ulix-init.c"                     // arch_setup_keyboard(): the book's <<setup keyboard>> chunk
 
@@ -83,7 +86,9 @@ void arch_console_input (unsigned char c) {
     if (scheduler_is_active) {
       scheduler_is_active = false;
       printf ("\nGoing to kernel shell\n");
+      irq_uart_to_cpu (smp_cpu ());
       kernel_shell ();
+      irq_uart_to_cpu (0);
       printf ("returning from kernel shell\n");
     }
     return;
@@ -108,6 +113,7 @@ void arch_kernel_fault_shell (void) {
   scheduler_is_active = false;
   __asm__ volatile ("msr daifclr, #2");
   printf ("\n");
+  irq_uart_to_cpu (smp_cpu ());                  // the keys must come to this CPU
   kernel_shell ();
   for (;;) __asm__ volatile ("wfe");
 }

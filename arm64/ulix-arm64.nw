@@ -31,7 +31,8 @@ void statusline_red (void);
 void statusline_blue (void);
 void set_statusline (char *text);
 uint request_new_frame (void);
-void release_page_range (uint first, uint last);
+void release_page (unsigned int pageno);
+void release_page_range (unsigned int start_pageno, unsigned int end_pageno);
 @
 
 <<ulix-globals.c>>=

@@ -4,14 +4,15 @@ characters and checks what comes back.
 
 usage: console_test.py KERNEL.elf DISK.img
 """
-import re, socket, subprocess, sys, time
+import os, re, shlex, socket, subprocess, sys, time
 
 kernel, disk = sys.argv[1:3]
 PORT = 45123
-qemu = subprocess.Popen(['qemu-system-aarch64', '-M', 'virt', '-cpu', 'cortex-a72', '-m', '128', '-display', 'none',
+# QEMU_M (machine), QEMU_MEM (MByte) and QEMU_EXTRA (further arguments, e.g. '-smp 4') select another configuration
+qemu = subprocess.Popen(['qemu-system-aarch64', '-M', os.environ.get('QEMU_M', 'virt'), '-cpu', 'cortex-a72', '-m', os.environ.get('QEMU_MEM', '128'), '-display', 'none',
                          '-monitor', 'none', '-kernel', kernel, '-snapshot',
                          '-drive', 'file=%s,format=raw,if=none,id=hd0' % disk, '-device', 'virtio-blk-device,drive=hd0',
-                         '-serial', 'tcp:127.0.0.1:%d,server=on,wait=on' % PORT],
+                         '-serial', 'tcp:127.0.0.1:%d,server=on,wait=on' % PORT] + shlex.split(os.environ.get('QEMU_EXTRA', '')),
                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 sock = None
 for _ in range(100):
