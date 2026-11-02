@@ -155,7 +155,7 @@ static void disk_test (void) {
   CHECK (minix_mount () == 0, "Minix file system mounted");
   int n = 0;
   minix_readdir (1, count_cb, &n);
-  CHECK (n == 26, "root directory has 26 entries (16 from x86 Ulix + 10 AArch64 files)");
+  CHECK (n == 27, "root directory has 27 entries (16 from x86 Ulix + 11 AArch64 files)");
   n = 0;
   minix_readdir (minix_lookup ("/bin"), count_cb, &n);
   CHECK (n == 63, "/bin has 63 entries");

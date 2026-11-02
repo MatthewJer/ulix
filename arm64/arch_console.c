@@ -100,3 +100,14 @@ void uart_rx_irq (void) {
   }
   UART_ICR = 0x7ff;
 }
+
+// An exception inside the kernel cannot be fixed (for example a bad user pointer in a system call).  Like the
+// page fault handler of the book: stop the scheduler, enable interrupts and jump to the kernel shell, which
+// is never left again.
+void arch_kernel_fault_shell (void) {
+  scheduler_is_active = false;
+  __asm__ volatile ("msr daifclr, #2");
+  printf ("\n");
+  kernel_shell ();
+  for (;;) __asm__ volatile ("wfe");
+}

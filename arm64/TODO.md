@@ -28,9 +28,10 @@ is still missing compared with the x86 build, most important first. Background a
 - [ ] **Real hardware / other boards**: GICv3 (qemu `-M virt,gic-version=3`), parse the device tree instead of
       the fixed 128 MByte of RAM and the fixed device addresses, cache maintenance for DMA in `virtio.c`
       (it relies on coherent memory), more than one CPU.
-- [ ] **User pointers in system calls**: the book dereferences them directly (like on x86). A bad pointer inside a
-      system call stops the kernel instead of ending the process. Idea: handle data aborts at EL1 on user
-      addresses in `exc_handler` (the copy-on-write path already does this for write faults) and fail the system call.
+- [x] **User pointers in system calls**: like on the x86 (the book's page fault handler treats a fault inside
+      kernel code as a kernel error) an exception in the kernel stops the scheduler and jumps to the kernel shell
+      (`arch_kernel_fault_shell`). A bad pointer in a system call therefore does not end just the process on
+      either platform. Test: `badptr64` in the shell test.
 - [x] Kernel stacks of finished processes are freed at the next `fork` (`arch_threads_reap`), and per-process
       ASIDs replace the TLB flush at address space switches (needs 16-bit ASIDs, else the old flush is used).
 - [ ] Interrupt-driven virtio (`virtio.c` polls) and more than one request at a time.

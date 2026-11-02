@@ -111,6 +111,10 @@ try:
     pump(0.5)
     if b'EXCEPTION' in log or b'killed:' in log: print('  FAIL: kernel exception or killed process'); fails += 1
     else: print('  ok:   no kernel exception, no process killed by a fault')
+    # a bad pointer in a system call: like on the x86 the kernel ends in the kernel shell
+    send('/badptr64\\r'); expect(r'KERNEL EXCEPTION', 'a bad pointer in a system call is a kernel exception')
+    expect(r'Ulix Kernel Shell', 'the kernel shell is started, as on the x86')
+    send('uname\\r'); expect(r'Ulix', 'the kernel shell works (uname)')
 finally:
     qemu.kill()
 print('shell test: %s' % ('all passed' if not fails else '%d FAILED' % fails))

@@ -14,6 +14,7 @@ extern void uart_rx_irq (void);
 extern void uart_rx_enable (void);
 extern void arch_clock_tick (void);
 extern int  arch_cow_fault (u64 va);
+extern void arch_kernel_fault_shell (void);
 
 // ---- GICv2 on qemu "virt" ------------------------------------------------
 #define GICD_BASE   (KERNEL_VA + 0x08000000UL)
@@ -107,6 +108,7 @@ void exc_handler (struct frame *f, int kind) {
   }
   printf ("\n*** KERNEL EXCEPTION kind=%d ESR=0x%lx (EC=0x%x) FAR=0x%lx ELR=0x%lx\n",
           kind, esr, ec, far, f->elr);
+  if (!from_user) arch_kernel_fault_shell ();       // as on the x86: the kernel shell, no way back to user mode
   for (;;) __asm__ volatile ("wfe");
 }
 
