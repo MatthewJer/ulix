@@ -1,3 +1,11 @@
+> **Notice: this is an unofficial fork.** It adds a port of Ulix to 64-bit ARM (AArch64) in the directory [`arm64/`](arm64/), a few
+> changes in `ulix-book.nw` that the port needs (mostly behind `#if` branches, see [`arm64/README.md`](arm64/README.md)) and one
+> additional appendix. **The ARM64 port and these changes were not written by the authors of Ulix** (Hans-Georg Eßer and
+> Felix Freiling). The authors have nothing to do with this fork, did not review or endorse it, and are not responsible for it.
+> The original project is at <https://github.com/hgesser/ulix>; please report problems with the ARM64 port to this fork, not to the
+> original authors. The software stays under the GNU General Public License, version 3 (see [`LICENSE`](LICENSE)); the copyright
+> notices of the original are kept. The text below is the original README.
+
 # Ulix, the Literate Unix
 Ulix (Literate Unix) is a Unix-like operating system that was developed at University of Erlangen-Nuremberg. We used Donald E. Knuth's concept of Literate Programming for the implementation and documentation. The intention was to create a fully working system which can be used in operating system courses to show students how OS concepts (such as paging and scheduling) can be implemented. Literate programs are very accessible because they can be read like a book; the order of presentation is not enforced by program logic or compiler restrictions, but instead is guided by the implementer's creative process.
 

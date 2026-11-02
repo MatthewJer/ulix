@@ -1,5 +1,11 @@
 # Ulix on ARM64
 
+> **Notice: not the work of the original authors.** This port to AArch64 is part of an unofficial fork of Ulix. It was **not
+> written by the authors of Ulix** (Hans-Georg Eßer and Felix Freiling), who have nothing to do with it, did not review or
+> endorse it and are not responsible for it. The original project is at <https://github.com/hgesser/ulix>. Licence: GNU GPL
+> version 3, like the original (see `../LICENSE`).
+
+
 This directory contains a port of the Ulix kernel (the code in [`../ulix-book.nw`](../ulix-book.nw)) to 64-bit ARM
 (AArch64). It runs on the `virt` machine of qemu (`qemu-system-aarch64`), also on Apple-silicon Macs, and boots
 the same system as the x86 version: `/init` → `/bin/login` → `/bin/sh`, with the programs of `lib-build/tools`.
@@ -42,19 +48,21 @@ The port keeps the book as the single source:
   unchanged into `gen/ulix-port.c`.
 * What the book does for the x86 hardware is written again for ARM64 in the `arch_*` and driver files and has the
   same names and data structures. See the table below.
-* The user space (`userland/`): `ulixlib`, `init` and the 59 programs of `../lib-build/tools` are compiled for
+* The user space (`userland/`): `ulixlib`, `init` and the 60 programs of `../lib-build/tools` are compiled for
   AArch64, unchanged.
 
 | x86 (book) | ARM64 (this directory) |
 |---|---|
 | GDT, IDT, TSS, `int 0x80`, `iret` | `vectors.S` (exception vectors, register frame), `svc #0`, `eret` |
-| 8259 PIC, 8253 PIT | `irq.c`: GICv2, generic timer (100 Hz) |
+| 8259 PIC, 8253 PIT | `gic.c` (GICv2 and GICv3), `irq.c`: generic timer (100 Hz) per CPU |
 | 2-level paging, kernel at `0xC0000000` | `mmu.c`, `start.S`: 4 levels, kernel in the upper half at `0xFFFF000000000000 + physical` |
 | fork/exec with kernel stacks inside the address space | `arch_thread.c`: separate kernel stack per thread, copy-on-write `fork`, `exec` with an ELF64 loader (`elf.c`) |
 | context switch by swapping ESP/EBP/CR3 | `cpu_switch` (`vectors.S`) and `arch_context_switch` |
 | signal delivery on the user stack | `arch_signal_check`, `sigreturn`, trampoline page |
-| IDE / floppy | `virtio.c`: virtio-blk; `minixfs.c`: small read-only reader used by the ELF loader |
-| VGA text mode, PS/2 keyboard, 10 virtual terminals | PL011 UART (`arch_console.c`); terminals are kept apart in software |
+| IDE / floppy | `virtio.c`, `glue.c`: virtio-blk, interrupt driven like the IDE driver; `minixfs.c`: small read-only reader used by the ELF loader |
+| VGA text mode, PS/2 keyboard, 10 virtual terminals | PL011 UART (`arch_console.c`); the screens of the terminals are a model of the VGA text screen (`arch_vt.c`) shown on the console with ANSI sequences |
+| device detection by BIOS/ports, one CPU | `dt.c`: device tree; `smp.c`: more than one CPU (PSCI, big kernel lock) |
+| swap file, page replacement | `arch_swap.c`: for the 4-level tables, with the access flag as accessed bit |
 | CMOS clock | PL031 RTC (`arch_clock.c`) |
 
 The kernel runs with interrupts masked, like the x86 kernel: the queues and tables of the book need no extra
@@ -104,11 +112,11 @@ version. They are fixed in `../ulix-book.nw` (x86 and ARM64 profit):
 
 ## Not done
 
-* No pthreads (`thread` and `mutex` in `lib-build/tools` do not run), no swap, no VGA functions (`vi` does not work as
-  an editor, `clrscr` uses ANSI codes), `recurse` (x86 assembler).
-* The buffer cache of the book is not used: `writeblock` writes through to the disk. (It would delay writes, and the
-  tests that check the disk image from outside need them to be there.)
-* Only the `virt` machine of qemu. GICv3, device tree parsing (the 128 MByte of RAM are fixed) and cache maintenance
-  for DMA on real hardware are missing. VirtualBox cannot run this on an ARM host; use qemu.
+* Everything has only been run on qemu (`-M virt`, GICv2 and GICv3, 1 to 4 CPUs, EL1 and EL2). Real boards are untested: the device
+  tree reader, the cache maintenance for DMA and the PSCI start of the other CPUs are written for them but could not be tried.
+  VirtualBox cannot run this on an ARM host; use qemu.
+* No `pthread_join` (the book has none either); `exit ()` and `exec ()` in threads behave like in the book.
+* The book's kernel is single-processor code. More than one CPU is done with one big kernel lock (see `smp.c`): user programs run in
+  parallel, the kernel does not.
 * The port is not yet described in the book itself; `ulix-arm64.nw` and `../ARM64-PORT.md` (in German, a log of the work with the
   reasoning behind each step) are the documentation for now.

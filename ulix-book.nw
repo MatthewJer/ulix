@@ -10907,7 +10907,7 @@ The return value of
 the system call can then be read from \register{EAX}. The following functions 
 On the ARM64 port the same convention is used with other registers: the system call number goes
 into [[x0]] (and the result comes back there), the arguments into [[x1]]--[[x5]], and the instruction is
-[[svc #0]]. The macro [[ARM64_SYSCALL_ASM]] hides that; the x86 code is selected with [[#if]]
+\verb!svc #0!. The macro [[ARM64_SYSCALL_ASM]] hides that; the x86 code is selected with [[#if]]
 and stays exactly as shown.
 
 <<ulixlib macro definitions>>=
@@ -31017,6 +31017,132 @@ As a closing remark, we'd like to rephrase what we wrote in the foreword: We hop
 
 
 \appendix
+
+%----------------------------------------------------------------------------------------
+
+
+
+\chapter{The ARM64 Port (an Unofficial Extension)}
+\label{chap:ulix:arm64}%
+\index{ARM64 port}\index{AArch64}\index{port!to ARM64}%
+
+\begin{quote}
+\textbf{Please note:} This appendix was \emph{not} written by the authors of this book. It documents an unofficial port of \UlixI{} to the 64-bit ARM architecture (AArch64) that was added to a fork of the book's sources. The authors of \UlixI{} did not write, review or endorse this port or this text, they have nothing to do with it, and they are not responsible for it. Everything in the other chapters describes the x86 version of the system, and the x86 version is unchanged by the port: the kernel is still produced from the same chunks, and the port reuses them.
+\end{quote}
+
+\section{What Was Done}
+
+The \UlixI{} kernel is a kernel for the PC platform: it talks to a PIC, an IDE controller, the VGA text screen and a PS/2 keyboard, and it uses the two-level paging of the 32-bit x86. A port to another processor therefore does not translate instructions; it rewrites the layer that touches the hardware and keeps everything else. The ARM64 port runs in the [[qemu-system-aarch64]] emulator on the \verb#virt# machine and has these properties:
+
+\begin{itemize}
+\item The parts of the kernel that do not depend on the hardware are the code of this book, compiled unchanged: the Minix file system, the VFS layer, the thread queues, the scheduler, mutexes and semaphores, the system call dispatcher and most system calls, signals, the buffer cache, the kernel shell and the user library. A file \path!port.manifest! lists the functions and global variables that are taken; a small script (\path!tools/port.py!) picks them out of the tangled sources, and the C compiler sees them exactly as the x86 compiler does. The declarations (constants, types, prototypes) are taken from the book as a whole.
+\item Everything that the book writes for the x86 hardware is written again, with the same names and the same data structures where that is possible: exception handling, the interrupt controller, paging, the context switch, process creation, the console, the disk driver and the clock.
+\item The user programs of the book (about 60, among them the shell, \verb#vi# and the threads demonstration) are compiled for AArch64 and run unchanged. The only exception is \verb#recurse#, where the x86 register name in its inline assembler is replaced at build time.
+\end{itemize}
+
+The port is described by the files in the directory \path!arm64/! of the sources; this appendix explains the ideas, not each line. The sources are organized as follows.
+
+\begin{center}
+\begin{tabular}{ll}
+\path!start.S!, \path!vectors.S! & boot code, exception vectors, context switch \\
+\path!dt.c!, \path!gic.c!, \path!irq.c! & device tree, interrupt controller, timer, exception handler \\
+\path!mmu.c!, \path!arch_swap.c! & frames, 4-level page tables, copy-on-write, swapping \\
+\path!arch_thread.c! & processes, threads, fork, exec, signals, system calls \\
+\path!smp.c! & more than one CPU \\
+\path!arch_console.c!, \path!arch_vt.c! & UART console and virtual terminals \\
+\path!virtio.c!, \path!glue.c!, \path!minixfs.c! & disk, glue to the book's block layer, ELF loader support \\
+\end{tabular}
+\end{center}
+
+\section{Booting}
+
+On the PC, GRUB loads the kernel and starts it in 32-bit protected mode. On \verb#virt# the emulator starts the kernel directly, with the MMU off, at exception level EL1 (or at EL2 if the machine has virtualization enabled). The kernel is linked at the virtual address \hex{FFFF000000000000} plus its physical address, so that the upper half of the address space belongs to the kernel (as the upper gigabyte does on the x86), and all of physical memory is reachable at \hex{FFFF000000000000} + physical address. The boot code runs at the physical address until it has set up a first translation table, switches the MMU on and jumps to the high address; this is the only code that must not use absolute addresses.
+
+The emulator tells the kernel where devices and memory are by handing over a \emph{device tree}: a binary description of the machine. It does that only for kernels in the Linux arm64 image format, so the kernel is also built as a flat image that starts with the 64-byte header of that format (a branch, the load offset, the image size and the magic number \verb!"ARM\x64"!). The function [[dt_init]] reads the tree and fills a structure with the size of RAM, the CPUs, the interrupt controller, the UART, the real-time clock, the timer interrupt, the PSCI interface for starting other CPUs and the list of virtio devices. If there is no device tree, the values of the \verb#virt# machine are used.
+
+If the machine starts the kernel at EL2, the boot code drops to EL1: it enables 64-bit EL1, gives EL1 access to the timer and to the system registers of the interrupt controller and returns with [[eret]].
+
+\section{Exceptions and System Calls}
+
+The x86 has an interrupt descriptor table; AArch64 has a vector table whose address is written to [[VBAR_EL1]]. It contains 16 entries (four kinds of exceptions for each of four origins), each only 32 instructions long. Every entry saves all registers in a frame on the kernel stack and calls one C function, [[exc_handler]]. The frame has the size of the book's [[context_t]] (288 bytes), so the book's system call functions, which read their arguments from the fields [[eax]], [[ebx]], [[ecx]] and [[edx]], work unchanged: these names are now the registers \verb#x0# to \verb#x3#.
+
+A system call is the instruction \verb!svc #0! with the number in \verb#x0# and the arguments in \verb#x1# to \verb#x5#. The handler passes the frame to the book's [[syscall_handler]]. Interrupts are acknowledged at the interrupt controller; the timer interrupt calls the book's [[scheduler]]. A data abort in user mode ends the process with exit code $-1$, as the page fault handler of the book does; an exception in the kernel stops the scheduler and jumps to the kernel shell, as it does on the x86.
+
+Return to user mode is the instruction [[eret]], which takes the program counter and the processor state from [[ELR_EL1]] and [[SPSR_EL1]], as [[iret]] does on the x86. The kernel stack pointer is a register of its own ([[SP_EL1]]), so the TSS of the x86 has no counterpart.
+
+\section{Memory}
+
+\subsection{Page Tables}
+
+AArch64 uses four levels of translation tables with 4-KByte pages and 48-bit addresses. Two base registers split the address space: [[TTBR1_EL1]] translates the upper half (the kernel) and [[TTBR0_EL1]] the lower half (the current process). The kernel maps all of RAM, and each device that the device tree names, with 1-GByte blocks; a process has its own table tree with its code, data, heap and stack below 2 GByte. Frames are allocated from a bump pointer and a free list, and a table counts the page table entries that refer to each frame.
+
+The \emph{address space id} of the book doubles as the hardware's ASID, and the user pages are marked ``not global''. A switch from one process to another therefore needs no flush of the translation cache; only the ASID of an address space that is destroyed or replaced by [[exec]] is flushed.
+
+\subsection{Copy-on-Write and Stack Growth}
+
+The book's [[fork]] copies all pages of a process. Here the child shares the frames of the parent: both page table entries are made read-only and get a software bit, and the frame's reference count is raised. The first write causes a permission fault; the fault handler gives the writer its own copy. The kernel also writes to user buffers inside system calls, so the same handler resolves faults taken in the kernel.
+
+The user mode stack grows as in the page fault handler of the book: if the program touches the page just below its stack, a new page is mapped (up to 64 MByte, never into the heap). Faults further away end the process.
+
+\subsection{Swapping}
+
+The book's swap file, the table of swapped pages and the page replacement with access counters are used unchanged. What depends on the page table format is written for AArch64. A page is swapped out by clearing the valid bit and setting a software bit in the entry; all other bits stay in the entry, so that the page comes back with its old permissions. The page fault handler brings the page back when the process touches it.
+
+The counters need the ``accessed'' bit of the x86 page table entry. The processor of the \verb#virt# machine does not maintain the corresponding access flag, so the kernel does it: when the timer task counts the accesses, it clears the flag; the next access faults, and the handler sets the flag again. The swap file \path!/tmp/swap! grows with the pages written to it, because the disk is much smaller than the 64 MByte of the book. Pages that are shared after a [[fork]] are never swapped out.
+
+\section{Processes and Threads}
+
+On the x86 the context switch exchanges the stack pointers inside the interrupt handler. Here every thread has a kernel stack of its own, and the switch saves the registers that a C function must preserve, the kernel stack pointer and the user stack pointer, and loads those of the other thread ([[cpu_switch]]). A new process starts with a prepared frame on its kernel stack; the first switch to it ``returns'' through the exception return code into user mode.
+
+The functions [[u_fork]] and [[u_execv]] are written for the new page tables; [[exec]] loads an ELF64 file. The POSIX threads of the book work as described in Chapter~\ref{chap:ulix:threads}: a thread is a thread table entry that shares the address space, the reference count of the address space keeps it alive until the last thread has ended, and the kernel mutexes serve as [[pthread_mutex_t]] (the user mutex holds an index into the lock table instead of a pointer, because the type is only 32 bits wide).
+
+\section{Devices}
+
+\textbf{Interrupt controller and timer.} The 8259 PIC is replaced by the generic interrupt controller, version 2 or 3; the device tree says which one is present. The controller has a distributor and, for each CPU, an interface (a register block in version 2, system registers and a \emph{redistributor} in version 3). The timer is the processor's own generic timer; it raises an interrupt 100 times per second on every CPU, as the 8253 does on the x86.
+
+\textbf{Console and terminals.} The keyboard and the VGA screen are replaced by a serial port (a PL011 UART) whose receive interrupt does what the keyboard handler of the book does. The virtual terminals keep their book data structure: a screen of 80 by 24 characters with a color attribute for each terminal, plus a cursor. [[kputch]], [[clrscr]], [[set_xy]], [[get_xy]], [[read_screen]] and [[write_screen]] work on this model, and the screen of the visible terminal is shown on the serial console with ANSI escape sequences (cursor positioning and colors), so that \verb#vi# works. Switching the terminal paints the new terminal's screen.
+
+\textbf{Disk.} The IDE driver is replaced by a driver for virtio-blk. A process that reads or writes a block takes the lock [[hd_lock]], starts the request and sleeps in [[harddisk_queue]]; the interrupt of the device wakes it up. This is the scheme of the IDE driver in Chapter~\ref{chap:ulix:disk-i-o}. The idle thread and the boot code poll instead, because the idle thread must never sleep. Before the device is used, the data cache lines that it reads are cleaned, and those that it writes are invalidated, so that the driver also works with devices that are not cache coherent.
+
+\textbf{Clock.} The CMOS clock is replaced by the PL031 real-time clock; the tick counting is that of the book.
+
+\section{More Than One CPU}
+
+The kernel of the book does not expect a second processor: its queues and tables have no locks. The port lets several CPUs share it by letting only one of them run kernel code at a time (a \emph{big kernel lock}). A CPU takes the lock when it enters the kernel and gives it back when it returns to user mode or goes to sleep waiting for an interrupt. User programs run in parallel.
+
+The book's variables [[current_task]] and [[current_as]] describe one thread, so they are saved and restored for each CPU when the lock is passed on; the code of the book always sees ``its'' thread. The scheduler of the book chooses from the ready queue, and threads that run on other CPUs are in that queue as well. While the scheduler chooses, they are removed from the queue and put back afterwards. Each CPU has its own idle context (the book's idle thread belongs to the first CPU). A signal for a thread that runs on another CPU is handed to that CPU, which then ends, stops or signals the thread itself; this way no thread or address space is released while another CPU still uses it. The other CPUs are started with the PSCI function [[CPU_ON]] that the device tree describes.
+
+The big kernel lock is simple and keeps the book's code unchanged, but it is not fast: the kernel is not parallel.
+
+\section{Building and Testing}
+
+The build needs an AArch64 cross compiler and [[qemu-system-aarch64]]. The command [[make check]] in the directory \path!arm64/! builds the kernel, the user programs and a disk image from the x86 disk image plus the AArch64 programs, and runs the tests:
+
+\begin{itemize}
+\item kernel tests that start the book's code and user programs (file system, threads, processes, signals, swapping, terminals, stack growth, \dots), at EL1 and EL2;
+\item the same tests on several virtual machines: interrupt controller version 2 and 3, one, two and four CPUs, and 64 MByte to 2 GByte of RAM;
+\item an independent check of the Minix file system on the disk image after the write tests (the checker is written in Python and shares no code with the kernel);
+\item a console test and a session that logs in, runs shell commands, switches terminals, edits a file with \verb#vi# and ends in the kernel shell.
+\end{itemize}
+
+\section{Differences from the x86 Version}
+
+\begin{itemize}
+\item There is no status line (the 25th screen line), and the console must understand ANSI escape sequences.
+\item The swap file is not 64 MByte large but grows on demand; the access bit is emulated.
+\item Integer division by zero does not cause an exception on AArch64; the kernel shell command \verb#div0# raises the exception by hand.
+\item The kernel is single-processor code that runs on several CPUs under one lock (see above).
+\item The port has only been run in an emulator; real boards are untested.
+\item Like the x86 version, it has no \verb#pthread_join#.
+\end{itemize}
+
+
+
+
+
+%----------------------------------------------------------------------------------------
+
+
 
 \chapter{Introduction to C}
 \label{chap:intro-to-c}%

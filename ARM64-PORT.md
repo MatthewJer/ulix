@@ -1,5 +1,11 @@
 # Ulix → ARM64: Bestandsaufnahme
 
+> **Hinweis: nicht das Werk der ursprünglichen Autoren.** Dieses Dokument gehört zu einem inoffiziellen Fork von Ulix, der einen
+> Port auf AArch64 enthält. Port und Dokument wurden **nicht von den Autoren von Ulix** (Hans-Georg Eßer und Felix Freiling)
+> geschrieben. Diese haben mit dem Fork nichts zu tun, haben ihn weder geprüft noch gebilligt und sind nicht dafür verantwortlich.
+> Das Originalprojekt: <https://github.com/hgesser/ulix>. Lizenz: GNU GPL Version 3 wie beim Original (siehe `LICENSE`).
+
+
 Stand: Branch `arm64-port`. Es wurde noch kein Code portiert. Dies ist die Analyse, die vor dem Port nötig ist.
 Alle Zeilennummern beziehen sich auf `ulix-book.nw` (32 557 Zeilen). Das Buch ist die einzige Quelle: `ulix.c`, `start.asm` und `ulix.ld` werden per `notangle` daraus erzeugt.
 
