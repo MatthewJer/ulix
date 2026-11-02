@@ -16,8 +16,7 @@ TOOLSRC  = ../../lib-build/tools
 BUILD    = build
 
 # recurse.c contains x86 inline assembler (it demonstrates stack growth of an x86 process).
-# swapper.c needs the x86 swap system calls.
-SKIP     = recurse swapper
+SKIP     = recurse
 TOOLS    = $(filter-out $(SKIP),$(patsubst $(TOOLSRC)/%.c,%,$(wildcard $(TOOLSRC)/*.c)))
 
 # GCC 4.4 accepted a lot that current compilers reject (return without value, missing types);
@@ -29,7 +28,7 @@ CFLAGS = -O0 -ffreestanding -nostdlib -fno-builtin -fno-stack-protector -fno-pic
          -Wno-error=int-conversion -Wno-error=incompatible-pointer-types
 LDFLAGS = -static -z max-page-size=4096 -T ../user/user.ld
 
-PROGS = $(addprefix $(BUILD)/bin/,$(addsuffix .elf,$(TOOLS) init swapper))
+PROGS = $(addprefix $(BUILD)/bin/,$(addsuffix .elf,$(TOOLS) init))
 
 all: $(PROGS)
 
@@ -51,11 +50,6 @@ $(BUILD)/tools/%.c: $(TOOLSRC)/%.c $(BUILD)/ulixlib.h
 
 $(BUILD)/tools/%.o: $(BUILD)/tools/%.c
 	$(CC) $(CFLAGS) -c -o $@ $<
-
-# swapper: stub, see swapper-stub.c
-$(BUILD)/tools/swapper.c: swapper-stub.c $(BUILD)/ulixlib.h
-	mkdir -p $(BUILD)/tools
-	cp $< $@
 
 # init: the book defines umain(); crt0 calls main()
 $(BUILD)/init.c: $(BOOK) $(BUILD)/ulixlib.h

@@ -147,7 +147,7 @@ static void disk_test (void) {
   CHECK (blk_read (blk_capacity (), a, 1) == -1, "read beyond the end of the disk is rejected");
 
   for (int i = 0; i < 1024; i++) a[i] = (u8)(i * 7 + 3);
-  CHECK (blk_write (2800, a, 2) == 0 && blk_read (2800, b, 2) == 0, "write 2 sectors and read them back");
+  CHECK (blk_write (8190, a, 2) == 0 && blk_read (8190, b, 2) == 0, "write 2 sectors and read them back");
   int same = 1;
   for (int i = 0; i < 1024; i++) if (a[i] != b[i]) same = 0;
   CHECK (same, "read-back data identical (disk is run with -snapshot, image file stays untouched)");
@@ -155,7 +155,7 @@ static void disk_test (void) {
   CHECK (minix_mount () == 0, "Minix file system mounted");
   int n = 0;
   minix_readdir (1, count_cb, &n);
-  CHECK (n == 27, "root directory has 27 entries (16 from x86 Ulix + 11 AArch64 files)");
+  CHECK (n == 28, "root directory has 28 entries (16 from x86 Ulix + 12 AArch64 files)");
   n = 0;
   minix_readdir (minix_lookup ("/bin"), count_cb, &n);
   CHECK (n == 63, "/bin has 63 entries");
@@ -198,6 +198,8 @@ static void console_main (void) {
 #endif
   char *argv[] = { CONSOLE_PROGRAM, 0 };
   arch_start_user (CONSOLE_PROGRAM, 1, argv);
+  extern void arch_next_pid_is_2 (void);
+  arch_next_pid_is_2 ();                           // on the x86 the first fork of the first process (login's swapper) gets PID 2
   for (;;) __asm__ volatile ("wfi");
 }
 #endif

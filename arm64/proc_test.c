@@ -122,6 +122,18 @@ int proc_test (void) {
   CHECK (count_in (out, "user FAIL") == 0 && count_in (out, "user ok:") == 14, "all 14 thread checks passed");
   CHECK (live_threads () == 0, "all threads are gone, also the one that was spinning");
 
+  // swapping: page_out / page_in, access by the kernel, fork, page replacement
+  char *swap_argv[] = { "swaptest64", 0 };
+  capture_start ();
+  pid = run ("/swaptest64", 1, swap_argv);
+  capture_stop (&out);
+  CHECK (pid > 0 && thread_table[pid].exitcode == 0, "/swaptest64 finished with exit status 0 (no failed checks)");
+  CHECK (count_in (out, "user FAIL") == 0 && count_in (out, "user ok:") == 14, "all 14 swap checks passed (one of them is the line that write () printed from a paged-out page)");
+  int swap_used = 0;
+  for (int i = 0; i < MAX_SWAP_FRAMES; i++) if (paging[i].used) swap_used++;
+  CHECK (swap_used == 0, "the swap file entries of the finished processes are released");
+  CHECK (live_threads () == 0, "no process is left");
+
   // signals: handler with exact register restore, SIG_IGN, default action, SIGSTOP/SIGCONT/SIGKILL
   char *sig_argv[] = { "sigtest64", 0 };
   capture_start ();

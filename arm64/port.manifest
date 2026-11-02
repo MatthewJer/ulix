@@ -86,6 +86,11 @@ global next_kl_semaphore
 global kernel_locks
 global system_ticks
 global paging_lock
+function write_swap_page
+function read_swap_page
+global swap_fd
+global paging
+global counter_table
 global swapper_lock
 global waitpid_queue
 global address_spaces

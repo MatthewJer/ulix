@@ -79,7 +79,7 @@ int bookfs_test (void) {
          "mx_stat: regular file, 316 bytes");
   CHECK (mx_stat (DEV, "/bin", &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR, "mx_stat: /bin is a directory");
   CHECK (mx_stat (DEV, "/nonexistent", &st) == -1, "mx_stat: missing file");
-  CHECK (count_entries ("/") == 27, "mx_getdent: / has 27 used entries (16 from x86 Ulix + 11 AArch64 files)");
+  CHECK (count_entries ("/") == 28, "mx_getdent: / has 28 used entries (16 from x86 Ulix + 12 AArch64 files)");
   CHECK (count_entries ("/bin") == 63, "mx_getdent: /bin has 63 entries");
   CHECK (mx_file_exists (DEV, "/bin/vi") && mx_file_is_directory (DEV, "/bin") &&
          !mx_file_is_directory (DEV, "/bin/vi"), "mx_file_exists / mx_file_is_directory");
@@ -200,17 +200,17 @@ int bookfs_test (void) {
     static char blk_a[1024], blk_b[1024], on_disk[1024];
 #define same(x, y) (same_bytes ((x), (y), 1024))
     for (int i = 0; i < 1024; i++) blk_a[i] = (char)(i * 7 + 1);
-    readblock_hd (0, 2700, blk_b);                                // the original block, directly from the disk
+    readblock_hd (0, 4095, blk_b);                                // the original block, directly from the disk
     memcpy (on_disk, blk_b, 1024);
-    writeblock (DEV_HDA, 2700, blk_a);
-    readblock_hd (0, 2700, blk_b);
+    writeblock (DEV_HDA, 4095, blk_a);
+    readblock_hd (0, 4095, blk_b);
     CHECK (same (blk_b, on_disk), "buffer cache: writeblock does not touch the disk yet");
-    readblock (DEV_HDA, 2700, blk_b);
-    CHECK (same (blk_b, blk_a) && buffer_contains (DEV_HDA, 2700), "buffer cache: readblock returns the new data from the cache");
+    readblock (DEV_HDA, 4095, blk_b);
+    CHECK (same (blk_b, blk_a) && buffer_contains (DEV_HDA, 4095), "buffer cache: readblock returns the new data from the cache");
     buffer_sync (1);
-    readblock_hd (0, 2700, blk_b);
+    readblock_hd (0, 4095, blk_b);
     CHECK (same (blk_b, blk_a), "buffer_sync writes the dirty block to the disk");
-    writeblock (DEV_HDA, 2700, on_disk);                          // put the original block back
+    writeblock (DEV_HDA, 4095, on_disk);                          // put the original block back
   }
 
   buffer_sync (1);                                                // the disk image is checked from outside afterwards (make verify)

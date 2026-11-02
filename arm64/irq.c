@@ -15,6 +15,7 @@ extern void uart_rx_enable (void);
 extern void arch_clock_tick (void);
 extern int  arch_cow_fault (u64 va);
 extern void arch_kernel_fault_shell (void);
+extern int  arch_user_fault (u64 va);
 
 // ---- GICv2 on qemu "virt" ------------------------------------------------
 #define GICD_BASE   (KERNEL_VA + 0x08000000UL)
@@ -88,6 +89,12 @@ void exc_handler (struct frame *f, int kind) {
   // it writes into a user buffer during a system call. After the copy the instruction is simply repeated.
   if (kind == 0 && (ec == 0x24 || ec == 0x25) && (esr & (1 << 6)) && (esr & 0x3c) == 0x0c &&
       far < 0x80000000UL && book_scheduler_on && arch_cow_fault (far))
+    return;
+
+  // a page that was paged out (translation fault) or whose access flag was cleared for the page replacement
+  // counters (access flag fault); from user mode, or from the kernel while it uses a user pointer
+  if (kind == 0 && (ec == 0x20 || ec == 0x21 || ec == 0x24 || ec == 0x25) && far < 0x80000000UL && book_scheduler_on &&
+      (((esr & 0x3c) == 0x04) || ((esr & 0x3c) == 0x08)) && arch_user_fault (far))
     return;
 
   if (kind == 0 && ec == 0x15) {            // SVC from AArch64

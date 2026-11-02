@@ -35,6 +35,8 @@ static inline long syscall3 (long nr, long a, long b, long c) {
 #define SYS_signal  48
 #define SYS_resign  66
 #define SYS_gettid  21
+#define SYS_page_out    508
+#define SYS_free_a_frame 510
 #define SYS_pthread_create 506
 #define SYS_pthread_exit   507
 #define SYS_mutex_init     517
@@ -78,6 +80,9 @@ static inline int  mutex_lock (int *m)                      { return syscall3 (S
 static inline int  mutex_unlock (int *m)                    { return syscall3 (SYS_mutex_unlock, (long)m, 0, 0); }
 static inline int  mutex_trylock (int *m)                   { return syscall3 (SYS_mutex_trylock, (long)m, 0, 0); }
 static inline int  mutex_destroy (int *m)                   { return syscall3 (SYS_mutex_destroy, (long)m, 0, 0); }
+
+static inline int  page_out (void *addr)                    { return syscall3 (SYS_page_out, (long)addr >> 12, 0, 0); }
+static inline void free_a_frame (void)                      { syscall3 (SYS_free_a_frame, 0, 0, 0); }
 
 int  strlen (const char *s);
 int  strcmp (const char *a, const char *b);

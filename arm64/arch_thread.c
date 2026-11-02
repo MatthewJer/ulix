@@ -44,7 +44,6 @@ void arch_clock_init (void);
 void arch_syscall_clrscr (context_t *r);
 void arch_syscall_idle (context_t *r);
 void arch_syscall_ignore (context_t *r);
-void arch_syscall_free_frames (context_t *r);
 extern long frames_in_use;
 void syscall_readchar (context_t *r);
 void syscall_setterm (context_t *r);
@@ -58,6 +57,12 @@ int book_scheduler_on = 0;                     // irq.c asks this before calling
 int arch_switch_count = 0;
 
 static u64 as_l0[MAX_ADDR_SPACES];             // physical address of the TTBR0 root table of each address space
+
+u64 arch_as_l0 (addr_space_id id) { return id >= 1 && id < MAX_ADDR_SPACES ? as_l0[id] : 0; }
+void arch_swap_release_as (addr_space_id as);
+void arch_swap_init (void);
+void arch_paging_timer_tasks (void);
+int page_in (int as, int pageno);
 
 // Make an address space the active one.  Every address space uses its own number as ASID and its user
 // pages are non-global, so the TLB is not flushed on a switch.  A CPU without 16-bit ASIDs falls back to
@@ -103,6 +108,7 @@ void arch_resign (void) {
 }
 
 void book_timer_tick (void) {                  // called by the timer interrupt, interrupts are masked
+  arch_paging_timer_tasks ();                  // page replacement counters, release of the swapper
   scheduler (0, SCHED_SRC_TIMER);
 }
 
@@ -160,6 +166,7 @@ void arch_threads_init (void) {
   current_mounts = 1;                          // the book mounts three disks; there is one: / (its /tmp and /mnt are plain directories)
   arch_buffer_init ();
   scheduler_is_active = true;
+  arch_swap_init ();                           // the book opens /tmp/swap when the system starts
   book_scheduler_on = 1;
 }
 
@@ -251,7 +258,7 @@ void destroy_address_space (addr_space_id id) {
     return;
   }
   if (current_as == id) arch_activate_as (1);        // leave it first: TTBR0 = empty table
-  if (as_l0[id]) { asid_flush (id); free_user_space (as_l0[id]); }
+  if (as_l0[id]) { arch_swap_release_as (id); asid_flush (id); free_user_space (as_l0[id]); }
   as_l0[id] = 0;
   address_spaces[id].status = AS_FREE;
 }
@@ -263,8 +270,12 @@ static int clone_level (u64 old_pa, u64 new_l0, int lvl, u64 va_prefix) {
   u64 *t = KVA (old_pa);
   for (int i = 0; i < 512; i++) {
     u64 e = t[i];
-    if (!(e & PTE_VALID)) continue;
     u64 va = va_prefix | ((u64)i << (39 - 9 * lvl));
+    if (lvl == 3 && !(e & PTE_VALID) && (e & PTE_SWAPPED)) {      // paged out: read it back first, the child needs it, too
+      if (page_in (current_as, va >> 12) != 0) return -1;
+      e = t[i];
+    }
+    if (!(e & PTE_VALID)) continue;
     if (lvl < 3) {
       if (clone_level (e & PTE_ADDR, new_l0, lvl + 1, va) < 0) return -1;
     } else {
@@ -492,6 +503,7 @@ int u_execv (char *filename, char *const argv[], memaddress *newstack) {
   as_l0[current_as] = nl0;
   address_spaces[current_as].memstart = 0x400000;
   address_spaces[current_as].memend   = image_end;      // the program break starts behind the image
+  arch_swap_release_as (current_as);                     // the old program's pages in the swap file
   asid_flush (current_as);                               // entries of the old program must not survive
   arch_activate_as (current_as);
   free_user_space (old);
@@ -624,6 +636,10 @@ void arch_syscall_mutex_destroy (context_t *r) {
 }
 
 
+// The real /bin/swapper only runs as process 2 (on the x86 the first process is PID 1 and its first fork gives 2). Here
+// /init is started as one of the first processes, so the next free PID is set to 2 once it runs.
+void arch_next_pid_is_2 (void) { next_pid = 2; }
+
 // ---- system calls: the book's dispatcher, called from the exception handler ----
 void book_syscall (void *frame) {
   syscall_handler ((context_t *)frame);
@@ -699,7 +715,9 @@ static void arch_syscalls_init (void) {
   install_syscall_handler (__NR_set_xy,    arch_syscall_ignore);
   install_syscall_handler (__NR_read_screen,  arch_syscall_ignore);
   install_syscall_handler (__NR_write_screen, arch_syscall_ignore);
-  install_syscall_handler (__NR_get_free_frames, arch_syscall_free_frames);
+  install_syscall_handler (__NR_page_out,        syscall_page_out);
+  install_syscall_handler (__NR_get_free_frames, syscall_get_free_frames);
+  install_syscall_handler (__NR_free_a_frame,    syscall_free_a_frame);
   install_syscall_handler (ARCH_NR_SIGRETURN, syscall_sigreturn);
 }
 
@@ -770,7 +788,6 @@ void *u_sbrk (int incr) {
 // ---- system calls that exist for the VGA screen / the x86 frame table ----
 void arch_syscall_clrscr (context_t *r)  { printf ("\033[2J\033[H"); }       // ANSI: clear the terminal
 void arch_syscall_ignore (context_t *r)  { r->eax = 0; }
-void arch_syscall_free_frames (context_t *r) { r->eax = 32768 - frames_in_use; }   // 128 MByte of RAM
 
 // the idle system call: wait for the next interrupt (x86: sti; hlt; cli)
 void arch_syscall_idle (context_t *r) {

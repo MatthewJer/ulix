@@ -81,7 +81,7 @@ try:
     run('rm f1', r'unlink returns 0', 'rm f1', P)
     run('rm out', r'unlink returns 0', 'rm out', P)
     run('rmdir d', r'rmdir returns 0', 'rmdir d', P)
-    run('ls', r'\./\s+\d+ \.\./\s*\r?\n', 'only . and .. are left', P)
+    run('ls', r'\./\s+\d+ \.\./\s+\d+ swap\s*\r?\n', 'only . and .. and the swap file /tmp/swap are left', P)
     send('cd\\r'); expect(PROMPT, 'cd goes home')
     send('ps\\r'); seen = expect(PROMPT, 'ps ran')
     for what in [b'login', b'/bin/sh', b'swapper', b'tty9', b'idle']:

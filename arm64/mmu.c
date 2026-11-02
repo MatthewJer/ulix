@@ -5,6 +5,7 @@
 
 extern u64 kernel_l0[512];
 extern int arch_cow_fault (u64 va);
+extern int arch_user_fault (u64 va);
 extern char __kernel_end[];
 
 #define RAM_START   0x40000000UL
@@ -88,6 +89,9 @@ static u64 *walk (u64 *l0, u64 va, int create) {
   return &table[IDX (va, 3)];
 }
 
+// the level-3 entry of a user address (valid or not), 0 if the tables do not exist
+u64 *pte_of (u64 l0_pa, u64 va) { return walk (KVA (l0_pa), va & ~(PAGE_SIZE - 1), 0); }
+
 int map_page_in (u64 l0_pa, u64 va, u64 pa, u64 flags) {
   u64 *e = walk (KVA (l0_pa), va, 1);
   if (!e || (*e & PTE_VALID)) return -1;
@@ -122,11 +126,13 @@ u64 virt_to_phys (u64 va) {
 // linear map and never dereferences user pointers itself.
 u64 user_to_phys (u64 va, int write) {
   if (va < USER_MIN || va >= USER_MAX) return 0;
-  u64 par;
-  if (write) __asm__ volatile ("at s1e1w, %1; isb; mrs %0, par_el1" : "=r" (par) : "r" (va));
-  else       __asm__ volatile ("at s1e1r, %1; isb; mrs %0, par_el1" : "=r" (par) : "r" (va));
-  if ((par & 1) && write && arch_cow_fault (va)) {         // a shared page: copy it, then try again
-    __asm__ volatile ("at s1e1w, %1; isb; mrs %0, par_el1" : "=r" (par) : "r" (va));
+  u64 par = 1;
+  for (int tries = 0; tries < 4 && (par & 1); tries++) {
+    if (write) __asm__ volatile ("at s1e1w, %1; isb; mrs %0, par_el1" : "=r" (par) : "r" (va));
+    else       __asm__ volatile ("at s1e1r, %1; isb; mrs %0, par_el1" : "=r" (par) : "r" (va));
+    if (!(par & 1)) break;
+    // not translated: a shared page (copy it), a page that was paged out (read it back) or a cleared access flag
+    if (!((write && arch_cow_fault (va)) || arch_user_fault (va))) break;
   }
   if (par & 1) return 0;
   return (par & PTE_ADDR) | (va & 0xfff);
