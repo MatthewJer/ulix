@@ -61,6 +61,8 @@ try:
     expect(r'ulix login: esser', 'init started login, which logs in "esser" automatically')
     expect(PROMPT, 'shell prompt (/bin/sh on the AArch64 userland)')
 
+    send('thread 1\\r'); expect(r'PROCESS EXIT, counter = 0', 'the book\'s thread program (3 threads, mutex) ends with counter = 0', timeout=150)
+    expect(PROMPT, 'prompt is back after "thread 1"')
     run('ls /', r'bin/.*hello\.c', 'ls /')
     run('cat /hello.c', r'Hello World', 'cat /hello.c')
     send('cd /tmp\\r'); expect(r'esser@ulix\[\d+\]:/tmp\$ ', 'cd /tmp changes the prompt')

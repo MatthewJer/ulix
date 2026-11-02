@@ -6,11 +6,10 @@ is still missing compared with the x86 build, most important first. Background a
 
 ## Missing functionality
 
-- [ ] **Pthreads** (13 functions: `u_pthread_create`, `syscall_pthread_*`, mutex calls for user threads).
-      The programs `thread` and `mutex` in `lib-build/tools` do not run. Needs a design for several threads per
-      address space: shared TTBR0 table, own user and kernel stack per thread, reference count on the address
-      space (also for `exit` and `exec`), `top_of_thread_kstack` handling. Test: a user program with 3 threads
-      and a mutex, like `thread_test.c` but in user mode.
+- [x] **Pthreads**: `pthread_create`, `pthread_exit` and the `pthread_mutex_*` calls work like in the book (threads
+      share the address space, the refcount keeps it alive until the last thread has gone; no `pthread_join`).
+      Tests: `thtest64` (kernel tests) and the book's `thread 1` in the shell test. The user programs are now
+      built with `-O0` like on the x86 (with `-O1`, `thread` never leaves its wait loop on plain globals).
 - [ ] **Buffer cache of the book** (`buffer_read`, `buffer_write`, `buffer_sync`, the flush logic). Today
       `writeblock` writes through (`glue.c`). Needs: periodic flush (timer task or thread), `sync` at exit/shutdown,
       and the tests that look at the disk image from outside (`make verify`) must call `sync` first.

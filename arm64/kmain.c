@@ -127,7 +127,7 @@ static void mmu_selftest (void) {
 }
 
 static u32 file_sum (const char *path, u32 *size_out) {
-  static u8 buf[32768] __attribute__ ((aligned (16)));
+  static u8 buf[65536] __attribute__ ((aligned (16)));
   u32 ino = minix_lookup (path), sum = 0;
   if (!ino) { *size_out = 0; return 0; }
   long n = minix_read (ino, 0, buf, sizeof buf);
@@ -155,7 +155,7 @@ static void disk_test (void) {
   CHECK (minix_mount () == 0, "Minix file system mounted");
   int n = 0;
   minix_readdir (1, count_cb, &n);
-  CHECK (n == 25, "root directory has 25 entries (16 from x86 Ulix + 9 AArch64 files)");
+  CHECK (n == 26, "root directory has 26 entries (16 from x86 Ulix + 10 AArch64 files)");
   n = 0;
   minix_readdir (minix_lookup ("/bin"), count_cb, &n);
   CHECK (n == 63, "/bin has 63 entries");

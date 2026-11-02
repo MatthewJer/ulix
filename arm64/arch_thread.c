@@ -37,6 +37,8 @@ extern void exit_exception (void);
 
 static struct kctx kctx[MAX_THREADS];
 static void arch_syscalls_init (void);
+void arch_resign (void);
+int arch_threads_reap (void);
 void syscall_sigreturn (context_t *r);
 void arch_clock_init (void);
 void arch_syscall_clrscr (context_t *r);
@@ -234,6 +236,10 @@ static int as_alloc (void) {
 // the book calls this from syscall_exit(); we may be running in the address space that is destroyed
 void destroy_address_space (addr_space_id id) {
   if (id < 2 || address_spaces[id].status == AS_FREE) return;
+  if (--address_spaces[id].refcount > 0) {           // other threads still use it (as in the book)
+    address_spaces[id].pid = -1;                     // the owner is gone: arch_threads_reap must not destroy it
+    return;
+  }
   if (current_as == id) arch_activate_as (1);        // leave it first: TTBR0 = empty table
   if (as_l0[id]) { asid_flush (id); free_user_space (as_l0[id]); }
   as_l0[id] = 0;
@@ -335,9 +341,10 @@ __asm__ (
 
 // kernel stack for a user process with a prepared exception frame: the first switch to the
 // thread "returns" through exit_exception (vectors.S) into user mode
-static void kstack_for_process (thread_id tid, const context_t *frame) {
-  kstack_as[tid] = thread_table[tid].addr_space;
-  address_spaces[kstack_as[tid]].pid = tid;        // marks who owns the address space (see arch_threads_reap)
+static void kstack_for_process (thread_id tid, const context_t *frame, int owns_as);
+static void kstack_for_process (thread_id tid, const context_t *frame, int owns_as) {
+  kstack_as[tid] = owns_as ? thread_table[tid].addr_space : 0;   // 0: an extra thread, the address space belongs to its process
+  if (owns_as) address_spaces[kstack_as[tid]].pid = tid;        // marks who owns the address space (see arch_threads_reap)
   if (kstack_pa[tid]) {
     for (int k = 0; k < KSTACK_PAGES_ARCH; k++) free_frame (kstack_pa[tid] + k * PAGE);
   }
@@ -446,7 +453,7 @@ int u_fork (context_t *r) {
 
   context_t child = *r;                   // the child continues exactly where the parent is ...
   child.eax = 0;                         // ... but fork() returns 0 there
-  kstack_for_process (new_tid, &child);
+  kstack_for_process (new_tid, &child, 1);
   add_to_ready_queue (new_tid);           // state becomes READY
   return new_tid;                         // in the parent, fork() returns the child's PID
 }
@@ -504,12 +511,108 @@ int arch_start_user (const char *path, int argc, char **argv) {
   f.elr = entry;
   f.spsr = 0;                             // EL0t, interrupts enabled
   f.sp_el0 = sp;
-  kstack_for_process (tid, &f);
+  kstack_for_process (tid, &f, 1);
   u64 flags = irq_save ();
   add_to_ready_queue (tid);
   irq_restore (flags);
   return tid;
 }
+
+
+// =====================================================================================
+// POSIX threads: several threads in one address space
+// A thread is a TCB with its own kernel stack and user stack that shares the address space (same
+// TTBR0 table and ASID, address_spaces[].refcount counts the threads) and the file table of the
+// process (its 'pid' is the TID of the main thread; for the main thread pid == tid).  The user stack
+// is taken from the heap (u_sbrk), like in the book.  Everything else follows the book, too: the address
+// space lives until its last thread has gone (exit() of the main thread does not stop the others).
+// =====================================================================================
+#define THREAD_STACK_PAGES 4
+
+int arch_pthread_create (u64 start) {
+  arch_threads_reap ();
+  TCB *to = &thread_table[current_task];
+  addr_space_id as = current_as;
+  void *ustack = u_sbrk (THREAD_STACK_PAGES * PAGE);
+  if (ustack == (void *)-1) return -1;
+  thread_id nt = register_new_tcb (as);
+  if (nt == -1) return -1;
+  TCB *tn = &thread_table[nt];
+  *tn = *to;                                   // like the book: copy the TCB, then fix it up
+  tn->used = true;
+  tn->state = TSTATE_FORK;
+  tn->tid = nt;
+  tn->addr_space = as;
+  tn->pid = to->pid;                           // same process
+  tn->ppid = to->ppid;
+  tn->sig_pending = 0;
+  context_t f;
+  memset (&f, 0, sizeof f);
+  f.elr = start;
+  f.spsr = 0;                                  // EL0t
+  f.sp_el0 = ((u64)ustack + THREAD_STACK_PAGES * PAGE) & ~15UL;
+  kstack_for_process (nt, &f, 0);
+  address_spaces[as].refcount++;
+  add_to_ready_queue (nt);
+  return nt;
+}
+
+void arch_syscall_pthread_create (context_t *r) { r->eax = arch_pthread_create (r->ebx); }
+
+// as in the book: the last thread of a process ends it like exit(), any other one just disappears
+void arch_syscall_pthread_exit (context_t *r) {
+  if (address_spaces[current_as].refcount == 1) {
+    r->ebx = 0;
+    syscall_exit (r);
+    return;
+  }
+  TCB *t = &thread_table[current_task];
+  remove_from_ready_queue (current_task);
+  t->state = TSTATE_EXIT;
+  address_spaces[current_as].refcount--;
+  if (address_spaces[current_as].pid == current_task) address_spaces[current_as].pid = -1;   // see arch_threads_reap
+  t->used = false;                             // the kernel stack is freed by arch_threads_reap
+  scheduler (r, SCHED_SRC_RESIGN);
+}
+
+// ---- pthread mutexes: the user mutex is the index of a kernel lock (the book stores the pointer in an int) ----
+static lock mutex_of (pthread_mutex_t *m) {
+  int i = *m;
+  if (i < 1 || i >= MAX_LOCKS || !kernel_locks[i].used) return NULL;
+  return &kernel_locks[i];
+}
+
+void arch_syscall_mutex_init (context_t *r) {
+  lock l = get_new_lock ("pthread");
+  if (!l) { thread_table[current_task].error = EAGAIN; r->eax = (unsigned long)-1; return; }
+  *(pthread_mutex_t *)r->ebx = (pthread_mutex_t)(l - kernel_locks);
+  r->eax = 0;
+}
+void arch_syscall_mutex_lock (context_t *r) {
+  lock l = mutex_of ((pthread_mutex_t *)r->ebx);
+  if (!l) { thread_table[current_task].error = EINVAL; r->eax = (unsigned long)-1; return; }
+  mutex_lock (l);
+  r->eax = 0;
+}
+void arch_syscall_mutex_trylock (context_t *r) {
+  lock l = mutex_of ((pthread_mutex_t *)r->ebx);
+  if (!l) { thread_table[current_task].error = EINVAL; r->eax = (unsigned long)-1; return; }
+  if (mutex_try_lock (l)) r->eax = 0;
+  else { thread_table[current_task].error = EBUSY; r->eax = (unsigned long)-1; }
+}
+void arch_syscall_mutex_unlock (context_t *r) {
+  lock l = mutex_of ((pthread_mutex_t *)r->ebx);
+  if (!l) { thread_table[current_task].error = EINVAL; r->eax = (unsigned long)-1; return; }
+  mutex_unlock (l);
+  r->eax = 0;
+}
+void arch_syscall_mutex_destroy (context_t *r) {
+  lock l = mutex_of ((pthread_mutex_t *)r->ebx);
+  if (!l) { thread_table[current_task].error = EINVAL; r->eax = (unsigned long)-1; return; }
+  l->used = false;
+  r->eax = 0;
+}
+
 
 // ---- system calls: the book's dispatcher, called from the exception handler ----
 void book_syscall (void *frame) {
@@ -571,6 +674,13 @@ static void arch_syscalls_init (void) {
   install_syscall_handler (__NR_chown,     syscall_chown);
   install_syscall_handler (__NR_chmod,     syscall_chmod);
   install_syscall_handler (__NR_brk,       syscall_sbrk);
+  install_syscall_handler (__NR_pthread_create,        arch_syscall_pthread_create);
+  install_syscall_handler (__NR_pthread_exit,          arch_syscall_pthread_exit);
+  install_syscall_handler (__NR_pthread_mutex_init,    arch_syscall_mutex_init);
+  install_syscall_handler (__NR_pthread_mutex_lock,    arch_syscall_mutex_lock);
+  install_syscall_handler (__NR_pthread_mutex_trylock, arch_syscall_mutex_trylock);
+  install_syscall_handler (__NR_pthread_mutex_unlock,  arch_syscall_mutex_unlock);
+  install_syscall_handler (__NR_pthread_mutex_destroy, arch_syscall_mutex_destroy);
   // there is no VGA screen: these only exist so that programs written for it keep working
   install_syscall_handler (__NR_idle,      arch_syscall_idle);
   install_syscall_handler (__NR_clrscr,    arch_syscall_clrscr);

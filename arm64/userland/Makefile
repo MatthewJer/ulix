@@ -22,7 +22,8 @@ TOOLS    = $(filter-out $(SKIP),$(patsubst $(TOOLSRC)/%.c,%,$(wildcard $(TOOLSRC
 
 # GCC 4.4 accepted a lot that current compilers reject (return without value, missing types);
 # these stay warnings. -fgnu89-inline: "inline" functions of the library also get an out-of-line copy.
-CFLAGS = -O1 -ffreestanding -nostdlib -fno-builtin -fno-stack-protector -fno-pic -mgeneral-regs-only \
+# -O0 like the x86 build (lib-build/Makefile): programs such as thread.c wait in loops on plain global variables
+CFLAGS = -O0 -ffreestanding -nostdlib -fno-builtin -fno-stack-protector -fno-pic -mgeneral-regs-only \
          -fgnu89-inline -std=gnu99 -w \
          -Wno-error=return-mismatch -Wno-error=implicit-int -Wno-error=implicit-function-declaration \
          -Wno-error=int-conversion -Wno-error=incompatible-pointer-types

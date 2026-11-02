@@ -34,6 +34,14 @@ static inline long syscall3 (long nr, long a, long b, long c) {
 #define SYS_kill    37
 #define SYS_signal  48
 #define SYS_resign  66
+#define SYS_gettid  21
+#define SYS_pthread_create 506
+#define SYS_pthread_exit   507
+#define SYS_mutex_init     517
+#define SYS_mutex_lock     518
+#define SYS_mutex_unlock   519
+#define SYS_mutex_destroy  520
+#define SYS_mutex_trylock  526
 
 static inline long write (int fd, const void *buf, u64 n)  { return syscall3 (SYS_write, fd, (long)buf, n); }
 static inline int  getpid (void)                           { return syscall3 (SYS_getpid, 0, 0, 0); }
@@ -61,6 +69,15 @@ static inline void *sbrk (int incr)                         { return (void *)(lo
 static inline int  get_free_frames (void)                   { return syscall3 (SYS_free_frames, 0, 0, 0); }
 static inline int  close (int fd)                          { return syscall3 (SYS_close, fd, 0, 0); }
 static inline int  lseek (int fd, int off, int whence)     { return syscall3 (SYS_lseek, fd, off, whence); }
+
+static inline int  gettid (void)                            { return syscall3 (SYS_gettid, 0, 0, 0); }
+static inline int  pthread_create (void (*f) (void))        { return syscall3 (SYS_pthread_create, (long)f, 0, 0); }
+static inline void pthread_exit (void)                      { syscall3 (SYS_pthread_exit, 0, 0, 0); for (;;) ; }
+static inline int  mutex_init (int *m)                      { return syscall3 (SYS_mutex_init, (long)m, 0, 0); }
+static inline int  mutex_lock (int *m)                      { return syscall3 (SYS_mutex_lock, (long)m, 0, 0); }
+static inline int  mutex_unlock (int *m)                    { return syscall3 (SYS_mutex_unlock, (long)m, 0, 0); }
+static inline int  mutex_trylock (int *m)                   { return syscall3 (SYS_mutex_trylock, (long)m, 0, 0); }
+static inline int  mutex_destroy (int *m)                   { return syscall3 (SYS_mutex_destroy, (long)m, 0, 0); }
 
 int  strlen (const char *s);
 int  strcmp (const char *a, const char *b);

@@ -113,6 +113,15 @@ int proc_test (void) {
   CHECK (count_in (out, "user FAIL") == 0 && count_in (out, "user ok:") == 10, "all 10 copy-on-write checks passed");
   CHECK (live_threads () == 0, "no process is left");
 
+  // threads: pthread_create/exit, mutexes, exit() while another thread runs
+  char *th_argv[] = { "thtest64", 0 };
+  capture_start ();
+  pid = run ("/thtest64", 1, th_argv);
+  capture_stop (&out);
+  CHECK (pid > 0 && thread_table[pid].exitcode == 0, "/thtest64 finished with exit status 0 (no failed checks)");
+  CHECK (count_in (out, "user FAIL") == 0 && count_in (out, "user ok:") == 14, "all 14 thread checks passed");
+  CHECK (live_threads () == 0, "all threads are gone, also the one that was spinning");
+
   // signals: handler with exact register restore, SIG_IGN, default action, SIGSTOP/SIGCONT/SIGKILL
   char *sig_argv[] = { "sigtest64", 0 };
   capture_start ();
