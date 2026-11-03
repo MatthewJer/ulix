@@ -94,6 +94,16 @@ to pin 8, GND to pin 6; never connect 5 V):
 6. Real time clock: there is none; start from a fixed date.
 7. Network (separate project, first in qemu `virt` with virtio-net): Ethernet, ARP, IPv4, ICMP, UDP, a small TCP, a telnet
    server that attaches a session to a virtual terminal; then the GENET driver for the board.
+**Decision (user, 2026-11-03): code from the BSD kernels and drivers (FreeBSD, NetBSD, OpenBSD) is adapted and used where it
+saves work.** Every adapted file keeps its original copyright and license notice and gets a line saying where it came from
+and what was changed; the notices go into the source file and into `arm64/README.md` (list of third-party code). Check the
+license header of each file first (BSD-2/3-Clause is fine; do not take files that are GPL-2.0-only).
+BSD files looked at on 2026-11-03 (all BSD-2/3-Clause, FreeBSD `main`; they are written for FreeBSD's newbus, `bus_space`,
+mbuf and mmc stack, so what is taken are the register definitions, the initialisation sequences and the transfer logic, not the
+glue around them):
+`sys/dev/sdhci/sdhci.c` (84 KB) and `sdhci.h` (18 KB), `sys/arm/broadcom/bcm2835/bcm2835_sdhci.c` (24 KB, the Pi's SDHCI glue) and
+`bcm2835_mbox.c` (15 KB, the firmware mailbox: clocks, power); `sys/arm64/broadcom/genet/if_genet.c` (46 KB) and `if_genetreg.h`
+(10 KB, the 4B's Ethernet); `sys/dev/uart/uart_dev_pl011.c` (the PL011); `sys/arm/arm/gic.c` (GIC, BSD-3-Clause).
 Sources to learn from: FreeBSD and NetBSD (BSD license: the drivers may be adapted), U-Boot (mostly GPL-2.0-or-later,
 compatible with this project's GPLv3), the Broadcom datasheets. Linux is GPL-2.0-only and must not be copied into this
 GPLv3 project (reading it for facts such as register layouts is fine).
