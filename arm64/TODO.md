@@ -31,6 +31,13 @@ The branch `arm64-port` is backed up in the PRIVATE repository https://github.co
   the highest MMIO slot down, because qemu fills the slots from the end. `make pcheck` has two jobs with two disks.
 - A process that waited for the disk ran only at the next timer tick (10 ms) after the interrupt woke it; with much
   swapping this made the memory test take minutes. The disk interrupt now calls the scheduler at once when the CPU is idle.
+- Third disk (`make disk3.img`, 1440 KByte, `a.txt` in it) stands in for the floppy `/dev/fd1` and is mounted on `/mnt/` like
+  on the x86; `testcp` runs (the shell test ends it with Ctrl-C and compares `b.txt` with `a.txt`).
+- Status line: the book's `_set_statusline` text is painted on line 25 of the console (`arch_vt.c`, at every new line).
+  The test scripts cut that escape sequence out of the output they check.
+- `xlogin`, `init2` and `fbomb` were run and work (`fbomb` is in the shell test); `readelf`, `inode`, `su`, `chown` too.
+- Two checks of `user/sigtest.c` assumed one CPU (after SIGKILL the first `waitpid` may still return the child, after SIGSTOP a
+  child on another CPU stops a moment later); with the faster disk wakeup they failed about every second run with 2 CPUs.
 - Open, same bugs as on the x86: the book's `mx_ftruncate` leaves zone pointers and indirect blocks in the inode, and
   `unlink` of a file with double indirect zones (more than 263 KByte) leaves zones marked wrongly. The swap file is
   therefore never cut back when it lives on the second disk.
@@ -45,12 +52,11 @@ The branch `arm64-port` is backed up in the PRIVATE repository https://github.co
   print, memwrite (with the screen window), fault-mem, fault-div0, mutex, dumblock (same "cannot remove process ...
   probably failure" line as the book's code), filecomm, keys, swapper ("don't start me manually"), clear, ps, sigtest
   (after the user_to_phys fix), thread, recurse, vi, login, sh.
-- Not run yet: `xlogin`, `init2`, `fbomb` (fork bomb), `testcp` (needs /mnt files).
 - Differences that remain (cannot or should not be changed):
   - `df` lists /dev/hdb and /dev/fd1 with the numbers of /dev/hda ("none" mount); check what the x86 shows without those
     disks (look at `df.c` and `syscall_diskfree`).
-  - There is no floppy (/dev/fd0, /dev/fd1) and no serial disk (the x86 mounts /mnt from fd1). Possible: a third virtio-blk
-    device as fd1 / `/mnt` (then `testcp` could run), and the serial disk over a second PL011 UART.
+  - `/dev/fd0` has no drive behind it (there is one stand-in for the second floppy only) and there is no serial disk. The serial
+    disk would need a second PL011 UART; check first whether anything uses it.
   - The swap file grows on demand instead of being 64 MByte in advance (disk is 4 MByte).
 
 ### What the ARM64 version can do that the x86 version cannot (for the README / book appendix)

@@ -31103,7 +31103,11 @@ The user mode stack grows as in the page fault handler of the book: if the progr
 
 The book's swap file, the table of swapped pages and the page replacement with access counters are used unchanged. What depends on the page table format is written for AArch64. A page is swapped out by clearing the valid bit and setting a software bit in the entry; all other bits stay in the entry, so that the page comes back with its old permissions. The page fault handler brings the page back when the process touches it.
 
-The counters need the ``accessed'' bit of the x86 page table entry. The processor of the \verb#virt# machine does not maintain the corresponding access flag, so the kernel does it: when the timer task counts the accesses, it clears the flag; the next access faults, and the handler sets the flag again. The swap file \path!/tmp/swap! grows with the pages written to it, because the disk is much smaller than the 64 MByte of the book. Pages that are shared after a [[fork]] are never swapped out.
+The counters need the ``accessed'' bit of the x86 page table entry. The processor of the \verb#virt# machine does not maintain the corresponding access flag, so the kernel does it: when the timer task counts the accesses, it clears the flag; the next access faults, and the handler sets the flag again. The swap file \path!/tmp/swap! grows with the pages written to it, because the disk is much smaller than the 64 MByte of the book; with a second disk (see below) it lives on that disk, as on the x86. Pages that are shared after a [[fork]] are never swapped out.
+
+\subsection{When the Memory Runs Out}
+
+A program that asks for more memory than there is must not stop the kernel. The frame allocator therefore swaps a page out when no frame is free, and the functions that need a frame ([[sbrk]], stack growth, [[fork]], [[exec]], the copy in copy-on-write, new page tables) report an error to the caller when even that does not help. A [[fork]] must not swap out pages of the process that it copies, because it needs them all; otherwise it would chase its own pages in a circle. The kernel stacks come from a small pool that is set aside at boot, since four contiguous frames are no longer available after a process has used up the memory. The test program \verb#memtest# asks for memory until the call fails, and the kernel test runs it twice: the second run must get as much as the first, which shows that everything was given back.
 
 \section{Processes and Threads}
 
@@ -31115,9 +31119,9 @@ The functions [[u_fork]] and [[u_execv]] are written for the new page tables; [[
 
 \textbf{Interrupt controller and timer.} The 8259 PIC is replaced by the generic interrupt controller, version 2 or 3; the device tree says which one is present. The controller has a distributor and, for each CPU, an interface (a register block in version 2, system registers and a \emph{redistributor} in version 3). The timer is the processor's own generic timer; it raises an interrupt 100 times per second on every CPU, as the 8253 does on the x86.
 
-\textbf{Console and terminals.} The keyboard and the VGA screen are replaced by a serial port (a PL011 UART) whose receive interrupt does what the keyboard handler of the book does. The virtual terminals keep their book data structure: a screen of 80 by 24 characters with a color attribute for each terminal, plus a cursor. [[kputch]], [[clrscr]], [[set_xy]], [[get_xy]], [[read_screen]] and [[write_screen]] work on this model, and the screen of the visible terminal is shown on the serial console with ANSI escape sequences (cursor positioning and colors), so that \verb#vi# works. Switching the terminal paints the new terminal's screen.
+\textbf{Console and terminals.} The keyboard and the VGA screen are replaced by a serial port (a PL011 UART) whose receive interrupt does what the keyboard handler of the book does. The virtual terminals keep their book data structure: a screen of 80 by 24 characters with a color attribute for each terminal, plus a cursor. [[kputch]], [[clrscr]], [[set_xy]], [[get_xy]], [[read_screen]] and [[write_screen]] work on this model, and the screen of the visible terminal is shown on the serial console with ANSI escape sequences (cursor positioning and colors), so that \verb#vi# works. Switching the terminal paints the new terminal's screen. The status line of the book is kept as a line of 80 characters and painted on the 25th line of the console, below the scroll region; it is painted when a new output line starts, so that its escape sequences never cut a line of output in two.
 
-\textbf{Disk.} The IDE driver is replaced by a driver for virtio-blk. A process that reads or writes a block takes the lock [[hd_lock]], starts the request and sleeps in [[harddisk_queue]]; the interrupt of the device wakes it up. This is the scheme of the IDE driver in Chapter~\ref{chap:ulix:disk-i-o}. The idle thread and the boot code poll instead, because the idle thread must never sleep. Before the device is used, the data cache lines that it reads are cleaned, and those that it writes are invalidated, so that the driver also works with devices that are not cache coherent.
+\textbf{Disks.} The IDE driver is replaced by a driver for virtio-blk. Up to three such devices are used, numbered from the one that the emulator gives the highest address: the first is \path!/dev/hda!, the second is \path!/dev/hdb! and is mounted on \path!/tmp! as in the book, and the third stands in for the second floppy disk \path!/dev/fd1!, which the book mounts on \path!/mnt!. Without the second and third disk, \path!/tmp! and \path!/mnt! are ordinary directories of the root file system. The directory \path!/dev! is mounted as well, so that the device files can be opened. A process that reads or writes a block takes the lock [[hd_lock]], starts the request and sleeps in [[harddisk_queue]]; the interrupt of the device wakes it up. This is the scheme of the IDE driver in Chapter~\ref{chap:ulix:disk-i-o}; if the CPU is idle when the interrupt arrives, the scheduler runs at once and the process continues without waiting for the next timer tick. The idle thread and the boot code poll instead, because the idle thread must never sleep. Before the device is used, the data cache lines that it reads are cleaned, and those that it writes are invalidated, so that the driver also works with devices that are not cache coherent.
 
 \textbf{Clock.} The CMOS clock is replaced by the PL031 real-time clock; the tick counting is that of the book.
 
@@ -31131,19 +31135,20 @@ The big kernel lock is simple and keeps the book's code unchanged, but it is not
 
 \section{Building and Testing}
 
-The build needs an AArch64 cross compiler and [[qemu-system-aarch64]]. The command [[make check]] in the directory \path!arm64/! builds the kernel, the user programs and a disk image from the x86 disk image plus the AArch64 programs, and runs the tests:
+The build needs an AArch64 cross compiler and [[qemu-system-aarch64]]. The command [[make check]] in the directory \path!arm64/! builds the kernel, the user programs and a disk image from the x86 disk image plus the AArch64 programs, and runs the tests one after the other; [[make pcheck]] runs all of them at the same time, each in a qemu of its own, which takes a few minutes instead of half an hour. The tests are:
 
 \begin{itemize}
 \item kernel tests that start the book's code and user programs (file system, threads, processes, signals, swapping, terminals, stack growth, \dots), at EL1 and EL2;
-\item the same tests on several virtual machines: interrupt controller version 2 and 3, one, two and four CPUs, and 64 MByte to 2 GByte of RAM;
-\item an independent check of the Minix file system on the disk image after the write tests (the checker is written in Python and shares no code with the kernel);
+\item the same tests on several virtual machines: interrupt controller version 2 and 3, one, two and four CPUs, 64 MByte to 3 GByte of RAM, and with one, two and three disks;
+\item an independent check of the Minix file systems on the disk images after the write tests (the checker is written in Python and shares no code with the kernel);
 \item a console test and a session that logs in, runs shell commands, switches terminals, edits a file with \verb#vi# and ends in the kernel shell.
 \end{itemize}
 
 \section{Differences from the x86 Version}
 
 \begin{itemize}
-\item There is no status line (the 25th screen line), and the console must understand ANSI escape sequences.
+\item The console must understand ANSI escape sequences (the status line is painted on the 25th line of the terminal).
+\item There is no floppy controller and no serial disk: a virtio disk stands in for the floppy \path!/dev/fd1!, and \path!/dev/fd0! has no drive behind it.
 \item The swap file is not 64 MByte large but grows on demand; the access bit is emulated.
 \item Integer division by zero does not cause an exception on AArch64; the kernel shell command \verb#div0# raises the exception by hand.
 \item The kernel is single-processor code that runs on several CPUs under one lock (see above).
