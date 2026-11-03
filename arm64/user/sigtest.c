@@ -68,6 +68,7 @@ int main (int argc, char **argv) {
   }
   while (file_size (log) < 5) yield ();
   kill (pid, SIGSTOP);
+  for (int i = 0; i < 40; i++) yield ();            // (a child on another CPU stops itself at its next entry into the kernel)
   int s1 = file_size (log);
   for (int i = 0; i < 40; i++) yield ();
   int s2 = file_size (log);
@@ -77,7 +78,10 @@ int main (int argc, char **argv) {
   int s3 = file_size (log);
   CHECK (s3 > s2, "after SIGCONT it goes on");
   kill (pid, SIGKILL);
-  CHECK (waitpid (pid, &status, 0) == -1, "SIGKILL removes the process at once (nothing left to wait for)");
+  // (a child that runs on another CPU when the signal arrives ends itself, so the first waitpid () may still return it)
+  int w = waitpid (pid, &status, 0);
+  if (w == pid) w = waitpid (pid, &status, 0);
+  CHECK (w == -1, "SIGKILL removes the process (nothing is left to wait for)");
   close (log);
 
   return fails;

@@ -27,13 +27,24 @@ sock.settimeout(0.2)
 log = b''
 fails = 0
 
+# The status line (line 25) is painted with its own escape sequence; it is for a real terminal and not part of the output
+# that is checked here.  (A sequence may arrive in two pieces: the first piece is kept until the rest is there.)
+STATUS = re.compile(rb'\x1b7\x1b\[25;1H\x1b\[0;97;4[14]m.{80}\x1b\[0m\x1b8', re.S)
+carry = b''
+def feed(data):
+    global log, carry
+    data = STATUS.sub(b'', carry + data); carry = b''
+    i = data.rfind(b'\x1b7')
+    if i >= 0 and len(data) - i < 110 and b'\x1b8' not in data[i:]: carry = data[i:]; data = data[:i]
+    log += data
+
 def pump(seconds=0.0):
     global log
     end = time.time() + seconds
     while True:
         try:
             data = sock.recv(4096)
-            if data: log += data
+            if data: feed(data)
             elif time.time() >= end: break
         except socket.timeout:
             if time.time() >= end: break

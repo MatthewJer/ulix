@@ -158,6 +158,10 @@ static void disk_test (void) {
 
   CHECK (minix_mount () == 0, "Minix file system mounted");
   extern int blk_disks;  extern u64 blk_capacity_of (int n);  extern int blk_read_n (int n, u64 sector, void *buf, u32 cnt);
+  if (blk_disks >= 3) {                                    // a third disk: stands in for the floppy /dev/fd1 (/mnt)
+    CHECK (blk_capacity_of (2) == 2880, "third disk (fd1) found: 2880 sectors (1440 KByte, like a floppy)");
+    CHECK (blk_read_n (2, 2, a, 2) == 0 && a[16] == 0x78 && a[17] == 0x24, "third disk: Minix v2 superblock read");
+  }
   if (blk_disks >= 2) {                                    // a second disk was given to qemu: /dev/hdb (see "make pcheck")
     CHECK (blk_capacity_of (1) == 65536, "second disk (hdb) found: 65536 sectors (32 MByte)");
     CHECK (blk_read_n (1, 2, a, 2) == 0 && a[16] == 0x78 && a[17] == 0x24, "second disk: Minix v2 superblock read");

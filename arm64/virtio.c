@@ -53,8 +53,9 @@ struct avail { unsigned short flags, idx, ring[QSIZE]; };
 struct used  { unsigned short flags, idx; struct { u32 id, len; } ring[QSIZE]; };
 
 // One structure per disk (virtio-blk device).  qemu puts the first -device in the LAST free MMIO slot, the second in the one
-// before it, so the disks are numbered from the highest address down: disk 0 is /dev/hda, disk 1 is /dev/hdb.
-#define MAX_DISKS 2
+// before it, so the disks are numbered from the highest address down: disk 0 is /dev/hda, disk 1 is /dev/hdb, disk 2 stands in for the
+// second floppy /dev/fd1 (mounted on /mnt).
+#define MAX_DISKS 3
 struct blk {
   volatile u8 *dev;                         // MMIO base of the block device
   volatile struct desc  *desc;

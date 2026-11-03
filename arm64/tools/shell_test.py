@@ -23,13 +23,24 @@ if not sock: qemu.kill(); sys.exit('cannot connect to qemu')
 sock.settimeout(0.2)
 log, fails = b'', 0
 
+# The status line (line 25) is painted with its own escape sequence; it is for a real terminal and not part of the output
+# that is checked here.  (A sequence may arrive in two pieces: the first piece is kept until the rest is there.)
+STATUS = re.compile(rb'\x1b7\x1b\[25;1H\x1b\[0;97;4[14]m.{80}\x1b\[0m\x1b8', re.S)
+carry = b''
+def feed(data):
+    global log, carry
+    data = STATUS.sub(b'', carry + data); carry = b''
+    i = data.rfind(b'\x1b7')
+    if i >= 0 and len(data) - i < 110 and b'\x1b8' not in data[i:]: carry = data[i:]; data = data[:i]
+    log += data
+
 def pump(seconds):
     global log
     end = time.time() + seconds
     while time.time() < end:
         try:
             data = sock.recv(4096)
-            if data: log += data
+            if data: feed(data)
         except socket.timeout: pass
 
 def expect(pattern, what=None, timeout=25.0):
@@ -73,6 +84,17 @@ try:
         run('ls /tmp', r'h2\.c.*swap|swap.*h2\.c', '/tmp (on hdb) holds the new file and the swap file')
         run('diff /hello.c /tmp/h2.c', r'', 'the copy on the second disk is identical', PROMPT)
         run('rm /tmp/h2.c', r'', 'rm on the second disk', PROMPT)
+    if os.environ.get('HAVE_DISK3'):                     # a third disk stands in for the floppy /dev/fd1, mounted on /mnt
+        run('df', r'/dev/fd1\s+1440 K .*/mnt/\r?\n', 'df: /dev/fd1 (1440 KByte) is mounted on /mnt/')
+        run('ls /mnt', r'a\.txt', 'ls /mnt shows a.txt')
+        run('cp /hello.c /mnt/h.c', r'', 'cp onto the floppy', PROMPT)
+        run('diff /hello.c /mnt/h.c', r'', 'the copy on the floppy is identical', PROMPT)
+        send('testcp\\r'); expect(r'copying /mnt/a\.txt to /mnt/b\.txt', 'the book\'s testcp program copies /mnt/a.txt to /mnt/b.txt')
+        pump(2); send('\\x03'); expect(PROMPT, 'Ctrl-C ends testcp (it copies forever)')
+        run('diff /mnt/a.txt /mnt/b.txt', r'', 'the copy made by testcp is identical to a.txt', PROMPT)
+        run('rm /mnt/h.c', r'', 'rm on the floppy', PROMPT)
+    run('fbomb', r'', 'fbomb starts 512 processes', PROMPT); pump(8)
+    run('ps', r'(?s)PID\s+PPID.*login', 'the system is alive after the fork bomb (ps lists the login processes)')
     run('readelf /bin/cat', r'e_entry:\s+400000\r?\n#pheaders: 3\r?\n', 'readelf reads the ELF64 header (entry 0x400000, 3 program headers)')
     run('inode 2', r'i_nlinks: 1\r?\n.*i_size:\s+\d+', 'inode: the book\'s debug system call 777 prints an inode')
     send('su\\r'); expect(r'Enter root password: ', 'su asks for the root password')

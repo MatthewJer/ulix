@@ -193,14 +193,18 @@ void arch_threads_init (void) {
   current_task = 1;
   next_pid = 3;                                // pids 1 (idle) and 2 (init) are protected by the book's kill()
   arch_clock_init ();                          // system_start_time from the real-time clock
-  // The book mounts "/" (hda), "/mnt/" (fd1, a floppy), "/tmp/" (hdb) and "/dev/" (the device files).  There is no floppy.
-  // Without a second disk /tmp is a plain directory of "/"; with one it is mounted from hdb, like on the x86 (the swap file
-  // /tmp/swap is then on that disk).
+  // The book mounts "/" (hda), "/mnt/" (fd1, a floppy), "/tmp/" (hdb) and "/dev/" (the device files).  Here a second and a
+  // third virtio disk stand in for hdb and fd1: without them /tmp and /mnt are plain directories of "/"; with them they are
+  // mounted like on the x86 (and the swap file /tmp/swap is on the second disk).
   {
     extern int blk_disks;
-    mount_table_entry tmp_entry = mount_table[2], dev_entry = mount_table[3];
-    if (blk_disks >= 2) { mount_table[1] = tmp_entry;  mount_table[2] = dev_entry;  current_mounts = 3; }
-    else                { mount_table[1] = dev_entry;  current_mounts = 2; }
+    mount_table_entry root_e = mount_table[0], mnt_e = mount_table[1], tmp_e = mount_table[2], dev_e = mount_table[3];
+    int n = 0;
+    mount_table[n++] = root_e;
+    if (blk_disks >= 3) mount_table[n++] = mnt_e;
+    if (blk_disks >= 2) mount_table[n++] = tmp_e;
+    mount_table[n++] = dev_e;
+    current_mounts = n;
   }
   arch_buffer_init ();
   scheduler_is_active = true;

@@ -51,6 +51,32 @@ static void host_attr (int attr) {                 // VGA attribute -> ANSI colo
   esc ("\033[0;"); num ((fg < 8 ? 30 : 90) + ansi[fg & 7]); putch (';'); num (40 + ansi[bg]); putch ('m');
 }
 
+// ---- the status line (line 25 of the x86 screen) ----
+// The book keeps a line of text at the bottom of the video memory (set_statusline, _set_statusline; statusline_red/blue
+// for the kernel shell).  Here it is a buffer of 80 characters that is painted on line 25 of the console, below the
+// scroll region of the 24 lines.  Changes only mark it dirty (the callers may be timer tasks or interrupt handlers);
+// it is painted when a new line starts on the visible terminal and when the screen is painted completely, so that the
+// escape sequences never split a line of output.
+static char sl_text[80];
+static int  sl_red = 0, sl_dirty = 1;
+
+static void host_status_draw (void) {
+  esc ("\0337\033[25;1H");                        // save the cursor, go to line 25
+  esc (sl_red ? "\033[0;97;41m" : "\033[0;97;44m");
+  for (int i = 0; i < 80; i++) putch (sl_text[i] >= ' ' ? sl_text[i] : ' ');
+  esc ("\033[0m\0338");                           // restore the cursor
+  sl_dirty = 0;
+}
+
+void _set_statusline (char *text, int offset) {
+  if (sl_text[0] == 0) memset (sl_text, ' ', sizeof sl_text);
+  for (int i = 0; text[i] && offset + i < 80; i++) sl_text[offset + i] = text[i];
+  sl_dirty = 1;
+}
+void set_statusline (char *text) { _set_statusline (text, 0); }
+void statusline_red (void)  { memset (sl_text, ' ', sizeof sl_text); sl_red = 1; sl_dirty = 1; }
+void statusline_blue (void) { memset (sl_text, ' ', sizeof sl_text); sl_red = 0; set_statusline (UNAME); }
+
 // paint the whole model of terminal t on the console
 static void host_repaint (int t) {
   word *mem = (word *)vt[t].mem;
@@ -73,6 +99,7 @@ static void host_repaint (int t) {
     }
     esc ("\033[0m\033[K");                         // the rest of the line is empty
   }
+  host_status_draw ();
   host_move (vt[t].x, vt[t].y);
   synced = 1;
 }
@@ -104,6 +131,7 @@ void kputch (byte c) {
   if (t == cur_vt) {                               // the visible terminal: the console shows it, too
     putch ((char)c);
     if (wrapped) putch ('\n');                     // (putch sends CR LF)
+    if ((c == '\n' || wrapped) && sl_dirty && synced) host_status_draw ();
   }
 }
 

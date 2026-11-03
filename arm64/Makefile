@@ -40,6 +40,12 @@ DISK2 ?= disk2.img
 $(DISK2): tools/minix_mkfs.py
 	python3 tools/minix_mkfs.py $@ 32768
 
+# the third disk (stands in for the floppy /dev/fd1, mounted on /mnt): 1440 KByte like a floppy, with a.txt for testcp
+DISK3 ?= disk3.img
+$(DISK3): tools/minix_mkfs.py tools/minix_add.py README.md
+	python3 tools/minix_mkfs.py $@ 1440
+	python3 tools/minix_add.py $@ /a.txt=README.md
+
 $(GENDIR)/disk_expected.h: $(DISK) tools/disk_expected.py tools/minix_check.py
 	mkdir -p $(GENDIR)
 	python3 tools/disk_expected.py $(DISK) /init /bin/vi /hello.c /test.txt > $@
@@ -179,8 +185,8 @@ check: ulix.bin ulix-console.bin ulix-shell.bin $(DISK)
 
 # The same tests as "check", all at once: one qemu per test, JOBS of them in parallel (make pcheck JOBS=8), logs in check-logs/
 JOBS ?= 6
-pcheck: ulix.bin ulix-console.bin ulix-shell.bin $(DISK) $(DISK2)
-	DISK=$(DISK) DISK2=$(DISK2) tools/parallel_check.sh $(JOBS)
+pcheck: ulix.bin ulix-console.bin ulix-shell.bin $(DISK) $(DISK2) $(DISK3)
+	DISK=$(DISK) DISK2=$(DISK2) DISK3=$(DISK3) tools/parallel_check.sh $(JOBS)
 
 # Interactive console test: types into the UART of a second kernel image and checks the answers
 console-test: ulix-console.bin $(DISK)
@@ -195,4 +201,4 @@ clean:
 	rm -rf gen
 	$(MAKE) -C userland clean
 	rm -rf check-logs
-	rm -f disk2.img verify-fs.log check-el1.log check-el2.log *.o ulix.elf ulix-console.elf ulix-shell.elf disk.img disk-after.img verify.log bad-arch.elf bad-wx.elf
+	rm -f disk2.img disk3.img verify-fs.log check-el1.log check-el2.log *.o ulix.elf ulix-console.elf ulix-shell.elf disk.img disk-after.img verify.log bad-arch.elf bad-wx.elf

@@ -60,9 +60,10 @@ void hd_interrupt (void) {
   if (t) deblock (t, &harddisk_queue);
 }
 
-// There is no floppy controller and no serial disk on this platform.
-void readblock_fd  (int device, int blockno, char *buffer) { }
-void writeblock_fd (int device, int blockno, char *buffer) { }
+// There is no floppy controller and no serial disk on this platform.  A third virtio disk stands in for the second floppy
+// /dev/fd1 (which the book mounts on /mnt); without one, and for fd0, nothing is read or written.
+void readblock_fd  (int device, int blockno, char *buffer) { if (device == 1 && blk_disks >= 3) hd_transfer (2, 0, blockno, buffer); }
+void writeblock_fd (int device, int blockno, char *buffer) { if (device == 1 && blk_disks >= 3) hd_transfer (2, 1, blockno, buffer); }
 void readblock_serial  (int secno, char *buf) { }
 void writeblock_serial (int secno, char *buf) { }
 
@@ -70,6 +71,7 @@ void writeblock_serial (int secno, char *buf) { }
 long dev_size (int dev) {
   if (dev == DEV_HDA) return (long)(blk_capacity_of (0) * 512);
   if (dev == DEV_HDB) return (long)(blk_capacity_of (1) * 512);
+  if (dev == DEV_FD1) return (long)(blk_capacity_of (2) * 512);
   return 0;
 }
 
@@ -78,8 +80,7 @@ long dev_size (int dev) {
 
 // Console output (kputch), the terminal functions (vt_clrscr, set_xy, ...) and terminal switching are in arch_vt.c.
 
-// ---- the x86 status line at the bottom of the VGA screen does not exist here ----
-void _set_statusline (char *text, int offset) { }
+// ---- the status line (arch_vt.c) ----
 
 // ---- diagnostics ----
 int debug_printf (const char *format, ...) { return 0; }                 // debugging output off
@@ -105,9 +106,6 @@ extern unsigned long alloc_frame (void);
 extern void free_frame (unsigned long pa);
 extern long frames_in_use;
 
-void statusline_red (void)   { }
-void statusline_blue (void)  { }
-void set_statusline (char *text) { }
 
 void arch_ksh_test (void);
 void ksh_command_test (void)  { arch_ksh_test (); }

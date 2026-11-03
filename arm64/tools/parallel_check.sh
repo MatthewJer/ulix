@@ -8,6 +8,8 @@ cd "$(dirname "$0")/.." || exit 1
 DISK=${DISK:-disk.img}
 DISK2=${DISK2:-disk2.img}
 D2="-drive file=$DISK2,format=raw,if=none,id=hd1 -device virtio-blk-device,drive=hd1"
+DISK3=${DISK3:-disk3.img}
+D3="-drive file=$DISK3,format=raw,if=none,id=hd2 -device virtio-blk-device,drive=hd2"
 L=check-logs
 QEMU=qemu-system-aarch64
 
@@ -20,6 +22,8 @@ JOBLIST=(
   "verify|write tests, then file system check of the disk copy|verify|virt||128"
   "two|two disks (hda and hdb on /tmp), 2 CPUs|kernel|virt|-smp 2 @D2@|128"
   "shell2|shell session with two disks|shell|virt,gic-version=3|-smp 2 @D2@|128"
+  "three|three disks (hda, hdb on /tmp, fd1 on /mnt), 2 CPUs|kernel|virt|-smp 2 @D2@ @D3@|128"
+  "shell3|shell session with three disks|shell|virt,gic-version=3|-smp 2 @D2@ @D3@|128"
   "ram512|RAM 512 MByte, 2 CPUs|kernel|virt|-smp 2|512"
   "ram64|RAM 64 MByte, 2 CPUs|kernel|virt|-smp 2|64"
   "el1|EL1, virtio legacy transport|kernel|virt||128"
@@ -36,30 +40,33 @@ JOBLIST=(
 # ---- one job: writes $L/NAME.log and $L/NAME.res ("ok" or "FAILED", then a one line summary) ----
 if [ "$1" = "--job" ]; then
   for j in "${JOBLIST[@]}"; do [ "${j%%|*}" = "$2" ] && IFS='|' read -r name desc kind machine extra mem <<< "$j"; done
-  extra=${extra//@D2@/$D2}
+  extra=${extra//@D2@/$D2}; extra=${extra//@D3@/$D3}
   log=$L/$name.log; res=$L/$name.res; rm -f "$res"
   case $kind in
     kernel)
       sum=$(QEMU_MEM=$mem tools/run_kernel_tests.sh ulix.bin $DISK "$log" -M $machine $extra | tr '\n' ' ' | sed 's/RESULT: //')
       grep -q "^RESULT: all checks passed" "$log" && st=ok || st=FAILED ;;
     shell|console)
-      HAVE_DISK2=$([[ $extra == *$DISK2* ]] && echo 1) QEMU_PORT=$([ $name = shell2 ] && echo 45126 || ([ $kind = shell ] && echo 45125 || echo 45123)) QEMU_M=$machine QEMU_MEM=$mem QEMU_EXTRA="$extra" python3 tools/${kind}_test.py ulix-$kind.bin $DISK > "$log" 2>&1
+      case $name in shell3) port=45127;; shell2) port=45126;; *) if [ $kind = shell ]; then port=45125; else port=45123; fi;; esac
+      HAVE_DISK2=$([[ $extra == *$DISK2* ]] && echo 1) HAVE_DISK3=$([[ $extra == *$DISK3* ]] && echo 1) QEMU_PORT=$port QEMU_M=$machine QEMU_MEM=$mem QEMU_EXTRA="$extra" python3 tools/${kind}_test.py ulix-$kind.bin $DISK > "$log" 2>&1
       rc=$?; sum=$(tail -1 "$log")
       [ $rc -eq 0 ] && grep -q "all passed" <<< "$sum" && st=ok || st=FAILED ;;
     verify)
       VD=$(mktemp -d)                                  # (the copies are written to: keep them off a slow SD card)
-      cp $DISK $VD/disk-after.img; cp $DISK2 $VD/disk2-after.img
+      cp $DISK $VD/disk-after.img; cp $DISK2 $VD/disk2-after.img; cp $DISK3 $VD/disk3-after.img
       $QEMU -M virt -cpu cortex-a72 -m 128 -display none -serial file:"$log" -monitor none -kernel ulix.bin \
         -drive file=$VD/disk-after.img,format=raw,if=none,id=hd0 -device virtio-blk-device,drive=hd0 \
-        -drive file=$VD/disk2-after.img,format=raw,if=none,id=hd1 -device virtio-blk-device,drive=hd1 2>/dev/null &
+        -drive file=$VD/disk2-after.img,format=raw,if=none,id=hd1 -device virtio-blk-device,drive=hd1 \
+        -drive file=$VD/disk3-after.img,format=raw,if=none,id=hd2 -device virtio-blk-device,drive=hd2 2>/dev/null &
       P=$!
       for i in $(seq 1 400); do sleep 1; grep -q "^RESULT" "$log" 2>/dev/null && break; done
       sleep 1; kill $P 2>/dev/null; wait $P 2>/dev/null
       python3 tools/minix_check.py $VD/disk-after.img --files > $L/verify-fs.log 2>&1
       python3 tools/minix_check.py $VD/disk2-after.img --files > $L/verify-fs2.log 2>&1
+      python3 tools/minix_check.py $VD/disk3-after.img --files > $L/verify-fs3.log 2>&1
       rm -rf $VD
-      sum="$(grep '^RESULT' "$log" | tr '\n' ' ')$(grep -E 'PROBLEMS|leaked' $L/verify-fs.log $L/verify-fs2.log | sed 's/^[^:]*://' | tr '\n' ' ')"
-      if grep -q "^RESULT: all checks passed" "$log" && ! grep -q 'PROBLEM:' $L/verify-fs.log $L/verify-fs2.log && grep -q 'leaked zones.*: 0,' $L/verify-fs.log && grep -q 'leaked zones.*: 0,' $L/verify-fs2.log; then st=ok; else st=FAILED; fi ;;
+      sum="$(grep '^RESULT' "$log" | tr '\n' ' ')$(grep -E 'PROBLEMS|leaked' $L/verify-fs.log $L/verify-fs2.log $L/verify-fs3.log | sed 's/^[^:]*://' | tr '\n' ' ')"
+      if grep -q "^RESULT: all checks passed" "$log" && ! grep -q 'PROBLEM:' $L/verify-fs.log $L/verify-fs2.log $L/verify-fs3.log && grep -q 'leaked zones.*: 0,' $L/verify-fs.log && grep -q 'leaked zones.*: 0,' $L/verify-fs2.log && grep -q 'leaked zones.*: 0,' $L/verify-fs3.log; then st=ok; else st=FAILED; fi ;;
   esac
   echo "$st $sum" > "$res"
   exit 0
