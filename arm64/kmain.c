@@ -157,6 +157,12 @@ static void disk_test (void) {
   CHECK (same, "read-back data identical (disk is run with -snapshot, image file stays untouched)");
 
   CHECK (minix_mount () == 0, "Minix file system mounted");
+  extern int blk_disks;  extern u64 blk_capacity_of (int n);  extern int blk_read_n (int n, u64 sector, void *buf, u32 cnt);
+  if (blk_disks >= 2) {                                    // a second disk was given to qemu: /dev/hdb (see "make pcheck")
+    CHECK (blk_capacity_of (1) == 65536, "second disk (hdb) found: 65536 sectors (32 MByte)");
+    CHECK (blk_read_n (1, 2, a, 2) == 0 && a[16] == 0x78 && a[17] == 0x24, "second disk: Minix v2 superblock read");
+    CHECK (blk_read_n (1, blk_capacity_of (1), a, 1) == -1, "second disk: read beyond its end is rejected");
+  }
   int n = 0;
   minix_readdir (1, count_cb, &n);
   CHECK (n == 31, "root directory has 31 entries (16 from x86 Ulix + 15 AArch64 files)");

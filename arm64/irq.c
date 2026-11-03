@@ -19,6 +19,7 @@ extern void arch_clock_tick (void);
 extern int  arch_cow_fault (u64 va);
 extern void smp_before_return (void *frame);
 extern int  blk_irq;
+extern int  blk_is_irq (int irq);
 extern void blk_irq_ack (void);
 extern void hd_interrupt (void);
 extern void arch_kernel_fault_shell (void);
@@ -64,16 +65,18 @@ static void exc_handler_locked (struct frame *f, int kind) {
   int from_user = (f->spsr & 0xf) == 0;     // M[3:0] == EL0t
 
   if (kind == 1) {                          // IRQ
+    int disk_woke_someone = 0;
     u32 iar = gic_ack ();
     u32 irq = GIC_INTID (iar);
     if (irq < 1020) gic_eoi (iar);          // acknowledge first: nested interrupts must be possible
                                             // (the kernel shell waits for keys inside the UART handler)
     if (irq == IRQ_TIMER) { if (smp_cpu () == 0) { ticks++; arch_clock_tick (); } timer_reload (); }
     else if (irq == IRQ_UART) { if (book_scheduler_on) uart_rx_irq (); }
-    else if (blk_irq && irq == (u32)blk_irq) { if (book_scheduler_on) hd_interrupt (); else blk_irq_ack (); }   // the disk
+    else if (blk_is_irq ((int)irq)) { if (book_scheduler_on) { hd_interrupt (); disk_woke_someone = 1; } else blk_irq_ack (); }   // the disk
     else if (irq < 16) ;                    // software interrupt from another CPU: entering the kernel was the point
     else if (irq < 1020) printf ("spurious IRQ %u\n", irq);
     if (irq == IRQ_TIMER && book_scheduler_on) book_timer_tick ();   // time slice over (10 ms)
+    else if (disk_woke_someone && book_scheduler_on && book_current_pid () == 1) book_timer_tick ();   // a process waited for the disk and the CPU is idle: run it now, not at the next tick
     if (from_user && book_scheduler_on) arch_signal_check (f);       // deliver pending signals
     return;
   }

@@ -7,7 +7,7 @@ usage: console_test.py KERNEL.elf DISK.img
 import os, re, shlex, socket, subprocess, sys, time
 
 kernel, disk = sys.argv[1:3]
-PORT = 45123
+PORT = int(os.environ.get('QEMU_PORT', 45123))
 # QEMU_M (machine), QEMU_MEM (MByte) and QEMU_EXTRA (further arguments, e.g. '-smp 4') select another configuration
 qemu = subprocess.Popen(['qemu-system-aarch64', '-M', os.environ.get('QEMU_M', 'virt'), '-cpu', 'cortex-a72', '-m', os.environ.get('QEMU_MEM', '128'), '-display', 'none',
                          '-monitor', 'none', '-kernel', kernel, '-snapshot',

@@ -35,6 +35,11 @@ disk.img: $(wildcard userland/build/bin/*.elf) ../bin-build/minixdata.img user/h
 
 # the user programs are rebuilt by their own Makefile whenever a source changed
 # size and checksum of files on the disk, computed by the independent Python parser
+# the second disk (/dev/hdb, mounted on /tmp like on the x86): an empty Minix file system of 32 MByte
+DISK2 ?= disk2.img
+$(DISK2): tools/minix_mkfs.py
+	python3 tools/minix_mkfs.py $@ 32768
+
 $(GENDIR)/disk_expected.h: $(DISK) tools/disk_expected.py tools/minix_check.py
 	mkdir -p $(GENDIR)
 	python3 tools/disk_expected.py $(DISK) /init /bin/vi /hello.c /test.txt > $@
@@ -174,8 +179,8 @@ check: ulix.bin ulix-console.bin ulix-shell.bin $(DISK)
 
 # The same tests as "check", all at once: one qemu per test, JOBS of them in parallel (make pcheck JOBS=8), logs in check-logs/
 JOBS ?= 6
-pcheck: ulix.bin ulix-console.bin ulix-shell.bin $(DISK)
-	DISK=$(DISK) tools/parallel_check.sh $(JOBS)
+pcheck: ulix.bin ulix-console.bin ulix-shell.bin $(DISK) $(DISK2)
+	DISK=$(DISK) DISK2=$(DISK2) tools/parallel_check.sh $(JOBS)
 
 # Interactive console test: types into the UART of a second kernel image and checks the answers
 console-test: ulix-console.bin $(DISK)
@@ -190,4 +195,4 @@ clean:
 	rm -rf gen
 	$(MAKE) -C userland clean
 	rm -rf check-logs
-	rm -f verify-fs.log check-el1.log check-el2.log *.o ulix.elf ulix-console.elf ulix-shell.elf disk.img disk-after.img verify.log bad-arch.elf bad-wx.elf
+	rm -f disk2.img verify-fs.log check-el1.log check-el2.log *.o ulix.elf ulix-console.elf ulix-shell.elf disk.img disk-after.img verify.log bad-arch.elf bad-wx.elf

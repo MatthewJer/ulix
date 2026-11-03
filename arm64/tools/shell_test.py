@@ -8,7 +8,7 @@ usage: shell_test.py KERNEL.elf DISK.img
 import os, re, shlex, socket, subprocess, sys, time
 
 kernel, disk = sys.argv[1:3]
-PORT = 45125
+PORT = int(os.environ.get('QEMU_PORT', 45125))
 # QEMU_M (machine), QEMU_MEM (MByte) and QEMU_EXTRA (further arguments, e.g. '-smp 4') select another configuration
 qemu = subprocess.Popen(['qemu-system-aarch64', '-M', os.environ.get('QEMU_M', 'virt'), '-cpu', 'cortex-a72', '-m', os.environ.get('QEMU_MEM', '128'), '-display', 'none',
                          '-monitor', 'none', '-kernel', kernel, '-snapshot',
@@ -66,6 +66,13 @@ try:
     expect(PROMPT, 'prompt is back after "thread 1"')
     run('ls /', r'bin/.*hello\.c', 'ls /')
     run('cat /hello.c', r'Hello World', 'cat /hello.c')
+    if os.environ.get('HAVE_DISK2'):                     # qemu was given a second disk (make pcheck, job "shell2")
+        run('df', r'/dev/hdb\s+32768 K .*/tmp/\r?\n', 'df: /dev/hdb (32 MByte) is mounted on /tmp/')
+        run('ls /dev', r'hda.*hdb.*kmem', 'ls /dev: the device files hda, hdb and kmem exist')
+        run('cp /hello.c /tmp/h2.c', r'', 'cp into /tmp (second disk)', PROMPT)
+        run('ls /tmp', r'h2\.c.*swap|swap.*h2\.c', '/tmp (on hdb) holds the new file and the swap file')
+        run('diff /hello.c /tmp/h2.c', r'', 'the copy on the second disk is identical', PROMPT)
+        run('rm /tmp/h2.c', r'', 'rm on the second disk', PROMPT)
     run('readelf /bin/cat', r'e_entry:\s+400000\r?\n#pheaders: 3\r?\n', 'readelf reads the ELF64 header (entry 0x400000, 3 program headers)')
     run('inode 2', r'i_nlinks: 1\r?\n.*i_size:\s+\d+', 'inode: the book\'s debug system call 777 prints an inode')
     send('su\\r'); expect(r'Enter root password: ', 'su asks for the root password')

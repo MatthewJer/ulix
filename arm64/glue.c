@@ -9,13 +9,15 @@ extern int  blk_write (unsigned long sector, void *buf, unsigned nsectors);
 extern unsigned long blk_capacity (void);
 
 // ---- block devices: the book's readblock() calls these two for /dev/hda, /dev/hdb ----
-// A block is 1 KByte = 2 sectors of 512 bytes (HD_SECSIZE).  The only disk is the virtio disk.
+// A block is 1 KByte = 2 sectors of 512 bytes (HD_SECSIZE).  The disks are the virtio disks (up to two).
 // Like the IDE driver of the book, a process that reads or writes a block takes hd_lock, starts the transfer and goes
 // to sleep in harddisk_queue; the interrupt of the device wakes it up (hd_interrupt).  Without a running scheduler,
 // for the idle thread (the tests, the boot code) and without a known interrupt the driver polls instead.
-extern int  blk_submit (int type, unsigned long sector, void *buf, unsigned nsectors);
-extern int  blk_done (void);
-extern int  blk_finish (void);
+extern int  blk_submit_n (int n, int type, unsigned long sector, void *buf, unsigned nsectors);
+extern int  blk_done_n (int n);
+extern int  blk_finish_n (int n);
+extern int  blk_disks;
+extern unsigned long blk_capacity_of (int n);
 extern void blk_irq_ack (void);
 extern int  blk_irq;
 extern unsigned long blk_capacity (void);
@@ -23,17 +25,17 @@ void arch_resign (void);
 
 int hd_sleeps = 0, hd_interrupts = 0;        // statistics, checked by the tests
 
-static int hd_transfer (int type, int blockno, char *buffer) {
+static int hd_transfer (int hd, int type, int blockno, char *buffer) {
   int sleep_ok = scheduler_is_active && blk_irq && current_task > 1;       // (thread 1 is the idle thread and must not sleep)
   if (hd_lock == NULL) hd_lock = get_new_lock ("hd");
   if (current_task > 1) mutex_lock (hd_lock);
     hd_direction = (type == 0) ? HD_OP_READ : HD_OP_WRITE;
-    int r = blk_submit (type, (unsigned long)blockno * 2, buffer, 2);
+    int r = blk_submit_n (hd, type, (unsigned long)blockno * 2, buffer, 2);
     if (r == 0) {
-      while (!blk_done ()) {
+      while (!blk_done_n (hd)) {
         if (sleep_ok) { hd_sleeps++; block (&harddisk_queue, TSTATE_WAITHD); arch_resign (); }
       }
-      r = blk_finish ();
+      r = blk_finish_n (hd);
     }
     hd_direction = HD_OP_NONE;
   if (current_task > 1) mutex_unlock (hd_lock);
@@ -41,13 +43,13 @@ static int hd_transfer (int type, int blockno, char *buffer) {
 }
 
 void readblock_hd (int hd, int blockno, char *buffer) {
-  if (hd != 0) return;
-  hd_transfer (0, blockno, buffer);
+  if (hd < 0 || hd >= blk_disks) return;
+  hd_transfer (hd, 0, blockno, buffer);
 }
 
 void writeblock_hd (int hd, int blockno, char *buffer) {
-  if (hd != 0) return;
-  hd_transfer (1, blockno, buffer);
+  if (hd < 0 || hd >= blk_disks) return;
+  hd_transfer (hd, 1, blockno, buffer);
 }
 
 // the interrupt handler of the disk: acknowledge, wake up the process that waits for the transfer
@@ -66,7 +68,8 @@ void writeblock_serial (int secno, char *buf) { }
 
 // Size of a device in bytes (the book's version asks the floppy and ATA drivers).
 long dev_size (int dev) {
-  if (dev == DEV_HDA) return (long)(blk_capacity () * 512);
+  if (dev == DEV_HDA) return (long)(blk_capacity_of (0) * 512);
+  if (dev == DEV_HDB) return (long)(blk_capacity_of (1) * 512);
   return 0;
 }
 

@@ -24,7 +24,15 @@ instances, logs in `check-logs/`) and the older sequential `make check` (about 3
   ELF64 version (`userland/readelf64.c`). `inode`, `su`/`chown` and `readelf` are in the shell test.
 - Run by hand and fine: `fork2`, `sbrk`, `paging`, `tp`, `bindump`, `su`, `chown`, `chgrp`. Not run: `testcp` (loops, needs
   /mnt), `xlogin`, `init2`, `fbomb`.
-- Open, same bug as on the x86: the book's `mx_ftruncate` leaves zone pointers and indirect blocks in the inode.
+- Second disk: `/dev/hdb` (a second virtio-blk device, 32 MByte, `make disk2.img` with `tools/minix_mkfs.py`) is mounted on
+  `/tmp/` like on the x86 and holds the swap file; without a second disk everything is as before. `/dev/` is now mounted
+  (it was a plain directory: `/dev/kmem`, `/dev/hda` and `/dev/hdb` could not be opened). The disks are numbered from
+  the highest MMIO slot down, because qemu fills the slots from the end. `make pcheck` has two jobs with two disks.
+- A process that waited for the disk ran only at the next timer tick (10 ms) after the interrupt woke it; with much
+  swapping this made the memory test take minutes. The disk interrupt now calls the scheduler at once when the CPU is idle.
+- Open, same bugs as on the x86: the book's `mx_ftruncate` leaves zone pointers and indirect blocks in the inode, and
+  `unlink` of a file with double indirect zones (more than 263 KByte) leaves zones marked wrongly. The swap file is
+  therefore never cut back when it lives on the second disk.
 - `make verify` and `pcheck` now fail when the file system check finds problems (before, they only printed them).
 
 ### Results of the "does it work on the ARM64 like on the x86?" check so far
@@ -40,9 +48,8 @@ instances, logs in `check-logs/`) and the older sequential `make check` (about 3
 - Differences that remain (cannot or should not be changed):
   - `df` lists /dev/hdb and /dev/fd1 with the numbers of /dev/hda ("none" mount); check what the x86 shows without those
     disks (look at `df.c` and `syscall_diskfree`).
-  - There is no floppy (/dev/fd0, /dev/fd1) and no serial disk, and only one hard disk (the x86 mounts up to three).
-    Possible to add: a second and third virtio-blk device as /dev/hdb and /dev/fd0 (the book's `readblock_fd` is the
-    x86 floppy controller), and the serial disk over a second PL011 UART. Worth checking what the x86 tests need.
+  - There is no floppy (/dev/fd0, /dev/fd1) and no serial disk (the x86 mounts /mnt from fd1). Possible: a third virtio-blk
+    device as fd1 / `/mnt` (then `testcp` could run), and the serial disk over a second PL011 UART.
   - The swap file grows on demand instead of being 64 MByte in advance (disk is 4 MByte).
 
 ### What the ARM64 version can do that the x86 version cannot (for the README / book appendix)

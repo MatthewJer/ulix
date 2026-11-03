@@ -51,12 +51,14 @@ static void flush_as (addr_space_id as) {
 // a block of the file can be swapped out (they are written over their old copy)
 static int swap_full = 0;
 static int swap_free_est = -1;               // free blocks of the disk (estimate, -1: unknown)
+static int swap_file_pages = 0;              // how many pages of the swap file are in the file (slots below it need no new disk blocks)
 static int swap_has_data = 0;                // the file has blocks (it is cut back to nothing when no page needs it)
 #define SWAP_RESERVE_BLOCKS 300              // KByte that stay free on the disk for files
 
 static int swap_free_blocks (void) {
   struct diskfree_query q;
-  q.device = DEV_HDA;
+  extern int blk_disks;
+  q.device = blk_disks >= 2 ? DEV_HDB : DEV_HDA;      // the disk that holds /tmp/swap
   mx_diskfree (&q);
   return q.free;
 }
@@ -86,6 +88,9 @@ static int swap_io_enter (void);
 static void swap_io_leave (int locked);
 extern int console_quiet;                    // kmain.c: the book's file system code prints a line for every block it frees
 void arch_swap_shrink (void) {
+  extern int blk_disks;
+  if (blk_disks >= 2) return;                  // the swap file is on the big second disk: it may keep its size (and the book's unlink does not
+                                               // free all zones of a file that big: it needs double indirect zones)
   if (swap_fd == -1 || !swap_has_data) return;
   for (int i = 0; i < MAX_SWAP_FRAMES; i++) if (paging[i].used) return;
   swap_has_data = 0;
@@ -100,6 +105,7 @@ void arch_swap_shrink (void) {
   console_quiet = 0;
   swap_full = 0;
   swap_free_est = -1;
+  swap_file_pages = 0;
   swap_io_leave (l);
 }
 
@@ -130,7 +136,9 @@ int page_out (int as, int pageno) {
   if (frame_refcount (pa) != 1) return -1;                 // shared with another process (copy-on-write)
   // The swap file grows with the pages written to it (the disk is small).  It must not take the whole disk: ordinary files
   // need room, too.  A page that already owns a block of the file is written over it and needs nothing.
-  if (swap_index (as, pageno) < 0) {
+  int next_slot = 0;                                       // the slot write_swap_page () takes for a new page: the first free one
+  while (next_slot < MAX_SWAP_FRAMES && paging[next_slot].used) next_slot++;
+  if (swap_index (as, pageno) < 0 && next_slot >= swap_file_pages) {      // (a slot inside the file is written over: no new blocks)
     // (counting the free blocks reads the whole block bitmap: measure once, then count along, measure again when it gets tight)
     if (swap_free_est < 0 || swap_free_est < SWAP_RESERVE_BLOCKS + 8) swap_free_est = swap_free_blocks ();
     if (swap_free_est < SWAP_RESERVE_BLOCKS + 8) { swap_full = 1; return -1; }
@@ -149,6 +157,7 @@ int page_out (int as, int pageno) {
   }
   swap_io_leave (l);
   swap_has_data = 1;
+  if (index + 1 > swap_file_pages) swap_file_pages = index + 1;
   *e = (*e & ~PTE_VALID) | PTE_SWAPPED;                    // mark page non-present and paged-out
   flush_page (as, va);
   free_frame (pa);                                         // the frame is free again

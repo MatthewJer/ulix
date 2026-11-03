@@ -193,7 +193,15 @@ void arch_threads_init (void) {
   current_task = 1;
   next_pid = 3;                                // pids 1 (idle) and 2 (init) are protected by the book's kill()
   arch_clock_init ();                          // system_start_time from the real-time clock
-  current_mounts = 1;                          // the book mounts three disks; there is one: / (its /tmp and /mnt are plain directories)
+  // The book mounts "/" (hda), "/mnt/" (fd1, a floppy), "/tmp/" (hdb) and "/dev/" (the device files).  There is no floppy.
+  // Without a second disk /tmp is a plain directory of "/"; with one it is mounted from hdb, like on the x86 (the swap file
+  // /tmp/swap is then on that disk).
+  {
+    extern int blk_disks;
+    mount_table_entry tmp_entry = mount_table[2], dev_entry = mount_table[3];
+    if (blk_disks >= 2) { mount_table[1] = tmp_entry;  mount_table[2] = dev_entry;  current_mounts = 3; }
+    else                { mount_table[1] = dev_entry;  current_mounts = 2; }
+  }
   arch_buffer_init ();
   scheduler_is_active = true;
   arch_swap_init ();                           // the book opens /tmp/swap when the system starts
