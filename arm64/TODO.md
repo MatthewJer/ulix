@@ -6,7 +6,7 @@ is still missing compared with the x86 build, most important first. Background a
 
 ## Where we stopped (2026-11-03) -- start here
 
-All tests are green: `make pcheck` (all 16 tests in parallel, about 3 minutes, `JOBS=n` sets the number of parallel qemu
+All tests are green: `make pcheck` (all 19 tests in parallel, about 3 minutes, `JOBS=n` sets the number of parallel qemu
 instances, logs in `check-logs/`) and the older sequential `make check` (about 30 minutes).
 The branch `arm64-port` is backed up in the PRIVATE repository https://github.com/MatthewJer/ulix-arm64 (remote `backup`;
 `origin` is the original, `hgesser/ulix`: never push there).
@@ -66,17 +66,45 @@ More than one CPU (1 to 8, with a big kernel lock), device tree and GICv2/GICv3,
 not hang the kernel when it is full, division by zero and out-of-memory handled without stopping the kernel. Still to
 verify and list properly tomorrow.
 
-### Then (in this order)
+### Still missing compared with the x86 (decided: do these later, they are the biggest items)
 
-1. Fix the hang, run everything, commit (two commits as before: code, documentation).
-2. Back up in the cloud: the user wants a PRIVATE copy. A GitHub fork of a public repository cannot be private, so create a
-   new private repository `MatthewJer/ulix-arm64` (`gh` is logged in as `MatthewJer`), add it as remote `backup`, push the
-   branch `arm64-port`. `origin` is the original (`hgesser/ulix`): never push there.
-3. Replace this file: when everything above is done, delete `TODO.md` and put the short list of remaining limitations
+- **Serial disk** (`readblock_serial` / `writeblock_serial` are empty): needs a second PL011 UART, the book's protocol on the
+  other side (read it in the book first, then a small program on the host that serves the disk) and a test. Check first
+  whether anything uses it.
+- **`/dev/fd0`** has no drive behind it: a fourth virtio disk would do (small).
+- Not checkable here: the x86 build with `gcc-4.4` (the compiler is not available on this machine).
+- Bugs of the book that are on the x86 as well and were not changed: `mx_ftruncate` and `unlink` of files with double indirect
+  zones (see "Done on 2026-11-03").
+
+### Next: Raspberry Pi 4B (hardware ordered 2026-11-03: Pi 4B 1 GB, USB-C power supply, Waveshare CP2102 USB-C UART module,
+### 8 GB microSD with card reader, Dupont cables)
+
+Why the 4B: BCM2711 has a real GIC-400 (GICv2: `gic.c` works), Ethernet (GENET) without USB, a UART header that is soldered.
+Plan, in this order; each step is first tried in qemu (`-M raspi4b`, if the installed qemu has it; else `raspi3b` for the
+parts that are the same) and then on the board over the serial adapter (3.3 V! TX/RX crossed: adapter TXD to pin 10, RXD
+to pin 8, GND to pin 6; never connect 5 V):
+
+1. Boot: the firmware loads `kernel8.img` at 0x80000 (our Linux-arm64 image header fits) and hands over a device tree
+   (`dt.c` reads it). RAM starts at 0, not at 0x40000000, and the peripherals are at 0xFE000000 (the "RAM from 1 GByte" assumption
+   in the kernel map has to go). `config.txt`: `arm_64bit=1`, `enable_uart=1` (or the PL011 on GPIO 14/15).
+2. UART: the PL011 driver of the virt machine with the Pi's base address and clock (48 MHz) and GPIO pin setup.
+3. Timer and interrupts: the generic timer and GICv2 as now (the Pi's GIC is at 0xFF840000 and in the device tree).
+4. SD card: SDHCI (Arasan, "EMMC2") in polling mode instead of virtio-blk; the disks become partitions or files on the card.
+5. More CPUs: spin-table or PSCI (depends on the firmware / armstub), start with one CPU.
+6. Real time clock: there is none; start from a fixed date.
+7. Network (separate project, first in qemu `virt` with virtio-net): Ethernet, ARP, IPv4, ICMP, UDP, a small TCP, a telnet
+   server that attaches a session to a virtual terminal; then the GENET driver for the board.
+Sources to learn from: FreeBSD and NetBSD (BSD license: the drivers may be adapted), U-Boot (mostly GPL-2.0-or-later,
+compatible with this project's GPLv3), the Broadcom datasheets. Linux is GPL-2.0-only and must not be copied into this
+GPLv3 project (reading it for facts such as register layouts is fine).
+
+### Then
+
+1. Replace this file when everything above is done: delete `TODO.md` and put the short list of remaining limitations
    (see "Differences that remain") into `README.md`. The notices that the port is not the work of the original authors
    are already in the READMEs, `ARM64-PORT.md` and the book appendix.
-4. The book appendix should get the new things (device tree, SMP, memory exhaustion) once they are final; the appendix is
-   `\chapter{The ARM64 Port (an Unofficial Extension)}` in `ulix-book.nw`. `tectonic` (brew) was installed for checking it.
+2. Before the repository is made public: check the notices again; `bin-build/bigdisk.img` (98 MByte) is in the history
+   of the original repository.
 
 ## Missing functionality
 
