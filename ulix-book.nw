@@ -6256,6 +6256,21 @@ a macro [[PHYSICAL]] that will translate an address from the first
 #endif
 @ %def PHYSICAL
 
+The memory device [[/dev/kmem]] is the physical memory, from address 0 on the x86; that includes the video memory at
+\hex{b8000}. On AArch64 RAM does not start at address 0 and there is no video memory, so the two access macros are
+replaced by functions: RAM starts at byte 0 of the device, and the window \hex{b8000}\dots\hex{b8f9f} is the screen
+of the visible terminal.
+
+<<macro definitions>>=
+#if defined(__i386__)
+#define KMEM_READ(buf, off, n)   memcpy ((buf), (char*)(PHYSICAL(off)), (n))
+#define KMEM_WRITE(off, buf, n)  memcpy ((char*)(PHYSICAL(off)), (buf), (n))
+#else
+#define KMEM_READ(buf, off, n)   arch_kmem_read ((buf), (off), (n))
+#define KMEM_WRITE(off, buf, n)  arch_kmem_write ((off), (buf), (n))
+#endif
+@ %def KMEM_READ KMEM_WRITE
+
 Now that we can access all of the physical addresses (including
 video memory) we can get rid of the video mapping for \hex{b8000}\dots\hex{b9000},
 we'll actually remove the first entry of the page directory which so far
@@ -24593,7 +24608,7 @@ int dev_read (int fd, char *buf, int nbyte) {
 
   // special case /dev/kmem: direct memcpy()
   if (dev_status[fd].dev == DEV_KMEM) {
-    memcpy (buf, (char*)(PHYSICAL(startbyte)), nbyte);
+    KMEM_READ (buf, startbyte, nbyte);
     dev_status[fd].pos += nbyte;
     return nbyte;
   }
@@ -24636,7 +24651,7 @@ int dev_write (int fd, char *buf, int nbyte) {
 
   // special case /dev/kmem: direct memcpy()
   if (dev_status[fd].dev == DEV_KMEM) {
-    memcpy ((char*)(PHYSICAL(startbyte)), buf, nbyte);
+    KMEM_WRITE (startbyte, buf, nbyte);
     dev_status[fd].pos += nbyte;
     return nbyte;
   }

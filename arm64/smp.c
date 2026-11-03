@@ -62,7 +62,7 @@ void bkl_lock (void) {
   while (__sync_lock_test_and_set (&bkl_word, 1)) {
     for (u64 spin = 0; bkl_word; spin++) {
       __asm__ volatile ("yield");
-      if (spin == 4000000000UL) { u64 elr; __asm__ volatile ("mrs %0, elr_el1" : "=r" (elr));
+      if (spin == 4000000000UL && scheduler_is_active) { u64 elr; __asm__ volatile ("mrs %0, elr_el1" : "=r" (elr));
         printf ("BKL: CPU %d waits for CPU %d (elr 0x%lx, its task %d, depth %d)\n", c, bkl_owner, elr, pc[bkl_owner].cur_task, pc[bkl_owner].depth); }
     }
   }

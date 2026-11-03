@@ -40,10 +40,12 @@ void platform_map (void) {
   __asm__ volatile ("dsb ishst; tlbi vmalle1is; dsb ish; isb" ::: "memory");
 }
 
+void kstack_reserve (int n);
 void frames_init (void) {
   next_free = (PA (__kernel_end) + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
   printf ("RAM: %lu MByte at 0x%lx, kernel ends at 0x%lx, first free frame 0x%lx\n",
           RAM_SIZE >> 20, RAM_START, PA (__kernel_end), next_free);
+  kstack_reserve (16);                      // kernel stacks for the first processes, whatever happens to the RAM later
 }
 
 static void zero_page (void *p) {
@@ -51,32 +53,79 @@ static void zero_page (void *p) {
   for (int i = 0; i < PAGE_SIZE / 8; i++) q[i] = 0;
 }
 
-static u64 bump (void) {
-  if (next_free + PAGE_SIZE > RAM_START + RAM_SIZE) { printf ("out of memory\n"); for (;;) ; }
+static u64 bump (void) {                    // 0 when RAM is used up
+  if (next_free + PAGE_SIZE > RAM_START + RAM_SIZE) return 0;
   u64 pa = next_free;
   next_free += PAGE_SIZE;
   return pa;
 }
 
-u64 alloc_frame (void) {                    // returns a zeroed frame (physical address)
-  u64 pa;
-  if (free_list) {
-    pa = free_list;
-    free_list = *(u64 *)KVA (pa);
-  } else {
-    pa = bump ();
+extern int arch_evict_one (void);           // arch_swap.c: page out the least used page ("page replacement: free one frame")
+
+// returns a zeroed frame (physical address), or 0 if there is none and no page can be swapped out
+u64 alloc_frame_try (void) {
+  for (;;) {
+    u64 pa;
+    if (free_list) {
+      pa = free_list;
+      free_list = *(u64 *)KVA (pa);
+    } else {
+      pa = bump ();
+    }
+    if (pa) {
+      zero_page (KVA (pa));
+      frames_in_use++;
+      REFS (pa) = 1;
+      return pa;
+    }
+    if (arch_evict_one () != 0) return 0;   // as in the book, a missing frame is made free by swapping a page out
   }
-  zero_page (KVA (pa));
-  frames_in_use++;
-  REFS (pa) = 1;
+}
+
+u64 alloc_frame (void) {                    // for callers that cannot handle a failure
+  u64 pa = alloc_frame_try ();
+  if (!pa) { printf ("out of memory (no free frame, nothing to swap out)\n"); for (;;) ; }
   return pa;
 }
 
-u64 alloc_frames_contig (int n) {           // only the bump area is contiguous
+// Kernel stacks are 4 contiguous frames, and contiguous frames can only come from the bump area.  So a stack that is
+// given back is kept in a list and used again (when a process has taken all RAM and gives it back, the free list holds
+// single frames only), and a few stacks are put aside at boot.  alloc returns 0 when there is no stack.
+static u64 kstack_pool = 0;
+#define KSTACK_FRAMES 4
+
+u64 kstack_alloc (void) {
+  u64 pa;
+  if (kstack_pool) {
+    pa = kstack_pool;
+    kstack_pool = *(u64 *)KVA (pa);
+  } else {
+    if (next_free + KSTACK_FRAMES * PAGE_SIZE > RAM_START + RAM_SIZE) return 0;
+    pa = next_free;
+    next_free += KSTACK_FRAMES * PAGE_SIZE;
+  }
+  for (int i = 0; i < KSTACK_FRAMES; i++) { zero_page (KVA (pa + i * PAGE_SIZE)); REFS (pa + i * PAGE_SIZE) = 1; }
+  frames_in_use += KSTACK_FRAMES;
+  return pa;
+}
+
+void kstack_free (u64 pa) {
+  for (int i = 0; i < KSTACK_FRAMES; i++) REFS (pa + i * PAGE_SIZE) = 0;
+  frames_in_use -= KSTACK_FRAMES;
+  *(u64 *)KVA (pa) = kstack_pool;
+  kstack_pool = pa;
+}
+
+void kstack_reserve (int n) {               // put n stacks aside (called once at boot)
+  for (int i = 0; i < n; i++) { u64 pa = kstack_alloc (); if (pa) kstack_free (pa); }
+}
+
+u64 alloc_frames_contig (int n) {           // (boot time) only the bump area is contiguous
   u64 first = bump ();
+  if (!first) { printf ("out of memory\n"); for (;;) ; }
   zero_page (KVA (first));
   REFS (first) = 1;
-  for (int i = 1; i < n; i++) { u64 pa = bump (); zero_page (KVA (pa)); REFS (pa) = 1; }
+  for (int i = 1; i < n; i++) { u64 pa = bump (); if (!pa) { printf ("out of memory\n"); for (;;) ; } zero_page (KVA (pa)); REFS (pa) = 1; }
   frames_in_use += n;
   return first;
 }
@@ -102,7 +151,9 @@ static u64 *walk (u64 *l0, u64 va, int create) {
     u64 *e = &table[IDX (va, lvl)];
     if (!(*e & PTE_VALID)) {
       if (!create) return 0;
-      *e = alloc_frame () | PTE_TABLE;
+      u64 t = alloc_frame_try ();
+      if (!t) return 0;                     // (map_page_in fails, the caller handles it)
+      *e = t | PTE_TABLE;
     } else if ((*e & 3) == 1) {
       return 0;                             // 1 GB / 2 MB block: can't descend
     }
@@ -154,7 +205,10 @@ u64 user_to_phys (u64 va, int write) {
     else       __asm__ volatile ("at s1e1r, %1; isb; mrs %0, par_el1" : "=r" (par) : "r" (va));
     if (!(par & 1)) break;
     // not translated: a shared page (copy it), a page that was paged out (read it back) or a cleared access flag
-    if (!((write && arch_cow_fault (va)) || arch_user_fault (va))) break;
+    int fixed = 0;                                         // (both are tried: a page can need a copy and a new access flag)
+    if (write && arch_cow_fault (va)) fixed = 1;
+    if (arch_user_fault (va)) fixed = 1;
+    if (!fixed) break;
   }
   if (par & 1) return 0;
   return (par & PTE_ADDR) | (va & 0xfff);
@@ -178,7 +232,7 @@ void user_mm_init (void) {
                     :: "r" (empty_l0_pa), "r" (tcr));
 }
 
-u64 new_user_l0 (void) { return alloc_frame (); }
+u64 new_user_l0 (void) { return alloc_frame_try (); }        // 0: no memory
 
 static void free_table (u64 pa, int lvl) {
   u64 *t = KVA (pa);
@@ -214,7 +268,8 @@ int cow_fault (u64 l0_pa, u64 va) {
   if (REFS (old) == 1) {                                   // the last user: just make it writable again
     *e = old | flags;
   } else {
-    u64 pa = alloc_frame ();
+    u64 pa = alloc_frame_try ();
+    if (!pa) return 0;                                      // no memory for the copy: the process cannot go on
     u64 *src = KVA (old), *dst = KVA (pa);
     for (int i = 0; i < (int)(PAGE_SIZE / 8); i++) dst[i] = src[i];
     REFS (old)--;                                          // we no longer use the shared frame

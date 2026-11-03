@@ -157,3 +157,46 @@ void arch_vt_switch (int n) {
   cur_vt = n;
   host_repaint (n);
 }
+
+// ---- /dev/kmem ----
+// On the x86 the device is the physical memory, from address 0, and the VGA text memory sits in it at 0xb8000 (80 x 25
+// characters of 2 bytes). Here byte 0 is the first byte of RAM, and the window at 0xb8000 is the screen of the visible
+// terminal (24 lines; the 25th line, the status line of the x86, reads as blanks and ignores writes).
+extern unsigned long arch_ram_base (void), arch_ram_size (void);
+#define VGA_BASE   0xb8000UL
+#define VGA_BYTES  (80 * 25 * 2)
+
+static void kmem_copy_ram (char *buf, unsigned long off, int n, int write) {
+  unsigned long base = arch_ram_base (), size = arch_ram_size ();
+  if (off >= size) { if (!write) memset (buf, 0, n); return; }
+  if (off + n > size) { if (!write) memset (buf + (size - off), 0, off + n - size); n = size - off; }
+  if (write) memcpy ((char *)PHYSICAL (base + off), buf, n);
+  else       memcpy (buf, (char *)PHYSICAL (base + off), n);
+}
+
+static void kmem_access (char *buf, unsigned long off, int n, int write) {
+  if (!vt_ready) vt_setup ();
+  while (n > 0) {
+    unsigned long end = off + n;
+    if (off < VGA_BASE) {                                  // RAM below the window
+      int part = end > VGA_BASE ? (int)(VGA_BASE - off) : n;
+      kmem_copy_ram (buf, off, part, write);
+      off += part; buf += part; n -= part;
+    } else if (off < VGA_BASE + VGA_BYTES) {               // the screen
+      int part = end > VGA_BASE + VGA_BYTES ? (int)(VGA_BASE + VGA_BYTES - off) : n;
+      for (int i = 0; i < part; i++) {
+        unsigned long idx = off - VGA_BASE + i;
+        if (idx < VT_SIZE) { if (write) vt[cur_vt].mem[idx] = buf[i]; else buf[i] = vt[cur_vt].mem[idx]; }
+        else if (!write) buf[i] = (idx & 1) ? 0x1f : ' ';
+      }
+      if (write) host_repaint (cur_vt);
+      off += part; buf += part; n -= part;
+    } else {                                               // RAM above it
+      kmem_copy_ram (buf, off, n, write);
+      return;
+    }
+  }
+}
+
+void arch_kmem_read (char *buf, unsigned long offset, int n)  { kmem_access (buf, offset, n, 0); }
+void arch_kmem_write (unsigned long offset, char *buf, int n) { kmem_access (buf, offset, n, 1); }

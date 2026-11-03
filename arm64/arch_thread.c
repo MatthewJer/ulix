@@ -18,10 +18,13 @@ struct kctx { u64 x19_x28[10]; u64 x29, x30, sp, sp_el0; int depth; };      // l
 
 extern void cpu_switch (struct kctx *old, struct kctx *new);
 extern u64  alloc_frames_contig (int n);
+extern u64  kstack_alloc (void);
+extern void kstack_free (u64 pa);
 extern void free_frame (u64 pa);
 extern void get_frame (u64 pa);
 extern int  cow_fault (u64 l0_pa, u64 va);
 extern u64  alloc_frame (void);
+extern u64  alloc_frame_try (void);
 extern u64  new_user_l0 (void);
 extern void free_user_space (u64 l0_pa);
 extern int  map_page_in (u64 l0_pa, u64 va, u64 pa, u64 flags);
@@ -49,6 +52,7 @@ static void arch_syscalls_init (void);
 void arch_resign (void);
 int arch_threads_reap (void);
 void syscall_sigreturn (context_t *r);
+void syscall_total_frames (context_t *r);
 void arch_clock_init (void);
 void syscall_read_screen (context_t *r);          // the book defines these without prototypes
 void syscall_write_screen (context_t *r);
@@ -204,9 +208,12 @@ int arch_thread_create (void (*entry)(void *), void *arg, const char *name) {
   if (tid == MAX_THREADS) return -1;
 
   if (kstack_pa[tid]) {                        // stack of a finished thread that used this ID before
-    for (int k = 0; k < KSTACK_PAGES_ARCH; k++) free_frame (kstack_pa[tid] + k * PAGE);
+    kstack_free (kstack_pa[tid]);
+    kstack_pa[tid] = 0;
   }
-  kstack_pa[tid] = alloc_frames_contig (KSTACK_PAGES_ARCH);
+  u64 stack = kstack_alloc ();
+  if (!stack) return -1;
+  kstack_pa[tid] = stack;
   u64 top = (u64)KVA (kstack_pa[tid]) + KSTACK_PAGES_ARCH * PAGE;
   struct kctx *c = &kctx[tid];
   c->depth = 1;                                // runs with the kernel lock, like the thread that starts it
@@ -233,8 +240,11 @@ int arch_thread_create (void (*entry)(void *), void *arg, const char *name) {
 }
 
 // free the kernel stacks of finished threads (the thread cannot do that itself)
+void arch_swap_shrink (void);
+void arch_evict_protect (addr_space_id as);
 int arch_threads_reap (void) {
   int n = 0;
+  arch_swap_shrink ();                         // (reap is called where the process may wait for the disk)
   u64 flags = irq_save ();
   for (thread_id tid = 2; tid < MAX_THREADS; tid++) {
     if (kstack_pa[tid] && !thread_table[tid].used && !smp_running_elsewhere (tid)) {
@@ -243,7 +253,7 @@ int arch_threads_reap (void) {
       if (as >= 2 && address_spaces[as].status == AS_USED && address_spaces[as].pid == (int)tid)
         destroy_address_space (as);
       kstack_as[tid] = 0;
-      for (int k = 0; k < KSTACK_PAGES_ARCH; k++) free_frame (kstack_pa[tid] + k * PAGE);
+      kstack_free (kstack_pa[tid]);
       kstack_pa[tid] = 0;
       n++;
     }
@@ -329,9 +339,11 @@ int arch_cow_fault (u64 va) {
 // Returns the initial user stack pointer, 0 on error.
 #define SIGPAGE_VA   0x7BFF0000UL            // the "signal trampoline" page, mapped in every process (below the biggest stack, see arch_swap.c)
 #define ARCH_NR_SIGRETURN 600                // AArch64 only: return from a signal handler
+#define ARCH_NR_TOTAL_FRAMES 601             // AArch64 only: number of frames of RAM (see userland/arm64-extra.h)
 
 static int map_sigpage (u64 l0) {
-  u64 pa = alloc_frame ();
+  u64 pa = alloc_frame_try ();
+  if (!pa) return -1;
   unsigned int *code = KVA (pa);
   code[0] = 0xD2800000 | ((ARCH_NR_SIGRETURN & 0xffff) << 5);   // movz x0, #600
   code[1] = 0xD4000001;                      // svc #0
@@ -344,7 +356,8 @@ static u64 build_user_stack (u64 l0, int argc, char **argv) {
   u64 top_pa = 0;
   if (map_sigpage (l0) != 0) return 0;
   for (int i = 1; i <= USER_STACK_PAGES; i++) {
-    u64 pa = alloc_frame ();
+    u64 pa = alloc_frame_try ();
+    if (!pa) return 0;
     if (i == 1) top_pa = pa;
     if (map_page_in (l0, USER_STACK_TOP - i * PAGE, pa, PAGE_URW) != 0) return 0;
   }
@@ -391,14 +404,17 @@ __asm__ (
 
 // kernel stack for a user process with a prepared exception frame: the first switch to the
 // thread "returns" through exit_exception (vectors.S) into user mode
-static void kstack_for_process (thread_id tid, const context_t *frame, int owns_as);
-static void kstack_for_process (thread_id tid, const context_t *frame, int owns_as) {
+static int kstack_for_process (thread_id tid, const context_t *frame, int owns_as);
+static int kstack_for_process (thread_id tid, const context_t *frame, int owns_as) {   // 0 = ok, -1 = no kernel stack
+  if (kstack_pa[tid]) {
+    kstack_free (kstack_pa[tid]);
+    kstack_pa[tid] = 0;
+  }
+  u64 stack = kstack_alloc ();
+  if (!stack) return -1;
+  kstack_pa[tid] = stack;
   kstack_as[tid] = owns_as ? thread_table[tid].addr_space : 0;   // 0: an extra thread, the address space belongs to its process
   if (owns_as) address_spaces[kstack_as[tid]].pid = tid;        // marks who owns the address space (see arch_threads_reap)
-  if (kstack_pa[tid]) {
-    for (int k = 0; k < KSTACK_PAGES_ARCH; k++) free_frame (kstack_pa[tid] + k * PAGE);
-  }
-  kstack_pa[tid] = alloc_frames_contig (KSTACK_PAGES_ARCH);
   u64 top = (u64)KVA (kstack_pa[tid]) + KSTACK_PAGES_ARCH * PAGE;
   context_t *f = (context_t *)(top - sizeof (context_t));
   *f = *frame;
@@ -409,6 +425,7 @@ static void kstack_for_process (thread_id tid, const context_t *frame, int owns_
   c->x30 = (u64)process_first_return;
   c->sp  = (u64)f;
   c->sp_el0 = f->sp_el0;
+  return 0;
 }
 
 static void tcb_init_process (TCB *t, thread_id tid, thread_id ppid, const char *name) {
@@ -498,8 +515,11 @@ int u_fork (context_t *r) {
   int new_as = as_alloc ();
   if (new_as == -1) return -1;
   u64 nl0 = new_user_l0 ();
+  if (!nl0) { destroy_address_space (new_as); return -1; }
   as_l0[new_as] = nl0;
+  arch_evict_protect (old_as);                           // (see arch_swap.c)
   int cloned = clone_level (as_l0[old_as], nl0, 0, 0);
+  arch_evict_protect (0);
   __asm__ volatile ("dsb ishst; tlbi vmalle1is; dsb ish; isb" ::: "memory");   // the parent's pages are read-only now (on all CPUs)
   if (cloned < 0) { destroy_address_space (new_as); return -1; }
   address_spaces[new_as].stacksize = address_spaces[old_as].stacksize;     // (the stack may have grown)
@@ -525,7 +545,11 @@ int u_fork (context_t *r) {
 
   context_t child = *r;                   // the child continues exactly where the parent is ...
   child.eax = 0;                         // ... but fork() returns 0 there
-  kstack_for_process (new_tid, &child, 1);
+  if (kstack_for_process (new_tid, &child, 1) != 0) {      // no kernel stack for the child
+    thread_table[new_tid].used = false;
+    destroy_address_space (new_as);
+    return -1;
+  }
   add_to_ready_queue (new_tid);           // state becomes READY
   return new_tid;                         // in the parent, fork() returns the child's PID
 }
@@ -565,6 +589,7 @@ static int u_execv_loading (char *filename, char *const argv[], memaddress *news
   if (!ino || !minix_is_file (ino)) return -1;
 
   u64 nl0 = new_user_l0 (), entry, image_end;
+  if (!nl0) return -1;
   if (elf_load (nl0, ino, &entry, &image_end) != 0) { free_user_space (nl0); return -1; }
   u64 sp = build_user_stack (nl0, argc, kargv);
   if (!sp) { free_user_space (nl0); return -1; }
@@ -598,6 +623,7 @@ static int arch_start_user_loading (const char *path, int argc, char **argv) {
   int as = as_alloc ();
   if (as == -1) return -1;
   u64 l0 = new_user_l0 (), entry, image_end = 0;
+  if (!l0) { destroy_address_space (as); return -1; }
   as_l0[as] = l0;
   u64 sp = 0;
   if (elf_load (l0, ino, &entry, &image_end) == 0) sp = build_user_stack (l0, argc, argv);
@@ -613,7 +639,7 @@ static int arch_start_user_loading (const char *path, int argc, char **argv) {
   f.elr = entry;
   f.spsr = 0;                             // EL0t, interrupts enabled
   f.sp_el0 = sp;
-  kstack_for_process (tid, &f, 1);
+  if (kstack_for_process (tid, &f, 1) != 0) { thread_table[tid].used = false; destroy_address_space (as); return -1; }
   u64 flags = irq_save ();
   add_to_ready_queue (tid);
   irq_restore (flags);
@@ -653,7 +679,7 @@ int arch_pthread_create (u64 start) {
   f.elr = start;
   f.spsr = 0;                                  // EL0t
   f.sp_el0 = ((u64)ustack + THREAD_STACK_PAGES * PAGE) & ~15UL;
-  kstack_for_process (nt, &f, 0);
+  if (kstack_for_process (nt, &f, 0) != 0) { tn->used = false; return -1; }
   address_spaces[as].refcount++;
   add_to_ready_queue (nt);
   return nt;
@@ -799,6 +825,7 @@ static void arch_syscalls_init (void) {
   install_syscall_handler (__NR_get_free_frames, syscall_get_free_frames);
   install_syscall_handler (__NR_free_a_frame,    syscall_free_a_frame);
   install_syscall_handler (ARCH_NR_SIGRETURN, syscall_sigreturn);
+  install_syscall_handler (ARCH_NR_TOTAL_FRAMES, syscall_total_frames);
 }
 
 
@@ -858,7 +885,10 @@ void *u_sbrk (int incr) {
   memaddress end = old + incr;
   if (end > SIGPAGE_VA - 0x100000UL) return (void *)-1;      // the heap stays below the trampoline page and the stack (which may grow to 64 MByte)
   for (u64 va = (old + PAGE - 1) & ~(PAGE - 1); va < end; va += PAGE) {
-    if (map_page_in (as_l0[as], va, alloc_frame (), PAGE_URW) != 0) return (void *)-1;
+    u64 pa = alloc_frame_try ();                         // (swaps a page out if the RAM is full; 0 if nothing helps)
+    if (!pa) return (void *)-1;
+    if (map_page_in (as_l0[as], va, pa, PAGE_URW) != 0) { free_frame (pa); return (void *)-1; }
+    address_spaces[as].memend = va + PAGE;               // (the pages that were mapped stay, as in the book)
   }
   address_spaces[as].memend = end;
   return (void *)old;

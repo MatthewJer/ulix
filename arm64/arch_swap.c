@@ -28,6 +28,7 @@
 extern u64  arch_as_l0 (addr_space_id id);
 extern u64 *pte_of (u64 l0_pa, u64 va);
 extern u64  alloc_frame (void);
+extern u64  alloc_frame_try (void);
 extern void free_frame (u64 pa);
 extern int  frame_refcount (u64 pa);
 extern int  asid_16bit;
@@ -46,6 +47,20 @@ static void flush_as (addr_space_id as) {
   else            __asm__ volatile ("dsb ishst; tlbi vmalle1is; dsb ish; isb" ::: "memory");
 }
 
+// set when the disk had no room for another swap file block: until entries are released only pages that already own
+// a block of the file can be swapped out (they are written over their old copy)
+static int swap_full = 0;
+static int swap_free_est = -1;               // free blocks of the disk (estimate, -1: unknown)
+static int swap_has_data = 0;                // the file has blocks (it is cut back to nothing when no page needs it)
+#define SWAP_RESERVE_BLOCKS 300              // KByte that stay free on the disk for files
+
+static int swap_free_blocks (void) {
+  struct diskfree_query q;
+  q.device = DEV_HDA;
+  mx_diskfree (&q);
+  return q.free;
+}
+
 // ---- swap file ----
 void arch_swap_init (void) {
   paging_lock  = get_new_lock ("paging");        // the book creates these in "initialize kernel global variables"
@@ -62,7 +77,30 @@ void arch_swap_init (void) {
 // are not reused for another program: here an id is reused by exec and by new processes)
 void arch_swap_release_as (addr_space_id as) {
   for (int i = 0; i < MAX_SWAP_FRAMES; i++)
-    if (paging[i].used && paging[i].as == as) paging[i].used = false;
+    if (paging[i].used && paging[i].as == as) { paging[i].used = false; swap_full = 0; }
+}
+
+// Give the blocks of the swap file back once no page lives in it any more.  Called where a process may wait for the disk
+// (not while a process ends), at the start of fork () and pthread_create ().
+static int swap_io_enter (void);
+static void swap_io_leave (int locked);
+extern int console_quiet;                    // kmain.c: the book's file system code prints a line for every block it frees
+void arch_swap_shrink (void) {
+  if (swap_fd == -1 || !swap_has_data) return;
+  for (int i = 0; i < MAX_SWAP_FRAMES; i++) if (paging[i].used) return;
+  swap_has_data = 0;
+  int l = swap_io_enter ();
+  for (int i = 0; i < MAX_SWAP_FRAMES; i++) if (paging[i].used) { swap_has_data = 1; swap_io_leave (l); return; }
+  console_quiet = 1;
+  // (the book's mx_ftruncate frees the data zones in the bitmap but leaves the zone pointers and indirect blocks in the
+  // inode: when the file grows again, the old and the new pointers meet.  A new, empty file is the clean way.)
+  u_close (swap_fd);
+  u_unlink ("/tmp/swap");
+  swap_fd = u_open ("/tmp/swap", O_RDWR | O_CREAT, 0);
+  console_quiet = 0;
+  swap_full = 0;
+  swap_free_est = -1;
+  swap_io_leave (l);
 }
 
 static int swap_index (int as, int pageno) {
@@ -90,6 +128,14 @@ int page_out (int as, int pageno) {
   if (!e || !(*e & PTE_VALID)) return -1;                  // fail: page not found
   u64 pa = *e & PTE_ADDR;
   if (frame_refcount (pa) != 1) return -1;                 // shared with another process (copy-on-write)
+  // The swap file grows with the pages written to it (the disk is small).  It must not take the whole disk: ordinary files
+  // need room, too.  A page that already owns a block of the file is written over it and needs nothing.
+  if (swap_index (as, pageno) < 0) {
+    // (counting the free blocks reads the whole block bitmap: measure once, then count along, measure again when it gets tight)
+    if (swap_free_est < 0 || swap_free_est < SWAP_RESERVE_BLOCKS + 8) swap_free_est = swap_free_blocks ();
+    if (swap_free_est < SWAP_RESERVE_BLOCKS + 8) { swap_full = 1; return -1; }
+    swap_free_est -= 5;                                    // a page is 4 blocks, plus a block for the file's indirect table now and then
+  }
   int l = swap_io_enter ();
   e = pte_of (l0, va);                                     // (the tables may have changed while we waited)
   if (!e || !(*e & PTE_VALID) || (*e & PTE_ADDR) != pa) { swap_io_leave (l); return -1; }
@@ -98,9 +144,11 @@ int page_out (int as, int pageno) {
   if (index < 0 || u_lseek (swap_fd, 0, SEEK_END) < (index + 1) * (int)PAGE) {   // the disk is full
     if (index >= 0) paging[index].used = false;
     swap_io_leave (l);
+    swap_full = 1;
     return -1;
   }
   swap_io_leave (l);
+  swap_has_data = 1;
   *e = (*e & ~PTE_VALID) | PTE_SWAPPED;                    // mark page non-present and paged-out
   flush_page (as, va);
   free_frame (pa);                                         // the frame is free again
@@ -113,7 +161,8 @@ int page_in (int as, int pageno) {
   u64 *e = pte_of (l0, va);
   if (!e || (*e & PTE_VALID) || !(*e & PTE_SWAPPED)) return -1;      // fail: page was not paged out
   if (swap_index (as, pageno) < 0) return -1;
-  u64 pa = alloc_frame ();                                 // reserve a frame
+  u64 pa = alloc_frame_try ();                             // reserve a frame
+  if (!pa) return -1;
   int l = swap_io_enter ();
   e = pte_of (l0, va);
   if (!e || (*e & PTE_VALID)) {                            // somebody else brought the page back while we waited
@@ -142,7 +191,9 @@ static int grow_stack (u64 l0, u64 va) {
   u64 bottom = USER_STACK_TOP - as->stacksize;
   if (va > USER_STACK_TOP || va + PAGE < bottom) return 0;                  // not just below the stack
   if (as->stacksize >= MAX_STACK || bottom - PAGE < as->memend + PAGE) return 0;
-  if (map_page_in (l0, bottom - PAGE, alloc_frame (), PAGE_URW) != 0) return 0;
+  u64 pa = alloc_frame_try ();
+  if (!pa) return 0;
+  if (map_page_in (l0, bottom - PAGE, pa, PAGE_URW) != 0) { free_frame (pa); return 0; }
   as->stacksize += PAGE;
   return 1;
 }
@@ -227,26 +278,49 @@ void syscall_page_out (context_t *r) {
   eax_return (page_out (current_as, r->ebx));
 }
 
-// "page replacement: free one frame": page out the page with the lowest counter
-void syscall_free_a_frame (context_t *r) {
+// "page replacement: free one frame": page out the page with the lowest counter.  Returns 0 if a frame was freed.
+// (Also called when the frame allocator runs dry; the lock serializes the callers, and a thread that is already
+// swapping does not start a second round.)
+// fork () brings back every swapped-out page of the parent before it copies the tables; if the parent's own pages could
+// be chosen to make room, the two would chase each other forever.  So the parent is off limits while it is cloned.
+static addr_space_id evict_protected = 0;
+void arch_evict_protect (addr_space_id as) { evict_protected = as; }
+
+int arch_evict_one (void) {
+  static thread_id owner = 0;
+  if (swap_fd == -1 || !paging_lock || owner == current_task) return -1;
+  if (current_task > 1) mutex_lock (paging_lock);
+  else if (!mutex_try_lock (paging_lock)) return -1;
+  owner = current_task;
   addr_space_id pick_as = -1;
-  int pick_pageno = -1, themin = 0;
-  while (!mutex_try_lock (paging_lock)) ;
+  int pick_pageno = -1, themin = 0, r = -1;
   for (int as = 2; as < MAX_ADDR_SPACES; as++) {
-    if (address_spaces[as].status != AS_USED || !arch_as_l0 (as)) continue;
+    if (address_spaces[as].status != AS_USED || !arch_as_l0 (as) || as == evict_protected) continue;
     int p = -1, m = 0;
     walk_pages (arch_as_l0 (as), 0, 0, as, 0, &p, &m);
     if (p >= 0 && (pick_as == -1 || m < themin)) { pick_as = as; pick_pageno = p; themin = m; }
   }
-  mutex_unlock (paging_lock);
-  if (pick_as != -1) {
-    mutex_lock (paging_lock);
-    page_out (pick_as, pick_pageno);
-    mutex_unlock (paging_lock);
-  } else {
-    printf ("\nERROR: cannot pick a page to evict!\n");
+  if (swap_full) {                                            // the file cannot grow: use pages that have a block in it already
+    pick_as = -1;
+    for (int i = 0; i < MAX_SWAP_FRAMES && pick_as == -1; i++) {
+      if (!paging[i].used) continue;
+      u64 l0 = arch_as_l0 (paging[i].as);
+      u64 *e = l0 ? pte_of (l0, (u64)paging[i].pageno << 12) : 0;
+      if (paging[i].as != evict_protected && e && (*e & PTE_VALID) && frame_refcount (*e & PTE_ADDR) == 1) { pick_as = paging[i].as; pick_pageno = paging[i].pageno; }
+    }
   }
+  if (pick_as != -1) r = page_out (pick_as, pick_pageno);
+  owner = 0;
+  mutex_unlock (paging_lock);
+  return r;
 }
+
+void syscall_free_a_frame (context_t *r) {
+  if (arch_evict_one () != 0) printf ("\nERROR: cannot pick a page to evict!\n");
+}
+
+// ARM64 only (the x86 programs use the constant MEM_SIZE): how many frames does the machine have?
+void syscall_total_frames (context_t *r) { eax_return ((long)arch_ram_frames ()); }
 
 // the swapper blocks on swapper_lock, which the timer releases every 0.1 seconds
 void syscall_get_free_frames (context_t *r) {

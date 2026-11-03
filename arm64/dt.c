@@ -167,3 +167,5 @@ unsigned long plat_cpu_mpidr (int i) { return plat.cpu_mpidr[i]; }
 unsigned long plat_rtc (void)  { return plat.rtc; }
 unsigned long plat_ram_size (void) { return plat.ram_size; }
 int  plat_uart_irq (void)      { return plat.uart_irq; }
+unsigned long arch_ram_base (void) { return plat.ram_base; }
+unsigned long arch_ram_size (void) { return plat.ram_size; }

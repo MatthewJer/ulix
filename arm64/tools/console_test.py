@@ -72,9 +72,17 @@ try:
     expect('Ulix Kernel Shell')
     for cmd, answer in [('uname', 'Ulix'), ('ps', 'idle'), ('queues', 'keyboard:'), ('time', 're:\\d+'),
                         ('hexdump', 're:[0-9a-f]{8}  [0-9a-f]{2} [0-9a-f]{2} [0-9a-f]{2} '), ('gf', 'New frame ID'), ('mem2', 'frames in use'), ('mem', 'root table at'),
-                        ('listas', 'kernel'), ('bogus', 'no such command'), ('help', 'Commands:')]:
+                        ('listas', 'kernel'), ('bogus', 'no such command'), ('help', 'Commands:'),
+                        # the rest of the commands of the kernel shell (the answer may be only the next prompt)
+                        ('test', 'root table of the AS'), ('locks', 'disk buffer'), ('longhelp', 'return to user mode'),
+                        ('lsof', 'mfd='), ('inode', 'mx_read_inode'), ('gp', None), ('rp', 'releasing page range'),
+                        ('disable', None), ('enable', None), ('clear', 're:\x1b\[2J'),
+                        ('gp1k', None), ('gp10k', None)]:
         send(cmd.encode() + b'\r')
-        expect(answer)
+        if answer is None:                   # no output: the shell must still answer the next command
+            time.sleep(0.5); send(b'uname\r'); expect('Ulix')
+        else:
+            expect(answer)
     send(b'exit\r')
     expect('returning from kernel shell')
     pump(1.0)

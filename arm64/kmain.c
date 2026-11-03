@@ -16,7 +16,9 @@ static int  cap_len = 0, cap_on = 0;
 void capture_start (void) { cap_len = 0; cap_on = 1; }
 int  capture_stop (char **text) { cap_on = 0; cap_buf[cap_len] = 0; *text = cap_buf; return cap_len; }
 
+int console_quiet = 0;                       // 1: output is dropped (for noisy debugging output of the book's code)
 void putch (char c) {
+  if (console_quiet) return;
   if (cap_on && cap_len < (int)sizeof cap_buf - 1) cap_buf[cap_len++] = c;
   if (c == '\n') putch ('\r');
   while (UART_FR & UART_FR_TXFF) ;
@@ -157,7 +159,7 @@ static void disk_test (void) {
   CHECK (minix_mount () == 0, "Minix file system mounted");
   int n = 0;
   minix_readdir (1, count_cb, &n);
-  CHECK (n == 30, "root directory has 30 entries (16 from x86 Ulix + 14 AArch64 files)");
+  CHECK (n == 31, "root directory has 31 entries (16 from x86 Ulix + 15 AArch64 files)");
   n = 0;
   minix_readdir (minix_lookup ("/bin"), count_cb, &n);
   CHECK (n == 63, "/bin has 63 entries");

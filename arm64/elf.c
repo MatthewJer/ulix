@@ -59,7 +59,8 @@ int elf_load (u64 l0, u32 ino, u64 *entry, u64 *image_end) {
     u64 seg_end = ph.vaddr + ph.memsz, file_end = ph.vaddr + ph.filesz;
     if (seg_end > end) end = seg_end;
     for (u64 p = ph.vaddr & ~(PAGE_SIZE - 1); p < seg_end; p += PAGE_SIZE) {
-      u64 pa = alloc_frame ();                           // comes zeroed: this is the .bss part
+      u64 pa = alloc_frame_try ();                       // comes zeroed: this is the .bss part
+      if (!pa) return fail ("out of memory");
       u64 a = p > ph.vaddr ? p : ph.vaddr;               // file bytes that land in this page
       u64 b = p + PAGE_SIZE < file_end ? p + PAGE_SIZE : file_end;
       if (a < b && minix_read (ino, ph.offset + (a - ph.vaddr), (u8 *)KVA (pa) + (a - p), b - a) != (long)(b - a)) {

@@ -21,7 +21,9 @@ TOOLS    = $(filter-out $(SKIP),$(patsubst $(TOOLSRC)/%.c,%,$(wildcard $(TOOLSRC
 # GCC 4.4 accepted a lot that current compilers reject (return without value, missing types);
 # these stay warnings. -fgnu89-inline: "inline" functions of the library also get an out-of-line copy.
 # -O0 like the x86 build (lib-build/Makefile): programs such as thread.c wait in loops on plain global variables
-CFLAGS = -O0 -ffreestanding -nostdlib -fno-builtin -fno-stack-protector -fno-pic -mgeneral-regs-only \
+# -fsanitize=integer-divide-by-zero with trap: an integer division by zero ends the process, as the fault of the x86 does
+# (AArch64 itself returns 0); -mno-outline-atomics: no helper functions of libgcc
+CFLAGS = -mno-outline-atomics -fsanitize=integer-divide-by-zero -fsanitize-undefined-trap-on-error -O0 -ffreestanding -nostdlib -fno-builtin -fno-stack-protector -fno-pic -mgeneral-regs-only \
          -fgnu89-inline -std=gnu99 -w \
          -Wno-error=return-mismatch -Wno-error=implicit-int -Wno-error=implicit-function-declaration \
          -Wno-error=int-conversion -Wno-error=incompatible-pointer-types
@@ -52,6 +54,16 @@ $(BUILD)/tools/recurse.c: $(TOOLSRC)/recurse.c $(BUILD)/ulixlib.h
 	mkdir -p $(BUILD)/tools
 	sed 's/asm volatile ("mov %%esp, %0" : "=r"(x))/asm volatile ("mov %x0, sp" : "=r"(x))/' $< > $@
 	grep -q 'mov %x0, sp' $@
+
+# free.c divides by the constant MEM_SIZE (the 64 MByte of the PC); here the size of the RAM is asked for instead
+$(BUILD)/arm64-extra.h: arm64-extra.h
+	mkdir -p $(BUILD)
+	cp $< $@
+
+$(BUILD)/tools/free.c: $(TOOLSRC)/free.c $(BUILD)/ulixlib.h $(BUILD)/arm64-extra.h
+	mkdir -p $(BUILD)/tools
+	sed -e 's|#include "../ulixlib.h"|&\n#include "../arm64-extra.h"|' -e 's|MEM_SIZE|(total_frames () * 4096)|g' $< > $@
+	grep -q 'total_frames' $@
 
 $(BUILD)/tools/%.o: $(BUILD)/tools/%.c
 	$(CC) $(CFLAGS) -c -o $@ $<

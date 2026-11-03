@@ -13,3 +13,5 @@ userland/build/
 check-el*.log
 *.bin
 machine.log
+check-logs/
+verify-fs.log

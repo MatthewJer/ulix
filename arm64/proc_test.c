@@ -166,6 +166,22 @@ int proc_test (void) {
   CHECK (procs_killed == killed_before + 1, "exactly one process was killed: the one that touched memory far below its stack");
   CHECK (live_threads () == 0, "no process is left");
 
+  // memory runs out (twice: the second run must get as much as the first, so everything was given back)
+  int mem_mb[2] = { 0, 0 };
+  for (int round = 0; round < 2; round++) {
+    char *mem_argv[] = { "memtest64", 0 };
+    capture_start ();
+    pid = run ("/memtest64", 1, mem_argv);
+    capture_stop (&out);
+    arch_threads_reap ();                                // (a process would do this when it forks: the swap file is cut back)
+    CHECK (pid > 0 && thread_table[pid].exitcode == 0, "/memtest64 finished with exit status 0 (no failed checks)");
+    CHECK (count_in (out, "user FAIL") == 0 && count_in (out, "user ok:") == 3, "all 3 memory checks passed: sbrk fails cleanly, fork returns, the process ends");
+    for (int i = 0; out[i]; i++) if (out[i] == 'i' && count_in (out + i, "info: ") && out[i + 1] == 'n' && out[i + 2] == 'f' && out[i + 3] == 'o')
+      { mem_mb[round] = 0; for (int k = i + 6; out[k] >= '0' && out[k] <= '9'; k++) mem_mb[round] = mem_mb[round] * 10 + out[k] - '0'; break; }
+  }
+  CHECK (mem_mb[0] > 20 && mem_mb[1] >= mem_mb[0] - 2, "after the process has ended all memory is available again (second run gets as much)");
+  CHECK (live_threads () == 0, "no process is left");
+
   // the disk: processes that read and write sleep until the interrupt of the device wakes them up
   extern int hd_sleeps, hd_interrupts;
   CHECK (hd_sleeps > 0 && hd_interrupts > 0, "disk transfers of processes were interrupt driven (they slept and were woken by the device)");

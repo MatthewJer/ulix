@@ -35,8 +35,11 @@ extern volatile u64 fault_esr, fault_far;
 
 // mmu.c
 void frames_init (void);
-u64  alloc_frame (void);                    // zeroed frame, returns physical address
-u64  alloc_frames_contig (int n);           // n zeroed, physically contiguous frames
+u64  alloc_frame (void);                    // zeroed frame, returns physical address (halts if there is none)
+u64  alloc_frame_try (void);                // the same, but returns 0 if there is none (after trying to swap a page out)
+u64  alloc_frames_contig (int n);
+u64  kstack_alloc (void);                   // a kernel stack (4 contiguous frames), 0 if there is none
+void kstack_free (u64 pa);           // n zeroed, physically contiguous frames
 void free_frame (u64 pa);                   // drops one reference
 void get_frame (u64 pa);                    // adds one reference (shared page)
 int  frame_refcount (u64 pa);
