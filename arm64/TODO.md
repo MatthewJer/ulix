@@ -8,7 +8,8 @@ is still missing compared with the x86 build, most important first. Background a
 
 All tests are green: `make pcheck` (all 16 tests in parallel, about 3 minutes, `JOBS=n` sets the number of parallel qemu
 instances, logs in `check-logs/`) and the older sequential `make check` (about 30 minutes).
-**Nothing is pushed anywhere yet, no GitHub repository exists yet.**
+The branch `arm64-port` is backed up in the PRIVATE repository https://github.com/MatthewJer/ulix-arm64 (remote `backup`;
+`origin` is the original, `hgesser/ulix`: never push there).
 
 ### Done on 2026-11-03
 
@@ -146,5 +147,5 @@ verify and list properly tomorrow.
       - [x] Notices that the port is *not* the work of the original authors, who have nothing to do with it: top of the main
         `README.md`, `arm64/README.md`, `ARM64-PORT.md` (German) and the first paragraph of the book appendix.
       - [x] The original license (GPL v3, `LICENSE`) and the copyright notices are untouched.
-      - [ ] Create the fork under the user's account (`gh` is logged in as `MatthewJer`), set its description to the same notice,
-        push `arm64-port`. Only after the user has agreed to the exact commands.
+      - [x] Private repository `MatthewJer/ulix-arm64` created (2026-11-03) with the notice as its description; `arm64-port` pushed.
+        Not a GitHub fork (a fork of a public repository cannot be private). Make it public only after checking the notices.
