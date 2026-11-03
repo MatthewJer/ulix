@@ -65,6 +65,11 @@ $(BUILD)/tools/free.c: $(TOOLSRC)/free.c $(BUILD)/ulixlib.h $(BUILD)/arm64-extra
 	sed -e 's|#include "../ulixlib.h"|&\n#include "../arm64-extra.h"|' -e 's|MEM_SIZE|(total_frames () * 4096)|g' $< > $@
 	grep -q 'total_frames' $@
 
+# readelf.c reads ELF32 headers; the programs here are ELF64 files
+$(BUILD)/tools/readelf.c: readelf64.c $(BUILD)/ulixlib.h
+	mkdir -p $(BUILD)/tools
+	cp $< $@
+
 $(BUILD)/tools/%.o: $(BUILD)/tools/%.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 

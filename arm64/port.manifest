@@ -192,6 +192,7 @@ function syscall_link
 function syscall_symlink
 function syscall_readlink
 function syscall_diskfree
+function syscall_print_inode
 function syscall_sync
 function syscall_setuid
 function syscall_setgid

@@ -796,6 +796,7 @@ static void arch_syscalls_init (void) {
   install_syscall_handler (__NR_symlink,   syscall_symlink);
   install_syscall_handler (__NR_readlink,  syscall_readlink);
   install_syscall_handler (__NR_diskfree,  syscall_diskfree);
+  install_syscall_handler (777,            syscall_print_inode);     // the book's debug call (program "inode")
   install_syscall_handler (__NR_sync,      syscall_sync);
   install_syscall_handler (__NR_setuid32,  syscall_setuid);
   install_syscall_handler (__NR_setgid32,  syscall_setgid);

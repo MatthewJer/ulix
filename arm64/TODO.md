@@ -20,6 +20,11 @@ instances, logs in `check-logs/`) and the older sequential `make check` (about 3
   `tools/minix_check.py`). The same bug is in the x86 build for `trunc`/`ftruncate`. The swap code now deletes and recreates
   the file instead; the book's function is not changed.
 - The memory test (`proc_test.c`) calls `arch_threads_reap ()` between its two rounds (a process does this at `fork`).
+- System call 777 (`inode`, the book's debug call) was not installed: added (also to `port.manifest`). `readelf` has an
+  ELF64 version (`userland/readelf64.c`). `inode`, `su`/`chown` and `readelf` are in the shell test.
+- Run by hand and fine: `fork2`, `sbrk`, `paging`, `tp`, `bindump`, `su`, `chown`, `chgrp`. Not run: `testcp` (loops, needs
+  /mnt), `xlogin`, `init2`, `fbomb`.
+- Open, same bug as on the x86: the book's `mx_ftruncate` leaves zone pointers and indirect blocks in the inode.
 - `make verify` and `pcheck` now fail when the file system check finds problems (before, they only printed them).
 
 ### Results of the "does it work on the ARM64 like on the x86?" check so far
@@ -31,11 +36,8 @@ instances, logs in `check-logs/`) and the older sequential `make check` (about 3
   print, memwrite (with the screen window), fault-mem, fault-div0, mutex, dumblock (same "cannot remove process ...
   probably failure" line as the book's code), filecomm, keys, swapper ("don't start me manually"), clear, ps, sigtest
   (after the user_to_phys fix), thread, recurse, vi, login, sh.
-- Not run yet: `fork2` (64 processes, "press Return"), `sbrk`, `paging`, `tp` (1000 page_outs with sync), `su`, `xlogin`,
-  `init2`, `fbomb` (fork bomb, skip or run with a limit), `testcp` (needs /mnt files), `bindump` (reads stdin), `inode`,
-  `chown`/`chgrp` as root.
+- Not run yet: `xlogin`, `init2`, `fbomb` (fork bomb), `testcp` (needs /mnt files).
 - Differences that remain (cannot or should not be changed):
-  - `readelf` reads ELF32 headers; ARM64 programs are ELF64, so it shows only part of the information.
   - `df` lists /dev/hdb and /dev/fd1 with the numbers of /dev/hda ("none" mount); check what the x86 shows without those
     disks (look at `df.c` and `syscall_diskfree`).
   - There is no floppy (/dev/fd0, /dev/fd1) and no serial disk, and only one hard disk (the x86 mounts up to three).
