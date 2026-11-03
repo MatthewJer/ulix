@@ -4,6 +4,64 @@ State: the port runs in `qemu-system-aarch64 -M virt` and passes `make check` (s
 is still missing compared with the x86 build, most important first. Background and reasons: `../ARM64-PORT.md`
 (sections 14-19).
 
+## Where we stopped (2026-11-03) -- start here
+
+All tests are green: `make pcheck` (all 16 tests in parallel, about 3 minutes, `JOBS=n` sets the number of parallel qemu
+instances, logs in `check-logs/`) and the older sequential `make check` (about 30 minutes).
+**Nothing is pushed anywhere yet, no GitHub repository exists yet.**
+
+### Done on 2026-11-03
+
+- The hang in the memory test: `fork ()` brings back all swapped-out pages of the parent; with full RAM each page_in evicted
+  another page of the same parent. Fixed with `arch_evict_protect (old_as)` around `clone_level` in `u_fork`.
+- The swap file is cut back when no page lives in it (`arch_swap_shrink`). The book's `mx_ftruncate` is unfinished: it frees
+  the data zones in the bitmap but keeps the zone pointers and indirect blocks in the inode (the code for the indirect
+  blocks is empty). When the file grew again, old and new pointers met ("zone N used by /tmp/swap and /tmp/swap" in
+  `tools/minix_check.py`). The same bug is in the x86 build for `trunc`/`ftruncate`. The swap code now deletes and recreates
+  the file instead; the book's function is not changed.
+- The memory test (`proc_test.c`) calls `arch_threads_reap ()` between its two rounds (a process does this at `fork`).
+- `make verify` and `pcheck` now fail when the file system check finds problems (before, they only printed them).
+
+### Results of the "does it work on the ARM64 like on the x86?" check so far
+
+- All 61 system calls of the book are installed (8 have ARM64-specific handlers: threads, mutexes, idle). OK.
+- All 22 kernel shell commands work (see above). OK.
+- Programs of `lib-build/tools` that were run and behave like on the x86: args, ascii, cat, cp, diff, grep, wc, hexdump,
+  touch, mkdir, ls, stat, chmod, rm, rmdir, df, ptree, pw, kill, sync, exit42, stdio, fork1, fork3, sbrk1, trunc, tt,
+  print, memwrite (with the screen window), fault-mem, fault-div0, mutex, dumblock (same "cannot remove process ...
+  probably failure" line as the book's code), filecomm, keys, swapper ("don't start me manually"), clear, ps, sigtest
+  (after the user_to_phys fix), thread, recurse, vi, login, sh.
+- Not run yet: `fork2` (64 processes, "press Return"), `sbrk`, `paging`, `tp` (1000 page_outs with sync), `su`, `xlogin`,
+  `init2`, `fbomb` (fork bomb, skip or run with a limit), `testcp` (needs /mnt files), `bindump` (reads stdin), `inode`,
+  `chown`/`chgrp` as root.
+- Differences that remain (cannot or should not be changed):
+  - `readelf` reads ELF32 headers; ARM64 programs are ELF64, so it shows only part of the information.
+  - `df` lists /dev/hdb and /dev/fd1 with the numbers of /dev/hda ("none" mount); check what the x86 shows without those
+    disks (look at `df.c` and `syscall_diskfree`).
+  - There is no floppy (/dev/fd0, /dev/fd1) and no serial disk, and only one hard disk (the x86 mounts up to three).
+    Possible to add: a second and third virtio-blk device as /dev/hdb and /dev/fd0 (the book's `readblock_fd` is the
+    x86 floppy controller), and the serial disk over a second PL011 UART. Worth checking what the x86 tests need.
+  - The swap file grows on demand instead of being 64 MByte in advance (disk is 4 MByte).
+
+### What the ARM64 version can do that the x86 version cannot (for the README / book appendix)
+
+More than one CPU (1 to 8, with a big kernel lock), device tree and GICv2/GICv3, more than 64 MByte of RAM (tested up to
+2 GByte), 64-bit pointers, stack growth up to 64 MByte, interrupt-driven disk like the book's IDE driver, swap that does
+not hang the kernel when it is full, division by zero and out-of-memory handled without stopping the kernel. Still to
+verify and list properly tomorrow.
+
+### Then (in this order)
+
+1. Fix the hang, run everything, commit (two commits as before: code, documentation).
+2. Back up in the cloud: the user wants a PRIVATE copy. A GitHub fork of a public repository cannot be private, so create a
+   new private repository `MatthewJer/ulix-arm64` (`gh` is logged in as `MatthewJer`), add it as remote `backup`, push the
+   branch `arm64-port`. `origin` is the original (`hgesser/ulix`): never push there.
+3. Replace this file: when everything above is done, delete `TODO.md` and put the short list of remaining limitations
+   (see "Differences that remain") into `README.md`. The notices that the port is not the work of the original authors
+   are already in the READMEs, `ARM64-PORT.md` and the book appendix.
+4. The book appendix should get the new things (device tree, SMP, memory exhaustion) once they are final; the appendix is
+   `\chapter{The ARM64 Port (an Unofficial Extension)}` in `ulix-book.nw`. `tectonic` (brew) was installed for checking it.
+
 ## Missing functionality
 
 - [x] **Pthreads**: `pthread_create`, `pthread_exit` and the `pthread_mutex_*` calls work like in the book (threads
