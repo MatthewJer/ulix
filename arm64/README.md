@@ -133,6 +133,11 @@ Found while porting, present on the x86 as well, left as they are in the book:
 | `mx_mkdir` does not check whether the directory exists (`u_mkdir` does); a second `mx_mkdir` on an existing path would damage the file system. | [23942](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L23942) |
 | `u_kill` on a blocked parent process leaves children that end later as zombies; `SIGKILL` sets `used = false` at once, so a following `waitpid` reports -1. | [27781](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L27781) |
 
+## Principles
+
+Ulix is a teaching system; what the port and the Raspberry Pi work follow from the original authors' idea is written down in
+[`PRINCIPLES.md`](PRINCIPLES.md), together with the plan (boot on the Pi, then networking, then telnet).
+
 ## Not done
 
 * Everything has only been run on qemu (`-M virt`, GICv2 and GICv3, 1 to 4 CPUs, EL1 and EL2). Real boards are untested: the device
