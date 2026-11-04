@@ -124,10 +124,15 @@ GPLv3 project (reading it for facts such as register layouts is fine).
   without a PL031 clock starts at 1 January 2026 (`arch_clock.c`). In qemu: RAM 960 MByte at 0, GIC-400 at 0xff841000, timer, PL011
   at 0xfe201000, MMU self-test pass; the disk tests fail because there is no SD driver yet. `make pcheck` for the qemu virt machine
   is unchanged.
-- `rpi4-qemu.dts` is a hand-written device tree for qemu's raspi4b (qemu has no firmware that provides one).
+- **Step 1, second part, done on 2026-11-04:** `dt.c` translates the addresses of devices through the `ranges` of the buses they sit on
+  (`address ()`): the real firmware tree gives the UART as bus address 0x7e201000 and the GIC as 0x40041000, which the cores see at
+  0xfe201000 and 0xff841000. `rpi4-qemu.dts` is laid out like the real `bcm2711.dtsi` (root with 2 address cells and 1 size cell, a
+  `soc` bus with three `ranges`), so qemu's raspi4b boot tests it; it is a hand-written tree because qemu has no firmware that
+  provides one. `make pcheck` has a job `rpi4` for this (22 tests now).
 - **Still open in step 1 (needs the board or the real firmware tree):**
-  - The real firmware device tree describes peripherals with *bus addresses* (0x7e201000) and a `ranges` property that translates them
-    to 0xfe201000; `dt.c` ignores `ranges` and would read the wrong addresses. It needs address translation (a few lines per level).
+  - Not verified against the real firmware tree: it may have more nodes and properties than the hand-written one (`dt.c` ignores
+    what it does not know, but nothing replaces a test on the board; once the board arrives, save its tree with
+    `dtc -I fs /proc/device_tree` from Raspberry Pi OS and test with that file).
   - Block 3 (0xC0000000-0xFFFFFFFF) holds the peripherals at 0xFE000000 but also RAM on the 4 GByte and 8 GByte models (up to
     0xFC000000); the boot table and `platform_map` map a whole GByte either as RAM or as device memory. The 1 GByte model that was
     ordered does not have this problem. For the bigger models the peripheral window has to be mapped with finer granularity.

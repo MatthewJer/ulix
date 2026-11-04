@@ -25,6 +25,7 @@ JOBLIST=(
   "three|three disks (hda, hdb on /tmp, fd1 on /mnt), 2 CPUs|kernel|virt|-smp 2 @D2@ @D3@|128"
   "shell3|shell session with three disks|shell|virt,gic-version=3|-smp 2 @D2@ @D3@|128"
   "sdisk|serial disk on a second UART (host program serves disk3.img), 2 CPUs|sdisk|virt|-smp 2|128"
+  "rpi4|Raspberry Pi 4B image in qemu raspi4b (device tree with ranges, RAM at 0)|rpi4|raspi4b||128"
   "ram512|RAM 512 MByte, 2 CPUs|kernel|virt|-smp 2|512"
   "ram64|RAM 64 MByte, 2 CPUs|kernel|virt|-smp 2|64"
   "el1|EL1, virtio legacy transport|kernel|virt||128"
@@ -56,6 +57,19 @@ if [ "$1" = "--job" ]; then
       QEMU_PORT=45131 QEMU_M=$machine QEMU_EXTRA="$extra" python3 tools/sdisk_test.py ulix.bin $DISK $DISK3 > "$log" 2>&1
       rc=$?; sum=$(tail -1 "$log")
       [ $rc -eq 0 ] && grep -q "all passed" <<< "$sum" && st=ok || st=FAILED ;;
+    rpi4)
+      # no disk and no SD driver yet: the boot messages and the MMU self-test must be fine (RAM at 0, the GIC and the UART found
+      # through the "ranges" of the device tree, the timer running)
+      rm -f "$log"
+      $QEMU -M raspi4b -dtb rpi4-qemu.dtb -serial file:"$log" -monitor none -display none -kernel kernel8.img 2>/dev/null &
+      P=$!
+      for i in $(seq 1 60); do sleep 1; grep -q '^disk test:' "$log" 2>/dev/null && break; done
+      kill $P 2>/dev/null; wait $P 2>/dev/null
+      mmu=$(awk '/^MMU self-test:/{f=1;next} /^disk test:/{f=0} f' "$log")
+      n_ok=$(grep -c '^  ok:' <<< "$mmu"); n_fail=$(grep -c 'FAIL' <<< "$mmu")
+      sum="$n_ok MMU checks ok, $n_fail failed"
+      if grep -q 'RAM: 960 MByte at 0x0' "$log" && grep -q 'GIC: version 2, distributor at 0xff841000' "$log" && grep -q '^Timer: ' "$log" \
+         && [ "$n_ok" -ge 10 ] && [ "$n_fail" -eq 0 ]; then st=ok; else st=FAILED; fi ;;
     verify)
       VD=$(mktemp -d)                                  # (the copies are written to: keep them off a slow SD card)
       cp $DISK $VD/disk-after.img; cp $DISK2 $VD/disk2-after.img; cp $DISK3 $VD/disk3-after.img

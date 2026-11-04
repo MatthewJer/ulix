@@ -1,17 +1,18 @@
 /dts-v1/;
 
 /* A small device tree for qemu's "raspi4b" machine. qemu does not create one (the real Raspberry Pi firmware does; the kernel
- * reads that one on the board). The format is the same as the tree of the qemu "virt" machine, so dt.c reads it unchanged.
- * Addresses are the ones of the BCM2711 as the ARM cores see them: peripherals at 0xFE000000, the GIC-400 at 0xFF841000. */
+ * reads that one on the board). It is laid out like the real tree of the BCM2711 (bcm2711.dtsi): the devices sit on the bus
+ * "soc" and are given with *bus addresses* (the UART at 0x7e201000, the GIC at 0x40041000); the "ranges" of the bus translate
+ * them to the addresses the ARM cores use (0xfe201000, 0xff841000). dt.c has to do that translation, so this tree tests it. */
 
 / {
 	compatible = "raspberrypi,4-model-b", "brcm,bcm2711";
 	#address-cells = <2>;
-	#size-cells = <2>;
+	#size-cells = <1>;
 
 	memory@0 {
 		device_type = "memory";
-		reg = <0x00 0x00 0x00 0x20000000>;      /* 512 MByte are enough for now; qemu has 2 GByte */
+		reg = <0x00 0x00 0x20000000>;           /* qemu fills in the real size */
 	};
 
 	cpus {
@@ -29,16 +30,27 @@
 		interrupts = <1 13 4>, <1 14 4>, <1 11 4>, <1 10 4>;
 	};
 
-	interrupt-controller@ff841000 {
-		compatible = "arm,gic-400", "arm,cortex-a15-gic";
-		#interrupt-cells = <3>;
-		interrupt-controller;
-		reg = <0x00 0xff841000 0x00 0x1000>, <0x00 0xff842000 0x00 0x2000>;
-	};
+	soc {
+		compatible = "simple-bus";
+		#address-cells = <1>;
+		#size-cells = <1>;
+		/* bus address, address in the address space of the cores, size */
+		ranges = <0x7e000000  0x00 0xfe000000  0x01800000>,
+			 <0x7c000000  0x00 0xfc000000  0x02000000>,
+			 <0x40000000  0x00 0xff800000  0x00800000>;
 
-	serial@fe201000 {
-		compatible = "arm,pl011", "arm,primecell";
-		reg = <0x00 0xfe201000 0x00 0x200>;
-		interrupts = <0 121 4>;
+		serial@7e201000 {
+			compatible = "arm,pl011", "arm,primecell";
+			reg = <0x7e201000 0x200>;
+			interrupts = <0 121 4>;
+		};
+
+		interrupt-controller@40041000 {
+			compatible = "arm,gic-400", "arm,cortex-a15-gic";
+			#interrupt-cells = <3>;
+			interrupt-controller;
+			reg = <0x40041000 0x1000>, <0x40042000 0x2000>,
+			      <0x40044000 0x2000>, <0x40046000 0x2000>;
+		};
 	};
 };

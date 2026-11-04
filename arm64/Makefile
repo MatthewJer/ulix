@@ -204,7 +204,7 @@ check: ulix.bin ulix-console.bin ulix-shell.bin $(DISK)
 
 # The same tests as "check", all at once: one qemu per test, JOBS of them in parallel (make pcheck JOBS=8), logs in check-logs/
 JOBS ?= 6
-pcheck: ulix.bin ulix-console.bin ulix-shell.bin $(DISK) $(DISK2) $(DISK3)
+pcheck: ulix.bin ulix-console.bin ulix-shell.bin kernel8.img rpi4-qemu.dtb $(DISK) $(DISK2) $(DISK3)
 	DISK=$(DISK) DISK2=$(DISK2) DISK3=$(DISK3) tools/parallel_check.sh $(JOBS)
 
 # The serial disk: the kernel tests with a second serial port, which tools/serial_disk.py serves from a copy of disk3.img

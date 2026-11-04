@@ -31,6 +31,7 @@ struct node {
   int pac, psc;                  // address and size cells for this node's "reg" (from the parent)
   int ac, sc;                    // #address-cells, #size-cells for the children
   const u8 *reg;  int reglen;
+  const u8 *ranges;  int rangeslen;   // how this node's children's addresses map into this node's own address space
   const u8 *compat;  int clen;
   const u8 *irq;  int irqlen;
   const char *devtype, *method;
@@ -53,7 +54,27 @@ static int irq_number (const u8 *p) {                // three cells: type (0 = S
   return type == 0 ? (int)num + 32 : (int)num + 16;
 }
 
-static void classify (const struct node *n) {
+// The "reg" of a device holds an address in the address space of the bus it sits on. On the Raspberry Pi 4 that is the bus
+// address 0x7e201000 for the UART, which the ARM cores see at 0xfe201000: the "ranges" of the bus (here "soc") say so. Each entry
+// is (child address, parent address, size), with as many cells as the child bus, the parent bus and the size need. The address is
+// translated up through all buses until it is an address of the CPU. A bus without "ranges" (or with an empty one) changes nothing.
+static u64 address (const struct node *stack, int depth, const u8 *reg) {
+  u64 a = cells (reg, stack[depth].pac);
+  for (int d = depth - 1; d >= 0; d--) {
+    const struct node *bus = &stack[d];
+    int entry = 4 * (bus->ac + bus->pac + bus->sc);
+    for (int off = 0; bus->ranges && off + entry <= bus->rangeslen; off += entry) {
+      u64 child = cells (bus->ranges + off, bus->ac);
+      u64 parent = cells (bus->ranges + off + 4 * bus->ac, bus->pac);
+      u64 size = cells (bus->ranges + off + 4 * (bus->ac + bus->pac), bus->sc);
+      if (a >= child && a - child < size) { a = a - child + parent; break; }
+    }
+  }
+  return a;
+}
+
+static void classify (const struct node *stack, int depth) {
+  const struct node *n = &stack[depth];
   if (n->devtype && str_eq (n->devtype, "memory") && n->reg && n->reglen >= 4 * (n->pac + n->psc)) {
     plat.ram_base = cells (n->reg, n->pac);
     plat.ram_size = cells (n->reg + 4 * n->pac, n->psc);
@@ -69,31 +90,31 @@ static void classify (const struct node *n) {
   int entry = 4 * (n->pac + n->psc);
   if (compat_has (n, "arm,gic-v3", 1) && n->reg && n->reglen >= 2 * entry) {
     plat.gic_version = 3;
-    plat.gicd = cells (n->reg, n->pac);
-    plat.gicr = cells (n->reg + entry, n->pac);
+    plat.gicd = address (stack, depth, n->reg);
+    plat.gicr = address (stack, depth, n->reg + entry);
     plat.gicr_size = cells (n->reg + entry + 4 * n->pac, n->psc);
   } else if ((compat_has (n, "arm,cortex-a15-gic", 1) || compat_has (n, "arm,gic-400", 1) ||
               compat_has (n, "arm,cortex-a9-gic", 1) || compat_has (n, "arm,cortex-a7-gic", 1)) &&
              n->reg && n->reglen >= 2 * entry) {
     plat.gic_version = 2;
-    plat.gicd = cells (n->reg, n->pac);
-    plat.gicc = cells (n->reg + entry, n->pac);
+    plat.gicd = address (stack, depth, n->reg);
+    plat.gicc = address (stack, depth, n->reg + entry);
   } else if (compat_has (n, "arm,pl011", 1) && n->reg) {
     static int uarts = 0;                                     // the first PL011 is the console, the second one the serial disk
     if (uarts == 0) {
-      plat.uart = cells (n->reg, n->pac);
+      plat.uart = address (stack, depth, n->reg);
       if (n->irq && n->irqlen >= 12) plat.uart_irq = irq_number (n->irq);
     } else if (uarts == 1) {
-      plat.uart2 = cells (n->reg, n->pac);
+      plat.uart2 = address (stack, depth, n->reg);
       plat.uart2_irq = (n->irq && n->irqlen >= 12) ? irq_number (n->irq) : 0;
     }
     uarts++;
   } else if (compat_has (n, "arm,pl031", 1) && n->reg) {
-    plat.rtc = cells (n->reg, n->pac);
+    plat.rtc = address (stack, depth, n->reg);
   } else if (compat_has (n, "virtio,mmio", 1) && n->reg) {
     if (plat.nvirtio < MAX_VIRTIO) {
       plat.virtio_irq[plat.nvirtio] = (n->irq && n->irqlen >= 12) ? irq_number (n->irq) : 0;
-      plat.virtio[plat.nvirtio++] = cells (n->reg, n->pac);
+      plat.virtio[plat.nvirtio++] = address (stack, depth, n->reg);
     }
     if (!n->coherent) plat.virtio_coherent = 0;
   } else if (compat_has (n, "arm,psci", 0)) {
@@ -145,6 +166,7 @@ void dt_init (u64 blob_pa) {
       if      (str_eq (pn, "reg"))             { n->reg = val; n->reglen = len; }
       else if (str_eq (pn, "compatible"))      { n->compat = val; n->clen = len; }
       else if (str_eq (pn, "interrupts"))      { n->irq = val; n->irqlen = len; }
+      else if (str_eq (pn, "ranges"))          { n->ranges = val; n->rangeslen = len; }
       else if (str_eq (pn, "device_type"))     n->devtype = (const char *)val;
       else if (str_eq (pn, "method"))          n->method = (const char *)val;
       else if (str_eq (pn, "dma-coherent"))    n->coherent = 1;
@@ -153,7 +175,7 @@ void dt_init (u64 blob_pa) {
       else if (str_eq (pn, "#size-cells"))     n->sc = be32 (val);
     } else if (tok == FDT_END_NODE) {
       if (depth < 0) return;
-      classify (&stack[depth]);
+      classify (stack, depth);
       depth--;
     } else if (tok == FDT_END) {
       break;
