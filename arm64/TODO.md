@@ -4,7 +4,69 @@ State: the port runs in `qemu-system-aarch64 -M virt` and passes `make check` (s
 is still missing compared with the x86 build, most important first. Background and reasons: `../ARM64-PORT.md`
 (sections 14-19).
 
-## Where we stopped (2026-11-03) -- start here
+## Where we stopped (2026-11-04) -- start here: waiting for the Raspberry Pi
+
+Work continues when the hardware has arrived (Pi 4B 1 GB, USB-C power supply, CP2102 UART module, 8 GB microSD, card reader,
+Dupont cables). Everything that can be tested in qemu is done: on branch `rpi4` the kernel, the console test and the whole shell
+session run on qemu's `raspi4b` machine from an SD card image (details in "Raspberry Pi 4B: progress" below). Principles for
+the rest of the work: `PRINCIPLES.md` (teaching system: simple, readable, small steps; BSD code only as a reference).
+The branch `rpi4` is only merged into `arm64-port` when `make pcheck` is green.
+
+### When the board arrives -- checklist, in this order
+
+1. **Prepare the card** (needs downloads: ask first, name the file, source and size). The boot partition (FAT32, first partition of
+   `sd.img`) needs the firmware files `start4.elf`, `fixup4.dat` and `bcm2711-rpi-4-b.dtb` from the `boot/` directory of
+   github.com/raspberrypi/firmware, a `config.txt`, and our `kernel8.img`. Extend `tools/make_sdcard.py` (or a new script) to format
+   partition 1 as FAT32 (`mformat`/`mcopy` from mtools, or write it by hand) and copy the files. `config.txt`:
+   `arm_64bit=1`, `kernel=kernel8.img` (or `kernel8-shell.img`), `enable_uart=1`, `dtoverlay=disable-bt` (puts the PL011 on
+   GPIO 14/15: by default the Pi 4 gives the PL011 to Bluetooth and the mini UART to the pins; our driver is for the PL011).
+   Check that the firmware takes the partition table with our Minix partitions (type 0x81) as it is.
+2. **Wire the UART** (3.3 V only!): adapter TXD to pin 10 (GPIO 15, RXD), adapter RXD to pin 8 (GPIO 14, TXD), GND to pin 6; no
+   5 V. Terminal on the Mac at 115200 baud, 8N1 (`screen /dev/cu.usbserial-... 115200`).
+3. **Set the baud rate in the kernel.** qemu ignores it, the real PL011 does not: the driver in `kmain.c` only writes characters.
+   With the 48 MHz UART clock of the Pi: IBRD = 26, FBRD = 3 for 115200 baud, 8N1 (`UARTLCR_H`, `UARTCR`), unless the firmware has
+   already set it up (it does when it uses the UART itself, `enable_uart=1`). Check what the firmware leaves, then decide.
+4. **First boot.** Expect surprises, look at the serial output first. Things already known to check:
+   - The firmware starts the kernel at EL2 and passes the device tree in `x0` (`start.S` drops to EL1; `boot_dtb`). Save the tree
+     the kernel gets and compare with `rpi4-qemu.dts` (`dtc -I dtb -O dts`); test `dt.c` with the real one, including `ranges`.
+   - Alignment faults on device memory: 8- and 16-bit registers must be accessed with their own width (as in `sdcard.c`).
+   - Only one CPU for now: the firmware parks the other three (spin table, no PSCI). The kernel must not try `CPU_ON` via PSCI
+     (`plat.psci` is 0 without the node, check that `ncpus` > 1 does not start anything). Later: start them from the spin table.
+   - The 1 GByte model has its peripherals in block 3 and RAM in block 0, which fits the boot tables; the 4 and 8 GByte models do not
+     (see "Still open in step 1").
+   - The generic timer frequency on the board is 54 MHz (qemu: 62.5 MHz): the code reads `cntfrq_el0`, check the 100 Hz tick.
+5. **SD card on the real controller** (EMMC2 at 0xfe340000): see "Not done and not testable in qemu" in the Pi progress section. If the
+   card does not initialise: log the status registers; the clock and power of EMMC2 may need the firmware mailbox
+   (`bcm2835_mbox`, FreeBSD `bcm2835_mbox.c` as reference).
+6. When the kernel tests, the console and the shell session run on the board: merge `rpi4` into `arm64-port` (after `make pcheck`),
+   tag the state, update `README.md` ("Not done": real boards are tested), and write the log entry in `../ARM64-PORT.md`.
+
+### After that (the actual goal: Ulix on the Pi with telnet)
+
+7. **Faster and nicer SD**: interrupts (a process sleeps while the card works, like the IDE driver of the book), multi-block commands,
+   4-bit bus, maybe DMA. Each as its own small step with a test.
+8. **Networking**, first in qemu `virt` with virtio-net (the Pi's GENET is not in qemu's `raspi4b`, and the Mac cannot test it
+   without the board): a virtio-net driver (polling first, then interrupts), then the layers, each small and tested on its own,
+   written like a chapter of the book: Ethernet frames, ARP, IPv4, ICMP (ping), UDP, then a small TCP (connect, send, receive, close,
+   retransmission by timer; no window scaling or options). Tests: a host-side program in Python that talks to the guest through
+   qemu's `-netdev` (ping, UDP echo, TCP echo). Reference for facts (not code to paste): FreeBSD and NetBSD.
+9. **GENET driver** for the Pi's Ethernet (BCM2711, `sys/arm64/broadcom/genet/if_genet.c` and `if_genetreg.h` of FreeBSD as the
+   reference): register definitions, DMA rings, PHY (MDIO) setup, link detection. Only on the board (or on newer qemu if it
+   gets a model). Plug it into the same interface as the virtio-net driver.
+10. **Telnet server**: a daemon (kernel thread or user process) that listens on port 23, handles the minimal telnet protocol (IAC, echo,
+    suppress go-ahead, terminal size can be ignored), and attaches the session to a virtual terminal of the book (there are ten).
+    Login through the book's `/bin/login`. Test: a Python script that connects to the guest and runs commands.
+11. **A clock over the network** (no RTC on the Pi): at the end a simple time query (SNTP over UDP) instead of the fixed start date
+    of 1 January 2026.
+
+### Smaller open points (not tied to the board)
+
+- Ask-first rule for downloads (firmware files, mtools if missing, anything else): name file, source and size.
+- The log entry for the Pi work so far is section 20 of `../ARM64-PORT.md`; add the results of the board there.
+- The Pi image still uses the test kernel's `kmain` for `kernel8.img`; `kernel8-shell.img` is the one that boots to the shell.
+- Before the repository is made public: check the notices again (see "Then" below).
+
+### Tests of 2026-11-03 (state at that time)
 
 All tests are green: `make pcheck` (all 21 tests in parallel, about 3 minutes, `JOBS=n` sets the number of parallel qemu
 instances, logs in `check-logs/`) and the older sequential `make check` (about 30 minutes).
