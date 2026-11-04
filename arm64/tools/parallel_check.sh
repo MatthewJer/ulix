@@ -25,7 +25,9 @@ JOBLIST=(
   "three|three disks (hda, hdb on /tmp, fd1 on /mnt), 2 CPUs|kernel|virt|-smp 2 @D2@ @D3@|128"
   "shell3|shell session with three disks|shell|virt,gic-version=3|-smp 2 @D2@ @D3@|128"
   "sdisk|serial disk on a second UART (host program serves disk3.img), 2 CPUs|sdisk|virt|-smp 2|128"
-  "rpi4|Raspberry Pi 4B image in qemu raspi4b (device tree with ranges, RAM at 0)|rpi4|raspi4b||128"
+  "rpi4|Raspberry Pi 4B in qemu raspi4b: kernel tests, SD card, device tree with ranges|rpi4|raspi4b||128"
+  "rpi4shell|Raspberry Pi 4B in qemu raspi4b: shell session|rpi4shell|raspi4b||128"
+  "rpi4console|Raspberry Pi 4B in qemu raspi4b: console test|rpi4console|raspi4b||128"
   "ram512|RAM 512 MByte, 2 CPUs|kernel|virt|-smp 2|512"
   "ram64|RAM 64 MByte, 2 CPUs|kernel|virt|-smp 2|64"
   "el1|EL1, virtio legacy transport|kernel|virt||128"
@@ -58,18 +60,21 @@ if [ "$1" = "--job" ]; then
       rc=$?; sum=$(tail -1 "$log")
       [ $rc -eq 0 ] && grep -q "all passed" <<< "$sum" && st=ok || st=FAILED ;;
     rpi4)
-      # no disk and no SD driver yet: the boot messages and the MMU self-test must be fine (RAM at 0, the GIC and the UART found
-      # through the "ranges" of the device tree, the timer running)
+      # the Raspberry Pi 4B image on qemu's raspi4b machine with the SD card (the disks are its partitions): the kernel tests
       rm -f "$log"
-      $QEMU -M raspi4b -dtb rpi4-qemu.dtb -serial file:"$log" -monitor none -display none -kernel kernel8.img 2>/dev/null &
+      $QEMU -M raspi4b -dtb rpi4-qemu.dtb -serial file:"$log" -monitor none -display none -kernel kernel8.img -snapshot \
+        -drive file=sd.img,if=sd,format=raw 2>/dev/null &
       P=$!
-      for i in $(seq 1 60); do sleep 1; grep -q '^disk test:' "$log" 2>/dev/null && break; done
+      for i in $(seq 1 240); do sleep 1; grep -q '^RESULT' "$log" 2>/dev/null && break; done
       kill $P 2>/dev/null; wait $P 2>/dev/null
-      mmu=$(awk '/^MMU self-test:/{f=1;next} /^disk test:/{f=0} f' "$log")
-      n_ok=$(grep -c '^  ok:' <<< "$mmu"); n_fail=$(grep -c 'FAIL' <<< "$mmu")
-      sum="$n_ok MMU checks ok, $n_fail failed"
-      if grep -q 'RAM: 960 MByte at 0x0' "$log" && grep -q 'GIC: version 2, distributor at 0xff841000' "$log" && grep -q '^Timer: ' "$log" \
-         && [ "$n_ok" -ge 10 ] && [ "$n_fail" -eq 0 ]; then st=ok; else st=FAILED; fi ;;
+      sum="$(grep -c '^  ok:' "$log") checks ok, $(grep -c 'FAIL' "$log") failed $(grep '^RESULT' "$log" | sed 's/RESULT: //')"
+      if grep -q "^RESULT: all checks passed" "$log" && grep -q 'GIC: version 2, distributor at 0xff841000' "$log" \
+         && grep -q '^sd: card ready' "$log" && grep -q 'RAM: 960 MByte at 0x0' "$log"; then st=ok; else st=FAILED; fi ;;
+    rpi4shell|rpi4console)
+      case $kind in rpi4shell) img=kernel8-shell.img; script=shell_test; port=45133;; *) img=kernel8-console.img; script=console_test; port=45132;; esac
+      QEMU_BOARD=rpi4 HAVE_DISK2=1 HAVE_DISK3=1 QEMU_PORT=$port python3 tools/$script.py $img sd.img > "$log" 2>&1
+      rc=$?; sum=$(tail -1 "$log")
+      [ $rc -eq 0 ] && grep -q "all passed" <<< "$sum" && st=ok || st=FAILED ;;
     verify)
       VD=$(mktemp -d)                                  # (the copies are written to: keep them off a slow SD card)
       cp $DISK $VD/disk-after.img; cp $DISK2 $VD/disk2-after.img; cp $DISK3 $VD/disk3-after.img

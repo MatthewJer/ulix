@@ -27,7 +27,8 @@ make                 # kernel images, user programs, disk image (disk.img)
 make run-shell       # boots to the shell; Ctrl-A X leaves qemu
 make check           # all test suites one after the other (slow)
 make pcheck          # the same tests as parallel qemu instances (about 3 minutes)
-make kernel8.img     # image for the Raspberry Pi 4B (work in progress, branch rpi4); make run-rpi4 starts it in qemu's raspi4b
+make kernel8.img     # image for the Raspberry Pi 4B (work in progress, branch rpi4)
+make run-rpi4-shell  # ... and the system with login and shell on qemu's raspi4b machine, with an SD card image (sd.img)
 ```
 
 In the shell: `ls`, `cat`, `cd`, `cp`, `rm`, `mkdir`, `rmdir`, `touch`, `wc`, `grep`, `stat`, `ps`, `df`, `free`, …
@@ -63,7 +64,7 @@ The port keeps the book as the single source:
 | fork/exec with kernel stacks inside the address space | `arch_thread.c`: separate kernel stack per thread, copy-on-write `fork`, `exec` with an ELF64 loader (`elf.c`) |
 | context switch by swapping ESP/EBP/CR3 | `cpu_switch` (`vectors.S`) and `arch_context_switch` |
 | signal delivery on the user stack | `arch_signal_check`, `sigreturn`, trampoline page |
-| IDE / floppy | `virtio.c`, `glue.c`: up to three virtio-blk disks (hda, hdb, a stand-in for fd1), interrupt driven like the IDE driver; `minixfs.c`: small read-only reader used by the ELF loader |
+| IDE / floppy | `virtio.c`, `glue.c`: up to three virtio-blk disks (hda, hdb, a stand-in for fd1), interrupt driven like the IDE driver; on the Raspberry Pi `sdcard.c` (SDHCI, polled) with the disks as partitions of the SD card; `minixfs.c`: small read-only reader used by the ELF loader |
 | serial disk (`/dev/sdisk`, major 42; second COM port) | `glue.c`: second PL011 with interrupt, same protocol; `tools/serial_disk.py` serves the disk on the host (`make sdisk-test`) |
 | VGA text mode, PS/2 keyboard, 10 virtual terminals | PL011 UART (`arch_console.c`); the screens of the terminals are a model of the VGA text screen (`arch_vt.c`) shown on the console with ANSI sequences |
 | device detection by BIOS/ports, one CPU | `dt.c`: device tree; `smp.c`: more than one CPU (PSCI, big kernel lock) |

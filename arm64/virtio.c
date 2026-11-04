@@ -1,7 +1,8 @@
-// Ulix ARM64 -- virtio-mmio block device driver (polling)
+// Ulix ARM64 -- the disks of the system: virtio-mmio block devices (polling or interrupts), or partitions of an SD card
 // Replaces the x86 IDE (PIO) and floppy (DMA) drivers: the same read/write-sectors
 // interface, but the "disk" is a virtio-blk device on the qemu "virt" machine.
-// Supports the legacy (version 1) and the modern (version 2) MMIO transport.
+// Supports the legacy (version 1) and the modern (version 2) MMIO transport. On a board without virtio devices (the
+// Raspberry Pi) the disks are the Ulix partitions of the SD card (sdcard.c); they are used through the same functions.
 
 #include "ulix.h"
 #include "plat.h"
@@ -66,6 +67,7 @@ struct blk {
   u64 capacity;                             // in sectors
   int irq;                                  // interrupt number of the device (0: none known)
   void *cur_buf;  u32 cur_len;  int cur_type;
+  int sd;  u64 sd_first;  int sd_result;      // sd: this disk is a partition of the SD card, starting at sector sd_first
 };
 static struct blk disks[MAX_DISKS];
 int blk_disks = 0;                          // how many were found
@@ -128,6 +130,23 @@ static int init_disk (struct blk *b) {
   return 0;
 }
 
+extern int sd_partitions (u64 *first, u64 *sectors, int max);
+extern int sd_read (u64 lba, void *buf, u32 count);
+extern int sd_write (u64 lba, const void *buf, u32 count);
+
+// no virtio device: look for an SD card with Ulix partitions
+static int sd_disks (void) {
+  u64 first[MAX_DISKS], sectors[MAX_DISKS];
+  int n = sd_partitions (first, sectors, MAX_DISKS);
+  if (n == 0) { printf ("virtio: no block device found, no SD card either\n"); return -1; }
+  for (int k = 0; k < n; k++) {
+    disks[k].sd = 1;  disks[k].sd_first = first[k];  disks[k].capacity = sectors[k];  disks[k].irq = 0;
+    printf ("sd: disk %d with %lu sectors (%lu KByte)\n", k, disks[k].capacity, disks[k].capacity / 2);
+  }
+  blk_disks = n;  blk_irq = 0;                // (the card is read by polling: a process that waits for it does not sleep)
+  return 0;
+}
+
 int blk_init (void) {
   int slots = plat.nvirtio ? plat.nvirtio : VIRTIO_SLOTS;                      // without a device tree: the 32 slots of qemu virt
   volatile u8 *found[MAX_DISKS];  int found_irq[MAX_DISKS], found_slot[MAX_DISKS], n = 0;
@@ -137,7 +156,7 @@ int blk_init (void) {
       found[n] = s;  found_slot[n] = i;  found_irq[n] = plat.nvirtio ? plat.virtio_irq[i] : 0;  n++;
     }
   }
-  if (n == 0) { printf ("virtio: no block device found\n"); return -1; }
+  if (n == 0) return sd_disks ();
   blk_disks = 0;
   for (int k = 0; k < n; k++) {
     struct blk *b = &disks[k];
@@ -162,6 +181,10 @@ int blk_submit_n (int n, int type, u64 sector, void *buf, u32 nsectors) {
   if (n < 0 || n >= blk_disks) return -1;
   struct blk *b = &disks[n];
   if (sector + nsectors > b->capacity) return -1;
+  if (b->sd) {                              // SD card: the transfer is done right here, nothing is left to wait for
+    b->sd_result = type == VIRTIO_BLK_T_IN ? sd_read (b->sd_first + sector, buf, nsectors) : sd_write (b->sd_first + sector, buf, nsectors);
+    return b->sd_result;
+  }
   u32 *hdr = KVA (b->req_pa);
   volatile u8 *status = (volatile u8 *)KVA (b->req_pa + 16);
   hdr[0] = type; hdr[1] = 0; hdr[2] = (u32)sector; hdr[3] = sector >> 32;
@@ -192,12 +215,14 @@ int blk_submit_n (int n, int type, u64 sector, void *buf, u32 nsectors) {
 
 int blk_done_n (int n) {                    // has the device finished the request?
   struct blk *b = &disks[n];
+  if (b->sd) return 1;
   cache_flush_inval ((const void *)b->used, sizeof (struct used));
   return b->used->idx != b->used_seen;
 }
 
 int blk_finish_n (int n) {                  // 0 = request done and successful
   struct blk *b = &disks[n];
+  if (b->sd) return b->sd_result;
   volatile u8 *status = (volatile u8 *)KVA (b->req_pa + 16);
   b->used_seen++;
   if (b->cur_type == VIRTIO_BLK_T_IN) cache_flush_inval (b->cur_buf, b->cur_len);       // see the data the device wrote
@@ -206,7 +231,7 @@ int blk_finish_n (int n) {                  // 0 = request done and successful
 }
 
 void blk_irq_ack (void) {                   // in the interrupt handler: every device stops signalling
-  for (int i = 0; i < blk_disks; i++) wr (&disks[i], R_INTERRUPT_ACK, rd (&disks[i], R_INTERRUPT_STATUS));
+  for (int i = 0; i < blk_disks; i++) if (!disks[i].sd) wr (&disks[i], R_INTERRUPT_ACK, rd (&disks[i], R_INTERRUPT_STATUS));
 }
 
 static int blk_request (int n, int type, u64 sector, void *buf, u32 nsectors) {

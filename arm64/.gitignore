@@ -20,3 +20,8 @@ disk3.img
 ulix-rpi4.elf
 kernel8.img
 rpi4-qemu.dtb
+ulix-rpi4-console.elf
+ulix-rpi4-shell.elf
+kernel8-console.img
+kernel8-shell.img
+sd.img

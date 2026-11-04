@@ -10,11 +10,15 @@ import os, re, shlex, socket, subprocess, sys, time
 kernel, disk = sys.argv[1:3]
 PORT = int(os.environ.get('QEMU_PORT', 45125))
 # QEMU_M (machine), QEMU_MEM (MByte) and QEMU_EXTRA (further arguments, e.g. '-smp 4') select another configuration
-qemu = subprocess.Popen(['qemu-system-aarch64', '-M', os.environ.get('QEMU_M', 'virt'), '-cpu', 'cortex-a72', '-m', os.environ.get('QEMU_MEM', '128'), '-display', 'none',
-                         '-monitor', 'none', '-kernel', kernel, '-snapshot',
-                         '-drive', 'file=%s,format=raw,if=none,id=hd0' % disk, '-device', 'virtio-blk-device,drive=hd0',
-                         '-serial', 'tcp:127.0.0.1:%d,server=on,wait=on' % PORT] + shlex.split(os.environ.get('QEMU_EXTRA', '')),
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+if os.environ.get('QEMU_BOARD') == 'rpi4':               # the Raspberry Pi 4B in qemu: "disk" is the SD card image (make sd.img)
+    cmd = ['qemu-system-aarch64', '-M', 'raspi4b', '-dtb', 'rpi4-qemu.dtb', '-display', 'none', '-monitor', 'none', '-kernel', kernel, '-snapshot',
+           '-drive', 'file=%s,if=sd,format=raw' % disk, '-serial', 'tcp:127.0.0.1:%d,server=on,wait=on' % PORT]
+else:
+    cmd = ['qemu-system-aarch64', '-M', os.environ.get('QEMU_M', 'virt'), '-cpu', 'cortex-a72', '-m', os.environ.get('QEMU_MEM', '128'), '-display', 'none',
+           '-monitor', 'none', '-kernel', kernel, '-snapshot',
+           '-drive', 'file=%s,format=raw,if=none,id=hd0' % disk, '-device', 'virtio-blk-device,drive=hd0',
+           '-serial', 'tcp:127.0.0.1:%d,server=on,wait=on' % PORT]
+qemu = subprocess.Popen(cmd + shlex.split(os.environ.get('QEMU_EXTRA', '')), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 sock = None
 for _ in range(100):
     try: sock = socket.create_connection(('127.0.0.1', PORT)); break

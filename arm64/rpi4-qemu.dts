@@ -45,6 +45,14 @@
 			interrupts = <0 121 4>;
 		};
 
+		/* qemu puts the SD card on the controller at 0x7e300000. On the real board the card slot is EMMC2 at 0x7e340000: the
+		 * firmware's tree says so, and that is the address the kernel then uses. */
+		mmc@7e300000 {
+			compatible = "brcm,bcm2711-emmc2";
+			reg = <0x7e300000 0x100>;
+			interrupts = <0 126 4>;
+		};
+
 		interrupt-controller@40041000 {
 			compatible = "arm,gic-400", "arm,cortex-a15-gic";
 			#interrupt-cells = <3>;

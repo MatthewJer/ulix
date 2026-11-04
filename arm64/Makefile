@@ -11,7 +11,7 @@ CFLAGS = -I$(GENDIR) -mno-outline-atomics -O0 -g -ffreestanding -nostdlib -fno-b
 # "-snapshot" keeps the file unmodified when running.
 DISK ?= disk.img
 
-OBJS = start.o vectors.o irq.o mmu.o virtio.o minixfs.o elf.o ulix-port.o glue.o arch_thread.o arch_console.o arch_clock.o arch_swap.o arch_vt.o dt.o gic.o smp.o \
+OBJS = start.o vectors.o irq.o mmu.o virtio.o sdcard.o minixfs.o elf.o ulix-port.o glue.o arch_thread.o arch_console.o arch_clock.o arch_swap.o arch_vt.o dt.o gic.o smp.o \
        bookfs_test.o thread_test.o proc_test.o kmain.o
 
 all: ulix.elf ulix-console.elf ulix-shell.elf ulix.bin ulix-console.bin ulix-shell.bin $(DISK) $(GENDIR)/disk_expected.h
@@ -123,7 +123,7 @@ proc_test.o: proc_test.c $(GENFILES) $(GENDIR)/ulix-api.h
 glue.o: glue.c $(GENFILES) $(GENDIR)/ulix-api.h
 	$(CC) $(BOOKFLAGS) -Dhash=glue_unused_hash -c -o $@ $<
 
-irq.o mmu.o virtio.o dt.o gic.o smp.o kmain.o kmain-console.o kmain-shell.o: plat.h gic.h smp.h ulix.h arch_pte.h
+irq.o mmu.o virtio.o sdcard.o dt.o gic.o smp.o kmain.o kmain-console.o kmain-shell.o: plat.h gic.h smp.h ulix.h arch_pte.h
 
 %.o: %.S
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -143,12 +143,35 @@ ulix-rpi4.elf: $(filter-out start.o,$(OBJS)) start-rpi4.o ulix.ld
 kernel8.img: ulix-rpi4.elf
 	$(OBJCOPY) -O binary $< $@
 
+# the same for the console test and for the system with login and shell (they differ from the test kernel in kmain only)
+ulix-rpi4-console.elf: $(filter-out start.o kmain.o,$(OBJS)) start-rpi4.o kmain-console.o ulix.ld
+	$(LD) -T ulix.ld --defsym=KERNEL_PA=0x80000 -o $@ $(filter-out start.o kmain.o,$(OBJS)) start-rpi4.o kmain-console.o
+
+ulix-rpi4-shell.elf: $(filter-out start.o kmain.o,$(OBJS)) start-rpi4.o kmain-shell.o ulix.ld
+	$(LD) -T ulix.ld --defsym=KERNEL_PA=0x80000 -o $@ $(filter-out start.o kmain.o,$(OBJS)) start-rpi4.o kmain-shell.o
+
+kernel8-console.img: ulix-rpi4-console.elf
+	$(OBJCOPY) -O binary $< $@
+
+kernel8-shell.img: ulix-rpi4-shell.elf
+	$(OBJCOPY) -O binary $< $@
+
 # qemu's raspi4b machine gets no device tree from a firmware: this one describes what it has (rpi4-qemu.dts)
 rpi4-qemu.dtb: rpi4-qemu.dts
 	dtc -I dts -O dtb -o $@ $<
 
-run-rpi4: kernel8.img rpi4-qemu.dtb
-	qemu-system-aarch64 -M raspi4b -dtb rpi4-qemu.dtb -serial stdio -display none -kernel kernel8.img
+# the SD card: partition table, a boot partition (empty here) and the three disks as partitions of type 0x81
+sd.img: tools/make_sdcard.py $(DISK) $(DISK2) $(DISK3)
+	python3 tools/make_sdcard.py $@ $(DISK) $(DISK2) $(DISK3)
+
+# the system with login and shell on the emulated Pi (Ctrl-A X leaves qemu)
+run-rpi4-shell: kernel8-shell.img rpi4-qemu.dtb sd.img
+	qemu-system-aarch64 -M raspi4b -dtb rpi4-qemu.dtb -serial stdio -display none -kernel kernel8-shell.img -snapshot \
+		-drive file=sd.img,if=sd,format=raw
+
+run-rpi4: kernel8.img rpi4-qemu.dtb sd.img
+	qemu-system-aarch64 -M raspi4b -dtb rpi4-qemu.dtb -serial stdio -display none -kernel kernel8.img -snapshot \
+		-drive file=sd.img,if=sd,format=raw
 
 run: ulix.bin
 	qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128 -nographic -kernel ulix.bin \
@@ -204,7 +227,7 @@ check: ulix.bin ulix-console.bin ulix-shell.bin $(DISK)
 
 # The same tests as "check", all at once: one qemu per test, JOBS of them in parallel (make pcheck JOBS=8), logs in check-logs/
 JOBS ?= 6
-pcheck: ulix.bin ulix-console.bin ulix-shell.bin kernel8.img rpi4-qemu.dtb $(DISK) $(DISK2) $(DISK3)
+pcheck: ulix.bin ulix-console.bin ulix-shell.bin kernel8.img kernel8-console.img kernel8-shell.img rpi4-qemu.dtb sd.img $(DISK) $(DISK2) $(DISK3)
 	DISK=$(DISK) DISK2=$(DISK2) DISK3=$(DISK3) tools/parallel_check.sh $(JOBS)
 
 # The serial disk: the kernel tests with a second serial port, which tools/serial_disk.py serves from a copy of disk3.img
@@ -224,4 +247,5 @@ clean:
 	rm -rf gen
 	$(MAKE) -C userland clean
 	rm -rf check-logs
+	rm -f sd.img kernel8*.img ulix-rpi4*.elf start-rpi4.o rpi4-qemu.dtb
 	rm -f disk2.img disk3.img verify-fs.log check-el1.log check-el2.log *.o ulix.elf ulix-console.elf ulix-shell.elf disk.img disk-after.img verify.log bad-arch.elf bad-wx.elf

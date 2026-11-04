@@ -35,7 +35,7 @@ void platform_map (void) {
   if (plat.ram_size > MAX_RAM) { printf ("RAM: using %lu of %lu MByte\n", MAX_RAM >> 20, plat.ram_size >> 20); plat.ram_size = MAX_RAM; }
   for (u64 pa = plat.ram_base & ~((1UL << 30) - 1); pa < plat.ram_base + plat.ram_size; pa += 1UL << 30) map_block (pa, 0);
   map_block (plat.gicd, 1);  map_block (plat.gicc, 1);  map_block (plat.gicr, 1);  map_block (plat.gicr + plat.gicr_size, 1);
-  map_block (plat.uart, 1);  map_block (plat.rtc, 1);
+  map_block (plat.uart, 1);  map_block (plat.rtc, 1);  map_block (plat.sdhci, 1);
   for (int i = 0; i < plat.nvirtio; i++) map_block (plat.virtio[i], 1);
   __asm__ volatile ("dsb ishst; tlbi vmalle1is; dsb ish; isb" ::: "memory");
 }

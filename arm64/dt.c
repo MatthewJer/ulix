@@ -109,6 +109,8 @@ static void classify (const struct node *stack, int depth) {
       plat.uart2_irq = (n->irq && n->irqlen >= 12) ? irq_number (n->irq) : 0;
     }
     uarts++;
+  } else if (compat_has (n, "brcm,bcm2711-emmc2", 1) && n->reg) {
+    plat.sdhci = address (stack, depth, n->reg);
   } else if (compat_has (n, "arm,pl031", 1) && n->reg) {
     plat.rtc = address (stack, depth, n->reg);
   } else if (compat_has (n, "virtio,mmio", 1) && n->reg) {

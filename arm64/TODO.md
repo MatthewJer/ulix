@@ -128,7 +128,21 @@ GPLv3 project (reading it for facts such as register layouts is fine).
   (`address ()`): the real firmware tree gives the UART as bus address 0x7e201000 and the GIC as 0x40041000, which the cores see at
   0xfe201000 and 0xff841000. `rpi4-qemu.dts` is laid out like the real `bcm2711.dtsi` (root with 2 address cells and 1 size cell, a
   `soc` bus with three `ranges`), so qemu's raspi4b boot tests it; it is a hand-written tree because qemu has no firmware that
-  provides one. `make pcheck` has a job `rpi4` for this (22 tests now).
+  provides one. `make pcheck` has a job for this.
+- **Step 4 (SD card), done on 2026-11-04, tested in qemu only:** `sdcard.c` is a polling driver for an SDHCI controller (reset, power,
+  clock divider from the capabilities, CMD0/8/41/2/3/7/16, one sector per CMD17/CMD24 through the data port; SDSC and SDHC). The MBR
+  of the card says where the disks are: the partitions of type 0x81 are `/dev/hda`, `/dev/hdb` and the stand-in for `/dev/fd1`, in
+  that order; partition 1 (FAT) is left alone. `virtio.c` (the block layer) uses them when there is no virtio device, so
+  everything above (buffer cache, Minix code, swap) is unchanged. `tools/make_sdcard.py` builds the card image (`make sd.img`, the
+  three disk images as partitions, 128 MByte); `make run-rpi4` / `make run-rpi4-shell` boot the Pi images on qemu's raspi4b with it.
+  Tests (`make pcheck`, 3 new jobs): all kernel tests (133 checks), the console test and the whole shell session pass on the
+  emulated board. The interrupt-driven disk check of `proc_test.c` is skipped there (`blk_irq` is 0: the card is polled).
+  - qemu puts its card on the controller at 0x7e300000, the real Pi 4 has the slot on EMMC2 (0x7e340000); `dt.c` uses whatever the
+    tree says (`brcm,bcm2711-emmc2`).
+  - Not done and not testable in qemu: the interrupt of the controller (a process could sleep instead of polling), DMA, multi-block
+    commands (faster), the 4-bit bus, the 1.8 V switch (UHS), the clock and power of EMMC2 through the firmware mailbox (the firmware
+    leaves the controller running when it starts the kernel, the driver resets it anyway), real cards that are slower than qemu's.
+    The first boot on the board will show what the real controller needs on top.
 - **Still open in step 1 (needs the board or the real firmware tree):**
   - Not verified against the real firmware tree: it may have more nodes and properties than the hand-written one (`dt.c` ignores
     what it does not know, but nothing replaces a test on the board; once the board arrives, save its tree with
