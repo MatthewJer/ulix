@@ -9,8 +9,11 @@
 extern unsigned long plat_rtc (void);                                          // from the device tree
 #define RTC_DR  (*(volatile unsigned int *)(0xffff000000000000UL + plat_rtc ()))     // data register: seconds
 
+// A board without a real-time clock (the Raspberry Pi 4B has none) starts at this date: 1 January 2026, 00:00 UTC.
+#define NO_CLOCK_START_TIME 1767225600U
+
 void arch_clock_init (void) {
-  system_start_time = RTC_DR;
+  system_start_time = plat_rtc () ? RTC_DR : NO_CLOCK_START_TIME;
   system_ticks = 0;
   system_time  = system_start_time;
 }

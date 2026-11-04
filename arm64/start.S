@@ -1,9 +1,16 @@
-// Ulix ARM64 -- boot code for qemu-system-aarch64 -M virt
-// qemu enters at the *physical* address 0x40080000 with the MMU off, at EL1 (or EL2).
+// Ulix ARM64 -- boot code for qemu-system-aarch64 -M virt and for the Raspberry Pi 4B
+// qemu enters at the *physical* address 0x40080000 with the MMU off, at EL1 (or EL2); the Pi firmware loads
+// kernel8.img at 0x80000 and starts it at EL2 (see ulix.ld and "make PLATFORM=rpi4" in the Makefile).
 // The kernel is linked at 0xFFFF000000000000 + PA, so everything up to the jump to
 // the high address must be position independent (adr, no absolute symbol loads).
 
 #define KERNEL_VA   0xFFFF000000000000
+
+// Number of the 1 GByte block in which the console UART sits; mapped as device memory in the boot tables so that the
+// first messages can be printed. qemu "virt": the UART is at 0x09000000 (block 0); Raspberry Pi 4B: 0xFE201000 (block 3).
+#ifndef BOOT_DEV_GB
+#define BOOT_DEV_GB 0
+#endif
 
 // descriptor bits
 #define D_BLOCK     0x1
@@ -72,23 +79,33 @@ at_el1:
         subs    x2, x2, #1
         b.ne    1b
 
-        // ---- TTBR1 (kernel, upper half): L0[0] -> L1; L1[0] = device 1GB, L1[1] = RAM 1GB
+        // The kernel is somewhere in RAM: on the qemu "virt" machine at 0x40080000, on the Raspberry Pi (RAM starts at 0)
+        // at 0x80000.  The 1 GByte block that contains this code is the RAM block of the boot tables; x6 = its address,
+        // x7 = its number (the index into the level 1 tables).  Everything else (the other RAM, the devices) is mapped
+        // later by platform_map () (mmu.c) from the device tree.
+        adr     x6, _start
+        and     x6, x6, #~0x3fffffff
+        lsr     x7, x6, #30
+
+        // ---- TTBR1 (kernel, upper half): L0[0] -> L1; L1[BOOT_DEV_GB] = the first device GByte (for the first
+        //      messages on the console, until the device tree has been read), L1[x7] = RAM
         adr     x1, pg_t1_l0
         adr     x2, pg_t1_l1
         orr     x3, x2, #D_TABLE
         str     x3, [x1]
-        ldr     x3, =(D_BLOCK | D_ATTR(0) | D_AF | D_PXN | D_UXN)
-        str     x3, [x2]
-        ldr     x3, =(0x40000000 | D_BLOCK | D_ATTR(1) | D_SH_INNER | D_AF)
-        str     x3, [x2, #8]
+        ldr     x3, =((BOOT_DEV_GB << 30) | D_BLOCK | D_ATTR(0) | D_AF | D_PXN | D_UXN)
+        str     x3, [x2, #(BOOT_DEV_GB * 8)]
+        ldr     x8, =(D_BLOCK | D_ATTR(1) | D_SH_INNER | D_AF)      // RAM: normal memory, write-back
+        orr     x3, x6, x8
+        str     x3, [x2, x7, lsl #3]
 
         // ---- TTBR0 (identity map of RAM, only needed until we run at the high address)
         adr     x4, pg_t0_l0
         adr     x5, pg_t0_l1
         orr     x3, x5, #D_TABLE
         str     x3, [x4]
-        ldr     x3, =(0x40000000 | D_BLOCK | D_ATTR(1) | D_SH_INNER | D_AF)
-        str     x3, [x5, #8]
+        orr     x3, x6, x8
+        str     x3, [x5, x7, lsl #3]
 
         // ---- MMU configuration
         ldr     x0, =0xff00             // MAIR: attr0 = device-nGnRnE, attr1 = normal write-back

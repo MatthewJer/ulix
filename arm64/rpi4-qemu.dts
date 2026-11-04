@@ -1,0 +1,44 @@
+/dts-v1/;
+
+/* A small device tree for qemu's "raspi4b" machine. qemu does not create one (the real Raspberry Pi firmware does; the kernel
+ * reads that one on the board). The format is the same as the tree of the qemu "virt" machine, so dt.c reads it unchanged.
+ * Addresses are the ones of the BCM2711 as the ARM cores see them: peripherals at 0xFE000000, the GIC-400 at 0xFF841000. */
+
+/ {
+	compatible = "raspberrypi,4-model-b", "brcm,bcm2711";
+	#address-cells = <2>;
+	#size-cells = <2>;
+
+	memory@0 {
+		device_type = "memory";
+		reg = <0x00 0x00 0x00 0x20000000>;      /* 512 MByte are enough for now; qemu has 2 GByte */
+	};
+
+	cpus {
+		#address-cells = <1>;
+		#size-cells = <0>;
+		cpu@0 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a72";
+			reg = <0>;
+		};
+	};
+
+	timer {
+		compatible = "arm,armv8-timer";
+		interrupts = <1 13 4>, <1 14 4>, <1 11 4>, <1 10 4>;
+	};
+
+	interrupt-controller@ff841000 {
+		compatible = "arm,gic-400", "arm,cortex-a15-gic";
+		#interrupt-cells = <3>;
+		interrupt-controller;
+		reg = <0x00 0xff841000 0x00 0x1000>, <0x00 0xff842000 0x00 0x2000>;
+	};
+
+	serial@fe201000 {
+		compatible = "arm,pl011", "arm,primecell";
+		reg = <0x00 0xfe201000 0x00 0x200>;
+		interrupts = <0 121 4>;
+	};
+};

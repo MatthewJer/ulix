@@ -120,6 +120,7 @@ void dt_init (u64 blob_pa) {
   int depth = -1;
   plat.virtio_coherent = 1;                          // cleared by the first virtio node without "dma-coherent"
   plat.ncpus = 0;
+  plat.rtc = 0;                                      // a board without a PL031 (the Raspberry Pi) has no clock: arch_clock.c copes
   for (;;) {
     u32 tok = be32 (p);  p += 4;
     if (tok == FDT_BEGIN_NODE) {

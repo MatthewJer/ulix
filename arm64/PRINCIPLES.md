@@ -55,8 +55,9 @@ Pi and a user can log in over telnet.
 ## Branches and builds
 
 - Work happens on the branch `rpi4` (from `arm64-port`). It is merged back only when `make pcheck` is green with the Pi changes.
-- **One source tree, two images.** `make` still builds the qemu image. `make PLATFORM=rpi4` builds `kernel8.img` for the board (own
-  linker script, load address and header; everything else shared).
+- **One source tree, two images.** `make` still builds the qemu image. `make kernel8.img` builds the image for the board: the same
+  objects, only the boot code (`start-rpi4.o`: which GByte holds the console UART) and the load address (`0x80000`, set at link
+  time) differ. Everything else, including the memory map, comes from the device tree at run time.
 - Drivers are normal files in `arm64/`. The kernel picks them from the `compatible` strings of the device tree, as it already does
   for virtio and the PL011. No `#ifdef` maze: platform differences live in `plat.h`/`dt.c` and in the driver files.
 - `origin` is the original project and is never pushed to; backups go to the private repository (`backup`).

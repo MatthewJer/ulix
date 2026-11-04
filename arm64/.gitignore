@@ -17,3 +17,6 @@ check-logs/
 verify-fs.log
 disk2.img
 disk3.img
+ulix-rpi4.elf
+kernel8.img
+rpi4-qemu.dtb

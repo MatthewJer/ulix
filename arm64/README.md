@@ -27,6 +27,7 @@ make                 # kernel images, user programs, disk image (disk.img)
 make run-shell       # boots to the shell; Ctrl-A X leaves qemu
 make check           # all test suites one after the other (slow)
 make pcheck          # the same tests as parallel qemu instances (about 3 minutes)
+make kernel8.img     # image for the Raspberry Pi 4B (work in progress, branch rpi4); make run-rpi4 starts it in qemu's raspi4b
 ```
 
 In the shell: `ls`, `cat`, `cd`, `cp`, `rm`, `mkdir`, `rmdir`, `touch`, `wc`, `grep`, `stat`, `ps`, `df`, `free`, …

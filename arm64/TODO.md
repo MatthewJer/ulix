@@ -116,6 +116,24 @@ Sources to learn from: FreeBSD and NetBSD (BSD license: the drivers may be adapt
 compatible with this project's GPLv3), the Broadcom datasheets. Linux is GPL-2.0-only and must not be copied into this
 GPLv3 project (reading it for facts such as register layouts is fine).
 
+### Raspberry Pi 4B: progress (branch `rpi4`; plan and principles: `PRINCIPLES.md`)
+
+- **Step 1, first part, done on 2026-11-04:** the kernel boots in qemu's `raspi4b` machine (`make run-rpi4`): `start.S` takes the
+  RAM block from the address it runs at (qemu virt: 0x40080000, Pi: 0x80000) instead of assuming RAM at 1 GByte, the other RAM and
+  all devices are mapped from the device tree (`platform_map`), `make kernel8.img` links the image for load address 0x80000, a board
+  without a PL031 clock starts at 1 January 2026 (`arch_clock.c`). In qemu: RAM 960 MByte at 0, GIC-400 at 0xff841000, timer, PL011
+  at 0xfe201000, MMU self-test pass; the disk tests fail because there is no SD driver yet. `make pcheck` for the qemu virt machine
+  is unchanged.
+- `rpi4-qemu.dts` is a hand-written device tree for qemu's raspi4b (qemu has no firmware that provides one).
+- **Still open in step 1 (needs the board or the real firmware tree):**
+  - The real firmware device tree describes peripherals with *bus addresses* (0x7e201000) and a `ranges` property that translates them
+    to 0xfe201000; `dt.c` ignores `ranges` and would read the wrong addresses. It needs address translation (a few lines per level).
+  - Block 3 (0xC0000000-0xFFFFFFFF) holds the peripherals at 0xFE000000 but also RAM on the 4 GByte and 8 GByte models (up to
+    0xFC000000); the boot table and `platform_map` map a whole GByte either as RAM or as device memory. The 1 GByte model that was
+    ordered does not have this problem. For the bigger models the peripheral window has to be mapped with finer granularity.
+  - Starting the other three CPUs (the firmware's spin table or PSCI), the interrupt numbers of the mini UART, boot on the board with
+    `config.txt` (`arm_64bit=1`, `enable_uart=1`).
+
 ### Then
 
 1. Replace this file when everything above is done: delete `TODO.md` and put the short list of remaining limitations

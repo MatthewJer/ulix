@@ -131,6 +131,25 @@ irq.o mmu.o virtio.o dt.o gic.o smp.o kmain.o kmain-console.o kmain-shell.o: pla
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+# ---- Raspberry Pi 4B (see PRINCIPLES.md) ----
+# The same sources as for qemu; only the boot code (which GByte holds the console UART) and the load address differ: the
+# firmware loads kernel8.img at 0x80000.  The kernel finds everything else in the device tree that the firmware hands over.
+start-rpi4.o: start.S
+	$(CC) $(CFLAGS) -DBOOT_DEV_GB=3 -c -o $@ $<
+
+ulix-rpi4.elf: $(filter-out start.o,$(OBJS)) start-rpi4.o ulix.ld
+	$(LD) -T ulix.ld --defsym=KERNEL_PA=0x80000 -o $@ $(filter-out start.o,$(OBJS)) start-rpi4.o
+
+kernel8.img: ulix-rpi4.elf
+	$(OBJCOPY) -O binary $< $@
+
+# qemu's raspi4b machine gets no device tree from a firmware: this one describes what it has (rpi4-qemu.dts)
+rpi4-qemu.dtb: rpi4-qemu.dts
+	dtc -I dts -O dtb -o $@ $<
+
+run-rpi4: kernel8.img rpi4-qemu.dtb
+	qemu-system-aarch64 -M raspi4b -dtb rpi4-qemu.dtb -serial stdio -display none -kernel kernel8.img
+
 run: ulix.bin
 	qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128 -nographic -kernel ulix.bin \
 		-snapshot -drive file=$(DISK),format=raw,if=none,id=hd0 -device virtio-blk-device,drive=hd0
