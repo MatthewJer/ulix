@@ -6,7 +6,7 @@ is still missing compared with the x86 build, most important first. Background a
 
 ## Where we stopped (2026-11-03) -- start here
 
-All tests are green: `make pcheck` (all 19 tests in parallel, about 3 minutes, `JOBS=n` sets the number of parallel qemu
+All tests are green: `make pcheck` (all 21 tests in parallel, about 3 minutes, `JOBS=n` sets the number of parallel qemu
 instances, logs in `check-logs/`) and the older sequential `make check` (about 30 minutes).
 The branch `arm64-port` is backed up in the PRIVATE repository https://github.com/MatthewJer/ulix-arm64 (remote `backup`;
 `origin` is the original, `hgesser/ulix`: never push there).
@@ -18,7 +18,7 @@ The branch `arm64-port` is backed up in the PRIVATE repository https://github.co
 - The swap file is cut back when no page lives in it (`arch_swap_shrink`). The book's `mx_ftruncate` is unfinished: it frees
   the data zones in the bitmap but keeps the zone pointers and indirect blocks in the inode (the code for the indirect
   blocks is empty). When the file grew again, old and new pointers met ("zone N used by /tmp/swap and /tmp/swap" in
-  `tools/minix_check.py`). The same bug is in the x86 build for `trunc`/`ftruncate`. The swap code now deletes and recreates
+  `tools/minix_check.py`). The same bug is in the x86 build for `trunc`/`ftruncate` (original code: [mx_ftruncate](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L23825-L23866), see "Bugs of the book that are not fixed" in `README.md`). The swap code now deletes and recreates
   the file instead; the book's function is not changed.
 - The memory test (`proc_test.c`) calls `arch_threads_reap ()` between its two rounds (a process does this at `fork`).
 - System call 777 (`inode`, the book's debug call) was not installed: added (also to `port.manifest`). `readelf` has an
@@ -39,14 +39,15 @@ The branch `arm64-port` is backed up in the PRIVATE repository https://github.co
 - Two checks of `user/sigtest.c` assumed one CPU (after SIGKILL the first `waitpid` may still return the child, after SIGSTOP a
   child on another CPU stops a moment later); with the faster disk wakeup they failed about every second run with 2 CPUs.
 - Open, same bugs as on the x86: the book's `mx_ftruncate` leaves zone pointers and indirect blocks in the inode, and
-  `unlink` of a file with double indirect zones (more than 263 KByte) leaves zones marked wrongly. The swap file is
-  therefore never cut back when it lives on the second disk.
+  `unlink` of a file with double indirect zones (more than 263 KByte) leaves zones marked wrongly (original code of the second
+  one: [free this inode: (3) double indirect blocks](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L23705-L23729)). The swap file is
+  therefore never cut back when it lives on the second disk. Locations of all bugs of the book: `README.md`.
 - `make verify` and `pcheck` now fail when the file system check finds problems (before, they only printed them).
 
 ### Results of the "does it work on the ARM64 like on the x86?" check so far
 
 - All 61 system calls of the book are installed (8 have ARM64-specific handlers: threads, mutexes, idle). OK.
-- All 22 kernel shell commands work (see above). OK.
+- All 23 kernel shell commands of the book (and `exit`) work (see above). OK.
 - Programs of `lib-build/tools` that were run and behave like on the x86: args, ascii, cat, cp, diff, grep, wc, hexdump,
   touch, mkdir, ls, stat, chmod, rm, rmdir, df, ptree, pw, kill, sync, exit42, stdio, fork1, fork3, sbrk1, trunc, tt,
   print, memwrite (with the screen window), fault-mem, fault-div0, mutex, dumblock (same "cannot remove process ...
@@ -55,8 +56,7 @@ The branch `arm64-port` is backed up in the PRIVATE repository https://github.co
 - Differences that remain (cannot or should not be changed):
   - `df` lists /dev/hdb and /dev/fd1 with the numbers of /dev/hda ("none" mount); check what the x86 shows without those
     disks (look at `df.c` and `syscall_diskfree`).
-  - `/dev/fd0` has no drive behind it (there is one stand-in for the second floppy only) and there is no serial disk. The serial
-    disk would need a second PL011 UART; check first whether anything uses it.
+  - `/dev/fd0` has no drive behind it (there is one stand-in for the second floppy only).
   - The swap file grows on demand instead of being 64 MByte in advance (disk is 4 MByte).
 
 ### What the ARM64 version can do that the x86 version cannot (for the README / book appendix)
@@ -68,13 +68,21 @@ verify and list properly tomorrow.
 
 ### Still missing compared with the x86 (decided: do these later, they are the biggest items)
 
-- **Serial disk** (`readblock_serial` / `writeblock_serial` are empty): needs a second PL011 UART, the book's protocol on the
-  other side (read it in the book first, then a small program on the host that serves the disk) and a test. Check first
-  whether anything uses it.
+- ~~**Serial disk**~~ **done on 2026-11-04**: `readblock_serial` / `writeblock_serial` in `glue.c` talk the book's protocol (CMD_GET / CMD_PUT,
+  block number as 4 bytes, 1024 bytes of data) over a second PL011 (`plat.uart2`, the second `pl011` node of the device tree; qemu
+  creates it when it gets a second `-serial`). A reading process sleeps in `serial_disk_queue` until the receive interrupt has collected
+  the block; the idle thread polls. The other end is `tools/serial_disk.py` (serves an image file over qemu's TCP serial port).
+  `make sdisk-test` (also part of `make pcheck`) runs the kernel tests with it: block I/O, the Minix file system of the book on
+  device 0x2a00 (`mx_stat`, `mx_read`, `mx_open`/`mx_write`), the buffer cache, two threads reading at the same time (sleep and
+  wake-up through the interrupt), and afterwards checks the image on the host with `minix_check.py`. Nothing in the book uses
+  `/dev/sdisk` (its table of devices says the device file does not exist), so it is not mounted and has no device file here either.
+  qemu's PL011 has no receive timeout, so the port runs with the FIFOs off (one interrupt per byte); the baud rate is not set
+  (qemu ignores it, a real UART would need it).
 - **`/dev/fd0`** has no drive behind it: a fourth virtio disk would do (small).
 - Not checkable here: the x86 build with `gcc-4.4` (the compiler is not available on this machine).
-- Bugs of the book that are on the x86 as well and were not changed: `mx_ftruncate` and `unlink` of files with double indirect
-  zones (see "Done on 2026-11-03").
+- Bugs of the book that are on the x86 as well and were not changed: `mx_ftruncate`, `unlink` of files with double indirect
+  zones (see "Done on 2026-11-03"), `u_write` returning -1, `mx_mkdir` without an existence check, `u_kill` on a blocked parent
+  (list with the places in the original book: "Bugs of the book that are *not* fixed" in `README.md`).
 
 ### Next: Raspberry Pi 4B (hardware ordered 2026-11-03: Pi 4B 1 GB, USB-C power supply, Waveshare CP2102 USB-C UART module,
 ### 8 GB microSD with card reader, Dupont cables)
@@ -137,8 +145,8 @@ GPLv3 project (reading it for facts such as register layouts is fine).
 - [x] **VGA-only functions**: `read_screen`, `write_screen`, `get_xy`, `set_xy`, `clrscr` and the output of `kputch` work like
       in the book on a model of the screen (`vt[]`, 80 x 24 characters with color attribute, cursor), see `arch_vt.c`.
       The serial console is the "screen": set_xy, clrscr, write_screen and switching terminals repaint it with ANSI
-      sequences (cursor positioning, colors, a scroll region of 24 lines). The book's `vi` works. Differences: there is no
-      status line (line 25), and the console must understand ANSI sequences.
+      sequences (cursor positioning, colors, a scroll region of 24 lines). The book's `vi` works. The status line (line 25) is
+      painted too (see "Done on 2026-11-03"); the console must understand ANSI sequences.
 - [x] **Kernel shell commands for x86 hardware**: `mem` dumps the 4-level tables of the current address space, `test` shows
       the page table data (TTBR0/TTBR1, root table, frames), `rp` releases a page range of the current address space with
       the book's `release_page_range`. `div0` raises the exception by hand (`brk`), because an integer division by zero

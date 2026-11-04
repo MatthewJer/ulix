@@ -79,8 +79,15 @@ static void classify (const struct node *n) {
     plat.gicd = cells (n->reg, n->pac);
     plat.gicc = cells (n->reg + entry, n->pac);
   } else if (compat_has (n, "arm,pl011", 1) && n->reg) {
-    plat.uart = cells (n->reg, n->pac);
-    if (n->irq && n->irqlen >= 12) plat.uart_irq = irq_number (n->irq);
+    static int uarts = 0;                                     // the first PL011 is the console, the second one the serial disk
+    if (uarts == 0) {
+      plat.uart = cells (n->reg, n->pac);
+      if (n->irq && n->irqlen >= 12) plat.uart_irq = irq_number (n->irq);
+    } else if (uarts == 1) {
+      plat.uart2 = cells (n->reg, n->pac);
+      plat.uart2_irq = (n->irq && n->irqlen >= 12) ? irq_number (n->irq) : 0;
+    }
+    uarts++;
   } else if (compat_has (n, "arm,pl031", 1) && n->reg) {
     plat.rtc = cells (n->reg, n->pac);
   } else if (compat_has (n, "virtio,mmio", 1) && n->reg) {
@@ -167,5 +174,7 @@ unsigned long plat_cpu_mpidr (int i) { return plat.cpu_mpidr[i]; }
 unsigned long plat_rtc (void)  { return plat.rtc; }
 unsigned long plat_ram_size (void) { return plat.ram_size; }
 int  plat_uart_irq (void)      { return plat.uart_irq; }
+unsigned long plat_uart2 (void) { return plat.uart2; }
+int  plat_uart2_irq (void)     { return plat.uart2_irq; }
 unsigned long arch_ram_base (void) { return plat.ram_base; }
 unsigned long arch_ram_size (void) { return plat.ram_size; }

@@ -6,8 +6,8 @@
 > Das Originalprojekt: <https://github.com/hgesser/ulix>. Lizenz: GNU GPL Version 3 wie beim Original (siehe `LICENSE`).
 
 
-Stand: Branch `arm64-port`. Es wurde noch kein Code portiert. Dies ist die Analyse, die vor dem Port nötig ist.
-Alle Zeilennummern beziehen sich auf `ulix-book.nw` (32 557 Zeilen). Das Buch ist die einzige Quelle: `ulix.c`, `start.asm` und `ulix.ld` werden per `notangle` daraus erzeugt.
+Stand: Branch `arm64-port`. Dieses Dokument ist ein **Arbeitsprotokoll**: Die Abschnitte 1 bis 4 sind die Analyse, die vor dem Port nötig war; ab Abschnitt 5 folgt das Protokoll der Etappen. Zahlen, Testzahlen und Aussagen wie "fehlt noch" gelten jeweils für den Stand der Etappe, in der sie stehen. Der Port läuft inzwischen vollständig in qemu; den heutigen Stand beschreiben `arm64/README.md` und `arm64/TODO.md`.
+Alle Zeilennummern beziehen sich auf den **ursprünglichen** `ulix-book.nw` (32 557 Zeilen, Upstream-Commit `32535a1`; das Buch in diesem Fork ist inzwischen länger). Das Buch ist die einzige Quelle: `ulix.c`, `start.asm` und `ulix.ld` werden per `notangle` daraus erzeugt.
 
 ## 1. Warum das kein "Befehle übersetzen" ist
 
@@ -238,7 +238,7 @@ Neu in `arm64/` (der Kernel-Code des Buchs wird **nicht kopiert**, sondern bei j
 
 Ergebnis in qemu (Cortex-A72, EL1 und EL2, Legacy- und modernes virtio): **79 Prüfungen, alle bestehen**, einschließlich der Tests der Etappen 4 bis 7.
 
-Zwei Eigenheiten des Buchs, die ich beim Testen gelernt habe (keine Portierungsfehler): `mx_getdent` liefert auch unbelegte 32-Byte-Slots (Inode 0), und `mx_mkdir` prüft nicht, ob das Verzeichnis schon existiert (das macht `u_mkdir` eine Ebene höher); ein zweiter `mx_mkdir` auf einen vorhandenen Pfad würde das Dateisystem beschädigen.
+Zwei Eigenheiten des Buchs, die ich beim Testen gelernt habe (keine Portierungsfehler): `mx_getdent` liefert auch unbelegte 32-Byte-Slots (Inode 0), und `mx_mkdir` ([Zeile 23942](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L23942)) prüft nicht, ob das Verzeichnis schon existiert (das macht `u_mkdir` eine Ebene höher); ein zweiter `mx_mkdir` auf einen vorhandenen Pfad würde das Dateisystem beschädigen.
 
 Nächster Schritt (Schritt 2 aus Abschnitt 12): Thread-Tabelle (TCB) und Scheduler des Buchs statt der vereinfachten aus Etappe 5; dann fallen Buffer-Cache-Stubs und Durchschreib-`writeblock` weg.
 
@@ -250,7 +250,7 @@ Aus dem Buch laufen jetzt auch **Scheduler, Ready- und Blocked-Queues, `block`/`
 - `<<scheduler implementation>>`: Der Kontextwechsel (ESP/EBP, CR3, TSS, `iret` für neue Threads) sowie die Blöcke „Signale prüfen“ und „alte Kernel-Stacks freigeben“ stehen jetzt in `#if defined(__i386__)`; sonst ruft der Scheduler `arch_context_switch()`.
 - `<<resign>>`: x86 behält `int 0x80` (Syscall 66), andere Architekturen rufen `arch_resign()`.
 - Prototypen von `arch_resign` und `arch_context_switch` unter `#if !defined(__i386__)`.
-- **Fehlerkorrektur im Buch:** `wait_semaphore` und `signal_semaphore` arbeiteten auf einer **Kopie** des Semaphors (`kl_semaphore sem = kl_semaphore_table[sid]`). Zähler und Warteschlange wurden nur in der Kopie auf dem Stack verändert, die Semaphore haben auf x86 daher nie funktioniert (der Kernel benutzt sie nirgends, nur die Mutexe, deshalb fiel es nicht auf). Jetzt wird mit einem Zeiger gearbeitet, im Text steht eine Anmerkung dazu.
+- **Fehlerkorrektur im Buch:** `wait_semaphore` und `signal_semaphore` arbeiteten auf einer **Kopie** des Semaphors (`kl_semaphore sem = kl_semaphore_table[sid]`; Fundstelle im Original: [Zeile 18163](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L18163-L18164) und [Zeile 18186](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L18186-L18187), ebenso in der inaktiven Variante [Zeile 19413–19426](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L19413-L19426)). Zähler und Warteschlange wurden nur in der Kopie auf dem Stack verändert, die Semaphore haben auf x86 daher nie funktioniert (der Kernel benutzt sie nirgends, nur die Mutexe, deshalb fiel es nicht auf). Jetzt wird mit einem Zeiger gearbeitet, im Text steht eine Anmerkung dazu.
 
 Nachweis, dass x86 unverändert bleibt: Nach den Scheduler-/`resign`-Änderungen ist der `.text`-Abschnitt weiterhin bit-identisch. Nach der Semaphor-Korrektur unterscheiden sich von 353 Funktionen genau die beiden korrigierten (Vergleich der Disassembly mit normalisierten Adressen), und der x86-Kernel bootet in `qemu-system-i386` mit identischer Ausgabe.
 
@@ -285,7 +285,7 @@ Tests in qemu (EL1 und EL2, modernes virtio): **89 Prüfungen im Kernel plus 25 
 x86-Nachweis: Von 353 Funktionen im x86-Objekt unterscheiden sich weiterhin nur die zwei bewusst korrigierten Semaphor-Funktionen; der x86-Kernel bootet in `qemu-system-i386` mit identischer Ausgabe.
 
 Offen / bekannte Lücken:
-- Kein Copy-on-Write und kein `brk`/`sbrk` (Heap) für Benutzerprogramme; `write` meldet wegen eines Fehlers im Buch (`u_write` fällt nach der Ausgabe auf STDOUT/STDERR in `default: return -1`) immer -1 zurück, die Ausgabe selbst funktioniert.
+- Kein Copy-on-Write und kein `brk`/`sbrk` (Heap) für Benutzerprogramme; `write` meldet wegen eines Fehlers im Buch (`u_write` fällt nach der Ausgabe auf STDOUT/STDERR in `default: return -1`, Fundstelle [Zeile 20713–20731](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L20713-L20731)) immer -1 zurück, die Ausgabe selbst funktioniert.
 - Das Buch dereferenziert Benutzerzeiger direkt (wie auf x86). Auf ARM64 funktioniert das, weil TTBR0 aktiv ist, aber ein ungültiger Zeiger in einem Systemaufruf würde den Kernel anhalten.
 - Signale, Pipes, pthreads, Terminals und die Kernel-Shell fehlen noch; der Buffer Cache ist weiter nicht eingebunden.
 
@@ -303,7 +303,7 @@ Offen / bekannte Lücken:
 
 Test (`user/sigtest.c`, alle 8 Prüfungen laufen im Benutzerprogramm): Ein Handler unterbricht eine Rechnung mit vielen Registern 8 Millionen Schleifendurchläufe lang, das Ergebnis ist trotzdem exakt, und der Handler lief mehrfach (vor dem ersten Befehl und mitten in der Rechnung); `SIG_IGN` stört nicht; ohne Handler tötet `SIGTERM` den Prozess (Meldung des Buchs); `SIGSTOP` hält einen Prozess an (kein Fortschritt in einer Logdatei), `SIGCONT` setzt fort, `SIGKILL` beendet sofort. Ergebnis in qemu (EL1 und EL2, modernes virtio): **93 Prüfungen im Kernel, alle bestehen**; `make verify` ohne Probleme. x86: Von 353 Funktionen unterscheiden sich weiterhin nur die zwei korrigierten Semaphor-Funktionen, der x86-Kernel bootet mit identischer Ausgabe.
 
-Bekannte Eigenheiten des Buchs, die ich nicht geändert habe: `kill` auf einen blockierten Elternprozess lässt dessen später endende Kinder als Zombies zurück (`u_kill` setzt Kinder nicht um); `SIGKILL` setzt `used = false` sofort, ein folgendes `waitpid` meldet -1.
+Bekannte Eigenheiten des Buchs, die ich nicht geändert habe (`u_kill`: [Zeile 27781](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L27781)): `kill` auf einen blockierten Elternprozess lässt dessen später endende Kinder als Zombies zurück (`u_kill` setzt Kinder nicht um); `SIGKILL` setzt `used = false` sofort, ein folgendes `waitpid` meldet -1.
 
 ## 17. Schritt 5 der Kernel-Portierung: Konsole über die UART und Kernel-Shell
 
@@ -319,8 +319,8 @@ Neu in `arm64/`:
 Änderungen am Buch (alle für x86 unverändert im Verhalten):
 - `<<enable interrupts>>` und `<<disable interrupts>>` sind prozessorabhängig (`sti`/`cli` auf x86, `msr daifclr/daifset` auf ARM64); `hexdump` und zwei Aufrufe nehmen `memaddress` statt `uint` (Adressen bleiben auf 64 Bit vollständig).
 - **Drei Fehler im Buch korrigiert** (gefunden durch Tests, jeweils mit Nachweis):
-  1. `u_open` und `u_chdir` rufen `u_stat` auf und ignorieren das Ergebnis; existiert die Datei noch nicht (zum Beispiel bei `O_CREAT`), blieb `struct stat` uninitialisiert, und der Stackinhalt entschied, ob die Datei wie ein Symlink behandelt wird. Ergebnis war zum Beispiel, dass `open("/progress.txt", O_CREAT)` das Wurzelverzeichnis öffnete. Jetzt `struct stat st = { 0 }`. (Das Symptom tauchte erst auf, nachdem sich durch eine zusätzliche Programmdatei der Stackinhalt geändert hatte: Fehler, der auf x86 genauso lauern kann.)
-  2. `mx_open` hielt einen **geschlossenen** Eintrag der internen Inode-Tabelle für „schon offen“, wenn dessen Inode-Nummer übereinstimmte (`mx_close` löscht `ino`/`device` nicht). Bekam eine neue Datei die Nummer einer gelöschten, erbte sie deren alte Größe und Zonen. Jetzt zählt nur ein Eintrag mit `refcount > 0`. Test in `bookfs_test.c`: ohne die Korrektur schlägt „... starts with size 0“ fehl, mit ihr besteht er.
+  1. `u_open` und `u_chdir` rufen `u_stat` auf und ignorieren das Ergebnis; existiert die Datei noch nicht (zum Beispiel bei `O_CREAT`), blieb `struct stat` uninitialisiert, und der Stackinhalt entschied, ob die Datei wie ein Symlink behandelt wird. Ergebnis war zum Beispiel, dass `open("/progress.txt", O_CREAT)` das Wurzelverzeichnis öffnete. Jetzt `struct stat st = { 0 }`. Fundstellen im Original: `u_open` [Zeile 20519–20521](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L20519-L20521), `u_chdir` [Zeile 21444–21445](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L21444-L21445). (Das Symptom tauchte erst auf, nachdem sich durch eine zusätzliche Programmdatei der Stackinhalt geändert hatte: Fehler, der auf x86 genauso lauern kann.)
+  2. `mx_open` hielt einen **geschlossenen** Eintrag der internen Inode-Tabelle für „schon offen“, wenn dessen Inode-Nummer übereinstimmte (`mx_close` löscht `ino`/`device` nicht). Bekam eine neue Datei die Nummer einer gelöschten, erbte sie deren alte Größe und Zonen. Jetzt zählt nur ein Eintrag mit `refcount > 0`. Fundstelle im Original: [Zeile 22860–22861](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L22860-L22861). Test in `bookfs_test.c`: ohne die Korrektur schlägt „... starts with size 0“ fehl, mit ihr besteht er.
   3. (aus Schritt 2) Semaphore arbeiteten auf einer Kopie.
 
 Ergebnis in qemu (EL1 und EL2, Legacy- und modernes virtio): **95 Prüfungen im Kernel, alle bestehen**; `make verify` 0 Probleme; `make console-test` 21 Prüfungen. x86: Von 353 Funktionen im Objekt unterscheiden sich genau die bewusst geänderten (`hexdump`, `mx_open`, `u_open`, `u_chdir` und die zwei Semaphor-Funktionen); der x86-Kernel bootet mit identischer Ausgabe.
@@ -335,10 +335,10 @@ Das System bootet jetzt wie das x86-Original: `/init` → `/bin/login` (automati
 
 **Änderungen am Buch** (x86-Bibliothek `.text` bit-identisch, Kernel nur an den Stellen, die Fehler korrigieren):
 - Die vier Systemaufruf-Funktionen der Benutzerbibliothek (`syscall1`..`syscall4`) haben einen ARM64-Zweig (`svc #0`, Nummer in `x0`, Argumente `x1`..`x5`).
-- `printf`/`sprintf` der Bibliothek lasen ihre Argumente direkt vom Stack (x86-Aufrufkonvention); über Makros (`PRINT_NEXT_INT` usw.) benutzt ARM64 jetzt `va_arg`, x86 behält dieselben Ausdrücke.
+- `printf`/`sprintf` der Bibliothek lasen ihre Argumente direkt vom Stack (x86-Aufrufkonvention; Fundstelle im Original: [Zeile 29393–29399](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L29393-L29399)); über Makros (`PRINT_NEXT_INT` usw.) benutzt ARM64 jetzt `va_arg`, x86 behält dieselben Ausdrücke.
 - **Weitere Fehler im Buch korrigiert** (jeweils beim Testen aufgefallen):
-  1. `syscall_waitpid` schrieb durch den Status-Zeiger, auch wenn dieser 0 war (`login` ruft `waitpid (pid, 0, 0)`). Auf x86 überschreibt das stillschweigend die ersten Bytes des Programms bei Adresse 0, auf ARM64 stürzte der Kernel ab.
-  2. `mx_rmdir` wechselte in das **übergeordnete** Verzeichnis und löschte dort `.` und `..`, statt im zu löschenden Verzeichnis. Danach war das Elternverzeichnis leer. Neuer Test in `bookfs_test.c`.
+  1. `syscall_waitpid` schrieb durch den Status-Zeiger, auch wenn dieser 0 war (`login` ruft `waitpid (pid, 0, 0)`; Fundstelle im Original: [Zeile 11713](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L11713) und [11729](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L11729)). Auf x86 überschreibt das stillschweigend die ersten Bytes des Programms bei Adresse 0, auf ARM64 stürzte der Kernel ab.
+  2. `mx_rmdir` wechselte in das **übergeordnete** Verzeichnis und löschte dort `.` und `..`, statt im zu löschenden Verzeichnis (Fundstelle im Original: [Zeile 24016–24022](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L24016-L24022)). Danach war das Elternverzeichnis leer. Neuer Test in `bookfs_test.c`.
 
 **Anpassungen an der einen Konsole:**
 - Zehn virtuelle Terminals des Buchs → eine UART: Ausgabe von Prozessen auf einem nicht sichtbaren Terminal wird je Terminal (4 KByte) gepuffert und beim Umschalten ausgegeben. **Strg-T und eine Ziffer** schaltet um (x86: Alt-1..0); nur Terminal 1 bekommt Eingabe-Interrupts zugeordnet, die Eingabepuffer sind je Terminal.
@@ -365,11 +365,11 @@ x86: Von 353 Funktionen im Kernel-Objekt unterscheiden sich nur `hexdump`, `mx_o
   Test `user/cowtest.c` zählt freie Frames: `fork` kopiert keine Datenseiten, Lesen kopiert nichts, Schreiben kopiert genau die 64
   betroffenen Seiten, der Elternprozess behält seine Daten, nach dem Ende des Kindes sind alle Frames zurück (10 Prüfungen).
 - **`make check`** führt alles aus: Kerneltests (EL1 mit Legacy-virtio, EL2 mit modernem virtio, je 104 Prüfungen), `make verify`
-  (Schreibtests plus unabhängige Prüfung des Images), `make console-test` (21), `make shell-test` (63). Dauer etwa 2 Minuten.
+  (Schreibtests plus unabhängige Prüfung des Images), `make console-test` (21), `make shell-test` (63). Dauer etwa 2 Minuten. (Stand dieser Etappe; heute: 129 Kerneltests, 34 und 93 Prüfungen in Konsolen- und Shelltest, `make pcheck` mit 21 parallelen Tests in etwa 3 Minuten.)
   `make run-shell` startet das System zum Selbstbedienen.
 - **Dokumentation:** `arm64/README.md` (Englisch, im Stil des Repositorys), Abschnitt im Haupt-`README.md`, dieser Bericht.
 
-**Bewusst nicht gemacht:**
+**Bewusst nicht gemacht (Stand dieser Etappe; Buffer Cache, Pthreads, Swap und das Kapitel im Buch sind inzwischen erledigt, siehe `arm64/TODO.md`):**
 - **Buffer Cache des Buchs:** Er verzögert Schreibzugriffe (ein Flush-Thread schreibt später). Die Tests, die das Image von außen prüfen,
   setzen voraus, dass geschrieben ist; der Gewinn (weniger Plattenzugriffe) ist unter qemu gering. `writeblock` schreibt durch.
 - **Pthreads** (`u_pthread_create` baut x86-Stacks): bräuchte einen ARM64-Entwurf für mehrere Threads je Adressraum
@@ -379,7 +379,6 @@ x86: Von 353 Funktionen im Kernel-Objekt unterscheiden sich nur `hexdump`, `mx_o
 - **Rückführung als Kapitel ins Buch:** `ulix-arm64.nw` ist bereits eine kommentierte noweb-Datei, aber ein eigenes Kapitel in
   `ulix-book.nw` wäre ein größerer Eingriff in den TeX-Text, den ich ohne LaTeX-Installation nicht prüfen konnte
   (`make pdf` ist hier nicht möglich).
-- **Echte Hardware:** GICv3, Device-Tree, Cache-Wartung für DMA, andere Boards.
+- **Echte Hardware:** GICv3, Device-Tree, Cache-Wartung für DMA, andere Boards. (Inzwischen geschrieben und in qemu getestet, auf echter Hardware nicht ausprobiert.)
 
-**Zählung des Umfangs:** 13 Commits auf dem Branch `arm64-port`; im Buch 213 Zeilen hinzugefügt, 49 geändert (alles x86-neutral oder
-Fehlerkorrekturen); im Verzeichnis `arm64/` rund 4 000 Zeilen (ohne die aus dem Buch erzeugten Teile).
+**Zählung des Umfangs** (ursprünglich nach Schritt 7, aktualisiert am 2026-11-04, ohne den Commit der seriellen Platte): 31 Commits auf dem Branch `arm64-port` seit dem Upstream-Stand `32535a1`; im Buch 361 Zeilen hinzugefügt und 51 entfernt (der Anhang über den Port eingeschlossen, sonst x86-neutral oder Fehlerkorrekturen); im Verzeichnis `arm64/` rund 4 700 Zeilen C, Assembler und Header (ohne die aus dem Buch erzeugten Teile), dazu rund 1 000 Zeilen Python und Shell in `arm64/tools/` und 700 Zeilen Testprogramme in `arm64/user/`.

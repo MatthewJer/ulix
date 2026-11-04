@@ -15,6 +15,8 @@ extern int  book_current_pid (void);
 extern void arch_signal_check (void *frame);
 extern void uart_rx_irq (void);
 extern void uart_rx_enable (void);
+extern void sdisk_irq (void);
+extern void sdisk_init (void);
 extern void arch_clock_tick (void);
 extern int  arch_cow_fault (u64 va);
 extern void smp_before_return (void *frame);
@@ -72,6 +74,7 @@ static void exc_handler_locked (struct frame *f, int kind) {
                                             // (the kernel shell waits for keys inside the UART handler)
     if (irq == IRQ_TIMER) { if (smp_cpu () == 0) { ticks++; arch_clock_tick (); } timer_reload (); }
     else if (irq == IRQ_UART) { if (book_scheduler_on) uart_rx_irq (); }
+    else if (plat.uart2 && irq == (u32)plat.uart2_irq) sdisk_irq ();          // the serial disk
     else if (blk_is_irq ((int)irq)) { if (book_scheduler_on) { hd_interrupt (); disk_woke_someone = 1; } else blk_irq_ack (); }   // the disk
     else if (irq < 16) ;                    // software interrupt from another CPU: entering the kernel was the point
     else if (irq < 1020) printf ("spurious IRQ %u\n", irq);
@@ -142,5 +145,6 @@ void irq_init (void) {
   __asm__ volatile ("msr vbar_el1, %0; isb" :: "r" (vectors));
   gic_init ();
   timer_init (HZ);
+  if (plat.uart2 && plat.uart2_irq) { sdisk_init (); gic_enable (plat.uart2_irq); }   // the serial disk, if qemu was given a second serial port
   __asm__ volatile ("msr daifclr, #2");     // unmask IRQs
 }

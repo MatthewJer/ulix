@@ -24,6 +24,7 @@ JOBLIST=(
   "shell2|shell session with two disks|shell|virt,gic-version=3|-smp 2 @D2@|128"
   "three|three disks (hda, hdb on /tmp, fd1 on /mnt), 2 CPUs|kernel|virt|-smp 2 @D2@ @D3@|128"
   "shell3|shell session with three disks|shell|virt,gic-version=3|-smp 2 @D2@ @D3@|128"
+  "sdisk|serial disk on a second UART (host program serves disk3.img), 2 CPUs|sdisk|virt|-smp 2|128"
   "ram512|RAM 512 MByte, 2 CPUs|kernel|virt|-smp 2|512"
   "ram64|RAM 64 MByte, 2 CPUs|kernel|virt|-smp 2|64"
   "el1|EL1, virtio legacy transport|kernel|virt||128"
@@ -49,6 +50,10 @@ if [ "$1" = "--job" ]; then
     shell|console)
       case $name in shell3) port=45127;; shell2) port=45126;; *) if [ $kind = shell ]; then port=45125; else port=45123; fi;; esac
       HAVE_DISK2=$([[ $extra == *$DISK2* ]] && echo 1) HAVE_DISK3=$([[ $extra == *$DISK3* ]] && echo 1) QEMU_PORT=$port QEMU_M=$machine QEMU_MEM=$mem QEMU_EXTRA="$extra" python3 tools/${kind}_test.py ulix-$kind.bin $DISK > "$log" 2>&1
+      rc=$?; sum=$(tail -1 "$log")
+      [ $rc -eq 0 ] && grep -q "all passed" <<< "$sum" && st=ok || st=FAILED ;;
+    sdisk)
+      QEMU_PORT=45131 QEMU_M=$machine QEMU_EXTRA="$extra" python3 tools/sdisk_test.py ulix.bin $DISK $DISK3 > "$log" 2>&1
       rc=$?; sum=$(tail -1 "$log")
       [ $rc -eq 0 ] && grep -q "all passed" <<< "$sum" && st=ok || st=FAILED ;;
     verify)

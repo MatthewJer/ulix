@@ -188,6 +188,10 @@ JOBS ?= 6
 pcheck: ulix.bin ulix-console.bin ulix-shell.bin $(DISK) $(DISK2) $(DISK3)
 	DISK=$(DISK) DISK2=$(DISK2) DISK3=$(DISK3) tools/parallel_check.sh $(JOBS)
 
+# The serial disk: the kernel tests with a second serial port, which tools/serial_disk.py serves from a copy of disk3.img
+sdisk-test: ulix.bin $(DISK) $(DISK3)
+	python3 tools/sdisk_test.py ulix.bin $(DISK) $(DISK3)
+
 # Interactive console test: types into the UART of a second kernel image and checks the answers
 console-test: ulix-console.bin $(DISK)
 	python3 tools/console_test.py ulix-console.bin $(DISK)

@@ -5,6 +5,7 @@
 #include "ulix-api.h"
 
 #define DEV DEV_HDA
+#define DEV_SDISK 0x2a00                 // /dev/sdisk: major 42, minor 0 (the book's table of devices)
 
 static int fails = 0;
 #define CHECK(cond, msg) do { if (cond) printf ("  ok:   %s\n", msg); \
@@ -214,6 +215,34 @@ int bookfs_test (void) {
     readblock_hd (0, 4095, blk_b);
     CHECK (same (blk_b, blk_a), "buffer_sync writes the dirty block to the disk");
     writeblock (DEV_HDA, 4095, on_disk);                          // put the original block back
+  }
+
+  // ---- the serial disk (/dev/sdisk): only with a second serial port, see tools/sdisk_test.py ----
+  extern unsigned long plat_uart2 (void);
+  if (plat_uart2 ()) {
+    static char s1[1024], s2[1024], s3[1024];
+    printf ("serial disk (second PL011, served by tools/serial_disk.py):\n");
+    readblock_serial (1, s1);
+    CHECK ((byte)s1[16] == 0x78 && (byte)s1[17] == 0x24, "serial disk: block 1 is a Minix v2 superblock (magic 0x2478)");
+    for (int i = 0; i < 1024; i++) s2[i] = (char)(i * 13 + 5);
+    writeblock_serial (1439, s2);
+    readblock_serial (1439, s3);
+    CHECK (same (s2, s3), "serial disk: block 1439 written and read back");
+    CHECK (mx_stat (DEV_SDISK, "/a.txt", &st) == 0 && (st.st_mode & S_IFMT) == S_IFREG && st.st_size > 1000,
+           "serial disk: file system on it: /a.txt is a regular file");
+    mfd = mx_open (DEV_SDISK, "/a.txt", O_RDONLY);
+    unsigned sum = 0; int total = 0, got;
+    while (mfd >= 0 && (got = mx_read (mfd, buf, 1000)) > 0) { for (int i = 0; i < got; i++) sum += buf[i]; total += got; }
+    printf ("  info: serial disk /a.txt: %d bytes, byte sum %u\n", total, sum);
+    CHECK (mfd >= 0 && total == st.st_size, "serial disk: /a.txt read completely");
+    mx_close (mfd);
+    mfd = mx_open (DEV_SDISK, "/new.txt", O_CREAT | O_WRONLY);
+    CHECK (mfd >= 0 && mx_write (mfd, (void *)"hello via serial", 16) == 16, "serial disk: /new.txt created and written");
+    mx_close (mfd);
+    for (int i = 0; i < 1024; i++) s2[i] = (char)(i * 3 + 9);
+    writeblock (DEV_SDISK, 1438, s2);
+    buffer_sync (1);
+    CHECK (buffer_contains (DEV_SDISK, 1438), "serial disk: writeblock goes through the buffer cache, buffer_sync flushes it");
   }
 
   buffer_sync (1);                                                // the disk image is checked from outside afterwards (make verify)

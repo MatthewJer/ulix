@@ -80,6 +80,21 @@ static volatile int stage = 0;
 static void waiter (void *arg)   { stage = 1; wait_semaphore (sem_go); stage = 2; }
 static void releaser (void *arg) { while (stage != 1) arch_resign (); arch_resign (); signal_semaphore (sem_go); }
 
+// ---- test 4: processes that read the serial disk at the same time sleep until the receive interrupt has brought the block ----
+extern unsigned long plat_uart2 (void);
+extern int sd_sleeps, sd_blocks_read;
+static volatile int sd_readers_ok = 0;
+static void sd_reader (void *arg) {
+  static char blk[2][1024];
+  int me = (int)(long)arg, good = 1;
+  for (int round = 0; round < 4; round++) {
+    readblock_serial (me == 0 ? 1 : 1439, blk[me]);
+    if (me == 0 && !((byte)blk[0][16] == 0x78 && (byte)blk[0][17] == 0x24)) good = 0;     // Minix superblock
+    if (me == 1) for (int i = 0; i < 1024; i++) if (blk[1][i] != (char)(i * 13 + 5)) good = 0;   // what bookfs_test wrote there
+  }
+  if (good) sd_readers_ok++;
+}
+
 int thread_test (void) {
   fails = 0;
   long frames_before = frames_in_use;
@@ -119,6 +134,15 @@ int thread_test (void) {
   CHECK (stage == 2, "a blocked thread continues after the other signalled its semaphore");
 
   CHECK (live_threads () == 0, "all threads finished, zombies removed from the thread table");
+
+  if (plat_uart2 ()) {
+    int slept = sd_sleeps, reads = sd_blocks_read;
+    arch_thread_create (sd_reader, (void *)0L, "sdisk0");
+    arch_thread_create (sd_reader, (void *)1L, "sdisk1");
+    run_until_done ();
+    CHECK (sd_readers_ok == 2 && sd_blocks_read - reads == 8, "serial disk: two threads read 4 blocks each at the same time, all data correct");
+    CHECK (sd_sleeps > slept, "serial disk: the threads slept until the receive interrupt delivered the block");
+  }
   arch_threads_reap ();                                    // stacks of IDs that were not reused
   CHECK (frames_in_use == frames_before, "no frame leaked");
   return fails;

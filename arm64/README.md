@@ -14,7 +14,9 @@ the same system as the x86 version: `/init` → `/bin/login` → `/bin/sh`, with
 needed in the book is written so that the x86 code stays as it was: either behind `#if defined(__i386__)`, or
 with types and macros that mean the same on both processors. After every change to the book, the x86 object code
 was compared function by function with the original, and the x86 kernel was booted in qemu. The only functions
-that differ are the ones in which a bug was fixed (see [Bugs found in the book](#bugs-found-in-the-book)).
+that differed in the last comparison (`../ARM64-PORT.md`, section 18) were the ones in which a bug was fixed (see
+[Bugs found in the book](#bugs-found-in-the-book)); that comparison has not been repeated for the later changes (swap, pthreads, the
+serial disk), which were written in the same way.
 
 ## Quick start (macOS)
 
@@ -23,7 +25,8 @@ brew install qemu noweb aarch64-elf-gcc aarch64-elf-binutils   # python3 is need
 cd arm64
 make                 # kernel images, user programs, disk image (disk.img)
 make run-shell       # boots to the shell; Ctrl-A X leaves qemu
-make check           # all test suites (about 2 minutes)
+make check           # all test suites one after the other (slow)
+make pcheck          # the same tests as parallel qemu instances (about 3 minutes)
 ```
 
 In the shell: `ls`, `cat`, `cd`, `cp`, `rm`, `mkdir`, `rmdir`, `touch`, `wc`, `grep`, `stat`, `ps`, `df`, `free`, …
@@ -43,7 +46,7 @@ The port keeps the book as the single source:
 
 * `ulix-arm64.nw` is a small noweb file that **reuses the chunks of the book**. `notangle` produces the
   declarations, global variables and function implementations of the kernel; `tools/port.py` then picks the
-  functions and globals listed in `port.manifest` (193 functions and 39 global variables: the Minix file system, the VFS layer,
+  functions and globals listed in `port.manifest` (208 functions and 46 global variables: the Minix file system, the VFS layer,
   threads, scheduler, mutexes, semaphores, system calls, signals, the kernel shell, …). They are compiled
   unchanged into `gen/ulix-port.c`.
 * What the book does for the x86 hardware is written again for ARM64 in the `arch_*` and driver files and has the
@@ -59,7 +62,8 @@ The port keeps the book as the single source:
 | fork/exec with kernel stacks inside the address space | `arch_thread.c`: separate kernel stack per thread, copy-on-write `fork`, `exec` with an ELF64 loader (`elf.c`) |
 | context switch by swapping ESP/EBP/CR3 | `cpu_switch` (`vectors.S`) and `arch_context_switch` |
 | signal delivery on the user stack | `arch_signal_check`, `sigreturn`, trampoline page |
-| IDE / floppy | `virtio.c`, `glue.c`: virtio-blk, interrupt driven like the IDE driver; `minixfs.c`: small read-only reader used by the ELF loader |
+| IDE / floppy | `virtio.c`, `glue.c`: up to three virtio-blk disks (hda, hdb, a stand-in for fd1), interrupt driven like the IDE driver; `minixfs.c`: small read-only reader used by the ELF loader |
+| serial disk (`/dev/sdisk`, major 42; second COM port) | `glue.c`: second PL011 with interrupt, same protocol; `tools/serial_disk.py` serves the disk on the host (`make sdisk-test`) |
 | VGA text mode, PS/2 keyboard, 10 virtual terminals | PL011 UART (`arch_console.c`); the screens of the terminals are a model of the VGA text screen (`arch_vt.c`) shown on the console with ANSI sequences |
 | device detection by BIOS/ports, one CPU | `dt.c`: device tree; `smp.c`: more than one CPU (PSCI, big kernel lock) |
 | swap file, page replacement | `arch_swap.c`: for the 4-level tables, with the access flag as accessed bit |
@@ -79,36 +83,55 @@ vectors.S        exceptions, context switch         irq.c           interrupts, 
 mmu.c            frames, page tables, COW           virtio.c        block device
 elf.c            ELF64 loader                       minixfs.c       Minix reader (for exec)
 userland/        user library, init, programs       user/           small test programs (hello, forktest, sigtest, …)
-tools/           minix_add.py, minix_check.py (host-side file system tools), disk_expected.py, test drivers
+tools/           minix_add.py, minix_check.py (host-side file system tools), disk_expected.py, test drivers,
+                 serial_disk.py (the host end of the serial disk), sdisk_test.py
 *_test.c         kernel test suites
 ```
 
-## Tests (`make check`)
+## Tests (`make check`, or `make pcheck` for the parallel version)
 
-* **Kernel tests** (104 checks, run at EL1 with the legacy virtio transport and at EL2 with the modern one):
+* **Kernel tests** (129 checks with one disk, 132 with two, 134 with three; run at EL1 with the legacy virtio transport and at EL2 with
+  the modern one, on GICv2 and GICv3, with 1 to 4 CPUs and 64 MByte to 3 GByte of RAM):
   MMU, file system (read and write, up to the double indirect zone), threads (mutexes, semaphores), ELF loader,
   `fork`/`exec`/`waitpid`, copy-on-write (measured by counting free frames), signals, faults in user programs.
 * **`make verify`**: the write tests run on a copy of the disk; afterwards `tools/minix_check.py`, an independent
   implementation, checks the file system (tree, bitmaps, link counts, leaked blocks) and the contents of the files.
-* **`make console-test`** (21 checks) types into the UART like a person; **`make shell-test`** (63 checks) runs a whole
-  session: boot, auto login, about 25 commands, Ctrl-C, terminal switching, `exit`, login with password.
+* **`make console-test`** (34 checks) types into the UART like a person; **`make shell-test`** (93 checks) runs a whole
+  session: boot, auto login, the programs of `lib-build/tools`, Ctrl-C, terminal switching, `exit`, login with password.
+* **`make sdisk-test`**: the kernel tests with a second serial port that `tools/serial_disk.py` serves as a disk (the book's serial
+  disk, `/dev/sdisk`); block I/O, the Minix code of the book on it, the buffer cache, two threads reading at the same time, and a
+  check of the image on the host afterwards.
 * The expected values for sizes and checksums are computed on the host by the independent parser, so the kernel is
   not compared with itself.
 
 ## Bugs found in the book
 
 Running the code on a second processor and under a modern compiler showed problems that were already in the x86
-version. They are fixed in `../ulix-book.nw` (x86 and ARM64 profit):
+version. They are fixed in `../ulix-book.nw` (x86 and ARM64 profit). The last column links to the place in the *original*
+`ulix-book.nw` (upstream commit `32535a1`, the state this fork started from); line numbers refer to that file, not to the
+current one.
 
-1. `wait_semaphore`/`signal_semaphore` worked on a *copy* of the semaphore, so they never worked.
-2. `u_open` and `u_chdir` used a `struct stat` that stays uninitialised when the file does not exist: depending on the
-   stack contents `open (..., O_CREAT)` could open the root directory.
-3. `mx_open` took a *closed* entry of its inode table for an open file; a new file with the inode number of a deleted one
-   inherited the old size and blocks.
-4. `mx_rmdir` removed `.` and `..` of the *parent* directory instead of the removed one.
-5. `syscall_waitpid` wrote through a null status pointer (`waitpid (pid, 0, 0)`, as `login` does).
-6. `printf` of the user library read its arguments from the stack (x86 calling convention only).
-7. Several 32-bit assumptions: `memaddress`, `size_t`, `hexdump`, `eax_return` (pointers cut to 32 bits).
+| # | Bug | Where it was in the original |
+|---|---|---|
+| 1 | `wait_semaphore`/`signal_semaphore` worked on a *copy* of the semaphore, so they never worked. | `kl_semaphore sem = …` in [wait_semaphore](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L18163-L18164) and [signal_semaphore](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L18186-L18187); the same pattern is in the inactive variant at [19413–19426](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L19413-L19426) |
+| 2 | `u_open` and `u_chdir` used a `struct stat` that stays uninitialised when the file does not exist: depending on the stack contents `open (..., O_CREAT)` could open the root directory. | `u_open`: [20519–20521](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L20519-L20521) (chunk "handle symlink"); `u_chdir`: [21444–21445](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L21444-L21445) |
+| 3 | `mx_open` took a *closed* entry of its inode table for an open file; a new file with the inode number of a deleted one inherited the old size and blocks. | search loop in `mx_open`, [22860–22861](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L22860-L22861) (compares only `ino` and `device`, not `refcount`; `mx_close` starts at [22975](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L22975)) |
+| 4 | `mx_rmdir` removed `.` and `..` of the *parent* directory instead of the removed one. | [24016–24022](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L24016-L24022) |
+| 5 | `syscall_waitpid` wrote through a null status pointer (`waitpid (pid, 0, 0)`, as `login` does). | [11713](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L11713) (`status = r->ecx`) and [11729](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L11729) (`*status = …`) |
+| 6 | `printf` of the user library read its arguments from the stack (x86 calling convention only). | [29393–29399](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L29393-L29399) (`varg = &format`) and `print` at [29356](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L29356) |
+| 7 | Several 32-bit assumptions: `memaddress`, `size_t`, `hexdump`, `eax_return` (pointers cut to 32 bits). | [size_t](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L2217) and [memaddress](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L2228) (typedefs), [eax_return](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L9215) (cast to `unsigned int`), [hexdump](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L29851) (`uint` parameters) |
+
+### Bugs of the book that are *not* fixed
+
+Found while porting, present on the x86 as well, left as they are in the book:
+
+| Bug | Where |
+|---|---|
+| `mx_ftruncate` frees the data zones in the bitmap but keeps the zone pointers and the indirect blocks in the inode (the two chunks for the indirect blocks are never written; the book says so itself). When the file grows again, old and new pointers meet. | [mx_ftruncate](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L23825-L23866), the missing chunks are used at [23853](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L23853) and [23856](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L23856), the book's remark is at [23868](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L23868) |
+| `mx_unlink` of a file with double indirect zones (more than about 263 KByte) leaves zones marked wrongly (found with `tools/minix_check.py`; the cause has not been analysed). | chunk "free this inode: (3) double indirect blocks", [23705–23729](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L23705-L23729) |
+| `u_write` returns -1 after writing to STDOUT/STDERR: the `case` has no `return`/`break` and falls into `default`. The output itself works. | [write: standard I/O](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L20713-L20731) |
+| `mx_mkdir` does not check whether the directory exists (`u_mkdir` does); a second `mx_mkdir` on an existing path would damage the file system. | [23942](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L23942) |
+| `u_kill` on a blocked parent process leaves children that end later as zombies; `SIGKILL` sets `used = false` at once, so a following `waitpid` reports -1. | [27781](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L27781) |
 
 ## Not done
 
@@ -118,5 +141,6 @@ version. They are fixed in `../ulix-book.nw` (x86 and ARM64 profit):
 * No `pthread_join` (the book has none either); `exit ()` and `exec ()` in threads behave like in the book.
 * The book's kernel is single-processor code. More than one CPU is done with one big kernel lock (see `smp.c`): user programs run in
   parallel, the kernel does not.
-* The port is not yet described in the book itself; `ulix-arm64.nw` and `../ARM64-PORT.md` (in German, a log of the work with the
-  reasoning behind each step) are the documentation for now.
+* The book has one appendix about the port ("The ARM64 Port (an Unofficial Extension)"); `ulix-arm64.nw` and `../ARM64-PORT.md` (in
+  German, a log of the work with the reasoning behind each step) go into more detail. The whole book could not be typeset on the machine
+  used for the port (`make pdf` was not run).
