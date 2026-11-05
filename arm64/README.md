@@ -31,7 +31,7 @@ make kernel8.img     # image for the Raspberry Pi 4B (work in progress, branch r
 make run-rpi4-shell  # ... and the system with login and shell on qemu's raspi4b machine, with an SD card image (sd.img)
 ```
 
-In the shell: `ls`, `cat`, `cd`, `cp`, `rm`, `mkdir`, `rmdir`, `touch`, `wc`, `grep`, `stat`, `ps`, `df`, `free`, `ping`, `ifconfig`, `route`, `dhclient`, …
+In the shell: `ls`, `cat`, `cd`, `cp`, `rm`, `mkdir`, `rmdir`, `touch`, `wc`, `grep`, `stat`, `ps`, `df`, `free`, `ping`, `ifconfig`, `route`, `dhclient`, `shutdown`, `poweroff`, `reboot`, …
 (it is Ulix, so `echo` copies its input until you press Ctrl-C). `>` and `<` redirect. Keys:
 
 | Key | Effect |
@@ -39,6 +39,8 @@ In the shell: `ls`, `cat`, `cd`, `cp`, `rm`, `mkdir`, `rmdir`, `touch`, `wc`, `g
 | Ctrl-C | ends the foreground program (like on x86) |
 | Ctrl-T, then 1…9 or 0 | switches to another terminal (x86: Alt-1…0); other terminals buffer their output |
 | Ctrl-] | stops the scheduler and opens the kernel shell (x86: Shift-Esc); `help`, `ps`, `queues`, `exit` |
+
+To leave qemu: `poweroff` (or `shutdown now`) in the shell; `reboot` starts the system again. (qemu's own Ctrl-A X works in most terminals.)
 
 Changes to the disk are discarded when qemu ends (`-snapshot`).
 
@@ -90,6 +92,7 @@ tools/           minix_add.py, minix_check.py (host-side file system tools), dis
                  make_sdcard.py (SD card image)
 *_test.c         kernel test suites
 sdcard.c         SD card (Raspberry Pi)             virtionet.c     network card (qemu virt)
+genet.c          Ethernet (Raspberry Pi 4, untested) netdev.c        which network card is there
 net.c  tcp.c     Ethernet, ARP, IP, ICMP, UDP, TCP  net.h           what the network layers offer each other
 ```
 
@@ -103,9 +106,12 @@ net.c  tcp.c     Ethernet, ARP, IP, ICMP, UDP, TCP  net.h           what the net
   implementation, checks the file system (tree, bitmaps, link counts, leaked blocks) and the contents of the files.
 * **`make console-test`** (34 checks) types into the UART like a person; **`make shell-test`** (93 checks) runs a whole
   session: boot, auto login, the programs of `lib-build/tools`, Ctrl-C, terminal switching, `exit`, login with password.
+* **`poweroff_test.py`** (job `poweroff`): `shutdown` and `poweroff` end qemu by themselves, `reboot` starts the kernel again.
 * The shell test has a variant with a network card (`make pcheck`, job `shellnet`): the program `ping` in the Ulix shell.
 * The network is configured like on a BSD: the kernel command line (`ip=dhcp`, `ip=10.0.0.5/24 gw=… dns=…`), and as root (`su`) the
   programs `ifconfig`, `route` and `dhclient`; the tests are the `shellnet` and `netconf` jobs of `make pcheck`.
+* **`make netd-test`**: the network thread. The console kernel with the command line `netecho` has nothing but the thread to answer; Python
+  sockets of the host get UDP and TCP echo back (up to 20000 bytes) while the kernel runs its program.
 * **`make net-test`**: the network. The kernel (own image `ulix-net.bin`) runs on qemu's user-mode network and a Python program on the
   host talks to it with ordinary sockets: ping of the router, UDP echo, TCP echo of 100 and 20000 bytes, and the kernel as a TCP client
   that loses its first SYN and its first data segment on purpose and must send them again.
@@ -148,6 +154,13 @@ Found while porting, present on the x86 as well, left as they are in the book:
 
 Ulix is a teaching system; what the port and the Raspberry Pi work follow from the original authors' idea is written down in
 [`PRINCIPLES.md`](PRINCIPLES.md), together with the plan (boot on the Pi, then networking, then telnet).
+
+## Third-party code
+
+* `genet.c` (the Ethernet controller of the Raspberry Pi 4B) is written new for Ulix, but its register names, register layout and the order
+  of the setup steps are those of the FreeBSD driver `sys/arm64/broadcom/genet/if_genet.c` and `if_genetreg.h` (BSD-2-Clause, Copyright
+  (c) 2020 Michael J Karels, (c) 2016, 2020 Jared McNeill; they derive from NetBSD's `bcmgenet.c`). The licence text and the copyrights are in the
+  header of `genet.c`. The FreeBSD files themselves are not part of this repository.
 
 ## Not done
 

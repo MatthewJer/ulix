@@ -186,7 +186,7 @@ static void disk_test (void) {
   CHECK (n == 31, "root directory has 31 entries (16 from x86 Ulix + 15 AArch64 files)");
   n = 0;
   minix_readdir (minix_lookup ("/bin"), count_cb, &n);
-  CHECK (n == 67, "/bin has 67 entries (the programs of lib-build/tools, init, ping, ifconfig, route and dhclient)");
+  CHECK (n == 70, "/bin has 70 entries (the programs of lib-build/tools, init, ping, ifconfig, route, dhclient, shutdown, poweroff and reboot)");
   CHECK (minix_lookup ("/nonexistent") == 0, "unknown path not found");
 
   // reference values computed on the host from the same image with an independent parser
@@ -220,9 +220,12 @@ static void console_main (void) {
   minix_mount ();
   extern int net_init (void);
   extern void net_configure_from_command_line (void);
-  if (net_init () == 0) net_configure_from_command_line ();      // the network card, if there is one (silent if not): ip=, gw=, dns= of the command line
+  int net_ok = net_init () == 0;                                  // the network card, if there is one (silent if not)
+  if (net_ok) net_configure_from_command_line ();                 // ip=, gw=, dns=, netecho of the command line
   arch_threads_init ();
   console_irq_init ();
+  extern void netd_start (void);
+  if (net_ok) netd_start ();                                      // the network thread: frames are handled as they arrive
   printf ("console ready (Ctrl-C: end the running program, Ctrl-]: kernel shell)\n");
 #ifndef CONSOLE_PROGRAM
 #define CONSOLE_PROGRAM "/contest64"

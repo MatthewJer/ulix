@@ -9,7 +9,9 @@
 // The driver polls: it looks into the queue whenever somebody asks for a frame (net_dev_recv) or waits for a frame to be sent.
 
 #include "ulix.h"
+#include "net.h"
 #include "plat.h"
+#include "cache.h"
 
 #define R_MAGIC         0x000
 #define R_VERSION       0x004
@@ -66,21 +68,11 @@ static struct queue rxq, txq;
 static u64 rx_pa;                   // the 16 receive buffers: one contiguous area of 16 * 2048 bytes
 static u64 tx_pa;                   // the transmit buffer (one frame at a time)
 static int hdr_len;                 // the card puts a header before every frame: 10 bytes (legacy transport), 12 bytes (modern)
+static int dev_irq = 0;             // the interrupt number from the device tree (0: not known)
 static u8 mac[6] = { 0x52, 0x54, 0x00, 0x12, 0x34, 0x56 };       // (qemu's default, in case the card does not say)
 
 static u32  rd (int off)        { return *(volatile u32 *)(dev + off); }
 static void wr (int off, u32 v) { *(volatile u32 *)(dev + off) = v; }
-
-// The memory the card reads (descriptors, the frame to send) must be written back from the CPU cache first, and what the card has
-// written (used ring, received frames) must be read again from memory: qemu's memory is coherent, real hardware often is not.
-static void cache_clean (const void *p, u64 len) {
-  for (u64 a = (u64)p & ~63UL; a < (u64)p + len; a += 64) __asm__ volatile ("dc cvac, %0" :: "r" (a) : "memory");
-  __asm__ volatile ("dsb sy" ::: "memory");
-}
-static void cache_flush_inval (const void *p, u64 len) {
-  for (u64 a = (u64)p & ~63UL; a < (u64)p + len; a += 64) __asm__ volatile ("dc civac, %0" :: "r" (a) : "memory");
-  __asm__ volatile ("dsb sy" ::: "memory");
-}
 
 // Set up one queue: memory for the three tables, and tell the card where they are.
 static void queue_init (struct queue *q, int number, int version) {
@@ -119,11 +111,11 @@ static void rx_post (int id) {
 }
 
 // Look for the card among the virtio slots; returns 0 if it was found and initialised.
-int net_dev_init (void) {
+static int init (void) {
   int slots = plat.nvirtio ? plat.nvirtio : 32;                  // without a device tree: the 32 slots of qemu virt
   for (int i = slots - 1; i >= 0; i--) {
     volatile u8 *s = (volatile u8 *)(plat.nvirtio ? KERNEL_VA + plat.virtio[i] : KERNEL_VA + 0x0a000000UL + i * 0x200);
-    if (*(volatile u32 *)(s + R_MAGIC) == 0x74726976 && *(volatile u32 *)(s + R_DEVICE_ID) == VIRTIO_ID_NET) { dev = s; break; }
+    if (*(volatile u32 *)(s + R_MAGIC) == 0x74726976 && *(volatile u32 *)(s + R_DEVICE_ID) == VIRTIO_ID_NET) { dev = s; dev_irq = plat.nvirtio ? plat.virtio_irq[i] : 0; break; }
   }
   if (!dev) return -1;
   u32 version = rd (R_VERSION);
@@ -153,14 +145,11 @@ int net_dev_init (void) {
   return 0;
 }
 
-const u8 *net_dev_mac (void) { return mac; }
+static const u8 *mac_address (void) { return mac; }
 
 // Send one frame (Ethernet header and data, without the checksum at the end: the card adds it). Returns 0 if it has been sent.
-int net_drop_tx = 0;                                           // tests: while > 0, a frame to send is thrown away (as if the network lost it)
-
-int net_dev_send (const void *frame, int len) {
+static int send_frame (const void *frame, int len) {
   if (!dev || len < 14 || len > FRAME_MAX) return -1;
-  if (net_drop_tx > 0) { net_drop_tx--; return 0; }
   u8 *buf = KVA (tx_pa);
   for (int i = 0; i < hdr_len; i++) buf[i] = 0;                  // the card's header: no offloading, nothing special
   for (int i = 0; i < len; i++) buf[hdr_len + i] = ((const u8 *)frame)[i];
@@ -186,7 +175,7 @@ int net_dev_send (const void *frame, int len) {
 }
 
 // Has a frame arrived? If so, copy it to 'out' (at most 'max' bytes) and return its length; 0 if nothing has arrived.
-int net_dev_recv (void *out, int max) {
+static int recv_frame (void *out, int max) {
   if (!dev) return 0;
   cache_flush_inval ((const void *)rxq.used, sizeof (struct used));
   if (rxq.used->idx == rxq.used_seen) return 0;
@@ -200,3 +189,12 @@ int net_dev_recv (void *out, int max) {
   rx_post (id);                                                  // the buffer goes back to the card
   return len > 0 ? len : 0;
 }
+
+// The card raises its interrupt whenever it has put a buffer into a used ring (a frame has arrived, or one has been sent); the driver
+// has to say "I have seen it" by writing the interrupt status back into the acknowledge register.
+#define R_INTERRUPT_STATUS 0x060
+#define R_INTERRUPT_ACK    0x064
+static int start_irq (void) { return dev_irq; }
+static void ack (void) { wr (R_INTERRUPT_ACK, rd (R_INTERRUPT_STATUS)); }
+
+const struct net_driver virtio_net_driver = { "vioif0", init, mac_address, send_frame, recv_frame, start_irq, ack };

@@ -12,6 +12,7 @@
 
 #include "ulix.h"
 #include "plat.h"
+#include "delay.h"
 
 // ---- registers of the controller (offsets from the base address; the width is part of the register) ----
 #define R_BLKSIZE    0x04      // 16 bit: block size in bytes
@@ -67,13 +68,6 @@ static u8   rd8  (int off) { return *(volatile u8 *)(base + off); }
 static void wr32 (int off, u32 v) { *(volatile u32 *)(base + off) = v; }
 static void wr16 (int off, unsigned short v) { *(volatile unsigned short *)(base + off) = v; }
 static void wr8  (int off, u8 v)  { *(volatile u8 *)(base + off) = v; }
-
-static void delay_us (u32 us) {            // the counter of the generic timer runs at a fixed frequency
-  u64 freq, start, now;
-  __asm__ volatile ("mrs %0, cntfrq_el0" : "=r" (freq));
-  __asm__ volatile ("mrs %0, cntpct_el0" : "=r" (start));
-  do __asm__ volatile ("mrs %0, cntpct_el0" : "=r" (now)); while ((now - start) * 1000000 / freq < us);
-}
 
 // wait until (register & mask) == want, at most 'ms' milliseconds; 0 = it happened. The registers have different widths and must
 // be read with their own width ('bytes' = 1, 2 or 4); a 32-bit read of the 8-bit reset register would be a misaligned access.

@@ -198,6 +198,12 @@ static long psci_call_conduit (int hvc, u32 fn, u64 a1, u64 a2, u64 a3) {
 
 static long psci_call (u32 fn, u64 a1, u64 a2, u64 a3) { return psci_call_conduit (plat_psci_hvc (), fn, a1, a2, a3); }
 
+// Switch the machine off: the firmware function SYSTEM_OFF of PSCI (under qemu this ends qemu). Returns if there is no PSCI.
+void smp_poweroff (void) { if (plat_psci ()) psci_call (0x84000008, 0, 0, 0); }
+
+// Start the machine again: PSCI SYSTEM_RESET. Returns -1 (if it returns at all) when there is no PSCI.
+int smp_reboot (void) { if (plat_psci ()) psci_call (0x84000009, 0, 0, 0); return -1; }
+
 void secondary_main (int cpu) {
   gic_init_cpu ();
   irq_init_cpu ();                           // this CPU's timer

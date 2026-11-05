@@ -34,6 +34,7 @@ struct node {
   const u8 *ranges;  int rangeslen;   // how this node's children's addresses map into this node's own address space
   const u8 *compat;  int clen;
   const u8 *irq;  int irqlen;
+  const u8 *mac;  int maclen;               // "mac-address" or "local-mac-address": the Ethernet address of a network controller
   const char *devtype, *method, *bootargs;
   int coherent, has_cpu_on;  u32 cpu_on;
 };
@@ -125,6 +126,10 @@ static void classify (const struct node *stack, int depth) {
       plat.uart2_irq = (n->irq && n->irqlen >= 12) ? irq_number (n->irq) : 0;
     }
     uarts++;
+  } else if ((compat_has (n, "brcm,bcm2711-genet-v5", 1) || compat_has (n, "brcm,genet-v5", 1)) && n->reg) {
+    plat.genet = address (stack, depth, n->reg);
+    plat.genet_irq = (n->irq && n->irqlen >= 12) ? irq_number (n->irq) : 0;          // (the first of its two interrupts: frames sent and received)
+    if (n->mac && n->maclen == 6) { for (int i = 0; i < 6; i++) plat.genet_mac[i] = n->mac[i]; plat.genet_has_mac = 1; }
   } else if (compat_has (n, "brcm,bcm2711-emmc2", 1) && n->reg) {
     plat.sdhci = address (stack, depth, n->reg);
     plat.sdhci_irq = (n->irq && n->irqlen >= 12) ? irq_number (n->irq) : 0;
@@ -188,6 +193,7 @@ void dt_init (u64 blob_pa) {
       else if (str_eq (pn, "ranges"))          { n->ranges = val; n->rangeslen = len; }
       else if (str_eq (pn, "device_type"))     n->devtype = (const char *)val;
       else if (str_eq (pn, "method"))          n->method = (const char *)val;
+      else if (str_eq (pn, "mac-address") || str_eq (pn, "local-mac-address")) { n->mac = val; n->maclen = len; }
       else if (str_eq (pn, "bootargs"))        n->bootargs = (const char *)val;     // the command line (cmdline.txt on the Pi)
       else if (str_eq (pn, "dma-coherent"))    n->coherent = 1;
       else if (str_eq (pn, "cpu_on"))          { n->cpu_on = be32 (val); n->has_cpu_on = 1; }

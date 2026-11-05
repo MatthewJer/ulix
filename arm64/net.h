@@ -7,11 +7,38 @@ typedef unsigned short u16;
 
 #define IP(a, b, c, d)  (((u32)(a) << 24) | ((u32)(b) << 16) | ((u32)(c) << 8) | (u32)(d))     // an IPv4 address as a 32 bit number
 
-// ---- the network card (virtionet.c) ----
-int  net_dev_init (void);                         // 0: a card was found
-const u8 *net_dev_mac (void);                     // its Ethernet address (6 bytes)
-int  net_dev_send (const void *frame, int len);   // one Ethernet frame (without the checksum at the end)
-int  net_dev_recv (void *out, int max);           // the length of a frame that has arrived (copied to out), or 0
+// ---- the network card (netdev.c; the drivers are virtionet.c for qemu and genet.c for the Raspberry Pi 4) ----
+// A driver moves complete Ethernet frames between memory and its card, and knows nothing about ARP, IP or TCP.
+struct net_driver {
+  const char *name;                                // the name of the interface: "vioif0" (NetBSD's name for a virtio card), "genet0"
+  int  (*init) (void);                             // 0: the card is there and ready
+  const u8 *(*mac) (void);                         // its Ethernet address (6 bytes)
+  int  (*send) (const void *frame, int len);       // one Ethernet frame (without the checksum at the end): 0 = sent
+  int  (*recv) (void *out, int max);               // the length of a frame that has arrived (copied to out), or 0
+  int  (*start_irq) (void);                        // let the card interrupt when frames arrive: its interrupt number (0: it cannot, keep polling)
+  void (*ack) (void);                              // in the interrupt handler: tell the card that we have noticed
+};
+extern const struct net_driver virtio_net_driver, genet_driver;
+
+int  net_dev_init (void);                         // look for a card with the drivers in turn: 0 = found one
+const u8 *net_dev_mac (void);
+int  net_dev_send (const void *frame, int len);
+int  net_dev_recv (void *out, int max);
+int  net_dev_start_irq (void);
+void net_dev_ack (void);
+
+// ---- the network thread (netd.c): a kernel thread that handles the frames as they arrive, woken by the interrupt of the card ----
+void netd_start (void);                           // start it (after the threads are set up and the card is found)
+extern int netd_irq;                              // the interrupt number of the card (0 until netd_start () has run, or when polling)
+void netd_interrupt (void);                       // in the interrupt handler
+void netd_tick (void);                            // every timer tick: wakes the thread now and then, for the timers of TCP
+extern int net_echo;                              // the kernel command line said "netecho": answer on port 7 (UDP and TCP) with what comes in
+
+// ---- the echo service (echo.c) ----
+int  echo_start (void);                           // open port 7 (UDP and TCP): 0 = ok
+int  echo_step (void);                            // serve the TCP connection a bit: 1 = something was moved
+extern int echo_udp_datagrams, echo_tcp_connections;
+extern long echo_tcp_bytes;
 
 // ---- Ethernet, ARP, IPv4, ICMP, UDP (net.c) ----
 extern u32 net_my_ip, net_netmask, net_gateway, net_dns;

@@ -14,6 +14,8 @@ struct platform {
   u64 uart;  int uart_irq;       // PL011 and its interrupt number (INTID)
   u64 uart2; int uart2_irq;      // the second PL011 (0: none), where the serial disk is connected
   u64 sdhci;  int sdhci_irq;     // SD host controller (the Raspberry Pi's EMMC2), 0: none, and its interrupt number
+  u64 genet;  int genet_irq;     // the Raspberry Pi 4's Ethernet controller (GENET), 0: none, and its interrupt number
+  u8  genet_mac[6];  int genet_has_mac;           // its Ethernet address as the firmware wrote it into the device tree
   u64 rtc;                       // PL031
   int timer_irq;                 // INTID of the EL1 physical timer (a PPI)
   int ncpus;  u64 cpu_mpidr[MAX_CPUS];

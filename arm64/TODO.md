@@ -48,14 +48,23 @@ The branch `rpi4` is only merged into `arm64-port` when `make pcheck` is green.
 
 7. **SD card, the rest:** interrupts, multi-block commands and the 4-bit bus are done (2026-11-05, tested in qemu). Left: DMA (ADMA2),
    the 1.8 V switch and faster clocks (UHS), and everything the real controller needs (see "Not done and not testable in qemu").
-8. **Network, the rest:** the layers up to TCP are done (see "Network: progress"). Left: an interrupt for the virtio-net card instead of
-   polling (the same pattern as the SD card: the process sleeps, the interrupt wakes it), a kernel thread that runs the network all the
-   time (until now whoever waits calls `net_poll_once ()`; without it nobody answers when another computer pings us), UDP and TCP sockets
-   for user programs (raw ICMP is done: system calls in the same style, then telnet can be a program), the answer to a ping that comes from
-   outside (untested: qemu's user network cannot send one; a `-netdev dgram` peer could), renewing the DHCP lease before it runs out (DHCP itself is done), DNS maybe, and TCP fast retransmit/congestion control if they are ever wanted.
-9. **GENET driver** for the Pi's Ethernet (BCM2711, `sys/arm64/broadcom/genet/if_genet.c` and `if_genetreg.h` of FreeBSD as the
-   reference): register definitions, DMA rings, PHY (MDIO) setup, link detection. Only on the board (or on newer qemu if it
-   gets a model). Plug it into the same interface as the virtio-net driver.
+8. **Network, the rest:** the layers up to TCP, the network thread and the interrupt of the card are done (see "Network: progress").
+   Left: UDP and TCP sockets for user programs (raw ICMP is done: system calls in the same style, then telnet can be a program, or a
+   service of the thread like the echo service), the answer to a ping that comes from outside (works now through the thread, but is
+   untested: qemu's user network cannot send one; a `-netdev dgram` peer could), renewing the DHCP lease before it runs out, DNS maybe,
+   and TCP fast retransmit/congestion control if they are ever wanted.
+9. **GENET driver** for the Pi's Ethernet: written (2026-11-05) but NOT TESTED, qemu has no model of the controller. `genet.c` follows the
+   FreeBSD driver (register layout and setup order; licence and copyrights in its header; the FreeBSD files are not in the repository):
+   reset, one transmit and one receive ring of 256 descriptors (which live in registers of the controller), polling, no address
+   filter (promiscuous, `net.c` picks), PHY by MDIO (autonegotiation, speed), RGMII setup for the PHY of the Pi 4 (`rgmii-rxid`, PHY
+   address 1). `netdev.c` tries the drivers in turn (`genet0` first, then `vioif0`), the layers above do not know which card it is. The
+   device tree node (`brcm,bcm2711-genet-v5`, behind the `scb` bus: `dt.c` translates its address through the bus's `ranges`) gives the base
+   address and the MAC address; `ifconfig` shows `genet0` on the board. **On the board, check first:** that the controller answers
+   (revision register: "GENET v5.x"), the PHY (`phy_read` returns sensible values, link up message), then a ping of the router.
+   If the first frames do not come: cache maintenance (`cache.h`), the RX padding of two bytes, the descriptor addresses (DMA address =
+   ARM physical address), the interrupt (`start_irq` unmasks frames received/sent, `ack` clears them; `netd.c` wakes the thread). If the
+   interrupt does not come, `netd` still looks every 50 ms (the timer tick wakes it), so the network works slowly: a first sign to look at
+   the interrupt number in the device tree (`interrupts` of the genet node, the first one).
 10. **Telnet server**: a daemon (kernel thread or user process) that listens on port 23, handles the minimal telnet protocol (IAC, echo,
     suppress go-ahead, terminal size can be ignored), and attaches the session to a virtual terminal of the book (there are ten).
     Login through the book's `/bin/login`. Test: a Python script that connects to the guest and runs commands.
@@ -80,7 +89,14 @@ The branch `rpi4` is only merged into `arm64-port` when `make pcheck` is green.
   the host are 10.0.2.2) with port forwarding, so that ordinary Python sockets talk to the kernel: UDP echo, TCP echo of 100 and of
   20000 bytes (more than the buffers and than one segment), and the kernel as the client: connects to the host with its first SYN
   thrown away (`net_drop_tx`), sends a line whose first segment is thrown away, reads the answer, closes. Everything passes.
-- Addresses are fixed (`net.c`: 10.0.2.15, router 10.0.2.2), which is what qemu's user network gives.
+- Addresses are fixed (`net.c`: 10.0.2.15, router 10.0.2.2) unless the command line, DHCP or `ifconfig` say otherwise.
+- **Network thread** (`netd.c`, 2026-11-05): a kernel thread that sleeps in a blocked queue (the floppy's, which this machine does not use) and is
+  woken by the interrupt of the card (`start_irq`/`ack` in `struct net_driver`; the virtio card's interrupt number comes from the device tree)
+  and, for the timers of TCP and for cards without an interrupt, by the timer tick every 50 ms. It handles every frame as it arrives: ARP,
+  ping from outside, TCP segments. Started by the shell/console kernel when there is a card. With `netecho` on the kernel command line it
+  also serves the echo service (`echo.c`, port 7, UDP and TCP). Test: `make netd-test` (job `netd`): the console kernel with `-append netecho`,
+  no test code in it, Python sockets of the host: UDP and TCP echo (up to 20000 bytes) while the kernel runs its program, and a check that the
+  thread was woken by the interrupt, not by polling.
 - **`ping` in the Ulix shell** (`userland/ping.c`, in `/bin`): `ping [-c count] [-s size] A.B.C.D`, dotted addresses only (no DNS). The
   program builds the ICMP messages itself, checksum included; the kernel offers raw ICMP sockets (`net.c`: `icmp_open/send/get`) through
   five system calls of the port (`net_syscalls.c`, numbers 602 to 606, used through `userland/arm64-extra.h`): `icmp_open`, `icmp_send`,
@@ -97,6 +113,17 @@ The branch `rpi4` is only merged into `arm64-port` when `make pcheck` is green.
   Tests: the DHCP checks in `net_test.c` (a wrong address is put in first, DHCP must bring back 10.0.2.15, router 10.0.2.2, name
   server 10.0.2.3), the root commands in the shell test (job `shellnet`), and job `netconf` (command line with a fixed address, and `ip=dhcp`).
   Not done: renewing the lease, several interfaces (`ifconfig -a`), aliases, `up`/`down`, routes other than the default one, DNS.
+
+### Switching off and restarting (2026-11-05)
+
+- `shutdown` (`shutdown now`, `-h`, `-p`: off; `-r`: restart), `poweroff` and `reboot` are one program (`userland/shutdown.c`) with three names.
+  The system calls `poweroff` and `reboot` (610, 611, in `net_syscalls.c`) write the buffer cache to the disks (`buffer_sync`), then ask the firmware:
+  PSCI `SYSTEM_OFF` or `SYSTEM_RESET` (`smp_poweroff`, `smp_reboot` in `smp.c`). Under qemu that ends qemu, or starts the kernel again (the
+  way out of `make run-shell` without keys: Ctrl-A X is not available in every terminal). Everybody may do it. Test: job `poweroff`.
+- **The Raspberry Pi has no PSCI** (the firmware's tree has no `psci` node for the stock boot): `poweroff` prints "System halted." and stops
+  the CPU; `reboot` returns an error ("cannot start itself again"). The Pi's own way is the watchdog: write the reset request into the power
+  management registers (`PM_RSTC`, `PM_WDOG` at 0xfe100000 + 0x1c and 0x24, with the password 0x5a000000) and the board restarts; for "off" the
+  same with the halt bit. To do on the board (needs the registers' exact bits from the BCM2835 headers of FreeBSD/NetBSD).
 
 ### Tests of 2026-11-03 (state at that time)
 

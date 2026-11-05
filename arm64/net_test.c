@@ -8,37 +8,8 @@ static int fails = 0;
 #define CHECK(cond, msg) do { if (cond) printf ("  ok:   %s\n", msg); \
                               else { printf ("  FAIL: %s\n", msg); fails++; } } while (0)
 
-// ---- the echo services on port 7: UDP and TCP send back what they get ----
-static int udp_echoed = 0;
-static void udp_echo (u32 src, u16 src_port, const u8 *data, int len) {
-  udp_send (src, src_port, 7, data, len);
-  udp_echoed++;
-}
-
-static tcp_conn *echo_conn = 0;           // the connection that is being served (one at a time is enough for the test)
-static u8 pending[1024];  static int pending_len = 0;     // bytes that were read but could not be sent back yet (send buffer full)
-static int tcp_echoed_connections = 0;
-static long tcp_echoed_bytes = 0;
-
-static void tcp_echo_step (void) {
-  if (!echo_conn) echo_conn = tcp_accept (7);
-  if (!echo_conn) return;
-  if (pending_len == 0) {
-    int n = tcp_read (echo_conn, pending, sizeof pending);
-    if (n > 0) pending_len = n, tcp_echoed_bytes += n;
-    else if (n < 0) { tcp_close (echo_conn); echo_conn = 0; tcp_echoed_connections++; return; }     // the host has closed: so do we
-  }
-  if (pending_len > 0) {
-    int sent = tcp_write (echo_conn, pending, pending_len);
-    if (sent > 0) {                                           // (it may take only a part: the rest stays for the next round)
-      for (int i = sent; i < pending_len; i++) pending[i - sent] = pending[i];
-      pending_len -= sent;
-    }
-  }
-}
-
 // run the network until 'done' is true or 'ms' have passed
-#define WAIT(cond, ms) do { u64 t0 = net_now_ms (); while (!(cond) && net_now_ms () - t0 < (u64)(ms)) { net_poll_once (); tcp_echo_step (); } } while (0)
+#define WAIT(cond, ms) do { u64 t0 = net_now_ms (); while (!(cond) && net_now_ms () - t0 < (u64)(ms)) { net_poll_once (); echo_step (); } } while (0)
 
 int net_test (void) {
   printf ("network test:\n");
@@ -59,13 +30,12 @@ int net_test (void) {
   const char *hello = "hello from Ulix";
   CHECK (udp_send (IP (10, 0, 2, 2), 5557, 4000, (const u8 *)hello, 15) == 0, "UDP datagram sent to the host (10.0.2.2 is the host, port 5557)");
 
-  CHECK (udp_bind (7, udp_echo) == 0, "UDP port 7 (echo service) bound");
-  CHECK (tcp_listen (7) == 0, "TCP port 7 (echo service) is listening");
+  CHECK (echo_start () == 0, "the echo service is open on port 7 (UDP and TCP)");
   printf ("net: ready for the host\n");                    // tools/net_test.py waits for this line
-  WAIT (udp_echoed == 3 && tcp_echoed_connections == 2, 60000);
-  CHECK (udp_echoed == 3, "three UDP datagrams from the host arrived and were echoed");
-  CHECK (tcp_echoed_connections == 2, "two TCP connections from the host were served until the host closed them");
-  printf ("  info: %ld bytes echoed over TCP\n", tcp_echoed_bytes);
+  WAIT (echo_udp_datagrams == 3 && echo_tcp_connections == 2, 60000);
+  CHECK (echo_udp_datagrams == 3, "three UDP datagrams from the host arrived and were echoed");
+  CHECK (echo_tcp_connections == 2, "two TCP connections from the host were served until the host closed them");
+  printf ("  info: %ld bytes echoed over TCP\n", echo_tcp_bytes);
 
   // the kernel as the client: connect to the host (port 5558), lose the SYN and the first data segment on the way (they are sent
   // again after the retransmission timeout), send a line, read the answer, close

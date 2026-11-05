@@ -7,10 +7,13 @@
 //     ip=10.0.0.5/24           a fixed address, the number after the slash is the length of the netmask in bits
 //     gw=10.0.0.1              the router (the "default gateway")
 //     dns=10.0.0.1             the name server
+//     netecho                  switch on the echo service on port 7 (a test: UDP and TCP send back what they get)
 //
 // Later the programs ifconfig, route and dhclient can change all this while the system runs (like on the BSDs).
 
 #include "net.h"
+
+int net_echo = 0;                       // "netecho" on the command line: the echo service is on
 
 int net_parse_ip (const char *s, u32 *ip, const char **end) {
   u32 value = 0;
@@ -50,6 +53,8 @@ void net_configure_from_command_line (void) {
           }
         }
       }
+    } else if (p - word == 7 && word[0] == 'n' && word[1] == 'e' && word[2] == 't' && word[3] == 'e' && word[4] == 'c' && word[5] == 'h' && word[6] == 'o') {
+      net_echo = 1;
     } else if (p - word > 3 && word[0] == 'g' && word[1] == 'w' && word[2] == '=') {
       net_parse_ip (word + 3, &net_gateway, 0);  set_by_hand = 1;
     } else if (p - word > 4 && word[0] == 'd' && word[1] == 'n' && word[2] == 's' && word[3] == '=') {

@@ -29,4 +29,10 @@ struct net_dhcp_args { int timeout_ms; unsigned server, address, netmask, gatewa
 static inline int net_info (struct net_info *i)       { return syscall2 (__NR_net_info, (int)(long)i); }          // 0 = ok, -1 = no network
 static inline int net_set (struct net_set *s)         { return syscall2 (__NR_net_set, (int)(long)s); }           // -2 = only root may do this
 static inline int net_dhcp (struct net_dhcp_args *d)  { return syscall2 (__NR_net_dhcp, (int)(long)d); }
+
+// switching the machine off, or starting it again (shutdown, poweroff, reboot)
+#define __NR_poweroff 610
+#define __NR_reboot   611
+static inline int poweroff (void) { return syscall1 (__NR_poweroff); }
+static inline int reboot (void)   { return syscall1 (__NR_reboot); }
 #endif

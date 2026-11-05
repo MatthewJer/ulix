@@ -30,6 +30,8 @@ JOBLIST=(
   "rpi4shell|Raspberry Pi 4B in qemu raspi4b: shell session|rpi4shell|raspi4b||128"
   "rpi4console|Raspberry Pi 4B in qemu raspi4b: console test|rpi4console|raspi4b||128"
   "net|network: virtio-net, ARP, ICMP, UDP and TCP against real sockets of the host|net|virt||128"
+  "poweroff|shutdown and poweroff end qemu by themselves, reboot starts the machine again|poweroff|virt||128"
+  "netd|network thread: echo service answers while the kernel runs its program (interrupt of the card)|netd|virt||128"
   "netconf|network settings from the kernel command line: fixed address and DHCP|netconf|virt||128"
   "maxcpus|kernel command line maxcpus=2 on a machine with 4 CPUs|maxcpus|virt||128"
   "ram512|RAM 512 MByte, 2 CPUs|kernel|virt|-smp 2|512"
@@ -81,6 +83,14 @@ if [ "$1" = "--job" ]; then
       [ $rc -eq 0 ] && grep -q "all passed" <<< "$sum" && st=ok || st=FAILED ;;
     net)
       python3 tools/net_test.py ulix-net.bin > "$log" 2>&1
+      rc=$?; sum=$(tail -1 "$log")
+      [ $rc -eq 0 ] && grep -q "all passed" <<< "$sum" && st=ok || st=FAILED ;;
+    poweroff)
+      python3 tools/poweroff_test.py ulix-shell.bin $DISK > "$log" 2>&1
+      rc=$?; sum=$(tail -1 "$log")
+      [ $rc -eq 0 ] && grep -q "all passed" <<< "$sum" && st=ok || st=FAILED ;;
+    netd)
+      python3 tools/netd_test.py ulix-console.bin $DISK > "$log" 2>&1
       rc=$?; sum=$(tail -1 "$log")
       [ $rc -eq 0 ] && grep -q "all passed" <<< "$sum" && st=ok || st=FAILED ;;
     netconf)

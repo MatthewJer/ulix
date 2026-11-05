@@ -68,6 +68,26 @@ void syscall_clock_us (context_t *r) {
   eax_return ((unsigned)(count * 1000000 / freq));
 }
 
+// ---- switching off (not about the network, but the system calls of the port are kept together here) ----
+extern void smp_poweroff (void);
+extern int  smp_reboot (void);
+
+// First everything that is only in the buffer cache goes to the disks (what the system call sync does), then the machine is switched
+// off by the firmware. Under qemu that ends qemu. A machine without that function (the Raspberry Pi: no PSCI) stops here instead.
+void syscall_poweroff (context_t *r) {
+  buffer_sync (1);
+  printf ("System halted.\n");
+  smp_poweroff ();
+  for (;;) __asm__ volatile ("msr daifset, #3; wfi");           // (no interrupts, wait forever; the power button is the way out)
+}
+
+// The same, but the firmware starts the machine again (PSCI SYSTEM_RESET): the kernel boots from the beginning. -1 if that is not possible.
+void syscall_reboot (context_t *r) {
+  buffer_sync (1);
+  printf ("Rebooting ...\n");
+  eax_return (smp_reboot ());
+}
+
 // ---- the configuration. Changing it is for root only, as on the BSDs (euid 0). -2 = not allowed ----
 static int is_root (void) { return thread_table[current_task].euid == 0; }
 

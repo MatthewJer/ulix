@@ -17,7 +17,7 @@ BUILD    = build
 
 SKIP     =
 # new programs of the AArch64 port (the network is not part of the original Ulix; the rule for them is further down)
-NEWTOOLS = ping ifconfig route dhclient
+NEWTOOLS = ping ifconfig route dhclient shutdown poweroff reboot
 TOOLS    = $(filter-out $(SKIP),$(patsubst $(TOOLSRC)/%.c,%,$(wildcard $(TOOLSRC)/*.c))) $(NEWTOOLS)
 
 # GCC 4.4 accepted a lot that current compilers reject (return without value, missing types);
@@ -69,7 +69,12 @@ $(BUILD)/tools/free.c: $(TOOLSRC)/free.c $(BUILD)/ulixlib.h $(BUILD)/arm64-extra
 
 # new programs of the AArch64 port (the network is not part of the original Ulix): ping uses raw ICMP sockets, ifconfig, route and dhclient
 # are modelled on the BSD programs of the same names
-$(addprefix $(BUILD)/tools/,$(addsuffix .c,$(NEWTOOLS))): $(BUILD)/tools/%.c: %.c $(BUILD)/ulixlib.h $(BUILD)/arm64-extra.h
+$(addprefix $(BUILD)/tools/,$(addsuffix .c,$(filter-out poweroff reboot,$(NEWTOOLS)))): $(BUILD)/tools/%.c: %.c $(BUILD)/ulixlib.h $(BUILD)/arm64-extra.h
+	mkdir -p $(BUILD)/tools
+	cp $< $@
+
+# poweroff and reboot are the same program under other names
+$(BUILD)/tools/poweroff.c $(BUILD)/tools/reboot.c: $(BUILD)/tools/%.c: shutdown.c
 	mkdir -p $(BUILD)/tools
 	cp $< $@
 
