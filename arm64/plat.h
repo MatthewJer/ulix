@@ -13,7 +13,7 @@ struct platform {
   u64 gicd, gicc, gicr, gicr_size;
   u64 uart;  int uart_irq;       // PL011 and its interrupt number (INTID)
   u64 uart2; int uart2_irq;      // the second PL011 (0: none), where the serial disk is connected
-  u64 sdhci;                     // SD host controller (the Raspberry Pi's EMMC2), 0: none
+  u64 sdhci;  int sdhci_irq;     // SD host controller (the Raspberry Pi's EMMC2), 0: none, and its interrupt number
   u64 rtc;                       // PL031
   int timer_irq;                 // INTID of the EL1 physical timer (a PPI)
   int ncpus;  u64 cpu_mpidr[MAX_CPUS];

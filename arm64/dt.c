@@ -34,7 +34,7 @@ struct node {
   const u8 *ranges;  int rangeslen;   // how this node's children's addresses map into this node's own address space
   const u8 *compat;  int clen;
   const u8 *irq;  int irqlen;
-  const char *devtype, *method;
+  const char *devtype, *method, *bootargs;
   int coherent, has_cpu_on;  u32 cpu_on;
 };
 
@@ -73,8 +73,24 @@ static u64 address (const struct node *stack, int depth, const u8 *reg) {
   return a;
 }
 
+static const char *bootargs = 0;                     // the kernel command line from /chosen (it points into the device tree: only used in dt_init)
+static char cmdline[256];                            // ... and a copy of it for later (plat_cmdline ())
+
+// "maxcpus=N" on the kernel command line limits the number of CPUs that are started. On the Raspberry Pi the other three cores
+// wait in a spin table of the firmware, not behind PSCI; until that is implemented the command line says "maxcpus=1".
+static void command_line (const char *args) {
+  for (const char *p = args; *p; p++) {
+    if (str_starts (p, "maxcpus=") && (p == args || p[-1] == ' ')) {
+      int n = 0;
+      for (const char *d = p + 8; *d >= '0' && *d <= '9'; d++) n = n * 10 + (*d - '0');
+      if (n >= 1 && n < plat.ncpus) plat.ncpus = n;
+    }
+  }
+}
+
 static void classify (const struct node *stack, int depth) {
   const struct node *n = &stack[depth];
+  if (n->bootargs) { bootargs = n->bootargs; return; }
   if (n->devtype && str_eq (n->devtype, "memory") && n->reg && n->reglen >= 4 * (n->pac + n->psc)) {
     plat.ram_base = cells (n->reg, n->pac);
     plat.ram_size = cells (n->reg + 4 * n->pac, n->psc);
@@ -111,6 +127,7 @@ static void classify (const struct node *stack, int depth) {
     uarts++;
   } else if (compat_has (n, "brcm,bcm2711-emmc2", 1) && n->reg) {
     plat.sdhci = address (stack, depth, n->reg);
+    plat.sdhci_irq = (n->irq && n->irqlen >= 12) ? irq_number (n->irq) : 0;
   } else if (compat_has (n, "arm,pl031", 1) && n->reg) {
     plat.rtc = address (stack, depth, n->reg);
   } else if (compat_has (n, "virtio,mmio", 1) && n->reg) {
@@ -171,6 +188,7 @@ void dt_init (u64 blob_pa) {
       else if (str_eq (pn, "ranges"))          { n->ranges = val; n->rangeslen = len; }
       else if (str_eq (pn, "device_type"))     n->devtype = (const char *)val;
       else if (str_eq (pn, "method"))          n->method = (const char *)val;
+      else if (str_eq (pn, "bootargs"))        n->bootargs = (const char *)val;     // the command line (cmdline.txt on the Pi)
       else if (str_eq (pn, "dma-coherent"))    n->coherent = 1;
       else if (str_eq (pn, "cpu_on"))          { n->cpu_on = be32 (val); n->has_cpu_on = 1; }
       else if (str_eq (pn, "#address-cells"))  n->ac = be32 (val);
@@ -187,11 +205,14 @@ void dt_init (u64 blob_pa) {
   }
   plat.dt_ok = 1;
   if (plat.ncpus == 0) plat.ncpus = 1;
+  if (bootargs) { int i = 0; while (bootargs[i] && i < (int)sizeof cmdline - 1) { cmdline[i] = bootargs[i]; i++; } cmdline[i] = 0; }
+  if (bootargs) command_line (bootargs);                  // (the CPU nodes come before or after /chosen: look at the end)
   if (plat.nvirtio == 0) plat.virtio_coherent = 0;
 }
 
 // accessors for files that do not include plat.h (they use the book's headers)
 int  plat_psci (void)          { return plat.psci; }
+const char *plat_cmdline (void) { return cmdline; }       // the kernel command line ("maxcpus=1 ip=dhcp"), empty if there is none
 int  plat_psci_hvc (void)      { return plat.psci_hvc; }
 unsigned plat_psci_cpu_on (void) { return plat.psci_cpu_on; }
 int  plat_ncpus (void)         { return plat.ncpus; }

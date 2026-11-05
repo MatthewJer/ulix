@@ -1,9 +1,9 @@
 // Ulix ARM64 -- the SD card of the Raspberry Pi 4B
 //
 // The card sits on an SD host controller that follows the "SD Host Controller Simplified Specification" (SDHCI); the Pi 4 has
-// two of them, and the card slot is on the one called EMMC2. This file talks to the controller in the simplest possible way:
-// no interrupts, no DMA, one 512-byte sector per command, the CPU copies every word through the data port ("polling" and PIO,
-// like the IDE driver of the book). Register names are those of the specification (FreeBSD's sys/dev/sdhci/sdhci.h, BSD-2-Clause,
+// two of them, and the card slot is on the one called EMMC2. This file talks to the controller in a simple way: no DMA, the CPU
+// copies every word through the data port ("PIO", like the IDE driver of the book). The CPU either waits by looking at the
+// controller again and again (polling), or sleeps and is woken by the interrupt of the controller. Register names are those of the specification (FreeBSD's sys/dev/sdhci/sdhci.h, BSD-2-Clause,
 // uses the same names; nothing is copied from it).
 //
 // On the card the MBR partition table says where the disks of Ulix are: every partition of type 0x81 (Minix) is one disk, in
@@ -136,6 +136,7 @@ static int command (u32 index, u32 arg, u32 flags, u32 transfer, u32 *resp) {
 #define WRITE_SINGLE_BLOCK 24
 #define APP_CMD           55
 #define SD_SEND_OP_COND   41      // an "application command": CMD55 first
+#define SET_BUS_WIDTH     6       // also an application command; argument 2 = four data lines
 
 static int app_command (u32 index, u32 arg, u32 flags, u32 *resp) {
   u32 r[4];
@@ -174,46 +175,102 @@ static int card_init (void) {
   rca = r[0] >> 16;
   if (command (SELECT_CARD, rca << 16, CMD_R1B | CMD_CRC_CHECK | CMD_INDEX_CHECK, 0, r) != 0) return -1;
   if (!high_capacity && command (SET_BLOCKLEN, 512, CMD_R1 | CMD_CRC_CHECK | CMD_INDEX_CHECK, 0, r) != 0) return -1;
-  if (set_clock (25000000) != 0) return -1;                // now the normal speed (1 data line; 4 lines would be faster)
-  printf ("sd: card ready (%s, address %u)\n", high_capacity ? "SDHC/SDXC" : "SDSC", rca);
+  if (app_command (SET_BUS_WIDTH, 2, CMD_R1 | CMD_CRC_CHECK | CMD_INDEX_CHECK, r) != 0) return -1;   // the card: 4 data lines
+  wr8 (R_HOSTCTL, rd8 (R_HOSTCTL) | 0x02);                 // ... and the controller, too
+  if (set_clock (25000000) != 0) return -1;                // now the normal speed
+  printf ("sd: card ready (%s, address %u, 4 data lines)\n", high_capacity ? "SDHC/SDXC" : "SDSC", rca);
   return 0;
 }
 
-// read or write one sector
-static int sector_io (int write, u64 lba, void *buf) {
-  u32 *words = buf;
-  u32 arg = high_capacity ? (u32)lba : (u32)(lba * 512);
-  wr16 (R_BLKSIZE, 512);
-  wr16 (R_BLKCNT, 1);
-  u32 ready = write ? INT_WRITE_READY : INT_READ_READY;
-  u32 flags = CMD_R1 | CMD_CRC_CHECK | CMD_INDEX_CHECK | CMD_DATA;
-  if (command (write ? WRITE_SINGLE_BLOCK : READ_SINGLE_BLOCK, arg, flags, TRN_BLKCNT_EN | (write ? 0 : TRN_READ), 0) != 0) return -1;
-  for (int i = 0; !(rd32 (R_INT_STATUS) & (ready | INT_ERROR)); i++)
-    if (i > 100000) { reset_lines (RESET_CMD | RESET_DAT); return -1; }
-  if (rd32 (R_INT_STATUS) & INT_ERROR) { reset_lines (RESET_CMD | RESET_DAT); return -1; }
-  wr32 (R_INT_STATUS, ready);
-  for (int i = 0; i < 128; i++) {                          // 512 bytes through the data port, a word at a time
-    if (write) wr32 (R_DATA, words[i]);
-    else       words[i] = rd32 (R_DATA);
+// ---- a transfer of one or more sectors ----
+// The command starts it. Then, for every sector, the controller says "buffer ready" and the CPU copies the 128 words of the sector
+// through the data port; "transfer complete" ends the transfer. service () does whatever the status bits ask for. Who calls it:
+// the interrupt handler, while a process sleeps and waits for the card, or the caller itself in a loop (the idle thread, the boot
+// code and the tests have nothing else to do, and a sleeping process would need the scheduler).
+static struct {
+  int active, write, by_interrupt, result;
+  u32 *buf;                                // where the next sector goes to / comes from
+  u32 sectors, done;                       // how many are to be moved, how many are
+  long polls;                              // how often the caller has looked (to give up on a card that never answers)
+} xfer;
+
+static void finish (int result) {
+  xfer.active = 0;
+  xfer.result = result;
+  wr32 (R_SIG_ENABLE, 0);                  // no more interrupts until the next transfer
+}
+
+static void service (void) {
+  if (!xfer.active) return;
+  u32 status = rd32 (R_INT_STATUS);
+  if (status & INT_ERROR) { reset_lines (RESET_CMD | RESET_DAT); finish (-1); return; }
+  u32 ready = xfer.write ? INT_WRITE_READY : INT_READ_READY;
+  if ((status & ready) && xfer.done < xfer.sectors) {
+    wr32 (R_INT_STATUS, ready);
+    for (int i = 0; i < 128; i++) {        // 512 bytes through the data port, a word at a time
+      if (xfer.write) wr32 (R_DATA, xfer.buf[i]);
+      else            xfer.buf[i] = rd32 (R_DATA);
+    }
+    xfer.buf += 128;
+    xfer.done++;
+    status = rd32 (R_INT_STATUS);          // (the end of the transfer may have been signalled meanwhile)
   }
-  for (int i = 0; !(rd32 (R_INT_STATUS) & (INT_XFER_DONE | INT_ERROR)); i++)
-    if (i > 1000000) { reset_lines (RESET_CMD | RESET_DAT); return -1; }
-  if (rd32 (R_INT_STATUS) & INT_ERROR) { reset_lines (RESET_CMD | RESET_DAT); return -1; }
-  wr32 (R_INT_STATUS, INT_XFER_DONE);
+  if (status & INT_XFER_DONE) {
+    wr32 (R_INT_STATUS, INT_XFER_DONE);
+    finish (xfer.done == xfer.sectors ? 0 : -1);
+  }
+}
+
+#define TRN_MULTI           0x0020         // several sectors with one command
+#define TRN_AUTO_STOP       0x0004         // the controller sends CMD12 (stop) after the last one itself
+#define READ_MULTIPLE_BLOCK 18
+#define WRITE_MULTIPLE_BLOCK 25
+
+// Start a transfer of 'count' sectors; it is running when this returns (0), the data moves in service ().
+static int start (int write, u64 lba, void *buf, u32 count, int by_interrupt) {
+  if (xfer.active || count == 0 || count > 0xffff) return -1;
+  xfer.active = 1;  xfer.write = write;  xfer.by_interrupt = by_interrupt;  xfer.result = -1;
+  xfer.buf = buf;  xfer.sectors = count;  xfer.done = 0;  xfer.polls = 0;
+  wr16 (R_BLKSIZE, 512);
+  wr16 (R_BLKCNT, count);
+  u32 arg = high_capacity ? (u32)lba : (u32)(lba * 512);
+  u32 index = count == 1 ? (write ? WRITE_SINGLE_BLOCK : READ_SINGLE_BLOCK) : (write ? WRITE_MULTIPLE_BLOCK : READ_MULTIPLE_BLOCK);
+  u32 mode = TRN_BLKCNT_EN | (write ? 0 : TRN_READ) | (count > 1 ? TRN_MULTI | TRN_AUTO_STOP : 0);
+  if (command (index, arg, CMD_R1 | CMD_CRC_CHECK | CMD_INDEX_CHECK | CMD_DATA, mode, 0) != 0) { xfer.active = 0; return -1; }
+  if (by_interrupt)                        // the status bits we want to be told about: buffer ready, transfer complete, errors
+    wr32 (R_SIG_ENABLE, 0xffff0000 | INT_ERROR | INT_XFER_DONE | (write ? INT_WRITE_READY : INT_READ_READY));
   return 0;
+}
+
+// the caller waits by looking at the controller over and over
+static int run_polled (int write, u64 lba, void *buf, u32 count) {
+  if (start (write, lba, buf, count, 0) != 0) return -1;
+  while (xfer.active) {
+    service ();
+    if (++xfer.polls > 20000000L) { reset_lines (RESET_CMD | RESET_DAT); finish (-1); }
+  }
+  return xfer.result;
 }
 
 // ---- what the block layer (virtio.c) uses ----
 
-int sd_read (u64 lba, void *buf, u32 count) {
-  for (u32 i = 0; i < count; i++) if (sector_io (0, lba + i, (u8 *)buf + 512 * i) != 0) return -1;
-  return 0;
+int sd_read (u64 lba, void *buf, u32 count) { return run_polled (0, lba, buf, count); }
+int sd_write (u64 lba, const void *buf, u32 count) { return run_polled (1, lba, (void *)buf, count); }
+
+// the same in three steps, so that a process can sleep in between: submit, ask whether it is done, collect the result.
+// With 'by_interrupt' the interrupt handler (sd_interrupt) moves the data; without, sd_done does it each time it is asked.
+int sd_submit (int write, u64 lba, void *buf, u32 count, int by_interrupt) { return start (write, lba, buf, count, by_interrupt); }
+
+int sd_done (void) {
+  if (xfer.active && !xfer.by_interrupt) {
+    service ();
+    if (xfer.active && ++xfer.polls > 20000000L) { reset_lines (RESET_CMD | RESET_DAT); finish (-1); }
+  }
+  return !xfer.active;
 }
 
-int sd_write (u64 lba, const void *buf, u32 count) {
-  for (u32 i = 0; i < count; i++) if (sector_io (1, lba + i, (u8 *)buf + 512 * i) != 0) return -1;
-  return 0;
-}
+int sd_finish (void) { return xfer.result; }
+void sd_interrupt (void) { service (); }
 
 // Initialise the card and look into the partition table. For every Ulix partition (type 0x81, at most 'max') the first sector
 // and the size in sectors are stored; the result is the number of partitions found (0: no card or no Ulix partition).

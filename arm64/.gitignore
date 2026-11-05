@@ -25,3 +25,7 @@ ulix-rpi4-shell.elf
 kernel8-console.img
 kernel8-shell.img
 sd.img
+sd-pi.img
+sd-boot/
+firmware/
+ulix-net.elf

@@ -4,34 +4,37 @@ State: the port runs in `qemu-system-aarch64 -M virt` and passes `make check` (s
 is still missing compared with the x86 build, most important first. Background and reasons: `../ARM64-PORT.md`
 (sections 14-19).
 
-## Where we stopped (2026-11-04) -- start here: waiting for the Raspberry Pi
+## Where we stopped (2026-11-05) -- start here: waiting for the Raspberry Pi
 
 Work continues when the hardware has arrived (Pi 4B 1 GB, USB-C power supply, CP2102 UART module, 8 GB microSD, card reader,
 Dupont cables). Everything that can be tested in qemu is done: on branch `rpi4` the kernel, the console test and the whole shell
-session run on qemu's `raspi4b` machine from an SD card image (details in "Raspberry Pi 4B: progress" below). Principles for
+session run on qemu's `raspi4b` machine from an SD card image (details in "Raspberry Pi 4B: progress" below), the SD card works with
+interrupts, multi-block commands and four data lines, and the network (virtio-net, ARP, IPv4, ICMP, UDP, TCP) is tested against real
+sockets of the host (`make net-test`, see "Network: progress"). Principles for
 the rest of the work: `PRINCIPLES.md` (teaching system: simple, readable, small steps; BSD code only as a reference).
 The branch `rpi4` is only merged into `arm64-port` when `make pcheck` is green.
 
 ### When the board arrives -- checklist, in this order
 
-1. **Prepare the card** (needs downloads: ask first, name the file, source and size). The boot partition (FAT32, first partition of
-   `sd.img`) needs the firmware files `start4.elf`, `fixup4.dat` and `bcm2711-rpi-4-b.dtb` from the `boot/` directory of
-   github.com/raspberrypi/firmware, a `config.txt`, and our `kernel8.img`. Extend `tools/make_sdcard.py` (or a new script) to format
-   partition 1 as FAT32 (`mformat`/`mcopy` from mtools, or write it by hand) and copy the files. `config.txt`:
-   `arm_64bit=1`, `kernel=kernel8.img` (or `kernel8-shell.img`), `enable_uart=1`, `dtoverlay=disable-bt` (puts the PL011 on
-   GPIO 14/15: by default the Pi 4 gives the PL011 to Bluetooth and the mini UART to the pins; our driver is for the PL011).
-   Check that the firmware takes the partition table with our Minix partitions (type 0x81) as it is.
+1. **Prepare the card.** Everything is ready except the firmware files, which need a download (ask first, name file, source and
+   size): `start4.elf`, `fixup4.dat` and `bcm2711-rpi-4-b.dtb` from the `boot/` directory of github.com/raspberrypi/firmware. Put
+   them into the directory `firmware/` (it is ignored by git), then `make sd-pi.img`: formats the first partition as FAT32 (mtools),
+   copies the firmware, `rpi4-config.txt` (as `config.txt`: `arm_64bit=1`, `enable_uart=1`, `dtoverlay=disable-bt` to put the PL011
+   on GPIO 14/15), `rpi4-cmdline.txt` (as `cmdline.txt`: `maxcpus=1`) and `kernel8-shell.img` (as `kernel8.img`). Tested here with
+   dummy files. Write it to the card: `diskutil list`, `diskutil unmountDisk /dev/diskN`, `sudo dd if=sd-pi.img of=/dev/rdiskN bs=4m`.
+   Check that the firmware is happy with the partition table that has our Minix partitions (type 0x81).
 2. **Wire the UART** (3.3 V only!): adapter TXD to pin 10 (GPIO 15, RXD), adapter RXD to pin 8 (GPIO 14, TXD), GND to pin 6; no
    5 V. Terminal on the Mac at 115200 baud, 8N1 (`screen /dev/cu.usbserial-... 115200`).
-3. **Set the baud rate in the kernel.** qemu ignores it, the real PL011 does not: the driver in `kmain.c` only writes characters.
-   With the 48 MHz UART clock of the Pi: IBRD = 26, FBRD = 3 for 115200 baud, 8N1 (`UARTLCR_H`, `UARTCR`), unless the firmware has
-   already set it up (it does when it uses the UART itself, `enable_uart=1`). Check what the firmware leaves, then decide.
+3. **The baud rate** is set by the kernel (`uart_init` in `kmain.c`): if the divisor is still 0, 115200 baud for the 48 MHz clock
+   of the Pi (IBRD 26, FBRD 3); a divisor that the firmware has set stays. FIFOs off. Check on the board that the text is readable;
+   if not, the firmware's UART clock is different (`core_freq`, `init_uart_clock` in `config.txt`).
 4. **First boot.** Expect surprises, look at the serial output first. Things already known to check:
    - The firmware starts the kernel at EL2 and passes the device tree in `x0` (`start.S` drops to EL1; `boot_dtb`). Save the tree
      the kernel gets and compare with `rpi4-qemu.dts` (`dtc -I dtb -O dts`); test `dt.c` with the real one, including `ranges`.
    - Alignment faults on device memory: 8- and 16-bit registers must be accessed with their own width (as in `sdcard.c`).
-   - Only one CPU for now: the firmware parks the other three (spin table, no PSCI). The kernel must not try `CPU_ON` via PSCI
-     (`plat.psci` is 0 without the node, check that `ncpus` > 1 does not start anything). Later: start them from the spin table.
+   - Only one CPU for now: the firmware parks the other three (spin table, no PSCI). `cmdline.txt` says `maxcpus=1`, which the kernel
+     reads from `/chosen/bootargs` (`dt.c`; tested in `make pcheck` with qemu's `-append maxcpus=2`) and then starts no CPU via PSCI.
+     Check that the firmware passes the command line. Later: start the other cores from the spin table.
    - The 1 GByte model has its peripherals in block 3 and RAM in block 0, which fits the boot tables; the 4 and 8 GByte models do not
      (see "Still open in step 1").
    - The generic timer frequency on the board is 54 MHz (qemu: 62.5 MHz): the code reads `cntfrq_el0`, check the 100 Hz tick.
@@ -43,13 +46,13 @@ The branch `rpi4` is only merged into `arm64-port` when `make pcheck` is green.
 
 ### After that (the actual goal: Ulix on the Pi with telnet)
 
-7. **Faster and nicer SD**: interrupts (a process sleeps while the card works, like the IDE driver of the book), multi-block commands,
-   4-bit bus, maybe DMA. Each as its own small step with a test.
-8. **Networking**, first in qemu `virt` with virtio-net (the Pi's GENET is not in qemu's `raspi4b`, and the Mac cannot test it
-   without the board): a virtio-net driver (polling first, then interrupts), then the layers, each small and tested on its own,
-   written like a chapter of the book: Ethernet frames, ARP, IPv4, ICMP (ping), UDP, then a small TCP (connect, send, receive, close,
-   retransmission by timer; no window scaling or options). Tests: a host-side program in Python that talks to the guest through
-   qemu's `-netdev` (ping, UDP echo, TCP echo). Reference for facts (not code to paste): FreeBSD and NetBSD.
+7. **SD card, the rest:** interrupts, multi-block commands and the 4-bit bus are done (2026-11-05, tested in qemu). Left: DMA (ADMA2),
+   the 1.8 V switch and faster clocks (UHS), and everything the real controller needs (see "Not done and not testable in qemu").
+8. **Network, the rest:** the layers up to TCP are done (see "Network: progress"). Left: an interrupt for the virtio-net card instead of
+   polling (the same pattern as the SD card: the process sleeps, the interrupt wakes it), a kernel thread that runs the network all the
+   time (until now whoever waits calls `net_poll_once ()`; without it nobody answers when another computer pings us), UDP and TCP sockets
+   for user programs (raw ICMP is done: system calls in the same style, then telnet can be a program), the answer to a ping that comes from
+   outside (untested: qemu's user network cannot send one; a `-netdev dgram` peer could), renewing the DHCP lease before it runs out (DHCP itself is done), DNS maybe, and TCP fast retransmit/congestion control if they are ever wanted.
 9. **GENET driver** for the Pi's Ethernet (BCM2711, `sys/arm64/broadcom/genet/if_genet.c` and `if_genetreg.h` of FreeBSD as the
    reference): register definitions, DMA rings, PHY (MDIO) setup, link detection. Only on the board (or on newer qemu if it
    gets a model). Plug it into the same interface as the virtio-net driver.
@@ -63,8 +66,37 @@ The branch `rpi4` is only merged into `arm64-port` when `make pcheck` is green.
 
 - Ask-first rule for downloads (firmware files, mtools if missing, anything else): name file, source and size.
 - The log entry for the Pi work so far is section 20 of `../ARM64-PORT.md`; add the results of the board there.
-- The Pi image still uses the test kernel's `kmain` for `kernel8.img`; `kernel8-shell.img` is the one that boots to the shell.
+- The Pi image `kernel8.img` is the test kernel; `kernel8-shell.img` boots to the shell (`make sd-pi.img` uses that one).
+- `virtio.c` and `virtionet.c` each define the virtio register offsets: move them into one `virtio.h`.
 - Before the repository is made public: check the notices again (see "Then" below).
+
+### Network: progress (2026-11-05, branch `rpi4`)
+
+- `virtionet.c` (the card: two queues, polling), `net.c` (Ethernet, ARP with a table of 8, IPv4 without fragments, ICMP echo, UDP with
+  bound ports), `tcp.c` (open, data both ways, close; retransmission with a timer and backoff, the receiver's window respected, out of
+  order segments dropped; no congestion control), `net.h` (the interfaces), `net_test.c` (the kernel side of the test, its own
+  kernel image `ulix-net.bin` without disk and processes).
+- `make net-test` (`tools/net_test.py`, job `net` in `make pcheck`): qemu's user-mode network (the kernel is 10.0.2.15, the router and
+  the host are 10.0.2.2) with port forwarding, so that ordinary Python sockets talk to the kernel: UDP echo, TCP echo of 100 and of
+  20000 bytes (more than the buffers and than one segment), and the kernel as the client: connects to the host with its first SYN
+  thrown away (`net_drop_tx`), sends a line whose first segment is thrown away, reads the answer, closes. Everything passes.
+- Addresses are fixed (`net.c`: 10.0.2.15, router 10.0.2.2), which is what qemu's user network gives.
+- **`ping` in the Ulix shell** (`userland/ping.c`, in `/bin`): `ping [-c count] [-s size] A.B.C.D`, dotted addresses only (no DNS). The
+  program builds the ICMP messages itself, checksum included; the kernel offers raw ICMP sockets (`net.c`: `icmp_open/send/get`) through
+  five system calls of the port (`net_syscalls.c`, numbers 602 to 606, used through `userland/arm64-extra.h`): `icmp_open`, `icmp_send`,
+  `icmp_recv` (waits with a timeout and gives the CPU to others meanwhile), `icmp_close`, `clock_us`. Try it: `make run-shell`, then
+  `ping 10.0.2.2` (qemu answers for its router; other addresses of the outside world may work, too). Shell test: job `shellnet`.
+  The network is only served while a program waits for it (`ping` calls the card in its receive loop); there is no thread for it yet.
+- **Configuration, in the manner of the BSDs** (2026-11-05): `dhcp.c` is a DHCP client (DISCOVER, OFFER, REQUEST, ACK; address, netmask,
+  router, name server, lease time; no renewal); `netconf.c` reads the kernel command line (`ip=dhcp`, `ip=10.0.0.5/24`, `gw=`, `dns=`;
+  on the Pi that is `cmdline.txt`, which now says `maxcpus=1 ip=dhcp`; qemu: `-append`). Programs, all in `/bin`: `ifconfig`
+  (show; set with `ifconfig vioif0 inet 10.0.2.15 netmask 255.255.255.0` or `10.0.2.15/24`; the interface is called `vioif0` like
+  NetBSD's virtio card, FreeBSD would say `vtnet0`; output as the BSDs print it: flags, `ether`, `inet ... netmask 0x... broadcast`),
+  `route` (`show`, `add default A.B.C.D`, `delete default`), `dhclient [-t seconds] [interface]`. Changing anything needs root
+  (`su`, password xyz; `euid == 0` is checked in the system calls `net_set` and `net_dhcp`, numbers 607 to 609); looking is free.
+  Tests: the DHCP checks in `net_test.c` (a wrong address is put in first, DHCP must bring back 10.0.2.15, router 10.0.2.2, name
+  server 10.0.2.3), the root commands in the shell test (job `shellnet`), and job `netconf` (command line with a fixed address, and `ip=dhcp`).
+  Not done: renewing the lease, several interfaces (`ifconfig -a`), aliases, `up`/`down`, routes other than the default one, DNS.
 
 ### Tests of 2026-11-03 (state at that time)
 

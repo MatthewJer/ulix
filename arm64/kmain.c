@@ -10,11 +10,25 @@ u64 uart_base = 0x09000000UL;                // PL011 (physical address; the dev
 #define UART_DR     (*(volatile u32 *)(UART0_BASE + 0x00))
 #define UART_FR     (*(volatile u32 *)(UART0_BASE + 0x18))
 #define UART_FR_TXFF (1 << 5)
+#define UART_IBRD   (*(volatile u32 *)(UART0_BASE + 0x24))     // baud rate divisor, integer part
+#define UART_FBRD   (*(volatile u32 *)(UART0_BASE + 0x28))     // ... and fractional part (in 1/64)
+#define UART_LCRH   (*(volatile u32 *)(UART0_BASE + 0x2c))     // line control: word length, FIFOs
+#define UART_CR     (*(volatile u32 *)(UART0_BASE + 0x30))     // control: UART, transmitter, receiver on
 
 static char cap_buf[8192];
 static int  cap_len = 0, cap_on = 0;
 void capture_start (void) { cap_len = 0; cap_on = 1; }
 int  capture_stop (char **text) { cap_on = 0; cap_buf[cap_len] = 0; *text = cap_buf; return cap_len; }
+
+// qemu does not care how the PL011 is set up, a real one does: it sends 115200 baud, 8 bits, no parity, one stop bit only if
+// the divisor is programmed. The Raspberry Pi's firmware does that when it uses the UART itself (enable_uart=1); if the divisor is
+// still 0 we do it: the UART clock is 48 MHz there, divisor = 48000000 / (16 * 115200) = 26.04 = 26 + 3/64.
+// The FIFOs stay off: qemu's PL011 has no receive timeout, so a character below the FIFO trigger level would never be seen.
+void uart_init (void) {
+  if (UART_IBRD == 0 && UART_FBRD == 0) { UART_CR = 0; UART_IBRD = 26; UART_FBRD = 3; }
+  UART_LCRH = 0x60;                           // 8 bits, FIFOs off (writing LCRH latches the divisor)
+  UART_CR = 0x301;                            // UART, transmitter and receiver on
+}
 
 int console_quiet = 0;                       // 1: output is dropped (for noisy debugging output of the book's code)
 void putch (char c) {
@@ -172,7 +186,7 @@ static void disk_test (void) {
   CHECK (n == 31, "root directory has 31 entries (16 from x86 Ulix + 15 AArch64 files)");
   n = 0;
   minix_readdir (minix_lookup ("/bin"), count_cb, &n);
-  CHECK (n == 63, "/bin has 63 entries");
+  CHECK (n == 67, "/bin has 67 entries (the programs of lib-build/tools, init, ping, ifconfig, route and dhclient)");
   CHECK (minix_lookup ("/nonexistent") == 0, "unknown path not found");
 
   // reference values computed on the host from the same image with an independent parser
@@ -204,6 +218,9 @@ static void console_main (void) {
   user_mm_init ();
   blk_init ();
   minix_mount ();
+  extern int net_init (void);
+  extern void net_configure_from_command_line (void);
+  if (net_init () == 0) net_configure_from_command_line ();      // the network card, if there is one (silent if not): ip=, gw=, dns= of the command line
   arch_threads_init ();
   console_irq_init ();
   printf ("console ready (Ctrl-C: end the running program, Ctrl-]: kernel shell)\n");
@@ -219,6 +236,18 @@ static void console_main (void) {
 }
 #endif
 
+#ifdef NET_MODE
+// Network test (ulix-net.elf): no disk, no processes; the test is in net_test.c and talks to tools/net_test.py on the host.
+extern int net_test (void);
+static void net_main (void) {
+  frames_init ();
+  user_mm_init ();
+  int fails = net_test ();
+  printf (fails ? "RESULT: %d check(s) FAILED\n" : "RESULT: all checks passed\n", fails);
+  for (;;) __asm__ volatile ("wfe");
+}
+#endif
+
 extern void smp_boot_init (void);
 extern void platform_map (void);
 
@@ -228,6 +257,7 @@ void kmain (void) {
   dt_init (boot_dtb);                              // what is where: from the device tree of the boot loader
   uart_base = plat.uart;
   platform_map ();
+  uart_init ();
   __asm__ volatile ("mrs %0, CurrentEL" : "=r" (el));
   printf ("Ulix-arm64 (work in progress)\n");
   printf ("Running at EL%d, sizeof(void*) = %d, kmain at 0x%lx (upper half)\n",
@@ -240,6 +270,9 @@ void kmain (void) {
   irq_init ();
 #ifdef CONSOLE_MODE
   console_main ();
+#endif
+#ifdef NET_MODE
+  net_main ();
 #endif
   __asm__ volatile ("svc #0");                    // kernel-mode svc: handler just reports it
 

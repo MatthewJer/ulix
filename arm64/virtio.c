@@ -67,7 +67,7 @@ struct blk {
   u64 capacity;                             // in sectors
   int irq;                                  // interrupt number of the device (0: none known)
   void *cur_buf;  u32 cur_len;  int cur_type;
-  int sd;  u64 sd_first;  int sd_result;      // sd: this disk is a partition of the SD card, starting at sector sd_first
+  int sd;  u64 sd_first;                      // sd: this disk is a partition of the SD card, starting at sector sd_first
 };
 static struct blk disks[MAX_DISKS];
 int blk_disks = 0;                          // how many were found
@@ -133,6 +133,11 @@ static int init_disk (struct blk *b) {
 extern int sd_partitions (u64 *first, u64 *sectors, int max);
 extern int sd_read (u64 lba, void *buf, u32 count);
 extern int sd_write (u64 lba, const void *buf, u32 count);
+extern int sd_submit (int write, u64 lba, void *buf, u32 count, int by_interrupt);
+extern int sd_done (void);
+extern int sd_finish (void);
+extern void sd_interrupt (void);
+int blk_irq_wait = 0;                       // set by the caller before a request: 1 = it will sleep and the interrupt wakes it, 0 = it polls
 
 // no virtio device: look for an SD card with Ulix partitions
 static int sd_disks (void) {
@@ -140,10 +145,11 @@ static int sd_disks (void) {
   int n = sd_partitions (first, sectors, MAX_DISKS);
   if (n == 0) { printf ("virtio: no block device found, no SD card either\n"); return -1; }
   for (int k = 0; k < n; k++) {
-    disks[k].sd = 1;  disks[k].sd_first = first[k];  disks[k].capacity = sectors[k];  disks[k].irq = 0;
+    disks[k].sd = 1;  disks[k].sd_first = first[k];  disks[k].capacity = sectors[k];  disks[k].irq = plat.sdhci_irq;
     printf ("sd: disk %d with %lu sectors (%lu KByte)\n", k, disks[k].capacity, disks[k].capacity / 2);
   }
-  blk_disks = n;  blk_irq = 0;                // (the card is read by polling: a process that waits for it does not sleep)
+  blk_disks = n;  blk_irq = plat.sdhci_irq;
+  if (blk_irq) gic_enable (blk_irq);          // a process that waits for the card can sleep (see glue.c)
   return 0;
 }
 
@@ -181,10 +187,8 @@ int blk_submit_n (int n, int type, u64 sector, void *buf, u32 nsectors) {
   if (n < 0 || n >= blk_disks) return -1;
   struct blk *b = &disks[n];
   if (sector + nsectors > b->capacity) return -1;
-  if (b->sd) {                              // SD card: the transfer is done right here, nothing is left to wait for
-    b->sd_result = type == VIRTIO_BLK_T_IN ? sd_read (b->sd_first + sector, buf, nsectors) : sd_write (b->sd_first + sector, buf, nsectors);
-    return b->sd_result;
-  }
+  if (b->sd)                                // SD card: the transfer is started; the data moves later (by interrupt or when asked)
+    return sd_submit (type == VIRTIO_BLK_T_OUT, b->sd_first + sector, buf, nsectors, blk_irq_wait && b->irq);
   u32 *hdr = KVA (b->req_pa);
   volatile u8 *status = (volatile u8 *)KVA (b->req_pa + 16);
   hdr[0] = type; hdr[1] = 0; hdr[2] = (u32)sector; hdr[3] = sector >> 32;
@@ -215,14 +219,14 @@ int blk_submit_n (int n, int type, u64 sector, void *buf, u32 nsectors) {
 
 int blk_done_n (int n) {                    // has the device finished the request?
   struct blk *b = &disks[n];
-  if (b->sd) return 1;
+  if (b->sd) return sd_done ();
   cache_flush_inval ((const void *)b->used, sizeof (struct used));
   return b->used->idx != b->used_seen;
 }
 
 int blk_finish_n (int n) {                  // 0 = request done and successful
   struct blk *b = &disks[n];
-  if (b->sd) return b->sd_result;
+  if (b->sd) return sd_finish ();
   volatile u8 *status = (volatile u8 *)KVA (b->req_pa + 16);
   b->used_seen++;
   if (b->cur_type == VIRTIO_BLK_T_IN) cache_flush_inval (b->cur_buf, b->cur_len);       // see the data the device wrote
@@ -231,7 +235,10 @@ int blk_finish_n (int n) {                  // 0 = request done and successful
 }
 
 void blk_irq_ack (void) {                   // in the interrupt handler: every device stops signalling
-  for (int i = 0; i < blk_disks; i++) if (!disks[i].sd) wr (&disks[i], R_INTERRUPT_ACK, rd (&disks[i], R_INTERRUPT_STATUS));
+  for (int i = 0; i < blk_disks; i++) {
+    if (disks[i].sd) { sd_interrupt (); continue; }       // (the SD controller is cleared by what the handler does)
+    wr (&disks[i], R_INTERRUPT_ACK, rd (&disks[i], R_INTERRUPT_STATUS));
+  }
 }
 
 static int blk_request (int n, int type, u64 sector, void *buf, u32 nsectors) {

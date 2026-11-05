@@ -1,0 +1,17 @@
+# config.txt for Ulix on the Raspberry Pi 4B (read by the firmware from the first partition of the SD card).
+# Comments must be on lines of their own: the firmware does not accept them behind a setting.
+
+# start the kernel in 64-bit mode
+arm_64bit=1
+
+# our kernel (make sd-pi.img copies kernel8-shell.img to this name)
+kernel=kernel8.img
+
+# the serial console on GPIO 14 and 15 ...
+enable_uart=1
+
+# ... on the PL011 (by default the PL011 belongs to Bluetooth and the pins get the mini UART)
+dtoverlay=disable-bt
+
+# uncomment to see the messages of the boot loader on the serial console, too
+#uart_2ndstage=1

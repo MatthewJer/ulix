@@ -16,7 +16,9 @@ TOOLSRC  = ../../lib-build/tools
 BUILD    = build
 
 SKIP     =
-TOOLS    = $(filter-out $(SKIP),$(patsubst $(TOOLSRC)/%.c,%,$(wildcard $(TOOLSRC)/*.c)))
+# new programs of the AArch64 port (the network is not part of the original Ulix; the rule for them is further down)
+NEWTOOLS = ping ifconfig route dhclient
+TOOLS    = $(filter-out $(SKIP),$(patsubst $(TOOLSRC)/%.c,%,$(wildcard $(TOOLSRC)/*.c))) $(NEWTOOLS)
 
 # GCC 4.4 accepted a lot that current compilers reject (return without value, missing types);
 # these stay warnings. -fgnu89-inline: "inline" functions of the library also get an out-of-line copy.
@@ -64,6 +66,12 @@ $(BUILD)/tools/free.c: $(TOOLSRC)/free.c $(BUILD)/ulixlib.h $(BUILD)/arm64-extra
 	mkdir -p $(BUILD)/tools
 	sed -e 's|#include "../ulixlib.h"|&\n#include "../arm64-extra.h"|' -e 's|MEM_SIZE|(total_frames () * 4096)|g' $< > $@
 	grep -q 'total_frames' $@
+
+# new programs of the AArch64 port (the network is not part of the original Ulix): ping uses raw ICMP sockets, ifconfig, route and dhclient
+# are modelled on the BSD programs of the same names
+$(addprefix $(BUILD)/tools/,$(addsuffix .c,$(NEWTOOLS))): $(BUILD)/tools/%.c: %.c $(BUILD)/ulixlib.h $(BUILD)/arm64-extra.h
+	mkdir -p $(BUILD)/tools
+	cp $< $@
 
 # readelf.c reads ELF32 headers; the programs here are ELF64 files
 $(BUILD)/tools/readelf.c: readelf64.c $(BUILD)/ulixlib.h

@@ -11,7 +11,7 @@ CFLAGS = -I$(GENDIR) -mno-outline-atomics -O0 -g -ffreestanding -nostdlib -fno-b
 # "-snapshot" keeps the file unmodified when running.
 DISK ?= disk.img
 
-OBJS = start.o vectors.o irq.o mmu.o virtio.o sdcard.o minixfs.o elf.o ulix-port.o glue.o arch_thread.o arch_console.o arch_clock.o arch_swap.o arch_vt.o dt.o gic.o smp.o \
+OBJS = start.o vectors.o irq.o mmu.o virtio.o sdcard.o virtionet.o net.o tcp.o dhcp.o netconf.o net_test.o net_syscalls.o minixfs.o elf.o ulix-port.o glue.o arch_thread.o arch_console.o arch_clock.o arch_swap.o arch_vt.o dt.o gic.o smp.o \
        bookfs_test.o thread_test.o proc_test.o kmain.o
 
 all: ulix.elf ulix-console.elf ulix-shell.elf ulix.bin ulix-console.bin ulix-shell.bin $(DISK) $(GENDIR)/disk_expected.h
@@ -70,6 +70,13 @@ ulix-shell.elf: $(filter-out kmain.o,$(OBJS)) kmain-shell.o ulix.ld
 kmain-shell.o: kmain.c ulix.h
 	$(CC) $(CFLAGS) -DCONSOLE_MODE -DCONSOLE_PROGRAM='"/init"' -c -o $@ $<
 
+# ulix-net.elf: the kernel for the network test (no disk, no processes, see net_test.c); "make net-test" runs it
+kmain-net.o: kmain.c ulix.h
+	$(CC) $(CFLAGS) -DNET_MODE -c -o $@ $<
+
+ulix-net.elf: $(filter-out kmain.o,$(OBJS)) kmain-net.o ulix.ld
+	$(LD) -T ulix.ld -o $@ $(filter-out kmain.o,$(OBJS)) kmain-net.o
+
 # qemu boots flat images in the format of the Linux arm64 boot protocol (and then passes the device tree in x0), not ELF files
 %.bin: %.elf
 	$(OBJCOPY) -O binary $< $@
@@ -107,6 +114,9 @@ bookfs_test.o: bookfs_test.c $(GENFILES) $(GENDIR)/ulix-api.h
 arch_thread.o: arch_thread.c $(GENFILES) $(GENDIR)/ulix-api.h
 	$(CC) $(BOOKFLAGS) -Dhash=arch_unused_hash -c -o $@ $<
 
+net_syscalls.o: net_syscalls.c $(GENFILES) $(GENDIR)/ulix-api.h
+	$(CC) $(BOOKFLAGS) -Dhash=netsys_unused_hash -c -o $@ $<
+
 arch_clock.o: arch_clock.c $(GENFILES) $(GENDIR)/ulix-api.h
 	$(CC) $(BOOKFLAGS) -Dhash=clock_unused_hash -c -o $@ $<
 
@@ -123,7 +133,8 @@ proc_test.o: proc_test.c $(GENFILES) $(GENDIR)/ulix-api.h
 glue.o: glue.c $(GENFILES) $(GENDIR)/ulix-api.h
 	$(CC) $(BOOKFLAGS) -Dhash=glue_unused_hash -c -o $@ $<
 
-irq.o mmu.o virtio.o sdcard.o dt.o gic.o smp.o kmain.o kmain-console.o kmain-shell.o: plat.h gic.h smp.h ulix.h arch_pte.h
+irq.o mmu.o virtio.o sdcard.o dt.o gic.o smp.o kmain.o kmain-console.o kmain-shell.o kmain-net.o: plat.h gic.h smp.h ulix.h arch_pte.h
+virtionet.o net.o tcp.o dhcp.o netconf.o net_test.o: net.h plat.h ulix.h
 
 %.o: %.S
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -163,6 +174,18 @@ rpi4-qemu.dtb: rpi4-qemu.dts
 # the SD card: partition table, a boot partition (empty here) and the three disks as partitions of type 0x81
 sd.img: tools/make_sdcard.py $(DISK) $(DISK2) $(DISK3)
 	python3 tools/make_sdcard.py $@ $(DISK) $(DISK2) $(DISK3)
+
+# The SD card for the real board: the same card image, but with the boot partition filled: the firmware files (not in the
+# repository: put start4.elf, fixup4.dat and bcm2711-rpi-4-b.dtb from github.com/raspberrypi/firmware, directory boot/, into
+# the directory firmware/), config.txt, cmdline.txt (maxcpus=1: the other cores wait in a spin table, see dt.c) and the kernel.
+# Write it to a card with: sudo dd if=sd-pi.img of=/dev/rdiskN bs=4m   (N: see "diskutil list"; unmount the card first)
+sd-pi.img: kernel8-shell.img rpi4-config.txt rpi4-cmdline.txt tools/make_sdcard.py $(DISK) $(DISK2) $(DISK3)
+	rm -rf sd-boot && mkdir sd-boot
+	if [ -d firmware ]; then cp -R firmware/. sd-boot/; else echo "note: no directory firmware/: the boot partition lacks the firmware files"; fi
+	cp rpi4-config.txt sd-boot/config.txt
+	cp rpi4-cmdline.txt sd-boot/cmdline.txt
+	cp kernel8-shell.img sd-boot/kernel8.img
+	python3 tools/make_sdcard.py --boot sd-boot $@ $(DISK) $(DISK2) $(DISK3)
 
 # the system with login and shell on the emulated Pi (Ctrl-A X leaves qemu)
 run-rpi4-shell: kernel8-shell.img rpi4-qemu.dtb sd.img
@@ -206,7 +229,8 @@ machines: ulix.bin ulix-console.bin ulix-shell.bin $(DISK)
 # to terminal 2, Ctrl-] opens the kernel shell, Ctrl-A X leaves qemu. Changes to the disk are discarded (-snapshot).
 run-shell: ulix-shell.bin $(DISK)
 	qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128 -nographic -kernel ulix-shell.bin -snapshot \
-		-drive file=$(DISK),format=raw,if=none,id=hd0 -device virtio-blk-device,drive=hd0
+		-drive file=$(DISK),format=raw,if=none,id=hd0 -device virtio-blk-device,drive=hd0 \
+		-netdev user,id=n0 -device virtio-net-device,netdev=n0
 
 # Everything: kernel test suites (EL1 with the legacy and EL2 with the modern virtio transport), the file system
 # check of the modified image, the console test and the complete shell session.
@@ -227,12 +251,16 @@ check: ulix.bin ulix-console.bin ulix-shell.bin $(DISK)
 
 # The same tests as "check", all at once: one qemu per test, JOBS of them in parallel (make pcheck JOBS=8), logs in check-logs/
 JOBS ?= 6
-pcheck: ulix.bin ulix-console.bin ulix-shell.bin kernel8.img kernel8-console.img kernel8-shell.img rpi4-qemu.dtb sd.img $(DISK) $(DISK2) $(DISK3)
+pcheck: ulix.bin ulix-console.bin ulix-shell.bin ulix-net.bin kernel8.img kernel8-console.img kernel8-shell.img rpi4-qemu.dtb sd.img $(DISK) $(DISK2) $(DISK3)
 	DISK=$(DISK) DISK2=$(DISK2) DISK3=$(DISK3) tools/parallel_check.sh $(JOBS)
 
 # The serial disk: the kernel tests with a second serial port, which tools/serial_disk.py serves from a copy of disk3.img
 sdisk-test: ulix.bin $(DISK) $(DISK3)
 	python3 tools/sdisk_test.py ulix.bin $(DISK) $(DISK3)
+
+# The network: the net test kernel talks to a Python program on the host through qemu's user-mode network
+net-test: ulix-net.bin
+	python3 tools/net_test.py ulix-net.bin
 
 # Interactive console test: types into the UART of a second kernel image and checks the answers
 console-test: ulix-console.bin $(DISK)
@@ -247,5 +275,5 @@ clean:
 	rm -rf gen
 	$(MAKE) -C userland clean
 	rm -rf check-logs
-	rm -f sd.img kernel8*.img ulix-rpi4*.elf start-rpi4.o rpi4-qemu.dtb
+	rm -rf sd-boot; rm -f sd.img sd-pi.img kernel8*.img ulix-rpi4*.elf start-rpi4.o rpi4-qemu.dtb
 	rm -f disk2.img disk3.img verify-fs.log check-el1.log check-el2.log *.o ulix.elf ulix-console.elf ulix-shell.elf disk.img disk-after.img verify.log bad-arch.elf bad-wx.elf

@@ -53,6 +53,9 @@ void arch_resign (void);
 int arch_threads_reap (void);
 void syscall_sigreturn (context_t *r);
 void syscall_total_frames (context_t *r);
+void syscall_icmp_open (context_t *r), syscall_icmp_send (context_t *r), syscall_icmp_recv (context_t *r), syscall_icmp_close (context_t *r);
+void syscall_clock_us (context_t *r);
+void syscall_net_info (context_t *r), syscall_net_set (context_t *r), syscall_net_dhcp (context_t *r);
 void arch_clock_init (void);
 void syscall_read_screen (context_t *r);          // the book defines these without prototypes
 void syscall_write_screen (context_t *r);
@@ -352,6 +355,14 @@ int arch_cow_fault (u64 va) {
 #define SIGPAGE_VA   0x7BFF0000UL            // the "signal trampoline" page, mapped in every process (below the biggest stack, see arch_swap.c)
 #define ARCH_NR_SIGRETURN 600                // AArch64 only: return from a signal handler
 #define ARCH_NR_TOTAL_FRAMES 601             // AArch64 only: number of frames of RAM (see userland/arm64-extra.h)
+#define ARCH_NR_ICMP_OPEN    602             // AArch64 only: network (net_syscalls.c, userland/arm64-extra.h)
+#define ARCH_NR_ICMP_SEND    603
+#define ARCH_NR_ICMP_RECV    604
+#define ARCH_NR_ICMP_CLOSE   605
+#define ARCH_NR_CLOCK_US     606
+#define ARCH_NR_NET_INFO     607
+#define ARCH_NR_NET_SET      608
+#define ARCH_NR_NET_DHCP     609
 
 static int map_sigpage (u64 l0) {
   u64 pa = alloc_frame_try ();
@@ -839,6 +850,14 @@ static void arch_syscalls_init (void) {
   install_syscall_handler (__NR_free_a_frame,    syscall_free_a_frame);
   install_syscall_handler (ARCH_NR_SIGRETURN, syscall_sigreturn);
   install_syscall_handler (ARCH_NR_TOTAL_FRAMES, syscall_total_frames);
+  install_syscall_handler (ARCH_NR_ICMP_OPEN,  syscall_icmp_open);
+  install_syscall_handler (ARCH_NR_ICMP_SEND,  syscall_icmp_send);
+  install_syscall_handler (ARCH_NR_ICMP_RECV,  syscall_icmp_recv);
+  install_syscall_handler (ARCH_NR_ICMP_CLOSE, syscall_icmp_close);
+  install_syscall_handler (ARCH_NR_CLOCK_US,   syscall_clock_us);
+  install_syscall_handler (ARCH_NR_NET_INFO,   syscall_net_info);
+  install_syscall_handler (ARCH_NR_NET_SET,    syscall_net_set);
+  install_syscall_handler (ARCH_NR_NET_DHCP,   syscall_net_dhcp);
 }
 
 

@@ -24,14 +24,14 @@ serial disk), which were written in the same way.
 brew install qemu noweb aarch64-elf-gcc aarch64-elf-binutils   # python3 is needed, too
 cd arm64
 make                 # kernel images, user programs, disk image (disk.img)
-make run-shell       # boots to the shell; Ctrl-A X leaves qemu
+make run-shell       # boots to the shell; Ctrl-A X leaves qemu (with a network card: try  ping 10.0.2.2  or  ifconfig )
 make check           # all test suites one after the other (slow)
 make pcheck          # the same tests as parallel qemu instances (about 3 minutes)
 make kernel8.img     # image for the Raspberry Pi 4B (work in progress, branch rpi4)
 make run-rpi4-shell  # ... and the system with login and shell on qemu's raspi4b machine, with an SD card image (sd.img)
 ```
 
-In the shell: `ls`, `cat`, `cd`, `cp`, `rm`, `mkdir`, `rmdir`, `touch`, `wc`, `grep`, `stat`, `ps`, `df`, `free`, …
+In the shell: `ls`, `cat`, `cd`, `cp`, `rm`, `mkdir`, `rmdir`, `touch`, `wc`, `grep`, `stat`, `ps`, `df`, `free`, `ping`, `ifconfig`, `route`, `dhclient`, …
 (it is Ulix, so `echo` copies its input until you press Ctrl-C). `>` and `<` redirect. Keys:
 
 | Key | Effect |
@@ -86,8 +86,11 @@ mmu.c            frames, page tables, COW           virtio.c        block device
 elf.c            ELF64 loader                       minixfs.c       Minix reader (for exec)
 userland/        user library, init, programs       user/           small test programs (hello, forktest, sigtest, …)
 tools/           minix_add.py, minix_check.py (host-side file system tools), disk_expected.py, test drivers,
-                 serial_disk.py (the host end of the serial disk), sdisk_test.py
+                 serial_disk.py (the host end of the serial disk), sdisk_test.py, net_test.py (the host end of the network test),
+                 make_sdcard.py (SD card image)
 *_test.c         kernel test suites
+sdcard.c         SD card (Raspberry Pi)             virtionet.c     network card (qemu virt)
+net.c  tcp.c     Ethernet, ARP, IP, ICMP, UDP, TCP  net.h           what the network layers offer each other
 ```
 
 ## Tests (`make check`, or `make pcheck` for the parallel version)
@@ -100,6 +103,12 @@ tools/           minix_add.py, minix_check.py (host-side file system tools), dis
   implementation, checks the file system (tree, bitmaps, link counts, leaked blocks) and the contents of the files.
 * **`make console-test`** (34 checks) types into the UART like a person; **`make shell-test`** (93 checks) runs a whole
   session: boot, auto login, the programs of `lib-build/tools`, Ctrl-C, terminal switching, `exit`, login with password.
+* The shell test has a variant with a network card (`make pcheck`, job `shellnet`): the program `ping` in the Ulix shell.
+* The network is configured like on a BSD: the kernel command line (`ip=dhcp`, `ip=10.0.0.5/24 gw=… dns=…`), and as root (`su`) the
+  programs `ifconfig`, `route` and `dhclient`; the tests are the `shellnet` and `netconf` jobs of `make pcheck`.
+* **`make net-test`**: the network. The kernel (own image `ulix-net.bin`) runs on qemu's user-mode network and a Python program on the
+  host talks to it with ordinary sockets: ping of the router, UDP echo, TCP echo of 100 and 20000 bytes, and the kernel as a TCP client
+  that loses its first SYN and its first data segment on purpose and must send them again.
 * **`make sdisk-test`**: the kernel tests with a second serial port that `tools/serial_disk.py` serves as a disk (the book's serial
   disk, `/dev/sdisk`); block I/O, the Minix code of the book on it, the buffer cache, two threads reading at the same time, and a
   check of the image on the host afterwards.

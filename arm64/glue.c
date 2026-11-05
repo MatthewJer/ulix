@@ -19,7 +19,7 @@ extern int  blk_finish_n (int n);
 extern int  blk_disks;
 extern unsigned long blk_capacity_of (int n);
 extern void blk_irq_ack (void);
-extern int  blk_irq;
+extern int  blk_irq, blk_irq_wait;
 extern unsigned long blk_capacity (void);
 void arch_resign (void);
 
@@ -30,6 +30,7 @@ static int hd_transfer (int hd, int type, int blockno, char *buffer) {
   if (hd_lock == NULL) hd_lock = get_new_lock ("hd");
   if (current_task > 1) mutex_lock (hd_lock);
     hd_direction = (type == 0) ? HD_OP_READ : HD_OP_WRITE;
+    blk_irq_wait = sleep_ok;                                      // (an SD card is told how it is waited for)
     int r = blk_submit_n (hd, type, (unsigned long)blockno * 2, buffer, 2);
     if (r == 0) {
       while (!blk_done_n (hd)) {

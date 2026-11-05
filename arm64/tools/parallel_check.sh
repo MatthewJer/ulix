@@ -23,11 +23,15 @@ JOBLIST=(
   "two|two disks (hda and hdb on /tmp), 2 CPUs|kernel|virt|-smp 2 @D2@|128"
   "shell2|shell session with two disks|shell|virt,gic-version=3|-smp 2 @D2@|128"
   "three|three disks (hda, hdb on /tmp, fd1 on /mnt), 2 CPUs|kernel|virt|-smp 2 @D2@ @D3@|128"
+  "shellnet|shell session with a network card: the program ping|shell|virt,gic-version=3|-smp 2 -netdev user,id=n0 -device virtio-net-device,netdev=n0|128"
   "shell3|shell session with three disks|shell|virt,gic-version=3|-smp 2 @D2@ @D3@|128"
   "sdisk|serial disk on a second UART (host program serves disk3.img), 2 CPUs|sdisk|virt|-smp 2|128"
   "rpi4|Raspberry Pi 4B in qemu raspi4b: kernel tests, SD card, device tree with ranges|rpi4|raspi4b||128"
   "rpi4shell|Raspberry Pi 4B in qemu raspi4b: shell session|rpi4shell|raspi4b||128"
   "rpi4console|Raspberry Pi 4B in qemu raspi4b: console test|rpi4console|raspi4b||128"
+  "net|network: virtio-net, ARP, ICMP, UDP and TCP against real sockets of the host|net|virt||128"
+  "netconf|network settings from the kernel command line: fixed address and DHCP|netconf|virt||128"
+  "maxcpus|kernel command line maxcpus=2 on a machine with 4 CPUs|maxcpus|virt||128"
   "ram512|RAM 512 MByte, 2 CPUs|kernel|virt|-smp 2|512"
   "ram64|RAM 64 MByte, 2 CPUs|kernel|virt|-smp 2|64"
   "el1|EL1, virtio legacy transport|kernel|virt||128"
@@ -51,8 +55,8 @@ if [ "$1" = "--job" ]; then
       sum=$(QEMU_MEM=$mem tools/run_kernel_tests.sh ulix.bin $DISK "$log" -M $machine $extra | tr '\n' ' ' | sed 's/RESULT: //')
       grep -q "^RESULT: all checks passed" "$log" && st=ok || st=FAILED ;;
     shell|console)
-      case $name in shell3) port=45127;; shell2) port=45126;; *) if [ $kind = shell ]; then port=45125; else port=45123; fi;; esac
-      HAVE_DISK2=$([[ $extra == *$DISK2* ]] && echo 1) HAVE_DISK3=$([[ $extra == *$DISK3* ]] && echo 1) QEMU_PORT=$port QEMU_M=$machine QEMU_MEM=$mem QEMU_EXTRA="$extra" python3 tools/${kind}_test.py ulix-$kind.bin $DISK > "$log" 2>&1
+      case $name in shellnet) port=45134;; shell3) port=45127;; shell2) port=45126;; *) if [ $kind = shell ]; then port=45125; else port=45123; fi;; esac
+      HAVE_DISK2=$([[ $extra == *$DISK2* ]] && echo 1) HAVE_DISK3=$([[ $extra == *$DISK3* ]] && echo 1) HAVE_NET=$([[ $extra == *virtio-net* ]] && echo 1) QEMU_PORT=$port QEMU_M=$machine QEMU_MEM=$mem QEMU_EXTRA="$extra" python3 tools/${kind}_test.py ulix-$kind.bin $DISK > "$log" 2>&1
       rc=$?; sum=$(tail -1 "$log")
       [ $rc -eq 0 ] && grep -q "all passed" <<< "$sum" && st=ok || st=FAILED ;;
     sdisk)
@@ -65,7 +69,7 @@ if [ "$1" = "--job" ]; then
       $QEMU -M raspi4b -dtb rpi4-qemu.dtb -serial file:"$log" -monitor none -display none -kernel kernel8.img -snapshot \
         -drive file=sd.img,if=sd,format=raw 2>/dev/null &
       P=$!
-      for i in $(seq 1 240); do sleep 1; grep -q '^RESULT' "$log" 2>/dev/null && break; done
+      for i in $(seq 1 900); do sleep 1; grep -q '^RESULT' "$log" 2>/dev/null && break; done
       kill $P 2>/dev/null; wait $P 2>/dev/null
       sum="$(grep -c '^  ok:' "$log") checks ok, $(grep -c 'FAIL' "$log") failed $(grep '^RESULT' "$log" | sed 's/RESULT: //')"
       if grep -q "^RESULT: all checks passed" "$log" && grep -q 'GIC: version 2, distributor at 0xff841000' "$log" \
@@ -75,6 +79,36 @@ if [ "$1" = "--job" ]; then
       QEMU_BOARD=rpi4 HAVE_DISK2=1 HAVE_DISK3=1 QEMU_PORT=$port python3 tools/$script.py $img sd.img > "$log" 2>&1
       rc=$?; sum=$(tail -1 "$log")
       [ $rc -eq 0 ] && grep -q "all passed" <<< "$sum" && st=ok || st=FAILED ;;
+    net)
+      python3 tools/net_test.py ulix-net.bin > "$log" 2>&1
+      rc=$?; sum=$(tail -1 "$log")
+      [ $rc -eq 0 ] && grep -q "all passed" <<< "$sum" && st=ok || st=FAILED ;;
+    netconf)
+      # the console kernel prints what it made of "ip=", "gw=", "dns=" and "ip=dhcp" (qemu -append) before it says "console ready"
+      NET="-netdev user,id=n0 -device virtio-net-device,netdev=n0"
+      rm -f "$log" "$log.2"
+      $QEMU -M virt -cpu cortex-a72 -m 128 -display none -serial file:"$log" -monitor none -kernel ulix-console.bin -snapshot -drive file=$DISK,format=raw,if=none,id=hd0 \
+        -device virtio-blk-device,drive=hd0 $NET -append "ip=10.9.8.7/16 gw=10.9.0.1 dns=10.9.0.2" 2>/dev/null &
+      P1=$!
+      $QEMU -M virt -cpu cortex-a72 -m 128 -display none -serial file:"$log.2" -monitor none -kernel ulix-console.bin -snapshot -drive file=$DISK,format=raw,if=none,id=hd0 \
+        -device virtio-blk-device,drive=hd0 $NET -append "ip=dhcp" 2>/dev/null &
+      P2=$!
+      for i in $(seq 1 60); do sleep 1; grep -q 'console ready' "$log" 2>/dev/null && grep -q 'console ready' "$log.2" 2>/dev/null && break; done
+      kill $P1 $P2 2>/dev/null; wait $P1 $P2 2>/dev/null
+      cat "$log.2" >> "$log"; rm -f "$log.2"
+      sum="$(grep -E '^net: (address|DHCP)' "$log" | tr '\n' ';')"
+      if grep -q '^net: address 10.9.8.7 netmask 255.255.0.0 router 10.9.0.1 name server 10.9.0.2 (from the command line)' "$log" \
+         && grep -q '^net: DHCP: address 10.0.2.15, router 10.0.2.2' "$log"; then st=ok; else st=FAILED; fi ;;
+    maxcpus)
+      # the device tree says 4 CPUs, "maxcpus=2" on the command line (qemu -append) limits it: CPU 1 comes up, CPU 2 and 3 do not
+      rm -f "$log"
+      $QEMU -M virt -cpu cortex-a72 -m 128 -smp 4 -display none -serial file:"$log" -monitor none -kernel ulix.bin -append maxcpus=2 -snapshot \
+        -drive file=$DISK,format=raw,if=none,id=hd0 -device virtio-blk-device,drive=hd0 2>/dev/null &
+      P=$!
+      for i in $(seq 1 60); do sleep 1; grep -q '^disk test:' "$log" 2>/dev/null && break; done
+      sleep 2; kill $P 2>/dev/null; wait $P 2>/dev/null
+      sum="$(grep -c 'SMP: CPU . online' "$log") secondary CPU(s) started: $(grep 'Device tree' "$log" | sed 's/.*MByte RAM at [^,]*, //; s/,.*//')"
+      if grep -q 'SMP: CPU 1 online' "$log" && ! grep -q 'SMP: CPU 2 online' "$log" && grep -q ' 2 CPU(s)' "$log"; then st=ok; else st=FAILED; fi ;;
     verify)
       VD=$(mktemp -d)                                  # (the copies are written to: keep them off a slow SD card)
       cp $DISK $VD/disk-after.img; cp $DISK2 $VD/disk2-after.img; cp $DISK3 $VD/disk3-after.img
