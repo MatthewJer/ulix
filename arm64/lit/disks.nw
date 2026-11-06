@@ -1,0 +1,646 @@
+\chapter{Disks: virtio and the SD Card}
+\label{ch:disks}
+
+The block layer of the book (buffer cache, Minix file system) sits on top of one function that reads and writes blocks. Two
+drivers sit below it. \texttt{virtio.c} drives qemu's virtual disks (and is the model of how a driver wakes a sleeping process from
+an interrupt). \texttt{sdcard.c} drives the SD card of the Raspberry Pi through its SDHCI controller; following the book's
+principle of \emph{simple first, then better} it began with polling and now handles multi-block commands, four data lines and
+interrupts. The partition table on the card tells which Minix partitions are the disks \texttt{hda}, \texttt{hdb} and \texttt{fd1}.
+
+@
+\section{The disks of the system: virtio-mmio block devices (polling or interrupts), or partitions of an SD card}
+\label{src:virtio.c}
+
+Replaces the [[x86]] IDE (PIO) and floppy (DMA) drivers: the same read/write-sectors
+interface, but the ``disk'' is a virtio-blk device on the qemu ``virt'' machine.
+Supports the legacy (version 1) and the modern (version 2) MMIO transport. On a board without virtio devices (the
+Raspberry Pi) the disks are the Ulix partitions of the SD card ([[sdcard.c]]); they are used through the same functions.
+
+@
+
+The complete file is put together from these parts:
+
+<<virtio.c>>=
+<<virtio.c: includes>>
+
+<<virtio.c: MAX_DISKS>>
+
+<<virtio.c: sd_disks>>
+
+<<virtio.c: R_INTERRUPT_STATUS>>
+@
+
+<<virtio.c: includes>>=
+#include "ulix.h"
+#include "plat.h"
+#include "gic.h"
+
+#define VIRTIO_BASE     (KERNEL_VA + 0x0a000000UL)   // 32 slots of 0x200 bytes
+#define VIRTIO_SLOTS    32
+#define VIRTIO_SLOT_SZ  0x200
+
+#define R_MAGIC         0x000
+#define R_VERSION       0x004
+#define R_DEVICE_ID     0x008
+#define R_DEV_FEATURES  0x010
+#define R_DEV_FEAT_SEL  0x014
+#define R_DRV_FEATURES  0x020
+#define R_DRV_FEAT_SEL  0x024
+#define R_GUEST_PGSIZE  0x028       // legacy
+#define R_QUEUE_SEL     0x030
+#define R_QUEUE_NUM_MAX 0x034
+#define R_QUEUE_NUM     0x038
+#define R_QUEUE_ALIGN   0x03c       // legacy
+#define R_QUEUE_PFN     0x040       // legacy
+#define R_QUEUE_READY   0x044       // modern
+#define R_QUEUE_NOTIFY  0x050
+#define R_STATUS        0x070
+#define R_DESC_LO       0x080       // modern
+#define R_DESC_HI       0x084
+#define R_AVAIL_LO      0x090
+#define R_AVAIL_HI      0x094
+#define R_USED_LO       0x0a0
+#define R_USED_HI       0x0a4
+#define R_CONFIG        0x100       // virtio-blk: capacity (u64, in 512-byte sectors)
+
+#define ST_ACK          1
+#define ST_DRIVER       2
+#define ST_DRIVER_OK    4
+#define ST_FEATURES_OK  8
+
+#define VIRTQ_DESC_F_NEXT   1
+#define VIRTQ_DESC_F_WRITE  2
+
+#define VIRTIO_BLK_T_IN     0
+#define VIRTIO_BLK_T_OUT    1
+
+#define QSIZE 8
+
+struct desc  { u64 addr; u32 len; unsigned short flags, next; };
+struct avail { unsigned short flags, idx, ring[QSIZE]; };
+struct used  { unsigned short flags, idx; struct { u32 id, len; } ring[QSIZE]; };
+
+@
+One structure per disk (virtio-blk device).  qemu puts the first -device in the LAST free MMIO slot, the second in the one
+before it, so the disks are numbered from the highest address down: disk 0 is /dev/hda, disk 1 is /dev/hdb, disk 2 stands in for the
+second floppy /dev/fd1 (mounted on /mnt).
+
+<<virtio.c: MAX_DISKS>>=
+#define MAX_DISKS 3
+struct blk {
+  volatile u8 *dev;                         // MMIO base of the block device
+  volatile struct desc  *desc;
+  volatile struct avail *avail;
+  volatile struct used  *used;
+  unsigned short used_seen;
+  u64 req_pa;                               // one frame: request header + status byte
+  u64 capacity;                             // in sectors
+  int irq;                                  // interrupt number of the device (0: none known)
+  void *cur_buf;  u32 cur_len;  int cur_type;
+  int sd;  u64 sd_first;                      // sd: this disk is a partition of the SD card, starting at sector sd_first
+};
+static struct blk disks[MAX_DISKS];
+int blk_disks = 0;                          // how many were found
+int blk_irq = 0;                            // interrupt number of disk 0 (0: none known)
+
+static u32  rd (struct blk *b, int off)          { return *(volatile u32 *)(b->dev + off); }
+static void wr (struct blk *b, int off, u32 v)   { *(volatile u32 *)(b->dev + off) = v; }
+
+static void cache_clean (const void *p, u64 len) {
+  for (u64 a = (u64)p & ~63UL; a < (u64)p + len; a += 64) __asm__ volatile ("dc cvac, %0" :: "r" (a) : "memory");
+  __asm__ volatile ("dsb sy" ::: "memory");
+}
+static void cache_flush_inval (const void *p, u64 len) {
+  for (u64 a = (u64)p & ~63UL; a < (u64)p + len; a += 64) __asm__ volatile ("dc civac, %0" :: "r" (a) : "memory");
+  __asm__ volatile ("dsb sy" ::: "memory");
+}
+
+u64 blk_capacity_of (int n) { return n >= 0 && n < blk_disks ? disks[n].capacity : 0; }
+u64 blk_capacity (void) { return blk_capacity_of (0); }
+int blk_is_irq (int irq) { for (int i = 0; i < blk_disks; i++) if (disks[i].irq && disks[i].irq == irq) return 1; return 0; }
+
+static int init_disk (struct blk *b) {
+  u32 version = rd (b, R_VERSION);
+
+  wr (b, R_STATUS, 0);                      // reset
+  wr (b, R_STATUS, ST_ACK);
+  wr (b, R_STATUS, ST_ACK | ST_DRIVER);
+  if (version == 2) {                       // modern devices must be told we speak VERSION_1
+    wr (b, R_DRV_FEAT_SEL, 0);  wr (b, R_DRV_FEATURES, 0);
+    wr (b, R_DRV_FEAT_SEL, 1);  wr (b, R_DRV_FEATURES, 1);        // bit 32
+    wr (b, R_STATUS, ST_ACK | ST_DRIVER | ST_FEATURES_OK);
+    if (!(rd (b, R_STATUS) & ST_FEATURES_OK)) { printf ("virtio: features rejected\n"); return -1; }
+  } else {
+    wr (b, R_DRV_FEAT_SEL, 0);  wr (b, R_DRV_FEATURES, 0);
+  }
+
+  wr (b, R_QUEUE_SEL, 0);
+  if (rd (b, R_QUEUE_NUM_MAX) < QSIZE) { printf ("virtio: queue too small\n"); return -1; }
+  wr (b, R_QUEUE_NUM, QSIZE);
+  u64 q = alloc_frames_contig (2);          // desc + avail in page 0, used ring in page 1
+  b->desc  = KVA (q);
+  b->avail = KVA (q + sizeof (struct desc) * QSIZE);
+  b->used  = KVA (q + PAGE_SIZE);
+  if (version == 1) {
+    wr (b, R_GUEST_PGSIZE, PAGE_SIZE);
+    wr (b, R_QUEUE_ALIGN, PAGE_SIZE);
+    wr (b, R_QUEUE_PFN, q / PAGE_SIZE);
+  } else {
+    u64 a = q + sizeof (struct desc) * QSIZE, u = q + PAGE_SIZE;
+    wr (b, R_DESC_LO,  (u32)q);  wr (b, R_DESC_HI,  q >> 32);
+    wr (b, R_AVAIL_LO, (u32)a);  wr (b, R_AVAIL_HI, a >> 32);
+    wr (b, R_USED_LO,  (u32)u);  wr (b, R_USED_HI,  u >> 32);
+    wr (b, R_QUEUE_READY, 1);
+  }
+  wr (b, R_STATUS, rd (b, R_STATUS) | ST_DRIVER_OK);
+
+  b->req_pa = alloc_frame ();
+  b->used_seen = 0;
+  b->capacity = rd (b, R_CONFIG) | ((u64)rd (b, R_CONFIG + 4) @<< 32);
+  return 0;
+}
+
+extern int sd_partitions (u64 *first, u64 *sectors, int max);
+extern int sd_read (u64 lba, void *buf, u32 count);
+extern int sd_write (u64 lba, const void *buf, u32 count);
+extern int sd_submit (int write, u64 lba, void *buf, u32 count, int by_interrupt);
+extern int sd_done (void);
+extern int sd_finish (void);
+extern void sd_interrupt (void);
+int blk_irq_wait = 0;                       // set by the caller before a request: 1 = it will sleep and the interrupt wakes it, 0 = it polls
+
+@
+no virtio device: look for an SD card with Ulix partitions
+
+<<virtio.c: sd_disks>>=
+static int sd_disks (void) {
+  u64 first[MAX_DISKS], sectors[MAX_DISKS];
+  int n = sd_partitions (first, sectors, MAX_DISKS);
+  if (n == 0) { printf ("virtio: no block device found, no SD card either\n"); return -1; }
+  for (int k = 0; k < n; k++) {
+    disks[k].sd = 1;  disks[k].sd_first = first[k];  disks[k].capacity = sectors[k];  disks[k].irq = plat.sdhci_irq;
+    printf ("sd: disk %d with %lu sectors (%lu KByte)\n", k, disks[k].capacity, disks[k].capacity / 2);
+  }
+  blk_disks = n;  blk_irq = plat.sdhci_irq;
+  if (blk_irq) gic_enable (blk_irq);          // a process that waits for the card can sleep (see glue.c)
+  return 0;
+}
+
+int blk_init (void) {
+  int slots = plat.nvirtio ? plat.nvirtio : VIRTIO_SLOTS;                      // without a device tree: the 32 slots of qemu virt
+  volatile u8 *found[MAX_DISKS];  int found_irq[MAX_DISKS], found_slot[MAX_DISKS], n = 0;
+  for (int i = slots - 1; i >= 0 && n < MAX_DISKS; i--) {                      // from the highest address down (see above)
+    volatile u8 *s = (volatile u8 *)(plat.nvirtio ? KERNEL_VA + plat.virtio[i] : VIRTIO_BASE + i * VIRTIO_SLOT_SZ);
+    if (*(volatile u32 *)(s + R_MAGIC) == 0x74726976 && *(volatile u32 *)(s + R_DEVICE_ID) == 2) {
+      found[n] = s;  found_slot[n] = i;  found_irq[n] = plat.nvirtio ? plat.virtio_irq[i] : 0;  n++;
+    }
+  }
+  if (n == 0) return sd_disks ();
+  blk_disks = 0;
+  for (int k = 0; k < n; k++) {
+    struct blk *b = &disks[k];
+    b->dev = found[k];  b->irq = found_irq[k];
+    printf ("virtio: block device %d in MMIO slot %d (transport version %u, interrupt %d)\n", k, found_slot[k], rd (b, R_VERSION), b->irq);
+    if (init_disk (b) != 0) { if (k == 0) return -1; break; }
+    blk_disks++;
+    printf ("virtio: disk %d with %lu sectors (%lu KByte)\n", k, b->capacity, b->capacity / 2);
+    if (b->irq) gic_enable (b->irq);        // transfers can be waited for with a sleeping process (see glue.c)
+  }
+  blk_irq = disks[0].irq;
+  return 0;
+}
+
+@
+one request = 3 descriptors: header (device reads), data, status byte (device writes)
+A request is submitted, the device works on it, and later the CPU finds it in the used ring.  The block driver
+glue ([[glue.c]]) lets a process sleep in between and wakes it from the interrupt; [[blk_read]] and [[blk_write]] poll.
+
+<<virtio.c: R_INTERRUPT_STATUS>>=
+#define R_INTERRUPT_STATUS 0x060
+#define R_INTERRUPT_ACK    0x064
+
+int blk_submit_n (int n, int type, u64 sector, void *buf, u32 nsectors) {
+  if (n < 0 || n >= blk_disks) return -1;
+  struct blk *b = &disks[n];
+  if (sector + nsectors > b->capacity) return -1;
+  if (b->sd)                                // SD card: the transfer is started; the data moves later (by interrupt or when asked)
+    return sd_submit (type == VIRTIO_BLK_T_OUT, b->sd_first + sector, buf, nsectors, blk_irq_wait && b->irq);
+  u32 *hdr = KVA (b->req_pa);
+  volatile u8 *status = (volatile u8 *)KVA (b->req_pa + 16);
+  hdr[0] = type; hdr[1] = 0; hdr[2] = (u32)sector; hdr[3] = sector >> 32;
+  *status = 0xff;
+
+  b->desc[0].addr = b->req_pa;       b->desc[0].len = 16;
+  b->desc[0].flags = VIRTQ_DESC_F_NEXT;  b->desc[0].next = 1;
+  b->desc[1].addr = PA (buf);     b->desc[1].len = nsectors * 512;
+  b->desc[1].flags = VIRTQ_DESC_F_NEXT | (type == VIRTIO_BLK_T_IN ? VIRTQ_DESC_F_WRITE : 0);
+  b->desc[1].next = 2;
+  b->desc[2].addr = b->req_pa + 16;  b->desc[2].len = 1;
+  b->desc[2].flags = VIRTQ_DESC_F_WRITE; b->desc[2].next = 0;
+
+  b->avail->ring[b->avail->idx % QSIZE] = 0;      // head of the chain
+  __asm__ volatile ("dmb ish" ::: "memory");
+  b->avail->idx++;
+  __asm__ volatile ("dmb ish" ::: "memory");
+  b->cur_buf = buf;  b->cur_len = nsectors * 512UL;  b->cur_type = type;
+  cache_clean ((const void *)b->desc, sizeof (struct desc) * QSIZE);               // everything the device reads
+  cache_clean ((const void *)b->avail, sizeof (struct avail));
+  cache_clean (hdr, 16);
+  if (type == VIRTIO_BLK_T_OUT) cache_clean (buf, b->cur_len);
+  else                          cache_flush_inval (buf, b->cur_len);                // (no dirty line may be written back over the data later)
+  cache_flush_inval ((const void *)status, 1);
+  wr (b, R_QUEUE_NOTIFY, 0);
+  return 0;
+}
+
+int blk_done_n (int n) {                    // has the device finished the request?
+  struct blk *b = &disks[n];
+  if (b->sd) return sd_done ();
+  cache_flush_inval ((const void *)b->used, sizeof (struct used));
+  return b->used->idx != b->used_seen;
+}
+
+int blk_finish_n (int n) {                  // 0 = request done and successful
+  struct blk *b = &disks[n];
+  if (b->sd) return sd_finish ();
+  volatile u8 *status = (volatile u8 *)KVA (b->req_pa + 16);
+  b->used_seen++;
+  if (b->cur_type == VIRTIO_BLK_T_IN) cache_flush_inval (b->cur_buf, b->cur_len);       // see the data the device wrote
+  cache_flush_inval ((const void *)status, 1);
+  return *status == 0 ? 0 : -1;
+}
+
+void blk_irq_ack (void) {                   // in the interrupt handler: every device stops signalling
+  for (int i = 0; i < blk_disks; i++) {
+    if (disks[i].sd) { sd_interrupt (); continue; }       // (the SD controller is cleared by what the handler does)
+    wr (&disks[i], R_INTERRUPT_ACK, rd (&disks[i], R_INTERRUPT_STATUS));
+  }
+}
+
+static int blk_request (int n, int type, u64 sector, void *buf, u32 nsectors) {
+  if (blk_submit_n (n, type, sector, buf, nsectors) != 0) return -1;
+  while (!blk_done_n (n)) __asm__ volatile ("dmb ish" ::: "memory");              // polling
+  return blk_finish_n (n);
+}
+
+int blk_read_n  (int n, u64 sector, void *buf, u32 cnt) { return blk_request (n, VIRTIO_BLK_T_IN,  sector, buf, cnt); }
+int blk_write_n (int n, u64 sector, void *buf, u32 cnt) { return blk_request (n, VIRTIO_BLK_T_OUT, sector, buf, cnt); }
+// disk 0 (the tests and the kernel's own Minix reader use these)
+int blk_read  (u64 sector, void *buf, u32 cnt) { return blk_read_n (0, sector, buf, cnt); }
+int blk_write (u64 sector, void *buf, u32 cnt) { return blk_write_n (0, sector, buf, cnt); }
+int blk_submit (int type, u64 sector, void *buf, u32 nsectors) { return blk_submit_n (0, type, sector, buf, nsectors); }
+int blk_done (void)   { return blk_done_n (0); }
+int blk_finish (void) { return blk_finish_n (0); }
+
+@
+\section{The SD card of the Raspberry Pi 4B}
+\label{src:sdcard.c}
+
+The card sits on an SD host controller that follows the ``SD Host Controller Simplified Specification'' (SDHCI); the Pi 4 has
+two of them, and the card slot is on the one called EMMC2. This file talks to the controller in a simple way: no DMA, the CPU
+copies every word through the data port (``PIO'', like the IDE driver of the book). The CPU either waits by looking at the
+controller again and again (polling), or sleeps and is woken by the interrupt of the controller. Register names are those of the specification (FreeBSD's sys/dev/sdhci/[[sdhci.h]], BSD-2-Clause,
+uses the same names; nothing is copied from it).
+
+On the card the MBR partition table says where the disks of Ulix are: every partition of type [[0x81]] (Minix) is one disk, in
+the order of the table: the first is /dev/hda, the second /dev/hdb, the third stands in for /dev/fd1. Partition 1 is the FAT
+partition with the firmware and the kernel; it is not touched.
+
+@
+
+The complete file is put together from these parts:
+
+<<sdcard.c>>=
+<<sdcard.c: includes>>
+
+<<sdcard.c: R_BLKSIZE>>
+
+<<sdcard.c: wait_for>>
+
+<<sdcard.c: set_clock>>
+
+<<sdcard.c: command>>
+
+<<sdcard.c: card_init>>
+
+<<sdcard.c: finish>>
+
+<<sdcard.c: start>>
+
+<<sdcard.c: run_polled>>
+
+<<sdcard.c: part 10>>
+
+<<sdcard.c: sd_done>>
+
+<<sdcard.c: sd_partitions>>
+@
+
+<<sdcard.c: includes>>=
+#include "ulix.h"
+#include "plat.h"
+#include "delay.h"
+
+@
+\subsection{registers of the controller (offsets from the base address; the width is part of the register)}
+
+<<sdcard.c: R_BLKSIZE>>=
+#define R_BLKSIZE    0x04      // 16 bit: block size in bytes
+#define R_BLKCNT     0x06      // 16 bit: number of blocks
+#define R_ARG        0x08      // 32 bit: command argument
+#define R_TRNMOD     0x0c      // 16 bit: transfer mode
+#define R_CMD        0x0e      // 16 bit: command (writing it starts the command)
+#define R_RESP       0x10      // 4 x 32 bit: response
+#define R_DATA       0x20      // 32 bit: data port
+#define R_PRESENT    0x24      // 32 bit: present state
+#define R_HOSTCTL    0x28      //  8 bit: host control (bus width)
+#define R_PWRCTL     0x29      //  8 bit: power control
+#define R_CLKCTL     0x2c      // 16 bit: clock control
+#define R_TIMEOUT    0x2e      //  8 bit: data timeout
+#define R_RESET      0x2f      //  8 bit: software reset
+#define R_INT_STATUS 0x30      // 32 bit: low half: normal interrupt status, high half: error interrupt status
+#define R_INT_ENABLE 0x34      // 32 bit: which of them can be seen in the status (we poll, so we want to see all)
+#define R_SIG_ENABLE 0x38      // 32 bit: which of them raise an interrupt (none)
+#define R_CAPS       0x40      // 32 bit: capabilities (bits 15..8: base clock in MHz)
+
+#define PRESENT_CMD_INHIBIT 0x00000001     // a command is still running
+#define PRESENT_DAT_INHIBIT 0x00000002     // a data transfer is still running
+#define PRESENT_CARD        0x00010000     // a card is in the slot
+
+#define INT_CMD_DONE        0x00000001
+#define INT_XFER_DONE       0x00000002
+#define INT_WRITE_READY     0x00000010     // the buffer has room for a sector
+#define INT_READ_READY      0x00000020     // the buffer holds a sector
+#define INT_ERROR           0x00008000     // (and the bits of the high half say which one)
+
+#define CMD_NO_RESPONSE     0x0000
+#define CMD_R2              0x0001         // 136 bit response
+#define CMD_R1              0x0002         // 48 bit response
+#define CMD_R1B             0x0003         // 48 bit response, then the card is busy
+#define CMD_CRC_CHECK       0x0008
+#define CMD_INDEX_CHECK     0x0010
+#define CMD_DATA            0x0020         // data follows (or is sent)
+
+#define TRN_BLKCNT_EN       0x0002
+#define TRN_READ            0x0010
+
+#define RESET_ALL           0x01
+#define RESET_CMD           0x02
+#define RESET_DAT           0x04
+
+static u64 base = 0;                       // virtual address of the controller (0: no SD card)
+static u32 rca = 0;                        // the address the card chose for itself
+static int high_capacity = 0;              // SDHC/SDXC: the argument of a read is the sector number, otherwise the byte address
+
+static u32  rd32 (int off) { return *(volatile u32 *)(base + off); }
+static unsigned short  rd16 (int off) { return *(volatile unsigned short *)(base + off); }
+static u8   rd8  (int off) { return *(volatile u8 *)(base + off); }
+static void wr32 (int off, u32 v) { *(volatile u32 *)(base + off) = v; }
+static void wr16 (int off, unsigned short v) { *(volatile unsigned short *)(base + off) = v; }
+static void wr8  (int off, u8 v)  { *(volatile u8 *)(base + off) = v; }
+
+@
+wait until (register \& mask) == want, at most 'ms' milliseconds; 0 = it happened. The registers have different widths and must
+be read with their own width ('bytes' = 1, 2 or 4); a 32-bit read of the 8-bit reset register would be a misaligned access.
+
+<<sdcard.c: wait_for>>=
+static int wait_for (int off, int bytes, u32 mask, u32 want, int ms) {
+  for (int i = 0; i < ms * 100; i++) {
+    u32 value = bytes == 1 ? rd8 (off) : bytes == 2 ? rd16 (off) : rd32 (off);
+    if ((value & mask) == want) return 0;
+    delay_us (10);
+  }
+  return -1;
+}
+
+@
+SDCLK = base clock / (2 * divider); divider 0 means the base clock itself. The divider has 10 bits, split over the register.
+
+<<sdcard.c: set_clock>>=
+static int set_clock (u32 hz) {
+  u32 basemhz = (rd32 (R_CAPS) >> 8) & 0xff;
+  u32 basehz = (basemhz ? basemhz : 100) * 1000000;       // (a controller that does not say: the Pi's 100 MHz)
+  u32 div = 1;
+  while (div < 1023 && basehz / (2 * div) > hz) div++;
+  wr16 (R_CLKCTL, 0);                                      // stop the clock while it is changed
+  wr16 (R_CLKCTL, ((div & 0xff) @<< 8) | (((div >> 8) & 3) @<< 6) | 0x0001);       // divider, internal clock on
+  if (wait_for (R_CLKCTL, 2, 0x0002, 0x0002, 100) != 0) return -1;                  // ... and stable
+  wr16 (R_CLKCTL, rd16 (R_CLKCTL) | 0x0004);               // the clock goes to the card
+  return 0;
+}
+
+static void reset_lines (int what) {                       // after an error: forget the command and the data that were under way
+  wr8 (R_RESET, what);
+  wait_for (R_RESET, 1, what, 0, 100);
+}
+
+@
+Send one command and wait for its answer. 'flags' says what kind of answer to expect ([[CMD_]]*), 'transfer' is the transfer mode
+of a data command. The answer goes to resp[0..3]. Returns 0 if all went well.
+
+<<sdcard.c: command>>=
+static int command (u32 index, u32 arg, u32 flags, u32 transfer, u32 *resp) {
+  u32 busy = PRESENT_CMD_INHIBIT;                          // the controller must be idle before a new command
+  if ((flags & CMD_DATA) || (flags & 3) == CMD_R1B) busy |= PRESENT_DAT_INHIBIT;
+  if (wait_for (R_PRESENT, 4, busy, 0, 100) != 0) return -1;
+  wr32 (R_INT_STATUS, 0xffffffff);                         // (writing a 1 clears a status bit)
+  wr32 (R_ARG, arg);
+  wr16 (R_TRNMOD, transfer);
+  wr16 (R_CMD, (index @<< 8) | flags);
+  for (int i = 0; ; i++) {
+    u32 status = rd32 (R_INT_STATUS);
+    if (status & INT_ERROR) { reset_lines (RESET_CMD | RESET_DAT); return -1; }
+    if (status & INT_CMD_DONE) break;
+    if (i > 100000) { reset_lines (RESET_CMD | RESET_DAT); return -1; }
+    delay_us (10);
+  }
+  wr32 (R_INT_STATUS, INT_CMD_DONE);
+  if (resp) for (int i = 0; i < 4; i++) resp[i] = rd32 (R_RESP + 4 * i);
+  return 0;
+}
+
+#define GO_IDLE_STATE     0
+#define ALL_SEND_CID      2
+#define SEND_RELATIVE_ADDR 3
+#define SELECT_CARD       7
+#define SEND_IF_COND      8
+#define SET_BLOCKLEN      16
+#define READ_SINGLE_BLOCK 17
+#define WRITE_SINGLE_BLOCK 24
+#define APP_CMD           55
+#define SD_SEND_OP_COND   41      // an "application command": CMD55 first
+#define SET_BUS_WIDTH     6       // also an application command; argument 2 = four data lines
+
+static int app_command (u32 index, u32 arg, u32 flags, u32 *resp) {
+  u32 r[4];
+  if (command (APP_CMD, rca @<< 16, CMD_R1 | CMD_CRC_CHECK | CMD_INDEX_CHECK, 0, r) != 0) return -1;
+  return command (index, arg, flags, 0, resp);
+}
+
+@
+Bring the card from ``just powered'' to ``ready to read and write sectors''. Returns 0 on success.
+
+<<sdcard.c: card_init>>=
+static int card_init (void) {
+  u32 r[4];
+  wr8 (R_RESET, RESET_ALL);
+  if (wait_for (R_RESET, 1, RESET_ALL, 0, 100) != 0) return -1;
+  if (!(rd32 (R_PRESENT) & PRESENT_CARD)) { printf ("sd: no card in the slot\n"); return -1; }
+  wr8 (R_PWRCTL, 0x0e | 0x01);                             // 3.3 V, power on
+  wr8 (R_TIMEOUT, 0x0e);                                   // the longest data timeout
+  wr32 (R_INT_ENABLE, 0xffffffff);                         // we poll the status, so every bit must show up there
+  wr32 (R_SIG_ENABLE, 0);                                  // ... but nothing interrupts
+  if (set_clock (400000) != 0) return -1;                  // a card that is not initialised yet must be slow (<= 400 kHz)
+  delay_us (2000);
+
+  rca = 0;
+  if (command (GO_IDLE_STATE, 0, CMD_NO_RESPONSE, 0, 0) != 0) return -1;
+  int v2 = command (SEND_IF_COND, 0x1aa, CMD_R1 | CMD_CRC_CHECK | CMD_INDEX_CHECK, 0, r) == 0 && (r[0] & 0xfff) == 0x1aa;
+  u32 ocr = 0;
+  for (int i = 0; i < 1000; i++) {                         // the card says "ready" in bit 31 once it has started up
+    if (app_command (SD_SEND_OP_COND, 0x00ff8000 | (v2 ? 0x40000000 : 0), CMD_R1, r) != 0) return -1;
+    ocr = r[0];
+    if (ocr & 0x80000000) break;
+    delay_us (1000);
+  }
+  if (!(ocr & 0x80000000)) { printf ("sd: card does not become ready\n"); return -1; }
+  high_capacity = (ocr & 0x40000000) != 0;                 // bit 30: the card is addressed by sector number
+
+  if (command (ALL_SEND_CID, 0, CMD_R2 | CMD_CRC_CHECK, 0, r) != 0) return -1;
+  if (command (SEND_RELATIVE_ADDR, 0, CMD_R1 | CMD_CRC_CHECK | CMD_INDEX_CHECK, 0, r) != 0) return -1;
+  rca = r[0] >> 16;
+  if (command (SELECT_CARD, rca @<< 16, CMD_R1B | CMD_CRC_CHECK | CMD_INDEX_CHECK, 0, r) != 0) return -1;
+  if (!high_capacity && command (SET_BLOCKLEN, 512, CMD_R1 | CMD_CRC_CHECK | CMD_INDEX_CHECK, 0, r) != 0) return -1;
+  if (app_command (SET_BUS_WIDTH, 2, CMD_R1 | CMD_CRC_CHECK | CMD_INDEX_CHECK, r) != 0) return -1;   // the card: 4 data lines
+  wr8 (R_HOSTCTL, rd8 (R_HOSTCTL) | 0x02);                 // ... and the controller, too
+  if (set_clock (25000000) != 0) return -1;                // now the normal speed
+  printf ("sd: card ready (%s, address %u, 4 data lines)\n", high_capacity ? "SDHC/SDXC" : "SDSC", rca);
+  return 0;
+}
+
+@
+---- a transfer of one or more sectors ----
+The command starts it. Then, for every sector, the controller says ``buffer ready'' and the CPU copies the 128 words of the sector
+through the data port; ``transfer complete'' ends the transfer. [[service ()]] does whatever the status bits ask for. Who calls it:
+the interrupt handler, while a process sleeps and waits for the card, or the caller itself in a loop (the idle thread, the boot
+code and the tests have nothing else to do, and a sleeping process would need the scheduler).
+
+<<sdcard.c: finish>>=
+static struct {
+  int active, write, by_interrupt, result;
+  u32 *buf;                                // where the next sector goes to / comes from
+  u32 sectors, done;                       // how many are to be moved, how many are
+  long polls;                              // how often the caller has looked (to give up on a card that never answers)
+} xfer;
+
+static void finish (int result) {
+  xfer.active = 0;
+  xfer.result = result;
+  wr32 (R_SIG_ENABLE, 0);                  // no more interrupts until the next transfer
+}
+
+static void service (void) {
+  if (!xfer.active) return;
+  u32 status = rd32 (R_INT_STATUS);
+  if (status & INT_ERROR) { reset_lines (RESET_CMD | RESET_DAT); finish (-1); return; }
+  u32 ready = xfer.write ? INT_WRITE_READY : INT_READ_READY;
+  if ((status & ready) && xfer.done < xfer.sectors) {
+    wr32 (R_INT_STATUS, ready);
+    for (int i = 0; i < 128; i++) {        // 512 bytes through the data port, a word at a time
+      if (xfer.write) wr32 (R_DATA, xfer.buf[i]);
+      else            xfer.buf[i] = rd32 (R_DATA);
+    }
+    xfer.buf += 128;
+    xfer.done++;
+    status = rd32 (R_INT_STATUS);          // (the end of the transfer may have been signalled meanwhile)
+  }
+  if (status & INT_XFER_DONE) {
+    wr32 (R_INT_STATUS, INT_XFER_DONE);
+    finish (xfer.done == xfer.sectors ? 0 : -1);
+  }
+}
+
+#define TRN_MULTI           0x0020         // several sectors with one command
+#define TRN_AUTO_STOP       0x0004         // the controller sends CMD12 (stop) after the last one itself
+#define READ_MULTIPLE_BLOCK 18
+#define WRITE_MULTIPLE_BLOCK 25
+
+@
+Start a transfer of 'count' sectors; it is running when this returns (0), the data moves in [[service ()]].
+
+<<sdcard.c: start>>=
+static int start (int write, u64 lba, void *buf, u32 count, int by_interrupt) {
+  if (xfer.active || count == 0 || count > 0xffff) return -1;
+  xfer.active = 1;  xfer.write = write;  xfer.by_interrupt = by_interrupt;  xfer.result = -1;
+  xfer.buf = buf;  xfer.sectors = count;  xfer.done = 0;  xfer.polls = 0;
+  wr16 (R_BLKSIZE, 512);
+  wr16 (R_BLKCNT, count);
+  u32 arg = high_capacity ? (u32)lba : (u32)(lba * 512);
+  u32 index = count == 1 ? (write ? WRITE_SINGLE_BLOCK : READ_SINGLE_BLOCK) : (write ? WRITE_MULTIPLE_BLOCK : READ_MULTIPLE_BLOCK);
+  u32 mode = TRN_BLKCNT_EN | (write ? 0 : TRN_READ) | (count > 1 ? TRN_MULTI | TRN_AUTO_STOP : 0);
+  if (command (index, arg, CMD_R1 | CMD_CRC_CHECK | CMD_INDEX_CHECK | CMD_DATA, mode, 0) != 0) { xfer.active = 0; return -1; }
+  if (by_interrupt)                        // the status bits we want to be told about: buffer ready, transfer complete, errors
+    wr32 (R_SIG_ENABLE, 0xffff0000 | INT_ERROR | INT_XFER_DONE | (write ? INT_WRITE_READY : INT_READ_READY));
+  return 0;
+}
+
+@
+the caller waits by looking at the controller over and over
+
+<<sdcard.c: run_polled>>=
+static int run_polled (int write, u64 lba, void *buf, u32 count) {
+  if (start (write, lba, buf, count, 0) != 0) return -1;
+  while (xfer.active) {
+    service ();
+    if (++xfer.polls > 20000000L) { reset_lines (RESET_CMD | RESET_DAT); finish (-1); }
+  }
+  return xfer.result;
+}
+
+@
+\subsection{what the block layer (virtio.c) uses}
+
+<<sdcard.c: part 10>>=
+int sd_read (u64 lba, void *buf, u32 count) { return run_polled (0, lba, buf, count); }
+int sd_write (u64 lba, const void *buf, u32 count) { return run_polled (1, lba, (void *)buf, count); }
+
+@
+the same in three steps, so that a process can sleep in between: submit, ask whether it is done, collect the result.
+With '[[by_interrupt]]' the interrupt handler ([[sd_interrupt]]) moves the data; without, [[sd_done]] does it each time it is asked.
+
+<<sdcard.c: sd_done>>=
+int sd_submit (int write, u64 lba, void *buf, u32 count, int by_interrupt) { return start (write, lba, buf, count, by_interrupt); }
+
+int sd_done (void) {
+  if (xfer.active && !xfer.by_interrupt) {
+    service ();
+    if (xfer.active && ++xfer.polls > 20000000L) { reset_lines (RESET_CMD | RESET_DAT); finish (-1); }
+  }
+  return !xfer.active;
+}
+
+int sd_finish (void) { return xfer.result; }
+void sd_interrupt (void) { service (); }
+
+@
+Initialise the card and look into the partition table. For every Ulix partition (type [[0x81]], at most 'max') the first sector
+and the size in sectors are stored; the result is the number of partitions found (0: no card or no Ulix partition).
+
+<<sdcard.c: sd_partitions>>=
+int sd_partitions (u64 *first, u64 *sectors, int max) {
+  if (!plat.sdhci) return 0;
+  base = KERNEL_VA + plat.sdhci;
+  if (card_init () != 0) { printf ("sd: card not usable\n"); return 0; }
+  static u8 mbr[512] __attribute__ ((aligned (16)));
+  if (sd_read (0, mbr, 1) != 0) { printf ("sd: cannot read sector 0\n"); return 0; }
+  if (mbr[510] != 0x55 || mbr[511] != 0xaa) { printf ("sd: no partition table\n"); return 0; }
+  int n = 0;
+  for (int i = 0; i < 4 && n < max; i++) {
+    u8 *e = mbr + 446 + 16 * i;                            // 16 bytes per entry: type at 4, first sector at 8, size at 12
+    u32 start = e[8] | (e[9] @<< 8) | (e[10] @<< 16) | ((u32)e[11] @<< 24);
+    u32 size  = e[12] | (e[13] @<< 8) | (e[14] @<< 16) | ((u32)e[15] @<< 24);
+    printf ("sd: partition %d: type 0x%x, first sector %u, %u sectors\n", i + 1, e[4], start, size);
+    if (e[4] == 0x81 && size > 0) { first[n] = start; sectors[n] = size; n++; }
+  }
+  return n;
+}

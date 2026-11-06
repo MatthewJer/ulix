@@ -1,4 +1,8 @@
 GENDIR = gen
+
+# The sources of the port are written as literate programs in lit/*.nw (see lit/Makefile for the book).
+# Tangle them first, before make looks at any dependency; only files whose content changed are touched.
+TANGLED := $(shell sh tools/tangle.sh)
 # Ulix ARM64 port, stage 2: bare-metal skeleton for qemu-system-aarch64 -M virt
 # Toolchain: brew install aarch64-elf-gcc aarch64-elf-binutils qemu
 CROSS ?= aarch64-elf-
@@ -52,6 +56,12 @@ $(GENDIR)/disk_expected.h: $(DISK) tools/disk_expected.py tools/minix_check.py
 
 user/%.elf: FORCE
 	$(MAKE) -C user
+
+# the book of the ARM64 part (lit/build/ulix-arm64.pdf)
+book:
+	$(MAKE) -C lit
+
+.PHONY: book
 
 FORCE:
 

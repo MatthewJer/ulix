@@ -30,6 +30,9 @@ all:
 	$(TEX) tmp
 	mv tmp.pdf ../ulix-book.pdf
 
+pdf-tectonic:
+	sh tectonic.sh
+
 clean:
 	rm -f ./tmp.* noweb.defs noweb.filtered.defs
 

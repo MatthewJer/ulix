@@ -1,0 +1,843 @@
+\chapter{Memory: Page Tables, Copy-on-Write and Swapping}
+\label{ch:memory}
+
+The x86 version of the book uses two-level page tables and a frame table. AArch64 uses four levels, address space identifiers
+(ASIDs) instead of flushing the TLB, and a kernel that lives in the upper half of the address space. On top of this the port
+implements \texttt{fork} with copy-on-write (a software bit in the page table entry and a reference count for each frame) and
+the swapping of the book (\texttt{page\_out}, \texttt{page\_in}, the swapper process).
+
+@
+\section{Page table entry bits (4 KByte granule), shared by all ARM64 sources}
+\label{src:arch_pte.h}
+
+
+@
+
+The complete file is put together from these parts:
+
+<<arch_pte.h>>=
+<<arch_pte.h: ARCH_PTE_H>>
+@
+
+<<arch_pte.h: ARCH_PTE_H>>=
+#ifndef ARCH_PTE_H
+#define ARCH_PTE_H
+#ifndef ULIX_H
+typedef unsigned long u64;
+#endif
+
+// page table entry bits (4 KB granule)
+#define PTE_VALID   0x1UL
+#define PTE_TABLE   0x3UL
+#define PTE_PAGE    0x3UL                   // level 3: bits[1:0] = 11
+#define PTE_ATTR(n) ((u64)(n) @<< 2)         // MAIR index: 0 = device, 1 = normal
+#define PTE_AP_USER (1UL @<< 6)              // AP[1]: accessible from EL0
+#define PTE_RO      (1UL @<< 7)              // AP[2]: read-only
+#define PTE_SH      (3UL @<< 8)
+#define PTE_AF      (1UL @<< 10)
+#define PTE_NG      (1UL @<< 11)             // not global: the TLB entry is tagged with the ASID (user pages only)
+#define PTE_PXN     (1UL @<< 53)
+#define PTE_UXN     (1UL @<< 54)
+#define PTE_COW     (1UL @<< 55)             // software bit (ignored by the hardware): copy-on-write page
+#define PTE_SWAPPED (1UL @<< 56)             // software bit: the page is in the swap file (valid bit clear)
+#define PTE_ADDR    0x0000FFFFFFFFF000UL
+
+#define PAGE_RW     (PTE_PAGE | PTE_ATTR (1) | PTE_SH | PTE_AF | PTE_PXN | PTE_UXN)
+#define PAGE_RO     (PAGE_RW | PTE_RO)
+#define PAGE_URX    (PTE_NG | PTE_PAGE | PTE_ATTR (1) | PTE_SH | PTE_AF | PTE_AP_USER | PTE_RO | PTE_PXN)
+#define PAGE_URO    (PTE_NG | PTE_PAGE | PTE_ATTR (1) | PTE_SH | PTE_AF | PTE_AP_USER | PTE_RO | PTE_PXN | PTE_UXN)
+#define PAGE_URW    (PTE_NG | PTE_PAGE | PTE_ATTR (1) | PTE_SH | PTE_AF | PTE_AP_USER | PTE_PXN | PTE_UXN)
+
+
+#endif
+
+@
+\section{Physical frame allocator and 4-level page table code}
+\label{src:mmu.c}
+
+(replaces the [[x86]] 2-level page directory / page table code and KMAP/KMAPD)
+
+@
+
+The complete file is put together from these parts:
+
+<<mmu.c>>=
+<<mmu.c: includes>>
+
+<<mmu.c: next_free>>
+
+<<mmu.c: kernel_l1>>
+
+<<mmu.c: alloc_frame_try>>
+
+<<mmu.c: kstack_pool>>
+
+<<mmu.c: free_frame>>
+
+<<mmu.c: IDX>>
+
+<<mmu.c: walk>>
+
+<<mmu.c: map_page_in>>
+
+<<mmu.c: virt_to_phys>>
+
+<<mmu.c: user_to_phys>>
+
+<<mmu.c: empty_l0_pa>>
+
+<<mmu.c: user_mm_init>>
+
+<<mmu.c: sync_icache>>
+
+<<mmu.c: cow_fault>>
+@
+
+<<mmu.c: includes>>=
+#include "ulix.h"
+#include "plat.h"
+
+extern u64 kernel_l0[512];
+extern int arch_cow_fault (u64 va);
+extern int arch_user_fault (u64 va);
+extern char __kernel_end[];
+
+#define MAX_RAM     (2UL @<< 30)             // the table of frame reference counts has room for 2 GByte
+#define RAM_START   (plat.ram_base)         // from the device tree
+#define RAM_SIZE    (plat.ram_size)
+
+@
+\subsection{frame allocator: bump pointer first, free list for released frames}
+
+<<mmu.c: next_free>>=
+static u64 next_free;                       // physical address
+static unsigned short frame_refs[MAX_RAM / PAGE_SIZE];     // how many page table entries use a frame (COW)
+#define REFS(pa)  frame_refs[((pa) - RAM_START) / PAGE_SIZE]
+static u64 free_list = 0;                   // singly linked through the frames themselves
+long frames_in_use = 0;
+
+u64 arch_ram_frames (void) { return plat.ram_size / PAGE_SIZE; }
+
+@
+The kernel map (TTBR1) covers the first GByte of RAM and of devices from the boot code; the others are added
+as 1 GByte blocks: all RAM, and the GByte of each device that the device tree names.
+
+<<mmu.c: kernel_l1>>=
+extern u64 kernel_l1[512];
+static void map_block (u64 pa, int device) {
+  u64 i = pa >> 30;
+  if (i >= 512 || (kernel_l1[i] & 1)) return;
+  kernel_l1[i] = (i @<< 30) | 1 | (device ? (PTE_ATTR (0) | PTE_AF | PTE_PXN | PTE_UXN) : (PTE_ATTR (1) | PTE_SH | PTE_AF));
+}
+
+void platform_map (void) {
+  if (plat.ram_size > MAX_RAM) { printf ("RAM: using %lu of %lu MByte\n", MAX_RAM >> 20, plat.ram_size >> 20); plat.ram_size = MAX_RAM; }
+  for (u64 pa = plat.ram_base & ~((1UL @<< 30) - 1); pa < plat.ram_base + plat.ram_size; pa += 1UL @<< 30) map_block (pa, 0);
+  map_block (plat.gicd, 1);  map_block (plat.gicc, 1);  map_block (plat.gicr, 1);  map_block (plat.gicr + plat.gicr_size, 1);
+  map_block (plat.uart, 1);  map_block (plat.rtc, 1);  map_block (plat.sdhci, 1);  map_block (plat.genet, 1);
+  for (int i = 0; i < plat.nvirtio; i++) map_block (plat.virtio[i], 1);
+  __asm__ volatile ("dsb ishst; tlbi vmalle1is; dsb ish; isb" ::: "memory");
+}
+
+void kstack_reserve (int n);
+void frames_init (void) {
+  next_free = (PA (__kernel_end) + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+  printf ("RAM: %lu MByte at 0x%lx, kernel ends at 0x%lx, first free frame 0x%lx\n",
+          RAM_SIZE >> 20, RAM_START, PA (__kernel_end), next_free);
+  kstack_reserve (16);                      // kernel stacks for the first processes, whatever happens to the RAM later
+}
+
+static void zero_page (void *p) {
+  u64 *q = p;
+  for (int i = 0; i < PAGE_SIZE / 8; i++) q[i] = 0;
+}
+
+static u64 bump (void) {                    // 0 when RAM is used up
+  if (next_free + PAGE_SIZE > RAM_START + RAM_SIZE) return 0;
+  u64 pa = next_free;
+  next_free += PAGE_SIZE;
+  return pa;
+}
+
+extern int arch_evict_one (void);           // arch_swap.c: page out the least used page ("page replacement: free one frame")
+
+@
+returns a zeroed frame (physical address), or 0 if there is none and no page can be swapped out
+
+<<mmu.c: alloc_frame_try>>=
+u64 alloc_frame_try (void) {
+  for (;;) {
+    u64 pa;
+    if (free_list) {
+      pa = free_list;
+      free_list = *(u64 *)KVA (pa);
+    } else {
+      pa = bump ();
+    }
+    if (pa) {
+      zero_page (KVA (pa));
+      frames_in_use++;
+      REFS (pa) = 1;
+      return pa;
+    }
+    if (arch_evict_one () != 0) return 0;   // as in the book, a missing frame is made free by swapping a page out
+  }
+}
+
+u64 alloc_frame (void) {                    // for callers that cannot handle a failure
+  u64 pa = alloc_frame_try ();
+  if (!pa) { printf ("out of memory (no free frame, nothing to swap out)\n"); for (;;) ; }
+  return pa;
+}
+
+@
+Kernel stacks are 4 contiguous frames, and contiguous frames can only come from the bump area.  So a stack that is
+given back is kept in a list and used again (when a process has taken all RAM and gives it back, the free list holds
+single frames only), and a few stacks are put aside at boot.  alloc returns 0 when there is no stack.
+
+<<mmu.c: kstack_pool>>=
+static u64 kstack_pool = 0;
+#define KSTACK_FRAMES 4
+
+u64 kstack_alloc (void) {
+  u64 pa;
+  if (kstack_pool) {
+    pa = kstack_pool;
+    kstack_pool = *(u64 *)KVA (pa);
+  } else {
+    if (next_free + KSTACK_FRAMES * PAGE_SIZE > RAM_START + RAM_SIZE) return 0;
+    pa = next_free;
+    next_free += KSTACK_FRAMES * PAGE_SIZE;
+  }
+  for (int i = 0; i < KSTACK_FRAMES; i++) { zero_page (KVA (pa + i * PAGE_SIZE)); REFS (pa + i * PAGE_SIZE) = 1; }
+  frames_in_use += KSTACK_FRAMES;
+  return pa;
+}
+
+void kstack_free (u64 pa) {
+  for (int i = 0; i < KSTACK_FRAMES; i++) REFS (pa + i * PAGE_SIZE) = 0;
+  frames_in_use -= KSTACK_FRAMES;
+  *(u64 *)KVA (pa) = kstack_pool;
+  kstack_pool = pa;
+}
+
+void kstack_reserve (int n) {               // put n stacks aside (called once at boot)
+  for (int i = 0; i < n; i++) { u64 pa = kstack_alloc (); if (pa) kstack_free (pa); }
+}
+
+u64 alloc_frames_contig (int n) {           // (boot time) only the bump area is contiguous
+  u64 first = bump ();
+  if (!first) { printf ("out of memory\n"); for (;;) ; }
+  zero_page (KVA (first));
+  REFS (first) = 1;
+  for (int i = 1; i < n; i++) { u64 pa = bump (); if (!pa) { printf ("out of memory\n"); for (;;) ; } zero_page (KVA (pa)); REFS (pa) = 1; }
+  frames_in_use += n;
+  return first;
+}
+
+@
+give up one reference; the frame is free when nobody uses it any more
+
+<<mmu.c: free_frame>>=
+void free_frame (u64 pa) {
+  if (--REFS (pa) > 0) return;
+  *(u64 *)KVA (pa) = free_list;
+  free_list = pa;
+  frames_in_use--;
+}
+
+void get_frame (u64 pa)       { REFS (pa)++; }                  // one more user of the frame (fork shares pages)
+int  frame_refcount (u64 pa)  { return REFS (pa); }
+
+@
+\subsection{page tables}
+
+<<mmu.c: IDX>>=
+#define IDX(va, lvl) (((va) >> (39 - 9 * (lvl))) & 511)
+
+@
+returns pointer to the level-3 entry for va; creates missing tables if 'create'
+
+<<mmu.c: walk>>=
+static u64 *walk (u64 *l0, u64 va, int create) {
+  u64 *table = l0;
+  for (int lvl = 0; lvl < 3; lvl++) {
+    u64 *e = &table[IDX (va, lvl)];
+    if (!(*e & PTE_VALID)) {
+      if (!create) return 0;
+      u64 t = alloc_frame_try ();
+      if (!t) return 0;                     // (map_page_in fails, the caller handles it)
+      *e = t | PTE_TABLE;
+    } else if ((*e & 3) == 1) {
+      return 0;                             // 1 GB / 2 MB block: can't descend
+    }
+    table = KVA (*e & PTE_ADDR);
+  }
+  return &table[IDX (va, 3)];
+}
+
+@
+the level-3 entry of a user address (valid or not), 0 if the tables do not exist
+
+<<mmu.c: map_page_in>>=
+u64 *pte_of (u64 l0_pa, u64 va) { return walk (KVA (l0_pa), va & ~(PAGE_SIZE - 1), 0); }
+
+int map_page_in (u64 l0_pa, u64 va, u64 pa, u64 flags) {
+  u64 *e = walk (KVA (l0_pa), va, 1);
+  if (!e || (*e & PTE_VALID)) return -1;
+  *e = (pa & PTE_ADDR) | flags;
+  __asm__ volatile ("dsb ishst; isb");
+  return 0;
+}
+
+int map_page (u64 va, u64 pa, u64 flags) {
+  return map_page_in (PA (kernel_l0), va, pa, flags);
+}
+
+u64 unmap_page (u64 va) {                   // returns the physical address that was mapped
+  u64 *e = walk (kernel_l0, va, 0);
+  if (!e || !(*e & PTE_VALID)) return 0;
+  u64 pa = *e & PTE_ADDR;
+  *e = 0;
+  __asm__ volatile ("dsb ishst; tlbi vaae1is, %0; dsb ish; isb" :: "r" (va >> 12));
+  return pa;
+}
+
+@
+translate with the hardware (AT instruction), like [[mmu_p()]] on [[x86]]; 0 = not mapped
+
+<<mmu.c: virt_to_phys>>=
+u64 virt_to_phys (u64 va) {
+  u64 par;
+  __asm__ volatile ("at s1e1r, %1; isb; mrs %0, par_el1" : "=r" (par) : "r" (va));
+  if (par & 1) return 0;
+  return (par & PTE_ADDR) | (va & 0xfff);
+}
+
+@
+Translate a pointer that came from user space. Only the user range is accepted, and for
+writes the page must really be writable. The kernel then accesses the data through the
+linear map and never dereferences user pointers itself.
+
+<<mmu.c: user_to_phys>>=
+u64 user_to_phys (u64 va, int write) {
+  if (va < USER_MIN || va >= USER_MAX) return 0;
+  u64 par = 1;
+  for (int tries = 0; tries < 4 && (par & 1); tries++) {
+    if (write) __asm__ volatile ("at s1e1w, %1; isb; mrs %0, par_el1" : "=r" (par) : "r" (va));
+    else       __asm__ volatile ("at s1e1r, %1; isb; mrs %0, par_el1" : "=r" (par) : "r" (va));
+    if (!(par & 1)) break;
+    // not translated: a shared page (copy it), a page that was paged out (read it back) or a cleared access flag
+    int fixed = 0;                                         // (both are tried: a page can need a copy and a new access flag)
+    if (write && arch_cow_fault (va)) fixed = 1;
+    if (arch_user_fault (va)) fixed = 1;
+    if (!fixed) break;
+  }
+  if (par & 1) return 0;
+  return (par & PTE_ADDR) | (va & 0xfff);
+}
+
+@
+\subsection{user address spaces (TTBR0)}
+
+<<mmu.c: empty_l0_pa>>=
+u64 empty_l0_pa;
+int asid_16bit = 0;                         // 1: the CPU has 16-bit ASIDs, address space switches need no TLB flush
+
+@
+The boot identity map is only needed until we run at the high address. From now on
+TTBR0 belongs to user processes; the kernel itself lives in TTBR1.
+
+<<mmu.c: user_mm_init>>=
+void user_mm_init (void) {
+  empty_l0_pa = alloc_frame ();
+  u64 tcr;
+  __asm__ volatile ("mrs %0, tcr_el1" : "=r" (tcr));
+  tcr &= ~(1UL @<< 7);                       // EPD0 = 0: walk TTBR0 again
+  u64 mmfr0;
+  __asm__ volatile ("mrs %0, id_aa64mmfr0_el1" : "=r" (mmfr0));
+  if (((mmfr0 >> 4) & 15) == 2) { tcr |= 1UL @<< 36; asid_16bit = 1; }   // TCR.AS: 16-bit ASIDs (one per address space)
+  __asm__ volatile ("msr ttbr0_el1, %0; msr tcr_el1, %1; tlbi vmalle1; dsb nsh; isb"
+                    :: "r" (empty_l0_pa), "r" (tcr));
+}
+
+u64 new_user_l0 (void) { return alloc_frame_try (); }        // 0: no memory
+
+static void free_table (u64 pa, int lvl) {
+  u64 *t = KVA (pa);
+  for (int i = 0; i < 512; i++) {
+    u64 e = t[i];
+    if (!(e & PTE_VALID)) continue;
+    if (lvl < 3) free_table (e & PTE_ADDR, lvl + 1);
+    else         free_frame (e & PTE_ADDR);
+  }
+  free_frame (pa);
+}
+
+void free_user_space (u64 l0_pa) { free_table (l0_pa, 0); }
+
+@
+[[make freshly]] written code visible to instruction fetch
+
+<<mmu.c: sync_icache>>=
+void sync_icache (void *p, u64 len) {
+  u64 a = (u64)p & ~63UL;
+  for (; a < (u64)p + len; a += 64) __asm__ volatile ("dc cvau, %0" :: "r" (a) : "memory");
+  __asm__ volatile ("dsb ish; ic ialluis; dsb ish; isb");
+}
+
+@
+---- copy-on-write ----
+[[fork()]] maps the pages of the parent in the child, too, and marks both entries read-only with [[PTE_COW]].
+The first write (by the process, or by the kernel inside a system call) causes a permission fault;
+[[cow_fault()]] then gives the writer its own copy. Returns 1 if the fault was a COW fault and is resolved.
+
+<<mmu.c: cow_fault>>=
+int cow_fault (u64 l0_pa, u64 va) {
+  if (va < USER_MIN || va >= USER_MAX) return 0;
+  u64 *e = walk (KVA (l0_pa), va & ~(PAGE_SIZE - 1), 0);
+  if (e && (*e & PTE_VALID) && !(*e & PTE_RO)) return 1;   // writable already: a thread on another CPU copied the page first
+  if (!e || !(*e & PTE_VALID) || !(*e & PTE_COW)) return 0;
+  u64 old = *e & PTE_ADDR, flags = *e & ~(PTE_ADDR | PTE_RO | PTE_COW);
+  if (REFS (old) == 1) {                                   // the last user: just make it writable again
+    *e = old | flags;
+  } else {
+    u64 pa = alloc_frame_try ();
+    if (!pa) return 0;                                      // no memory for the copy: the process cannot go on
+    u64 *src = KVA (old), *dst = KVA (pa);
+    for (int i = 0; i < (int)(PAGE_SIZE / 8); i++) dst[i] = src[i];
+    REFS (old)--;                                          // we no longer use the shared frame
+    *e = pa | flags;
+  }
+  __asm__ volatile ("dsb ishst; tlbi vaae1is, %0; dsb ish; isb" :: "r" (va >> 12));
+  return 1;
+}
+
+@
+\section{Swapping (ulix-book.nw: ``The Swap File'', ``Page Replacement Strategy'')}
+\label{src:arch_swap.c}
+
+The book's swap file code ([[write_swap_page]], [[read_swap_page]], the paging[] table, the hash function and the
+counter table) is used unchanged.  What depends on the [[x86]] page tables is written here for the 4-level
+AArch64 tables, with the same names and the same behavior:
+  [[page_out]] / [[page_in]]        the ``present'' bit of the [[x86]] descriptor is the valid bit of the AArch64 entry;
+\begin{quote}\begin{verbatim}
+                            the "paged_out" bit is the software bit PTE_SWAPPED (the other bits stay in the
+                            entry, so that page_in restores the permissions, copy-on-write marks, ...)
+\end{verbatim}\end{quote}
+  the accessed bit          AArch64 CPUs without hardware access flag management (like the one that qemu
+\begin{quote}\begin{verbatim}
+                            emulates) fault on the first access to a page whose AF bit is clear.  The counter
+                            update clears AF where it counts an access, and arch_user_fault sets it again.
+\end{verbatim}\end{quote}
+  page replacement          update/rescale counters (timer tasks of the book) and ``free one frame''
+  syscalls                  [[page_out]] (508), [[get_free_frames]] (509), [[free_a_frame]] (510)
+Pages whose frame is shared (copy-on-write after fork) are never paged out.
+
+@
+
+The complete file is put together from these parts:
+
+<<arch_swap.c>>=
+<<arch_swap.c: hash>>
+
+<<arch_swap.c: swap_full>>
+
+<<arch_swap.c: arch_swap_init>>
+
+<<arch_swap.c: arch_swap_release_as>>
+
+<<arch_swap.c: console_quiet>>
+
+<<arch_swap.c: swap_io_lock>>
+
+<<arch_swap.c: USER_STACK_TOP>>
+
+<<arch_swap.c: release_page>>
+
+<<arch_swap.c: walk_pages>>
+
+<<arch_swap.c: syscall_page_out>>
+
+<<arch_swap.c: evict_protected>>
+
+<<arch_swap.c: part 12>>
+
+<<arch_swap.c: syscall_get_free_frames>>
+
+<<arch_swap.c: arch_paging_timer_tasks>>
+@
+the book defines [[hash()]] in the header (every file that includes it gets a copy): keep this copy private
+
+<<arch_swap.c: hash>>=
+#define hash arch_swap_hash
+#include "ulix-api.h"
+#undef hash
+#define hash arch_swap_hash
+#include "arch_pte.h"
+
+#define KVA(pa)  ((void *)(0xFFFF000000000000UL + (u64)(pa)))
+#define USER_LO  0x00400000UL
+#define USER_HI  0x80000000UL
+#define PAGE     4096UL
+
+extern u64  arch_as_l0 (addr_space_id id);
+extern u64 *pte_of (u64 l0_pa, u64 va);
+extern u64  alloc_frame (void);
+extern u64  alloc_frame_try (void);
+extern void free_frame (u64 pa);
+extern int  frame_refcount (u64 pa);
+extern int  asid_16bit;
+extern long frames_in_use;
+extern u64  arch_ram_frames (void);
+
+unsigned int mmu_p (addr_space_id id, unsigned int pageno) { return (unsigned int)-1; }        // the book's swap functions call it when no frame number is given
+
+static void flush_page (addr_space_id as, u64 va) {
+  if (asid_16bit) __asm__ volatile ("dsb ishst; tlbi vae1is, %0; dsb ish; isb" :: "r" (((u64)as @<< 48) | (va >> 12)) : "memory");
+  else            __asm__ volatile ("dsb ishst; tlbi vmalle1is; dsb ish; isb" ::: "memory");
+}
+
+static void flush_as (addr_space_id as) {
+  if (asid_16bit) __asm__ volatile ("dsb ishst; tlbi aside1is, %0; dsb ish; isb" :: "r" ((u64)as @<< 48) : "memory");
+  else            __asm__ volatile ("dsb ishst; tlbi vmalle1is; dsb ish; isb" ::: "memory");
+}
+
+@
+set when the disk had no room for another swap file block: until entries are released only pages that already own
+a block of the file can be swapped out (they are written over their old copy)
+
+<<arch_swap.c: swap_full>>=
+static int swap_full = 0;
+static int swap_free_est = -1;               // free blocks of the disk (estimate, -1: unknown)
+static int swap_file_pages = 0;              // how many pages of the swap file are in the file (slots below it need no new disk blocks)
+static int swap_has_data = 0;                // the file has blocks (it is cut back to nothing when no page needs it)
+#define SWAP_RESERVE_BLOCKS 300              // KByte that stay free on the disk for files
+
+static int swap_free_blocks (void) {
+  struct diskfree_query q;
+  extern int blk_disks;
+  q.device = blk_disks >= 2 ? DEV_HDB : DEV_HDA;      // the disk that holds /tmp/swap
+  mx_diskfree (&q);
+  return q.free;
+}
+
+@
+\subsection{swap file}
+
+<<arch_swap.c: arch_swap_init>>=
+void arch_swap_init (void) {
+  paging_lock  = get_new_lock ("paging");        // the book creates these in "initialize kernel global variables"
+  swapper_lock = get_new_lock ("swapper");
+  swap_fd = u_open ("/tmp/swap", O_RDWR, 0);
+  if (swap_fd == -1) swap_fd = u_open ("/tmp/swap", O_RDWR | O_CREAT, 0);   // the file grows with the pages written to it
+  if (swap_fd != -1)
+    printf ("swapon: enabling /tmp/swap (up to %d KByte)\n", MAX_SWAP_FRAMES * 4);
+  else
+    printf ("swapon: error opening /tmp/swap!\n");
+}
+
+@
+give the swap file entries of an address space back (the book never frees them, but its address space ids
+are not reused for another program: here an id is reused by exec and by new processes)
+
+<<arch_swap.c: arch_swap_release_as>>=
+void arch_swap_release_as (addr_space_id as) {
+  for (int i = 0; i < MAX_SWAP_FRAMES; i++)
+    if (paging[i].used && paging[i].as == as) { paging[i].used = false; swap_full = 0; }
+}
+
+@
+Give the blocks of the swap file back once no page lives in it any more.  Called where a process may wait for the disk
+(not while a process ends), at the start of [[fork ()]] and [[pthread_create ()]].
+
+<<arch_swap.c: console_quiet>>=
+static int swap_io_enter (void);
+static void swap_io_leave (int locked);
+extern int console_quiet;                    // kmain.c: the book's file system code prints a line for every block it frees
+void arch_swap_shrink (void) {
+  extern int blk_disks;
+  if (blk_disks >= 2) return;                  // the swap file is on the big second disk: it may keep its size (and the book's unlink does not
+                                               // free all zones of a file that big: it needs double indirect zones)
+  if (swap_fd == -1 || !swap_has_data) return;
+  for (int i = 0; i < MAX_SWAP_FRAMES; i++) if (paging[i].used) return;
+  swap_has_data = 0;
+  int l = swap_io_enter ();
+  for (int i = 0; i < MAX_SWAP_FRAMES; i++) if (paging[i].used) { swap_has_data = 1; swap_io_leave (l); return; }
+  console_quiet = 1;
+  // (the book's mx_ftruncate frees the data zones in the bitmap but leaves the zone pointers and indirect blocks in the
+  // inode: when the file grows again, the old and the new pointers meet.  A new, empty file is the clean way.)
+  u_close (swap_fd);
+  u_unlink ("/tmp/swap");
+  swap_fd = u_open ("/tmp/swap", O_RDWR | O_CREAT, 0);
+  console_quiet = 0;
+  swap_full = 0;
+  swap_free_est = -1;
+  swap_file_pages = 0;
+  swap_io_leave (l);
+}
+
+static int swap_index (int as, int pageno) {
+  for (int i = 0; i < MAX_SWAP_FRAMES; i++)
+    if (paging[i].used && paging[i].as == as && paging[i].pageno == pageno) return i;
+  return -1;
+}
+
+@
+---- [[page_out]] and [[page_in]] ----
+The swap file has one file position for everybody, and a process that waits for the disk lets others run: one
+transfer at a time.
+
+<<arch_swap.c: swap_io_lock>>=
+static lock swap_io_lock = NULL;
+static int swap_io_enter (void) {
+  if (current_task <= 1) return 0;
+  if (!swap_io_lock) swap_io_lock = get_new_lock ("swap io");
+  mutex_lock (swap_io_lock);
+  return 1;
+}
+static void swap_io_leave (int locked) { if (locked) mutex_unlock (swap_io_lock); }
+
+int page_out (int as, int pageno) {
+  u64 l0 = arch_as_l0 (as), va = (u64)pageno @<< 12;
+  if (!l0 || swap_fd == -1 || va < USER_LO || va >= USER_HI) return -1;
+  u64 *e = pte_of (l0, va);
+  if (!e || !(*e & PTE_VALID)) return -1;                  // fail: page not found
+  u64 pa = *e & PTE_ADDR;
+  if (frame_refcount (pa) != 1) return -1;                 // shared with another process (copy-on-write)
+  // The swap file grows with the pages written to it (the disk is small).  It must not take the whole disk: ordinary files
+  // need room, too.  A page that already owns a block of the file is written over it and needs nothing.
+  int next_slot = 0;                                       // the slot write_swap_page () takes for a new page: the first free one
+  while (next_slot < MAX_SWAP_FRAMES && paging[next_slot].used) next_slot++;
+  if (swap_index (as, pageno) < 0 && next_slot >= swap_file_pages) {      // (a slot inside the file is written over: no new blocks)
+    // (counting the free blocks reads the whole block bitmap: measure once, then count along, measure again when it gets tight)
+    if (swap_free_est < 0 || swap_free_est < SWAP_RESERVE_BLOCKS + 8) swap_free_est = swap_free_blocks ();
+    if (swap_free_est < SWAP_RESERVE_BLOCKS + 8) { swap_full = 1; return -1; }
+    swap_free_est -= 5;                                    // a page is 4 blocks, plus a block for the file's indirect table now and then
+  }
+  int l = swap_io_enter ();
+  e = pte_of (l0, va);                                     // (the tables may have changed while we waited)
+  if (!e || !(*e & PTE_VALID) || (*e & PTE_ADDR) != pa) { swap_io_leave (l); return -1; }
+  if (write_swap_page (as, pageno, (int)(pa >> 12)) != 0) { swap_io_leave (l); return -1; }
+  int index = swap_index (as, pageno);
+  if (index < 0 || u_lseek (swap_fd, 0, SEEK_END) < (index + 1) * (int)PAGE) {   // the disk is full
+    if (index >= 0) paging[index].used = false;
+    swap_io_leave (l);
+    swap_full = 1;
+    return -1;
+  }
+  swap_io_leave (l);
+  swap_has_data = 1;
+  if (index + 1 > swap_file_pages) swap_file_pages = index + 1;
+  *e = (*e & ~PTE_VALID) | PTE_SWAPPED;                    // mark page non-present and paged-out
+  flush_page (as, va);
+  free_frame (pa);                                         // the frame is free again
+  return 0;
+}
+
+int page_in (int as, int pageno) {
+  u64 l0 = arch_as_l0 (as), va = (u64)pageno @<< 12;
+  if (!l0 || swap_fd == -1) return -1;
+  u64 *e = pte_of (l0, va);
+  if (!e || (*e & PTE_VALID) || !(*e & PTE_SWAPPED)) return -1;      // fail: page was not paged out
+  if (swap_index (as, pageno) < 0) return -1;
+  u64 pa = alloc_frame_try ();                             // reserve a frame
+  if (!pa) return -1;
+  int l = swap_io_enter ();
+  e = pte_of (l0, va);
+  if (!e || (*e & PTE_VALID)) {                            // somebody else brought the page back while we waited
+    swap_io_leave (l);  free_frame (pa);
+    return (e && (*e & PTE_VALID)) ? 0 : -1;
+  }
+  read_swap_page (as, pageno, (int)(pa >> 12));
+  swap_io_leave (l);
+  e = pte_of (l0, va);
+  if (!e || (*e & PTE_VALID)) { free_frame (pa); return (e && (*e & PTE_VALID)) ? 0 : -1; }
+  *e = pa | ((*e & ~(PTE_ADDR | PTE_SWAPPED)) | PTE_VALID | PTE_AF);
+  __asm__ volatile ("dsb ishst; isb" ::: "memory");
+  return 0;
+}
+
+@
+Fault handler part of the book: ``check if page was paged out''.  Also resolves the access flag faults.
+Returns 1 if the instruction can be repeated.
+The user mode stack grows by a page when the program touches the page just below it (``page fault handler:
+enlarge user mode stack'' of the book; the stack is limited to 64 MByte and must not run into the heap).
+
+<<arch_swap.c: USER_STACK_TOP>>=
+#define USER_STACK_TOP   0x80000000UL
+#define MAX_STACK        (64UL @<< 20)
+extern int map_page_in (u64 l0_pa, u64 va, u64 pa, u64 flags);
+
+static int grow_stack (u64 l0, u64 va) {
+  address_space *as = &address_spaces[current_as];
+  u64 bottom = USER_STACK_TOP - as->stacksize;
+  if (va > USER_STACK_TOP || va + PAGE < bottom) return 0;                  // not just below the stack
+  if (as->stacksize >= MAX_STACK || bottom - PAGE < as->memend + PAGE) return 0;
+  u64 pa = alloc_frame_try ();
+  if (!pa) return 0;
+  if (map_page_in (l0, bottom - PAGE, pa, PAGE_URW) != 0) { free_frame (pa); return 0; }
+  as->stacksize += PAGE;
+  return 1;
+}
+
+int arch_user_fault (u64 va) {
+  if (va < USER_LO || va >= USER_HI) return 0;
+  u64 l0 = arch_as_l0 (current_as);
+  if (!l0) return 0;
+  u64 *e = pte_of (l0, va);
+  if (!e || (!(*e & PTE_VALID) && !(*e & PTE_SWAPPED))) return grow_stack (l0, va);
+  if (!(*e & PTE_VALID)) return page_in (current_as, va >> 12) == 0;
+  if (!(*e & PTE_AF)) *e |= PTE_AF;
+  flush_page (current_as, va);
+  return 1;     // (if the entry is fine already, another thread of the process on another CPU was faster: just repeat the access)
+}
+
+@
+[[release_page]] of the book: take a page out of the current address space and free its frame (used by the
+kernel shell command rp through [[release_page_range]], which is the book's)
+
+<<arch_swap.c: release_page>>=
+void release_page (unsigned int pageno) {
+  u64 l0 = arch_as_l0 (current_as), va = (u64)pageno @<< 12;
+  if (!l0 || va < USER_LO || va >= USER_HI) return;
+  u64 *e = pte_of (l0, va);
+  if (!e || !(*e & (PTE_VALID | PTE_SWAPPED))) return;                     // no such page
+  u64 pa = *e & PTE_ADDR;
+  int present = (*e & PTE_VALID) != 0;
+  *e = 0;
+  flush_page (current_as, va);
+  if (present) free_frame (pa);
+}
+
+@
+---- page replacement: counters ----
+visit every valid user page of an address space; with 'count' the access flag is evaluated and cleared,
+otherwise the page with the lowest counter is searched
+
+<<arch_swap.c: walk_pages>>=
+static void walk_pages (u64 table_pa, int lvl, u64 prefix, addr_space_id as, int count, int *pick_pageno, int *themin) {
+  u64 *t = KVA (table_pa);
+  for (int i = 0; i < 512; i++) {
+    u64 va = prefix | ((u64)i @<< (39 - 9 * lvl));
+    if (va >= USER_HI) return;
+    u64 e = t[i];
+    if (!(e & PTE_VALID)) continue;
+    if (lvl < 3) { walk_pages (e & PTE_ADDR, lvl + 1, va, as, count, pick_pageno, themin); continue; }
+    int pageno = (int)(va >> 12);
+    int index = hash ((as @<< 20) | pageno, PG_MAX_COUNTERS);
+    if (count) {
+      if (e & PTE_AF) {                                    // accessed since the last time
+        t[i] = e & ~PTE_AF;
+        if (index < PG_MAX_COUNTERS) { counter_table[index].used = true; counter_table[index].count++; }
+      }
+    } else if (va >= USER_LO && frame_refcount (e & PTE_ADDR) == 1) {
+      int c = counter_table[index].used ? counter_table[index].count : 0;
+      if (*pick_pageno < 0 || c < *themin) { *pick_pageno = pageno; *themin = c; }
+    }
+  }
+}
+
+void arch_update_counters (void) {
+  if (!mutex_try_lock (paging_lock)) return;
+  for (int as = 2; as < MAX_ADDR_SPACES; as++) {
+    if (address_spaces[as].status == AS_FREE || !arch_as_l0 (as)) continue;
+    int dummy_page = -1, dummy_min = 0;
+    walk_pages (arch_as_l0 (as), 0, 0, as, 1, &dummy_page, &dummy_min);
+    flush_as (as);                                         // the cleared access flags must be noticed
+  }
+  mutex_unlock (paging_lock);
+}
+
+void arch_rescale_counters (void) {
+  int themax = 0;
+  if (!mutex_try_lock (paging_lock)) return;
+  for (int index = 0; index < PG_MAX_COUNTERS; index++)
+    if (counter_table[index].used && counter_table[index].count > themax) themax = counter_table[index].count;
+  if (themax > PG_COUNTER_THRESHOLD) {
+    for (int index = 0; index < PG_MAX_COUNTERS; index++)
+      if (counter_table[index].used) { counter_table[index].count /= 2; counter_table[index].count += 1; }
+  }
+  mutex_unlock (paging_lock);
+}
+
+@
+\subsection{system calls}
+
+<<arch_swap.c: syscall_page_out>>=
+void syscall_page_out (context_t *r) {
+  // ebx: page number
+  eax_return (page_out (current_as, r->ebx));
+}
+
+@
+``page replacement: free one frame'': page out the page with the lowest counter.  Returns 0 if a frame was freed.
+(Also called when the frame allocator runs dry; the lock serializes the callers, and a thread that is already
+swapping does not start a second round.)
+[[fork ()]] brings back every swapped-out page of the parent before it copies the tables; if the parent's own pages could
+be chosen to [[make room]], the two would chase each other forever.  So the parent is off limits while it is cloned.
+
+<<arch_swap.c: evict_protected>>=
+static addr_space_id evict_protected = 0;
+void arch_evict_protect (addr_space_id as) { evict_protected = as; }
+
+int arch_evict_one (void) {
+  static thread_id owner = 0;
+  if (swap_fd == -1 || !paging_lock || owner == current_task) return -1;
+  if (current_task > 1) mutex_lock (paging_lock);
+  else if (!mutex_try_lock (paging_lock)) return -1;
+  owner = current_task;
+  addr_space_id pick_as = -1;
+  int pick_pageno = -1, themin = 0, r = -1;
+  for (int as = 2; as < MAX_ADDR_SPACES; as++) {
+    if (address_spaces[as].status != AS_USED || !arch_as_l0 (as) || as == evict_protected) continue;
+    int p = -1, m = 0;
+    walk_pages (arch_as_l0 (as), 0, 0, as, 0, &p, &m);
+    if (p >= 0 && (pick_as == -1 || m < themin)) { pick_as = as; pick_pageno = p; themin = m; }
+  }
+  if (swap_full) {                                            // the file cannot grow: use pages that have a block in it already
+    pick_as = -1;
+    for (int i = 0; i < MAX_SWAP_FRAMES && pick_as == -1; i++) {
+      if (!paging[i].used) continue;
+      u64 l0 = arch_as_l0 (paging[i].as);
+      u64 *e = l0 ? pte_of (l0, (u64)paging[i].pageno @<< 12) : 0;
+      if (paging[i].as != evict_protected && e && (*e & PTE_VALID) && frame_refcount (*e & PTE_ADDR) == 1) { pick_as = paging[i].as; pick_pageno = paging[i].pageno; }
+    }
+  }
+  if (pick_as != -1) r = page_out (pick_as, pick_pageno);
+  owner = 0;
+  mutex_unlock (paging_lock);
+  return r;
+}
+
+void syscall_free_a_frame (context_t *r) {
+  if (arch_evict_one () != 0) printf ("\nERROR: cannot pick a page to evict!\n");
+}
+
+@
+ARM64 only (the [[x86]] programs use the constant [[MEM_SIZE]]): how many frames does the machine have?
+
+<<arch_swap.c: part 12>>=
+void syscall_total_frames (context_t *r) { eax_return ((long)arch_ram_frames ()); }
+
+@
+the swapper blocks on [[swapper_lock]], which the timer releases every 0.1 seconds
+
+<<arch_swap.c: syscall_get_free_frames>>=
+void syscall_get_free_frames (context_t *r) {
+  mutex_lock (swapper_lock);
+  eax_return ((long)arch_ram_frames () - frames_in_use);
+}
+
+@
+timer tasks of the book that concern paging; called from the timer interrupt
+
+<<arch_swap.c: arch_paging_timer_tasks>>=
+void arch_paging_timer_tasks (void) {
+  if (!scheduler_is_active) return;
+  if ((system_ticks % 10) == 0) {
+    arch_update_counters ();
+    if (swapper_lock->bq.next) mutex_unlock (swapper_lock);
+  }
+  if ((system_ticks % 50) == 5) arch_rescale_counters ();
+}

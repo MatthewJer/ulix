@@ -1,0 +1,1570 @@
+\chapter{User Programs and Their Library}
+\label{ch:userland}
+
+The 59 programs of the book's \texttt{lib-build/tools} are compiled unchanged for AArch64. This chapter holds what is
+specific to the port: the small user library and start code of the test programs, the test programs themselves, and the new
+network tools (\texttt{ping}, \texttt{ifconfig}, \texttt{route}, \texttt{dhclient}) and \texttt{shutdown}, which are named and
+behave like their BSD counterparts.
+
+@
+\section{Tiny user-space library (system calls and printf)}
+\label{src:user:ulib.h}
+
+
+@
+
+The complete file is put together from these parts:
+
+<<user/ulib.h>>=
+<<user/ulib.h: ULIB_H>>
+@
+
+<<user/ulib.h: ULIB_H>>=
+#ifndef ULIB_H
+#define ULIB_H
+
+typedef unsigned long u64;
+typedef unsigned int  u32;
+typedef unsigned char u8;
+
+// System call ABI (the same convention as the x86 version of Ulix, with the registers renamed):
+// svc #0; x0 = system call number (afterwards: the result), x1..x5 = arguments.
+// The numbers are those of the book (__NR_* in ulix-book.nw).
+static inline long syscall3 (long nr, long a, long b, long c) {
+  register long x0 __asm__ ("x0") = nr;
+  register long x1 __asm__ ("x1") = a;
+  register long x2 __asm__ ("x2") = b;
+  register long x3 __asm__ ("x3") = c;
+  __asm__ volatile ("svc #0" : "+r" (x0) : "r" (x1), "r" (x2), "r" (x3) : "memory");
+  return (int)x0;                          // the kernel returns 32-bit values
+}
+
+#define SYS_exit     1
+#define SYS_fork     2
+#define SYS_read     3
+#define SYS_write    4
+#define SYS_open     5
+#define SYS_close    6
+#define SYS_waitpid  7
+#define SYS_execve  11
+#define SYS_lseek   19
+#define SYS_getpid  20
+#define SYS_getppid 64
+#define SYS_brk     45
+#define SYS_free_frames 509
+#define SYS_kill    37
+#define SYS_signal  48
+#define SYS_resign  66
+#define SYS_gettid  21
+#define SYS_clrscr      512
+#define SYS_get_xy      513
+#define SYS_set_xy      514
+#define SYS_read_screen 515
+#define SYS_write_screen 516
+#define SYS_page_out    508
+#define SYS_free_a_frame 510
+#define SYS_pthread_create 506
+#define SYS_pthread_exit   507
+#define SYS_mutex_init     517
+#define SYS_mutex_lock     518
+#define SYS_mutex_unlock   519
+#define SYS_mutex_destroy  520
+#define SYS_mutex_trylock  526
+
+static inline long write (int fd, const void *buf, u64 n)  { return syscall3 (SYS_write, fd, (long)buf, n); }
+static inline int  getpid (void)                           { return syscall3 (SYS_getpid, 0, 0, 0); }
+static inline int  getppid (void)                          { return syscall3 (SYS_getppid, 0, 0, 0); }
+static inline void yield (void)                            { syscall3 (SYS_resign, 0, 0, 0); }
+static inline void exit (int code)                         { syscall3 (SYS_exit, code, 0, 0); for (;;) ; }
+static inline int  fork (void)                             { return syscall3 (SYS_fork, 0, 0, 0); }
+static inline int  waitpid (int pid, int *status, int opt) { return syscall3 (SYS_waitpid, pid, (long)status, opt); }
+static inline int  execv (const char *path, char *const argv[]) { return syscall3 (SYS_execve, (long)path, (long)argv, 0); }
+static inline int  open (const char *path, int flags)      { return syscall3 (SYS_open, (long)path, flags, 0); }
+static inline long read (int fd, void *buf, u64 n)         { return syscall3 (SYS_read, fd, (long)buf, n); }
+typedef void (*sighandler_t) (int);
+#define SIG_DFL ((sighandler_t)0)
+#define SIG_IGN ((sighandler_t)1)
+#define SIG_ERR ((sighandler_t)-1)
+#define SIGKILL   9
+#define SIGTERM  15
+#define SIGSTOP  17
+#define SIGCONT  19
+#define SIGUSR1  30
+#define SIGUSR2  31
+static inline sighandler_t signal (int sig, sighandler_t f) { return (sighandler_t)syscall3 (SYS_signal, sig, (long)f, 0); }
+static inline int  kill (int pid, int sig)                  { return syscall3 (SYS_kill, pid, sig, 0); }
+static inline void *sbrk (int incr)                         { return (void *)(long)syscall3 (SYS_brk, incr, 0, 0); }
+static inline int  get_free_frames (void)                   { return syscall3 (SYS_free_frames, 0, 0, 0); }
+static inline int  close (int fd)                          { return syscall3 (SYS_close, fd, 0, 0); }
+static inline int  lseek (int fd, int off, int whence)     { return syscall3 (SYS_lseek, fd, off, whence); }
+
+static inline int  gettid (void)                            { return syscall3 (SYS_gettid, 0, 0, 0); }
+static inline int  pthread_create (void (*f) (void))        { return syscall3 (SYS_pthread_create, (long)f, 0, 0); }
+static inline void pthread_exit (void)                      { syscall3 (SYS_pthread_exit, 0, 0, 0); for (;;) ; }
+static inline int  mutex_init (int *m)                      { return syscall3 (SYS_mutex_init, (long)m, 0, 0); }
+static inline int  mutex_lock (int *m)                      { return syscall3 (SYS_mutex_lock, (long)m, 0, 0); }
+static inline int  mutex_unlock (int *m)                    { return syscall3 (SYS_mutex_unlock, (long)m, 0, 0); }
+static inline int  mutex_trylock (int *m)                   { return syscall3 (SYS_mutex_trylock, (long)m, 0, 0); }
+static inline int  mutex_destroy (int *m)                   { return syscall3 (SYS_mutex_destroy, (long)m, 0, 0); }
+
+static inline int  page_out (void *addr)                    { return syscall3 (SYS_page_out, (long)addr >> 12, 0, 0); }
+static inline void free_a_frame (void)                      { syscall3 (SYS_free_a_frame, 0, 0, 0); }
+
+static inline void clrscr (void)                            { syscall3 (SYS_clrscr, 0, 0, 0); }
+static inline void get_xy (char *x, char *y)                { syscall3 (SYS_get_xy, (long)x, (long)y, 0); }
+static inline void set_xy (char x, char y)                  { syscall3 (SYS_set_xy, x, y, 0); }
+static inline void read_screen (char *buf)                  { syscall3 (SYS_read_screen, (long)buf, 0, 0); }
+static inline void write_screen (char *buf)                 { syscall3 (SYS_write_screen, (long)buf, 0, 0); }
+
+int  strlen (const char *s);
+int  strcmp (const char *a, const char *b);
+void printf (const char *fmt, ...);        // %s %c %d %u %x, width / 0-padding
+
+#endif
+
+@
+\section{\texttt{user/ulib.c}}
+\label{src:user:ulib.c}
+
+@
+
+The complete file is put together from these parts:
+
+<<user/ulib.c>>=
+<<user/ulib.c: includes>>
+@
+
+<<user/ulib.c: includes>>=
+#include "ulib.h"
+
+int strlen (const char *s) { int n = 0; while (s[n]) n++; return n; }
+
+int strcmp (const char *a, const char *b) {
+  while (*a && *a == *b) { a++; b++; }
+  return (u8)*a - (u8)*b;
+}
+
+struct out { char buf[256]; int n; };
+static void put (struct out *o, char c) { if (o->n < (int)sizeof o->buf) o->buf[o->n++] = c; }
+
+static void putnum (struct out *o, u64 v, int base, int width, char pad) {
+  char t[24]; int n = 0;
+  do { t[n++] = "0123456789abcdef"[v % base]; v /= base; } while (v);
+  while (width > n) { put (o, pad); width--; }
+  while (n) put (o, t[--n]);
+}
+
+void printf (const char *fmt, ...) {
+  struct out o; o.n = 0;
+  __builtin_va_list ap;
+  __builtin_va_start (ap, fmt);
+  for (; *fmt; fmt++) {
+    if (*fmt != '%') { put (&o, *fmt); continue; }
+    fmt++;
+    char pad = ' '; int width = 0;
+    if (*fmt == '0') { pad = '0'; fmt++; }
+    while (*fmt >= '0' && *fmt <= '9') width = width * 10 + (*fmt++ - '0');
+    switch (*fmt) {
+      case 's': { const char *s = __builtin_va_arg (ap, const char *); while (*s) put (&o, *s++); break; }
+      case 'c': put (&o, (char)__builtin_va_arg (ap, int)); break;
+      case 'd': { int v = __builtin_va_arg (ap, int); if (v < 0) { put (&o, '-'); v = -v; }
+                  putnum (&o, v, 10, width, pad); break; }
+      case 'u': putnum (&o, __builtin_va_arg (ap, u32), 10, width, pad); break;
+      case 'x': putnum (&o, __builtin_va_arg (ap, u32), 16, width, pad); break;
+      case '%': put (&o, '%'); break;
+      default:  put (&o, '%'); put (&o, *fmt); break;
+    }
+  }
+  __builtin_va_end (ap);
+  write (1, o.buf, o.n);
+}
+
+@
+\section{Start of every user program.  The kernel (u\_execv / arch\_start\_user) leaves  [argc][argv]}
+\label{src:user:crt0.S}
+
+at the top of the stack; main (argc, argv) is called as an ordinary function.
+
+@
+
+The complete file is put together from these parts:
+
+<<user/crt0.S>>=
+<<user/crt0.S: _start>>
+@
+
+<<user/crt0.S: _start>>=
+        .section .text.start
+        .global _start
+_start:
+        ldp     x0, x1, [sp]            // x0 = argc, x1 = argv
+        bl      main                    // returns the exit status in x0
+        mov     x1, x0                  // exit (status): system call 1, argument in x1
+        mov     x0, #1
+        svc     #0
+1:      b       1b
+
+@
+\section{Self-checking test program: exercises .text, .rodata, .data, .bss and the stack}
+\label{src:user:hello.c}
+
+Exit status = number of failed checks.
+
+@
+
+The complete file is put together from these parts:
+
+<<user/hello.c>>=
+<<user/hello.c: includes>>
+@
+
+<<user/hello.c: includes>>=
+#include "ulib.h"
+
+static const char greeting[] = "hello from an AArch64 ELF loaded from the Minix disk";   // .rodata
+static int table[100] = { 1, 2, 3, 4, 5 };                                                // .data
+static char big[9000];                                                                    // .bss, > 2 pages
+
+static int fails = 0;
+#define CHECK(c, msg) do { if (c) printf ("  user ok:   %s\n", msg); \
+                           else { printf ("  user FAIL: %s\n", msg); fails++; } } while (0)
+
+static int depth (int n) { volatile char pad[64]; pad[0] = n; return n == 0 ? 0 : 1 + depth (n - 1) + pad[0] * 0; }
+
+int main (int argc, char **argv) {
+  printf ("%s\n", greeting);
+  printf ("pid %d, argc=%d\n", getpid (), argc);
+  for (int i = 0; i < argc; i++) printf ("argv[%d]=%s\n", i, argv[i]);
+
+  CHECK (argc == 3 && !strcmp (argv[1], "foo") && !strcmp (argv[2], "bar"), "argc/argv delivered on the stack");
+  int s = 0; for (int i = 0; i < 100; i++) s += table[i];
+  CHECK (s == 15, ".data initialised from the ELF file (sum of table is 15)");
+  table[50] = 7; CHECK (table[50] == 7, ".data is writable");
+  int z = 0; for (int i = 0; i < (int)sizeof big; i++) z |= big[i];
+  CHECK (z == 0, ".bss (9000 bytes, three pages) is zero-filled");
+  big[8999] = 'x'; CHECK (big[8999] == 'x', ".bss is writable");
+  CHECK (strlen (greeting) == 52, ".rodata string intact");
+  CHECK (depth (40) == 40, "recursion uses the user stack");
+  yield ();
+  return fails;
+}
+
+@
+\section{Cat FILE: reads a file from the Minix disk with open/read/close and writes it to the console}
+\label{src:user:cat.c}
+
+
+@
+
+The complete file is put together from these parts:
+
+<<user/cat.c>>=
+<<user/cat.c: includes>>
+@
+
+<<user/cat.c: includes>>=
+#include "ulib.h"
+
+int main (int argc, char **argv) {
+  if (argc < 2) { printf ("usage: cat FILE\n"); return 2; }
+  int fd = open (argv[1], 0);
+  if (fd < 0) { printf ("cat: cannot open %s\n", argv[1]); return 1; }
+  char buf[200];
+  long n, total = 0;
+  while ((n = read (fd, buf, sizeof buf)) > 0) { write (1, buf, n); total += n; }
+  printf ("\n-- %d bytes\n", (int)total);
+  close (fd);
+  return 0;
+}
+
+@
+\section{Writes to its own code page: the kernel must kill this process (permission fault)}
+\label{src:user:crash.c}
+
+
+@
+
+The complete file is put together from these parts:
+
+<<user/crash.c>>=
+<<user/crash.c: includes>>
+@
+
+<<user/crash.c: includes>>=
+#include "ulib.h"
+
+int main (int argc, char **argv) {
+  printf ("crash: about to write to my own .text\n");
+  *(volatile int *)main = 0;
+  printf ("crash: not reached\n");
+  return 0;
+}
+
+@
+\section{Tests fork, exec and waitpid (system calls of the book's kernel).  Exit status = failed checks}
+\label{src:user:forktest.c}
+
+
+@
+
+The complete file is put together from these parts:
+
+<<user/forktest.c>>=
+<<user/forktest.c: includes>>
+@
+
+<<user/forktest.c: includes>>=
+#include "ulib.h"
+
+static int fails = 0;
+#define CHECK(c, msg) do { if (c) printf ("  user ok:   %s\n", msg); \
+                           else { printf ("  user FAIL: %s\n", msg); fails++; } } while (0)
+
+static int shared = 5;                      // .data: every process has its own copy
+
+int main (int argc, char **argv) {
+  int status = 12345, pid;
+  printf ("forktest: pid %d, parent %d\n", getpid (), getppid ());
+
+  // 1. fork, exit status, separate address spaces
+  pid = fork ();
+  if (pid == 0) {
+    shared = 99;
+    printf ("child: pid %d, parent %d, shared = %d\n", getpid (), getppid (), shared);
+    exit (7);
+  }
+  CHECK (pid > 0, "fork returns the child's pid in the parent");
+  CHECK (waitpid (pid, &status, 0) == pid, "waitpid returns the pid of the child");
+  CHECK (status == 7, "exit status 7 of the child arrives");
+  CHECK (shared == 5, "a write in the child did not change the parent (separate address spaces)");
+
+  // 2. fork + exec
+  pid = fork ();
+  if (pid == 0) {
+    char *args[] = { "hello64", "foo", "bar", 0 };
+    execv ("/hello64", args);
+    printf ("exec failed\n");
+    exit (99);
+  }
+  waitpid (pid, &status, 0);
+  CHECK (status == 0, "child exec'ed /hello64, which reports 0 failed checks");
+
+  // 3. several children at the same time, they take turns
+  int pids[3];
+  for (int i = 0; i < 3; i++) {
+    pids[i] = fork ();
+    if (pids[i] == 0) {
+      for (int k = 0; k < 3; k++) { printf ("worker %d round %d\n", i, k); yield (); }
+      exit (10 + i);
+    }
+  }
+  int ok = 1;
+  for (int i = 0; i < 3; i++) {
+    waitpid (pids[i], &status, 0);
+    if (status != 10 + i) ok = 0;
+  }
+  CHECK (ok, "three children ran concurrently, each exit status arrived");
+
+  // 4. a child that crashes is killed, the parent goes on
+  pid = fork ();
+  if (pid == 0) {
+    char *args[] = { "crash64", 0 };
+    execv ("/crash64", args);
+    exit (99);
+  }
+  waitpid (pid, &status, 0);
+  CHECK (status == -1, "the crashing child was killed by the kernel (exit status -1)");
+
+  // 5. exec of a missing file fails, the process keeps running
+  pid = fork ();
+  if (pid == 0) {
+    char *args[] = { "x", 0 };
+    int r = execv ("/nonexistent", args);
+    exit (r == -1 ? 42 : 43);
+  }
+  waitpid (pid, &status, 0);
+  CHECK (status == 42, "execv of a missing file returns -1");
+
+  // 6. grandchild
+  pid = fork ();
+  if (pid == 0) {
+    int g = fork ();
+    if (g == 0) exit (3);
+    int st = 0;
+    waitpid (g, &st, 0);
+    exit (st + 20);
+  }
+  waitpid (pid, &status, 0);
+  CHECK (status == 23, "grandchild: exit status 3 passed through the child (3 + 20)");
+
+  return fails;
+}
+
+@
+\section{Tests signals: handlers that interrupt a computation at arbitrary points, SIG\_IGN, the default}
+\label{src:user:sigtest.c}
+
+action of [[kill()]], and SIGSTOP / SIGCONT.  Exit status = number of failed checks.
+
+@
+
+The complete file is put together from these parts:
+
+<<user/sigtest.c>>=
+<<user/sigtest.c: includes>>
+
+<<user/sigtest.c: __attribute__>>
+@
+
+<<user/sigtest.c: includes>>=
+#include "ulib.h"
+
+static int fails = 0;
+#define CHECK(c, msg) do { if (c) printf ("  user ok:   %s\n", msg); \
+                           else { printf ("  user FAIL: %s\n", msg); fails++; } } while (0)
+
+static volatile int got = 0, last_signal = 0;
+// (atomic: on several CPUs the signals can arrive faster than a handler runs, so that handlers interrupt each other; a
+// plain got++ would then lose counts. An exception return clears the exclusive monitor, so the loop of the atomic add retries.)
+static void handler (int sig) { __sync_fetch_and_add (&got, 1); last_signal = sig; }
+
+@
+some arithmetic that uses many registers: any register lost across a signal changes the result
+
+<<user/sigtest.c: __attribute__>>=
+static unsigned __attribute__ ((noinline)) work (int n) {
+  unsigned s = 1, a = 3, b = 5, c = 7;
+  for (int i = 0; i < n; i++) {
+    s = s * 31 + (unsigned)i * 7 + (s >> 3);
+    a += s ^ b;  b += a >> 2;  c ^= a + b + s;
+    s += c & 0xff;
+  }
+  return s ^ a ^ b ^ c;
+}
+
+#define N 8000000
+
+static int file_size (int fd) { return lseek (fd, 0, 2); }       // SEEK_END
+
+int main (int argc, char **argv) {
+  int status = -12345, pid;
+
+  // 1. a handler interrupts a running computation, which still gets the right result
+  signal (SIGUSR1, handler);                       // inherited by the child
+  pid = fork ();
+  if (pid == 0) {
+    unsigned r = work (N);
+    int n = got > 63 ? 63 : got;                    // number of handler calls in bits 23..28
+    exit ((int)((r & 0x7fffff) | ((unsigned)n @<< 23)));
+  }
+  for (int i = 0; i < 30; i++) { kill (pid, SIGUSR1); yield (); }
+  waitpid (pid, &status, 0);
+  unsigned expect = work (N) & 0x7fffff;
+  CHECK ((status >> 23) >= 2, "the handler ran several times (before the first instruction and in the middle of the computation)");
+  CHECK ((unsigned)(status & 0x7fffff) == expect, "the interrupted computation delivered the exact result");
+
+  // 2. SIG_IGN: the signal is dropped, the process goes on
+  signal (SIGUSR2, SIG_IGN);                       // inherited by the child
+  pid = fork ();
+  if (pid == 0) { work (200000); exit (5); }
+  for (int i = 0; i < 5; i++) { kill (pid, SIGUSR2); yield (); }
+  waitpid (pid, &status, 0);
+  CHECK (status == 5, "an ignored signal does not disturb the child");
+
+  // 3. default action: no handler, so the process is killed
+  pid = fork ();
+  if (pid == 0) { for (;;) yield (); }
+  yield ();
+  CHECK (kill (pid, SIGTERM) == 0, "kill (SIGTERM) on a process without handler");
+  waitpid (pid, &status, 0);
+  CHECK (kill (pid, 0) == -1, "the process is gone afterwards");
+
+  // 4. SIGSTOP / SIGCONT, observed through a file the child appends to
+  int log = open ("/progress.txt", 0x202);         // O_CREAT | O_RDWR
+  pid = fork ();
+  if (pid == 0) {
+    int f = open ("/progress.txt", 0x202);
+    for (;;) { write (f, "x", 1); yield (); }
+  }
+  while (file_size (log) < 5) yield ();
+  kill (pid, SIGSTOP);
+  for (int i = 0; i < 40; i++) yield ();            // (a child on another CPU stops itself at its next entry into the kernel)
+  int s1 = file_size (log);
+  for (int i = 0; i < 40; i++) yield ();
+  int s2 = file_size (log);
+  CHECK (s1 >= 5 && s2 == s1, "a stopped process makes no progress");
+  kill (pid, SIGCONT);
+  for (int i = 0; i < 40; i++) yield ();
+  int s3 = file_size (log);
+  CHECK (s3 > s2, "after SIGCONT it goes on");
+  kill (pid, SIGKILL);
+  // (a child that runs on another CPU when the signal arrives ends itself, so the first waitpid () may still return it)
+  int w = waitpid (pid, &status, 0);
+  if (w == pid) w = waitpid (pid, &status, 0);
+  CHECK (w == -1, "SIGKILL removes the process (nothing is left to wait for)");
+  close (log);
+
+  return fails;
+}
+
+@
+\section{Console test: reads lines from the console (the UART) with read (0, ...), echoes them, and finally}
+\label{src:user:contest.c}
+
+spins until the user presses Ctrl-C.
+
+@
+
+The complete file is put together from these parts:
+
+<<user/contest.c>>=
+<<user/contest.c: includes>>
+@
+
+<<user/contest.c: includes>>=
+#include "ulib.h"
+
+static int read_line (char *line, int max) {
+  int n = 0;
+  for (;;) {
+    char c = 0;
+    read (0, &c, 1);                       // returns 0 when we were woken up without a character
+    if (c == 0) continue;
+    if (c == '\n') { printf ("\n"); line[n] = 0; return n; }
+    if (c == '\b') { if (n > 0) { n--; printf ("\b \b"); } continue; }
+    if (n < max - 1) { line[n++] = c; printf ("%c", c); }
+  }
+}
+
+int main (int argc, char **argv) {
+  char line[80];
+  printf ("contest: pid %d is reading from the console\n", getpid ());
+  for (int round = 1; round <= 2; round++) {
+    printf ("prompt%d> ", round);
+    read_line (line, sizeof line);
+    printf ("you typed: [%s]\n", line);
+  }
+  printf ("now spinning, press Ctrl-C\n");
+  for (;;) yield ();
+  return 0;
+}
+
+@
+\section{Copy-on-write fork: the child shares the pages of the parent until somebody writes}
+\label{src:user:cowtest.c}
+
+The number of free frames of the system tells how many pages were really copied.
+
+@
+
+The complete file is put together from these parts:
+
+<<user/cowtest.c>>=
+<<user/cowtest.c: includes>>
+@
+
+<<user/cowtest.c: includes>>=
+#include "ulib.h"
+
+static int fails = 0;
+#define CHECK(c, msg) do { if (c) printf ("  user ok:   %s\n", msg); \
+                           else { printf ("  user FAIL: %s\n", msg); fails++; } } while (0)
+
+#define PAGES 64
+
+int main (int argc, char **argv) {
+  char *buf = sbrk (PAGES * 4096);
+  CHECK ((long)buf > 0, "sbrk gives 64 pages (256 KByte)");
+  for (int i = 0; i < PAGES; i++) { buf[i * 4096] = i + 1; buf[i * 4096 + 4095] = 'z'; }
+
+  int before = get_free_frames ();
+  int pid = fork ();
+  if (pid == 0) {
+    int after_fork = get_free_frames ();
+    CHECK (before - after_fork < 16, "fork copied no data pages (only page tables and the kernel stack)");
+
+    int sum = 0;
+    for (int i = 0; i < PAGES; i++) sum += buf[i * 4096];
+    int after_read = get_free_frames ();
+    CHECK (sum == PAGES * (PAGES + 1) / 2, "the child sees the data of the parent");
+    CHECK (after_fork == after_read, "reading does not copy anything");
+
+    for (int i = 0; i < PAGES; i++) buf[i * 4096] = 100 + i;
+    int after_write = get_free_frames ();
+    CHECK (after_read - after_write == PAGES, "writing one byte per page copies exactly the 64 pages");
+
+    int ok = 1;
+    for (int i = 0; i < PAGES; i++) if (buf[i * 4096] != 100 + i || buf[i * 4096 + 4095] != 'z') ok = 0;
+    CHECK (ok, "the copies hold the new and the untouched old bytes");
+    exit (fails);
+  }
+
+  int status = -1;
+  waitpid (pid, &status, 0);
+  CHECK (status == 0, "the child's checks all passed");
+  int ok = 1;
+  for (int i = 0; i < PAGES; i++) if (buf[i * 4096] != i + 1 || buf[i * 4096 + 4095] != 'z') ok = 0;
+  CHECK (ok, "the parent still has its own data (the child's writes went to copies)");
+
+  // the parent writes to pages that are no longer shared: no copy needed any more
+  int f1 = get_free_frames ();
+  for (int i = 0; i < PAGES; i++) buf[i * 4096] = 7;
+  CHECK (f1 == get_free_frames (), "after the child is gone the parent writes without copying");
+  CHECK (get_free_frames () >= before - 8, "all frames of the child were returned (the kernel stack is freed later)");
+  return fails;
+}
+
+@
+\section{Threads in user mode: three threads and a mutex, shared memory, trylock, and exit() with a running thread}
+\label{src:user:thtest.c}
+
+
+@
+
+The complete file is put together from these parts:
+
+<<user/thtest.c>>=
+<<user/thtest.c: includes>>
+
+<<user/thtest.c: spinner>>
+@
+
+<<user/thtest.c: includes>>=
+#include "ulib.h"
+
+static int fails = 0;
+#define CHECK(c, msg) do { if (c) printf ("  user ok:   %s\n", msg); \
+                           else { printf ("  user FAIL: %s\n", msg); fails++; } } while (0)
+
+#define ROUNDS 200
+static int mutex, counter = 0, in_critical = 0, overlap = 0;
+static volatile int finished = 0, tids[3], started = 0;
+static volatile int spinner_alive = 0;
+
+static void worker (void) {
+  int me = started++;
+  tids[me] = gettid ();
+  for (int i = 0; i < ROUNDS; i++) {
+    mutex_lock (&mutex);
+    if (++in_critical != 1) overlap = 1;
+    int tmp = counter;
+    yield ();                           // other threads run now and must wait for the mutex
+    counter = tmp + 1;
+    in_critical--;
+    mutex_unlock (&mutex);
+  }
+  finished++;
+  pthread_exit ();
+}
+
+@
+outlives the main thread: [[exit()]] of the main thread does not end the other threads (as on the [[x86]]); the
+address space is freed when the last thread has gone
+
+<<user/thtest.c: spinner>>=
+static void spinner (void) {
+  spinner_alive = 1;
+  for (int i = 0; i < 300; i++) yield ();
+  printf ("  user ok:   a thread goes on after exit() of the main thread\n");
+  pthread_exit ();
+}
+
+int main (int argc, char **argv) {
+  int mypid = getpid ();
+  CHECK (mutex_init (&mutex) == 0 && mutex > 0, "pthread_mutex_init gives a handle");
+  CHECK (mutex_trylock (&mutex) == 0, "trylock on a free mutex succeeds");
+  CHECK (mutex_trylock (&mutex) == -1, "trylock on a locked mutex fails (EBUSY)");
+  mutex_unlock (&mutex);
+
+  for (int i = 0; i < 3; i++) CHECK (pthread_create (worker) > 0, "pthread_create");
+  while (finished < 3) yield ();
+
+  CHECK (counter == 3 * ROUNDS, "counter is exactly 3 * 200: the mutex serializes the threads");
+  CHECK (!overlap, "never two threads in the critical section");
+  CHECK (tids[0] != tids[1] && tids[1] != tids[2] && tids[0] != tids[2], "the threads have different thread IDs");
+  CHECK (tids[0] != mypid && getpid () == mypid, "thread IDs differ from the process ID, getpid is unchanged");
+  CHECK (mutex_destroy (&mutex) == 0 && mutex_lock (&mutex) == -1, "a destroyed mutex is refused");
+
+  // exit() of the main thread while another thread is running
+  CHECK (pthread_create (spinner) > 0, "start a thread that outlives the main thread");
+  while (!spinner_alive) yield ();
+  CHECK (fails == 0, "all checks passed, calling exit() while a thread runs");
+  exit (fails);
+}
+
+@
+\section{Passes an unmapped address to a system call: the kernel faults while it reads the user buffer}
+\label{src:user:badptr.c}
+
+Like on the [[x86]] (page fault handler of the book) this ends in the kernel shell.
+
+@
+
+The complete file is put together from these parts:
+
+<<user/badptr.c>>=
+<<user/badptr.c: includes>>
+@
+
+<<user/badptr.c: includes>>=
+#include "ulib.h"
+
+int main (int argc, char **argv) {
+  printf ("badptr: write (1, 0x10, 5) with an unmapped buffer\n");
+  write (1, (const void *)0x10, 5);
+  printf ("badptr: not reached\n");
+  return 0;
+}
+
+@
+\section{Swapping: pages are written to /tmp/swap and come back on the next access -- by the program itself, by the}
+\label{src:user:swaptest.c}
+
+kernel inside a system call, and in a forked child.
+
+@
+
+The complete file is put together from these parts:
+
+<<user/swaptest.c>>=
+<<user/swaptest.c: includes>>
+@
+
+<<user/swaptest.c: includes>>=
+#include "ulib.h"
+
+static int fails = 0;
+#define CHECK(c, msg) do { if (c) printf ("  user ok:   %s\n", msg); \
+                           else { printf ("  user FAIL: %s\n", msg); fails++; } } while (0)
+
+#define PAGES 48
+static char *buf;
+
+static void fill (int p) { for (int i = 0; i < 4096; i++) buf[p * 4096 + i] = (char)(p * 7 + i); }
+static int  intact (int p) { for (int i = 0; i < 4096; i++) if (buf[p * 4096 + i] != (char)(p * 7 + i)) return 0; return 1; }
+static int  all_intact (void) { for (int p = 0; p < PAGES; p++) if (!intact (p)) return 0; return 1; }
+
+int main (int argc, char **argv) {
+  buf = (char *)(((long)sbrk (0) + 4095) & ~4095L);
+  CHECK (sbrk ((PAGES + 1) * 4096) != (void *)-1, "sbrk gives 48 pages");
+  for (int p = 0; p < PAGES; p++) fill (p);
+
+  CHECK (page_out (0) == -1, "page_out of an unmapped page fails");
+
+  int free0 = get_free_frames ();
+  int ok = 1;
+  for (int p = 0; p < 16; p++) if (page_out (buf + p * 4096) != 0) ok = 0;
+  CHECK (ok, "page_out of 16 pages");
+  int free1 = get_free_frames ();
+  CHECK (free1 - free0 == 16, "the 16 frames are free again");
+  CHECK (page_out (buf) == -1, "a page that is already paged out cannot be paged out again");
+  CHECK (all_intact (), "all 48 pages hold their data (the 16 paged-out pages came back on access)");
+  int free2 = get_free_frames ();
+  CHECK (free2 == free0, "paging in took the frames again");
+
+  // the kernel uses a user pointer: read () into a paged-out page, write () from one
+  page_out (buf + 20 * 4096);
+  int fd = open ("/hello.c", 0);
+  long n = read (fd, buf + 20 * 4096, 100);
+  close (fd);
+  CHECK (n == 100 && buf[20 * 4096] == '#' && buf[20 * 4096 + 1] == 'i', "read () into a paged-out page: the kernel paged it in");
+  fill (20);
+  page_out (buf + 21 * 4096);
+  buf[21 * 4096] = 0;
+  const char *msg = "  user ok:   write () from a paged-out page\n";
+  for (int i = 0; msg[i]; i++) buf[21 * 4096 + i] = msg[i];
+  page_out (buf + 21 * 4096);
+  write (1, buf + 21 * 4096, strlen (msg));
+  fill (21);
+
+  // fork with paged-out pages: the child gets its own copy
+  for (int p = 24; p < 32; p++) page_out (buf + p * 4096);
+  int pid = fork ();
+  if (pid == 0) {
+    CHECK (all_intact (), "child: all pages intact (the paged-out ones were read back for fork)");
+    for (int p = 0; p < PAGES; p++) buf[p * 4096] = 99;
+    exit (fails);
+  }
+  int status = -1;
+  waitpid (pid, &status, 0);
+  CHECK (status == 0, "the child's checks passed");
+  CHECK (all_intact (), "parent: its pages are unchanged by the child");
+
+  // page replacement: free_a_frame pages out the page with the lowest access counter
+  int before = get_free_frames ();
+  for (int i = 0; i < 10; i++) free_a_frame ();
+  int after = get_free_frames ();
+  CHECK (after - before == 10, "free_a_frame x 10 freed 10 frames");
+  CHECK (all_intact (), "all pages intact after page replacement");
+
+  exit (fails);
+}
+
+@
+\section{The screen functions of the book: clrscr, set\_xy, get\_xy, read\_screen, write\_screen, wrapping and scrolling}
+\label{src:user:screentest.c}
+
+The checks are made first and printed at the end; the program leaves ``DONE'' at column 2 of line 3.
+
+@
+
+The complete file is put together from these parts:
+
+<<user/screentest.c>>=
+<<user/screentest.c: includes>>
+@
+
+<<user/screentest.c: includes>>=
+#include "ulib.h"
+
+typedef unsigned short word;
+#define W 80
+#define H 24
+static word scr[W * H];
+
+static int results[16], names_n = 0;
+static const char *names[16];
+static void check (int ok, const char *name) { results[names_n] = ok; names[names_n++] = name; }
+static int cell_is (int x, int y, char c) { return (scr[y * W + x] & 0xff) == (unsigned char)c; }
+
+int main (int argc, char **argv) {
+  char x, y;
+
+  clrscr ();
+  get_xy (&x, &y);
+  check (x == 0 && y == 0, "clrscr puts the cursor in the top left corner");
+
+  set_xy (10, 5);
+  printf ("HELLO");
+  get_xy (&x, &y);
+  check (x == 15 && y == 5, "set_xy, printf and get_xy: the cursor is behind the text");
+  read_screen ((char *)scr);
+  check (cell_is (10, 5, 'H') && cell_is (14, 5, 'O') && cell_is (9, 5, ' ') && cell_is (15, 5, ' '), "read_screen sees the text at the cursor position");
+  check ((scr[5 * W + 10] >> 8) == 0x0F, "normal text has the attribute 0x0F");
+
+  clrscr ();
+  for (int i = 0; i < W + 5; i++) printf ("a");
+  get_xy (&x, &y);
+  read_screen ((char *)scr);
+  check (x == 5 && y == 1, "after 85 characters the cursor is at column 5 of line 1 (wrapped)");
+  check (cell_is (79, 0, 'a') && cell_is (4, 1, 'a') && cell_is (5, 1, ' '), "the text wrapped to the next line");
+
+  clrscr ();
+  set_xy (0, 23);
+  printf ("X\nY");
+  get_xy (&x, &y);
+  read_screen ((char *)scr);
+  check (x == 1 && y == 23, "a newline in the last line scrolls: the cursor stays in line 23");
+  check (cell_is (0, 22, 'X') && cell_is (0, 23, 'Y'), "the screen scrolled by one line");
+
+  for (int i = 0; i < W * H; i++) scr[i] = ' ' | 0x0F00;
+  const char *msg = "WRITTEN";
+  for (int i = 0; msg[i]; i++) scr[3 * W + 20 + i] = msg[i] | 0x1F00;   // white on blue
+  write_screen ((char *)scr);
+  for (int i = 0; i < W * H; i++) scr[i] = 0;
+  read_screen ((char *)scr);
+  check (cell_is (20, 3, 'W') && cell_is (26, 3, 'N') && (scr[3 * W + 20] >> 8) == 0x1F, "write_screen and read_screen: text and color attribute come back");
+
+  clrscr ();
+  int bad = 0;
+  for (int i = 0; i < names_n; i++) if (!results[i]) bad++;
+  for (int i = 0; i < names_n; i++)
+    printf ("  %s %s\n", results[i] ? "user ok:  " : "user FAIL:", names[i]);
+  clrscr ();
+  set_xy (2, 3);
+  printf ("DONE");
+  exit (bad);
+}
+
+@
+\section{The user mode stack grows when the program touches the page just below it, but not further down}
+\label{src:user:stacktest.c}
+
+
+@
+
+The complete file is put together from these parts:
+
+<<user/stacktest.c>>=
+<<user/stacktest.c: includes>>
+@
+
+<<user/stacktest.c: includes>>=
+#include "ulib.h"
+
+static int fails = 0;
+#define CHECK(c, msg) do { if (c) printf ("  user ok:   %s\n", msg); \
+                           else { printf ("  user FAIL: %s\n", msg); fails++; } } while (0)
+
+static int deep (int n) {                  // about 1 KByte of stack per level
+  volatile char pad[1000];
+  pad[0] = (char)n;  pad[999] = (char)(n + 1);
+  if (n == 0) return 0;
+  int r = deep (n - 1);
+  return r + (pad[0] == (char)n && pad[999] == (char)(n + 1) ? 1 : 1000000);
+}
+
+int main (int argc, char **argv) {
+  CHECK (deep (600) == 600, "recursion 600 levels deep (about 600 KByte of stack, the start is 16 KByte)");
+
+  int before = get_free_frames ();
+  deep (300);
+  CHECK (get_free_frames () - before == 0, "the grown stack stays: calling again needs no new frames");
+
+  int pid = fork ();
+  if (pid == 0) {                          // touching memory far below the stack ends the process
+    volatile char *p = (volatile char *)&pid - 2 * 1024 * 1024;
+    *p = 1;
+    printf ("  user FAIL: access 2 MByte below the stack was allowed\n");
+    exit (0);
+  }
+  int status = 0;
+  waitpid (pid, &status, 0);
+  CHECK (status == -1, "an access far below the stack is a fault: the process is killed");
+
+  pid = fork ();
+  if (pid == 0) {                          // the child has the grown stack, too
+    exit (deep (500) == 500 ? 0 : 1);
+  }
+  waitpid (pid, &status, 0);
+  CHECK (status == 0, "a forked child can use the grown stack");
+  exit (fails);
+}
+
+@
+\section{Memory runs out: sbrk () asks for 1 MByte at a time until it fails.  Pages are swapped out to make room (as in the book),}
+\label{src:user:memtest.c}
+
+and when that does not help any more [[sbrk ()]] returns -1 -- the kernel must neither hang nor crash. (Reading everything
+back is not possible then: a page that is swapped out needs a free frame, and there is none; swaptest checks the data.)
+
+@
+
+The complete file is put together from these parts:
+
+<<user/memtest.c>>=
+<<user/memtest.c: includes>>
+@
+
+<<user/memtest.c: includes>>=
+#include "ulib.h"
+
+static int fails = 0;
+#define CHECK(c, msg) do { if (c) printf ("  user ok:   %s\n", msg); \
+                           else { printf ("  user FAIL: %s\n", msg); fails++; } } while (0)
+
+#define MB (1024 * 1024)
+
+int main (int argc, char **argv) {
+  char *base = (char *)sbrk (0);
+  int n = 0;
+  for (;;) {
+    char *p = (char *)sbrk (MB);
+    if ((long)p == -1) break;
+    p[0] = (char)(n + 1);  p[5 * 4096] = (char)(n * 3 + 7);        // two pages of each megabyte get a pattern
+    for (int i = 1; i < 256; i++) p[i * 4096] = 0;                  // (the rest of the megabyte is touched, too)
+    n++;
+    if (n >= 2000) break;
+  }
+  CHECK (n > 20 && n < 2000, "sbrk () fails when memory is used up; it does not hang or crash the kernel");
+  printf ("  info: %d MByte were handed out before sbrk () failed\n", n);
+
+  int pid = fork ();                                                  // no memory left for a copy of everything: fork fails or works, but must not hang
+  if (pid == 0) exit (0);
+  if (pid > 0) { int st; waitpid (pid, &st, 0); }
+  CHECK (1, "fork () returns when memory is short");
+  CHECK (n > 0, "the process ends and gives all its memory back");
+  exit (fails);
+}
+
+@
+\section{What the AArch64 build adds to programs of lib-build/tools that were written for a 64 MByte PC}
+\label{src:userland:arm64-extra.h}
+
+(Only the programs that need it include this file; see the rule for [[free.c]] in the Makefile.)
+
+@
+
+The complete file is put together from these parts:
+
+<<userland/arm64-extra.h>>=
+<<userland/arm64-extra.h: ARM64_EXTRA_H>>
+@
+
+<<userland/arm64-extra.h: ARM64_EXTRA_H>>=
+#ifndef ARM64_EXTRA_H
+#define ARM64_EXTRA_H
+#define __NR_total_frames 601                       // AArch64-only system call: frames (4 KByte) of RAM
+static inline int total_frames (void) { return syscall1 (__NR_total_frames); }
+
+// the network: raw ICMP sockets (net_syscalls.c). The structure is passed by address; user addresses are below 2 GByte,
+// so they fit into the int that the system call wrappers take.
+#define __NR_icmp_open  602
+#define __NR_icmp_send  603
+#define __NR_icmp_recv  604
+#define __NR_icmp_close 605
+#define __NR_clock_us   606
+struct icmp_msg { int handle; unsigned int ip; char *buf; int len; int timeout_ms; };
+static inline int icmp_open (void)                  { return syscall1 (__NR_icmp_open); }
+static inline int icmp_send (struct icmp_msg *m)    { return syscall2 (__NR_icmp_send, (int)(long)m); }
+static inline int icmp_recv (struct icmp_msg *m)    { return syscall2 (__NR_icmp_recv, (int)(long)m); }
+static inline int icmp_close (int handle)           { return syscall2 (__NR_icmp_close, handle); }
+static inline unsigned int clock_us (void)          { return (unsigned int)syscall1 (__NR_clock_us); }
+
+// the settings of the network interface (the programs ifconfig, route and dhclient)
+#define __NR_net_info 607
+#define __NR_net_set  608
+#define __NR_net_dhcp 609
+struct net_info { char name[16]; unsigned char mac[6]; unsigned short mtu; unsigned flags; unsigned address, netmask, gateway, dns, dhcp_server, dhcp_lease; };
+struct net_set  { unsigned what; unsigned address, netmask, gateway; };         // what: 1 = address and netmask, 2 = router, 4 = remove the router
+struct net_dhcp_args { int timeout_ms; unsigned server, address, netmask, gateway, dns, lease; };
+static inline int net_info (struct net_info *i)       { return syscall2 (__NR_net_info, (int)(long)i); }          // 0 = ok, -1 = no network
+static inline int net_set (struct net_set *s)         { return syscall2 (__NR_net_set, (int)(long)s); }           // -2 = only root may do this
+static inline int net_dhcp (struct net_dhcp_args *d)  { return syscall2 (__NR_net_dhcp, (int)(long)d); }
+
+// switching the machine off, or starting it again (shutdown, poweroff, reboot)
+#define __NR_poweroff 610
+#define __NR_reboot   611
+static inline int poweroff (void) { return syscall1 (__NR_poweroff); }
+static inline int reboot (void)   { return syscall1 (__NR_reboot); }
+#endif
+
+@
+\section{\texttt{userland/ping.c}}
+\label{src:userland:ping.c}
+
+@
+
+The complete file is put together from these parts:
+
+<<userland/ping.c>>=
+<<userland/ping.c: includes>>
+
+<<userland/ping.c: checksum>>
+
+<<userland/ping.c: parse_address>>
+
+<<userland/ping.c: main>>
+@
+
+<<userland/ping.c: includes>>=
+#include "../ulixlib.h"
+#include "../arm64-extra.h"
+
+@
+ping -- does a computer answer? (a new program for the AArch64 port; the network is not part of the original Ulix)
+
+\begin{quote}\begin{verbatim}
+    ping [-c count] [-s size] A.B.C.D
+\end{verbatim}\end{quote}
+
+ping sends an ICMP ``echo request'' and waits for the ``echo reply'' that the other computer sends back, and shows how long that took.
+The message looks like this (RFC 792):
+
+\begin{quote}\begin{verbatim}
+    | type (1) | code (1) | checksum (2) | identifier (2) | sequence number (2) | data ...
+\end{verbatim}\end{quote}
+
+type 8 is a request, type 0 a reply. The other side copies identifier, sequence number and data into its reply, so that we can
+tell which request an answer belongs to; the identifier tells our answers from those that another ping program waits for.
+The kernel only provides a ``raw ICMP socket'' ([[icmp_open]], [[icmp_send]], [[icmp_recv]]): the message is built here, including the checksum.
+The checksum: the sum of all 16 bit words, carries added back in, all bits turned around.
+
+<<userland/ping.c: checksum>>=
+static unsigned short checksum (unsigned char *data, int len) {
+  unsigned sum = 0;
+  for (int i = 0; i + 1 < len; i += 2) sum += (data[i] @<< 8) | data[i + 1];
+  if (len & 1) sum += data[len - 1] @<< 8;
+  while (sum >> 16) sum = (sum & 0xffff) + (sum >> 16);
+  return (unsigned short)~sum;
+}
+
+@
+``10.0.2.2'' -> the address as a number; 0 = ok
+
+<<userland/ping.c: parse_address>>=
+static int parse_address (char *s, unsigned *address) {
+  unsigned value = 0;
+  for (int part = 0; part < 4; part++) {
+    if (*s < '0' || *s > '9') return -1;
+    unsigned n = 0;
+    while (*s >= '0' && *s <= '9') n = n * 10 + (*s++ - '0');
+    if (n > 255) return -1;
+    value = (value @<< 8) | n;
+    if (part < 3) { if (*s != '.') return -1; s++; }
+  }
+  if (*s != 0) return -1;
+  *address = value;
+  return 0;
+}
+
+static int number (char *s) {
+  int n = 0;
+  while (*s >= '0' && *s <= '9') n = n * 10 + (*s++ - '0');
+  return n;
+}
+
+static void usage (void) { printf ("usage: ping [-c count] [-s size] A.B.C.D   (a dotted address, for example 10.0.2.2)\n"); }
+
+@
+microseconds -> ``3.4'' (milliseconds with one decimal)
+
+<<userland/ping.c: main>>=
+static void show_time (unsigned us) { printf ("%d.%d", us / 1000, (us / 100) % 10); }
+
+int main (int argc, char *argv[]) {
+  int count = 4, size = 32, i = 1;
+  unsigned address = 0;
+  int have_address = 0;
+  for (; i < argc; i++) {
+    if (argv[i][0] == '-' && argv[i][1] == 'c' && i + 1 < argc) count = number (argv[++i]);
+    else if (argv[i][0] == '-' && argv[i][1] == 's' && i + 1 < argc) size = number (argv[++i]);
+    else if (!have_address && parse_address (argv[i], &address) == 0) have_address = 1;
+    else { usage (); return 1; }
+  }
+  if (!have_address || count < 1 || size < 0 || size > 200) { usage (); return 1; }
+
+  int sock = icmp_open ();
+  if (sock < 0) { printf ("ping: cannot open a socket (is there a network card?)\n"); return 1; }
+
+  unsigned char request[8 + 200], reply[256];
+  unsigned short id = getpid () & 0xffff;
+  int sent = 0, received = 0;
+  unsigned rtt_min = 0xffffffff, rtt_max = 0, rtt_sum = 0;
+
+  printf ("PING %d.%d.%d.%d: %d data bytes\n", address >> 24, (address >> 16) & 255, (address >> 8) & 255, address & 255, size);
+  for (int seq = 1; seq <= count; seq++) {
+    request[0] = 8;  request[1] = 0;  request[2] = 0;  request[3] = 0;           // echo request, checksum still 0
+    request[4] = id >> 8;  request[5] = id & 255;  request[6] = seq >> 8;  request[7] = seq & 255;
+    for (int k = 0; k < size; k++) request[8 + k] = 'a' + k % 26;
+    unsigned short sum = checksum (request, 8 + size);
+    request[2] = sum >> 8;  request[3] = sum & 255;
+
+    struct icmp_msg m;
+    m.handle = sock;  m.ip = address;  m.buf = (char *)request;  m.len = 8 + size;
+    unsigned start = clock_us ();
+    if (icmp_send (&m) != 0) { printf ("ping: sending failed (no answer to the question who has this address?)\n"); continue; }
+    sent++;
+
+    int answered = 0;
+    for (;;) {                                                                    // wait for OUR reply, at most one second
+      unsigned waited = (clock_us () - start) / 1000;
+      if (waited >= 1000) break;
+      m.buf = (char *)reply;  m.len = sizeof reply;  m.timeout_ms = 1000 - waited;
+      int n = icmp_recv (&m);
+      if (n <= 0) break;                                                          // timeout
+      if (n < 8) continue;
+      unsigned rtt = clock_us () - start;
+      if (reply[0] == 0 && m.ip == address && ((reply[4] @<< 8) | reply[5]) == id && ((reply[6] @<< 8) | reply[7]) == seq) {
+        printf ("%d bytes from %d.%d.%d.%d: icmp_seq=%d time=", n, m.ip >> 24, (m.ip >> 16) & 255, (m.ip >> 8) & 255, m.ip & 255, seq);
+        show_time (rtt);  printf (" ms\n");
+        received++;  answered = 1;
+        if (rtt < rtt_min) rtt_min = rtt;
+        if (rtt > rtt_max) rtt_max = rtt;
+        rtt_sum += rtt;
+        break;
+      }
+      if (reply[0] == 3 || reply[0] == 11) {                                      // the network says that it cannot deliver the request
+        printf ("from %d.%d.%d.%d: %s\n", m.ip >> 24, (m.ip >> 16) & 255, (m.ip >> 8) & 255, m.ip & 255,
+                reply[0] == 3 ? "destination unreachable" : "time exceeded");
+        answered = 1;
+        break;
+      }
+    }
+    if (!answered) printf ("Request timeout for icmp_seq %d\n", seq);
+    if (seq < count) while ((clock_us () - start) / 1000 < 1000) syscall1 (__NR_resign);       // one request per second
+  }
+  icmp_close (sock);
+
+  printf ("--- %d.%d.%d.%d ping statistics ---\n", address >> 24, (address >> 16) & 255, (address >> 8) & 255, address & 255);
+  printf ("%d packets transmitted, %d received, %d%% packet loss\n", sent, received, sent ? (sent - received) * 100 / sent : 100);
+  if (received) {
+    printf ("round-trip min/avg/max = ");  show_time (rtt_min);  printf ("/");  show_time (rtt_sum / received);  printf ("/");  show_time (rtt_max);  printf (" ms\n");
+  }
+  return received ? 0 : 1;
+}
+
+@
+\section{\texttt{userland/ifconfig.c}}
+\label{src:userland:ifconfig.c}
+
+@
+
+The complete file is put together from these parts:
+
+<<userland/ifconfig.c>>=
+<<userland/ifconfig.c: includes>>
+
+<<userland/ifconfig.c: part 2>>
+
+<<userland/ifconfig.c: parse_netmask>>
+@
+
+<<userland/ifconfig.c: includes>>=
+#include "../ulixlib.h"
+#include "../arm64-extra.h"
+
+@
+ifconfig -- show or set the address of the network interface (modelled on ifconfig of FreeBSD and NetBSD)
+
+\begin{quote}\begin{verbatim}
+    ifconfig [interface]                                     show
+    ifconfig interface [inet] A.B.C.D [netmask MASK]         set the address; MASK as 255.255.255.0 or 0xffffff00
+    ifconfig interface [inet] A.B.C.D/N                      set the address; N = number of bits of the netmask
+\end{verbatim}\end{quote}
+
+Only root may change the address (use su).
+
+<<userland/ifconfig.c: part 2>>=
+static int parse_address (char *s, unsigned *address, char **end) {                // "10.0.2.15" -> number; 0 = ok
+  unsigned value = 0;
+  for (int part = 0; part < 4; part++) {
+    if (*s < '0' || *s > '9') return -1;
+    unsigned n = 0;
+    while (*s >= '0' && *s <= '9') n = n * 10 + (*s++ - '0');
+    if (n > 255) return -1;
+    value = (value @<< 8) | n;
+    if (part < 3) { if (*s != '.') return -1; s++; }
+  }
+  *address = value;
+  *end = s;
+  return 0;
+}
+
+static int hex_digit (char c) { return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1; }
+
+@
+a netmask: dotted (255.255.255.0) or hexadecimal ([[0xffffff00]]), the way the BSDs print and accept it
+
+<<userland/ifconfig.c: parse_netmask>>=
+static int parse_netmask (char *s, unsigned *mask) {
+  char *end;
+  if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+    unsigned v = 0;
+    s += 2;
+    if (hex_digit (*s) < 0) return -1;
+    for (; hex_digit (*s) >= 0; s++) v = v * 16 + hex_digit (*s);
+    if (*s) return -1;
+    *mask = v;
+    return 0;
+  }
+  if (parse_address (s, mask, &end) != 0 || *end) return -1;
+  return 0;
+}
+
+static void show (struct net_info *i) {
+  printf ("%s: flags=%x<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST> mtu %d\n", i->name, 0x8843, i->mtu);
+  printf ("\tether %02x:%02x:%02x:%02x:%02x:%02x\n", i->mac[0], i->mac[1], i->mac[2], i->mac[3], i->mac[4], i->mac[5]);
+  unsigned broadcast = i->address | ~i->netmask;
+  if (i->address)
+    printf ("\tinet %d.%d.%d.%d netmask 0x%x broadcast %d.%d.%d.%d\n", i->address >> 24, (i->address >> 16) & 255, (i->address >> 8) & 255, i->address & 255,
+            i->netmask, broadcast >> 24, (broadcast >> 16) & 255, (broadcast >> 8) & 255, broadcast & 255);
+}
+
+static void usage (void) {
+  printf ("usage: ifconfig [interface]\n       ifconfig interface [inet] address [netmask mask]\n       ifconfig interface [inet] address/bits\n");
+}
+
+int main (int argc, char *argv[]) {
+  struct net_info info;
+  if (net_info (&info) != 0) { printf ("ifconfig: there is no network interface\n"); return 1; }
+  if (argc == 1) { show (&info); return 0; }
+
+  // the interface must be the one we have
+  char *n = argv[1], *m = info.name;
+  while (*n && *n == *m) { n++; m++; }
+  if (*n || *m) { printf ("ifconfig: interface %s does not exist\n", argv[1]); return 1; }
+  if (argc == 2) { show (&info); return 0; }
+
+  int i = 2;
+  if (argv[i][0] == 'i' && argv[i][1] == 'n' && argv[i][2] == 'e' && argv[i][3] == 't' && !argv[i][4]) i++;      // the word "inet" may be left out
+  if (i >= argc) { usage (); return 1; }
+  struct net_set set;
+  char *end;
+  if (parse_address (argv[i], &set.address, &end) != 0) { usage (); return 1; }
+  set.netmask = info.netmask;
+  if (*end == '/') {                                                      // 10.0.2.15/24
+    int bits = 0;
+    for (end++; *end >= '0' && *end <= '9'; end++) bits = bits * 10 + (*end - '0');
+    if (*end || bits > 32) { usage (); return 1; }
+    set.netmask = bits == 0 ? 0 : ~((1u @<< (32 - bits)) - 1);
+    if (bits == 32) set.netmask = 0xffffffff;
+  } else if (*end) { usage (); return 1; }
+  i++;
+  if (i < argc) {
+    if (!(argv[i][0] == 'n' && argv[i][1] == 'e' && argv[i][2] == 't' && argv[i][3] == 'm' && argv[i][4] == 'a' && argv[i][5] == 's' && argv[i][6] == 'k' && !argv[i][7]) ||
+        i + 1 >= argc || parse_netmask (argv[i + 1], &set.netmask) != 0 || i + 2 < argc) { usage (); return 1; }
+  }
+  set.what = 1;
+  int r = net_set (&set);
+  if (r == -2) { printf ("ifconfig: permission denied (only root may change the address)\n"); return 1; }
+  return r != 0;
+}
+
+@
+\section{\texttt{userland/route.c}}
+\label{src:userland:route.c}
+
+@
+
+The complete file is put together from these parts:
+
+<<userland/route.c>>=
+<<userland/route.c: includes>>
+
+<<userland/route.c: parse_address>>
+@
+
+<<userland/route.c: includes>>=
+#include "../ulixlib.h"
+#include "../arm64-extra.h"
+
+@
+route -- show or change the route to other networks (modelled on route and ``netstat -r'' of FreeBSD and NetBSD)
+
+\begin{quote}\begin{verbatim}
+    route show                    the routing table (also: route, route -n show)
+    route add default A.B.C.D     send everything that is not on our own network to this router
+    route delete default          remove the router
+\end{verbatim}\end{quote}
+
+Ulix has only two routes: the one to our own network (it comes from the address and the netmask) and the default route.
+Only root may change the default route (use su).
+
+<<userland/route.c: parse_address>>=
+static int parse_address (char *s, unsigned *address) {
+  unsigned value = 0;
+  for (int part = 0; part < 4; part++) {
+    if (*s < '0' || *s > '9') return -1;
+    unsigned n = 0;
+    while (*s >= '0' && *s <= '9') n = n * 10 + (*s++ - '0');
+    if (n > 255) return -1;
+    value = (value @<< 8) | n;
+    if (part < 3) { if (*s != '.') return -1; s++; }
+  }
+  if (*s) return -1;
+  *address = value;
+  return 0;
+}
+
+static int equal (char *a, char *b) { while (*a && *a == *b) { a++; b++; } return *a == *b; }
+
+static void show (struct net_info *i) {
+  char gateway[24], network[24];
+  int bits = 0;
+  for (unsigned m = i->netmask; m & 0x80000000; m @<<= 1) bits++;
+  unsigned net = i->address & i->netmask;
+  printf ("Routing tables\n\nInternet:\n");
+  printf ("Destination        Gateway            Flags     Netif\n");
+  if (i->gateway) {
+    sprintf (gateway, "%d.%d.%d.%d", i->gateway >> 24, (i->gateway >> 16) & 255, (i->gateway >> 8) & 255, i->gateway & 255);
+    printf ("%-18s %-18s %-9s %s\n", "default", gateway, "UGS", i->name);              // U = up, G = through a gateway, S = set by hand
+  }
+  if (i->address) {
+    sprintf (network, "%d.%d.%d.%d/%d", net >> 24, (net >> 16) & 255, (net >> 8) & 255, net & 255, bits);
+    printf ("%-18s %-18s %-9s %s\n", network, "link#1", "U", i->name);                 // the network we are on: directly reachable
+  }
+}
+
+static void usage (void) { printf ("usage: route [-n] show\n       route add default gateway\n       route delete default\n"); }
+
+int main (int argc, char *argv[]) {
+  struct net_info info;
+  if (net_info (&info) != 0) { printf ("route: there is no network interface\n"); return 1; }
+  int i = 1;
+  if (i < argc && equal (argv[i], "-n")) i++;                                  // (addresses are always shown as numbers)
+  if (i >= argc || equal (argv[i], "show") || equal (argv[i], "print")) { show (&info); return 0; }
+
+  struct net_set set;
+  if (equal (argv[i], "add") && argc == i + 3 && equal (argv[i + 1], "default") && parse_address (argv[i + 2], &set.gateway) == 0) set.what = 2;
+  else if (equal (argv[i], "delete") && argc == i + 2 && equal (argv[i + 1], "default")) set.what = 4;
+  else { usage (); return 1; }
+  int r = net_set (&set);
+  if (r == -2) { printf ("route: permission denied (only root may change the routes)\n"); return 1; }
+  return r != 0;
+}
+
+@
+\section{\texttt{userland/dhclient.c}}
+\label{src:userland:dhclient.c}
+
+@
+
+The complete file is put together from these parts:
+
+<<userland/dhclient.c>>=
+<<userland/dhclient.c: includes>>
+
+<<userland/dhclient.c: main>>
+@
+
+<<userland/dhclient.c: includes>>=
+#include "../ulixlib.h"
+#include "../arm64-extra.h"
+
+@
+dhclient -- ask a DHCP server for an address and use it (modelled on dhclient of FreeBSD)
+
+\begin{quote}\begin{verbatim}
+    dhclient [-t seconds] [interface]
+\end{verbatim}\end{quote}
+
+The kernel does the talking (see [[dhcp.c]]: DISCOVER, OFFER, REQUEST, ACK); this program starts it and tells what came of it.
+Only root may do this (use su).
+
+<<userland/dhclient.c: main>>=
+static int equal (char *a, char *b) { while (*a && *a == *b) { a++; b++; } return *a == *b; }
+
+static void print_address (unsigned a) { printf ("%d.%d.%d.%d", a >> 24, (a >> 16) & 255, (a >> 8) & 255, a & 255); }
+
+int main (int argc, char *argv[]) {
+  struct net_info info;
+  if (net_info (&info) != 0) { printf ("dhclient: there is no network interface\n"); return 1; }
+  int seconds = 10;
+  for (int i = 1; i < argc; i++) {
+    if (equal (argv[i], "-t") && i + 1 < argc) { seconds = 0; for (char *s = argv[++i]; *s >= '0' && *s <= '9'; s++) seconds = seconds * 10 + (*s - '0'); }
+    else if (!equal (argv[i], info.name)) { printf ("dhclient: interface %s does not exist (usage: dhclient [-t seconds] [interface])\n", argv[i]); return 1; }
+  }
+  printf ("DHCPDISCOVER on %s to 255.255.255.255 port 67\n", info.name);
+  struct net_dhcp_args d;
+  d.timeout_ms = seconds * 1000;
+  int r = net_dhcp (&d);
+  if (r == -2) { printf ("dhclient: permission denied (only root may configure the network)\n"); return 1; }
+  if (r != 0) { printf ("No DHCPOFFERS received.\n"); return 1; }
+  printf ("DHCPACK from ");  print_address (d.server);  printf ("\n");
+  printf ("bound to ");  print_address (d.address);  printf (" netmask ");  print_address (d.netmask);  printf ("\n");
+  if (d.gateway) { printf ("router ");  print_address (d.gateway);  printf ("\n"); }
+  if (d.dns) { printf ("name server ");  print_address (d.dns);  printf ("\n"); }
+  printf ("lease %d seconds\n", d.lease);
+  return 0;
+}
+
+@
+\section{\texttt{userland/shutdown.c}}
+\label{src:userland:shutdown.c}
+
+@
+
+The complete file is put together from these parts:
+
+<<userland/shutdown.c>>=
+<<userland/shutdown.c: includes>>
+
+<<userland/shutdown.c: ends_with>>
+@
+
+<<userland/shutdown.c: includes>>=
+#include "../ulixlib.h"
+#include "../arm64-extra.h"
+
+@
+shutdown, poweroff, reboot -- stop the machine, or stop it and start it again (modelled on the programs of the BSDs, without most of
+their options). One program with three names: it looks at the name it was called with.
+
+\begin{quote}\begin{verbatim}
+    poweroff          switch the machine off
+    reboot            start the machine again
+    shutdown now      switch off          shutdown -r now     start again       (-h and -p mean "off", too)
+\end{verbatim}\end{quote}
+
+The data in the buffer cache is written to the disks first. Under qemu ``off'' ends qemu, which is the way out of "[[make run-shell]]"
+without any keys. Everybody may do it (this is a system for a single user at a time).
+
+<<userland/shutdown.c: ends_with>>=
+static int ends_with (char *s, char *tail) {
+  int n = 0, m = 0;
+  while (s[n]) n++;
+  while (tail[m]) m++;
+  if (m > n) return 0;
+  for (int i = 0; i < m; i++) if (s[n - m + i] != tail[i]) return 0;
+  return 1;
+}
+
+int main (int argc, char *argv[]) {
+  int again = ends_with (argv[0], "reboot");
+  for (int i = 1; i < argc; i++) if (argv[i][0] == '-' && argv[i][1] == 'r') again = 1;
+  if (again) {
+    printf ("Rebooting NOW!\n");
+    reboot ();
+    printf ("reboot: the machine cannot start itself again\n");
+  } else {
+    printf ("Shutdown NOW!\n");
+    poweroff ();
+    printf ("shutdown: the machine cannot be switched off\n");
+  }
+  return 1;
+}
+
+@
+\section{\texttt{userland/readelf64.c}}
+\label{src:userland:readelf64.c}
+
+@
+
+The complete file is put together from these parts:
+
+<<userland/readelf64.c>>=
+<<userland/readelf64.c: includes>>
+@
+
+<<userland/readelf64.c: includes>>=
+#include "../ulixlib.h"
+// AArch64 version of the book's readelf (lib-build/tools/readelf.c): the programs of the ARM64 port are ELF64 files,
+// whose headers have other field sizes and another order than the ELF32 headers the book's program reads.
+// Same output as the book's program. (Addresses are printed as 32 bit numbers: user space is below 2 GByte.)
+
+typedef struct {
+  unsigned char   e_ident[16];
+  unsigned short  e_type, e_machine;
+  unsigned int    e_version;
+  unsigned long   e_entry, e_phoff, e_shoff;
+  unsigned int    e_flags;
+  unsigned short  e_ehsize, e_phentsize, e_phnum, e_shentsize, e_shnum, e_shstrndx;
+} Elf64_Ehdr;
+
+typedef struct {
+  unsigned int    p_type, p_flags;
+  unsigned long   p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_align;
+} Elf64_Phdr;
+
+int main (int argc, char* argv[]) {
+    if (argc != 2) {
+      printf ("elf: requires one argument\n");
+      return;
+    }
+
+    Elf64_Ehdr elf_header;
+    Elf64_Phdr program_header;
+
+    int fd = open(argv[1], 0);
+    printf ("fd = open() = %d\n", fd);
+    if (fd == -1)
+      printf ("elf: %s: no such file\n", argv[1]);
+    else {
+      read (fd, &elf_header, sizeof(elf_header));
+      printf ("version:   %d\n", elf_header.e_version);
+      printf ("e_entry:   %x\n", (unsigned int)elf_header.e_entry);
+      printf ("#pheaders: %d\n", elf_header.e_phnum);
+      printf ("e_phoff  : %d\n", (int)elf_header.e_phoff);
+
+      int phoffset = (int)elf_header.e_phoff;
+
+      printf ("program header:\n");
+      int i;
+      for (i=0; i < elf_header.e_phnum; i++) {
+        lseek (fd, phoffset + i * elf_header.e_phentsize, SEEK_SET);
+        read (fd, &program_header, sizeof(program_header));
+        if (program_header.p_type == 1) { // type = PT_LOAD
+          printf ("p_type   : %d\n", program_header.p_type);
+          printf ("p_offset : %d\n", (int)program_header.p_offset);
+          printf ("p_vaddr  : 0x%x\n", (unsigned int)program_header.p_vaddr);
+          printf ("p_filesz : 0x%x\n", (unsigned int)program_header.p_filesz);
+          printf ("p_memsz  : 0x%x\n", (unsigned int)program_header.p_memsz);
+          printf ("p_flags  : %d\n", program_header.p_flags);
+        }
+      }
+
+      close (fd);
+      return;
+    }
+}

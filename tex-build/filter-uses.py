@@ -68,4 +68,4 @@ for line in fileinput.input():
     line = sub (r"nwidentuses.*nwindexuse", r"nwindexuse", line)
     deletemode = False
   
-  print line
+  print(line)

@@ -1,0 +1,2106 @@
+\chapter{Networking: Ethernet, ARP, IP, ICMP, UDP, TCP and DHCP}
+\label{ch:network}
+
+The x86 version of Ulix has no network. This chapter is new. It is written from the bottom up, each layer small enough to read
+and to test on its own against the real TCP/IP stack of the host (\texttt{make net-test}): the network card drivers (virtio-net
+for qemu, GENET for the Raspberry Pi~4, which has not run on real hardware yet), Ethernet and ARP, IPv4 without fragments, ICMP echo
+(\texttt{ping}), UDP, a small TCP with retransmission, a DHCP client, the configuration from the kernel command line, a network
+thread that an interrupt wakes, and the system calls with which user programs reach all this. The goal is a telnet server;
+until then the echo service shows how a server attaches to the stack.
+
+@
+\section{The network: what the layers offer each other and the rest of the kernel (see net.c, tcp.c, virtionet.c)}
+\label{src:net.h}
+
+
+@
+
+The complete file is put together from these parts:
+
+<<net.h>>=
+<<net.h: NET_H>>
+@
+
+<<net.h: NET_H>>=
+#ifndef NET_H
+#define NET_H
+#include "ulix.h"
+
+typedef unsigned short u16;
+
+#define IP(a, b, c, d)  (((u32)(a) @<< 24) | ((u32)(b) @<< 16) | ((u32)(c) @<< 8) | (u32)(d))     // an IPv4 address as a 32 bit number
+
+// ---- the network card (netdev.c; the drivers are virtionet.c for qemu and genet.c for the Raspberry Pi 4) ----
+// A driver moves complete Ethernet frames between memory and its card, and knows nothing about ARP, IP or TCP.
+struct net_driver {
+  const char *name;                                // the name of the interface: "vioif0" (NetBSD's name for a virtio card), "genet0"
+  int  (*init) (void);                             // 0: the card is there and ready
+  const u8 *(*mac) (void);                         // its Ethernet address (6 bytes)
+  int  (*send) (const void *frame, int len);       // one Ethernet frame (without the checksum at the end): 0 = sent
+  int  (*recv) (void *out, int max);               // the length of a frame that has arrived (copied to out), or 0
+  int  (*start_irq) (void);                        // let the card interrupt when frames arrive: its interrupt number (0: it cannot, keep polling)
+  void (*ack) (void);                              // in the interrupt handler: tell the card that we have noticed
+};
+extern const struct net_driver virtio_net_driver, genet_driver;
+
+int  net_dev_init (void);                         // look for a card with the drivers in turn: 0 = found one
+const u8 *net_dev_mac (void);
+int  net_dev_send (const void *frame, int len);
+int  net_dev_recv (void *out, int max);
+int  net_dev_start_irq (void);
+void net_dev_ack (void);
+
+// ---- the network thread (netd.c): a kernel thread that handles the frames as they arrive, woken by the interrupt of the card ----
+void netd_start (void);                           // start it (after the threads are set up and the card is found)
+extern int netd_irq;                              // the interrupt number of the card (0 until netd_start () has run, or when polling)
+void netd_interrupt (void);                       // in the interrupt handler
+void netd_tick (void);                            // every timer tick: wakes the thread now and then, for the timers of TCP
+extern int net_echo;                              // the kernel command line said "netecho": answer on port 7 (UDP and TCP) with what comes in
+
+// ---- the echo service (echo.c) ----
+int  echo_start (void);                           // open port 7 (UDP and TCP): 0 = ok
+int  echo_step (void);                            // serve the TCP connection a bit: 1 = something was moved
+extern int echo_udp_datagrams, echo_tcp_connections;
+extern long echo_tcp_bytes;
+
+// ---- Ethernet, ARP, IPv4, ICMP, UDP (net.c) ----
+extern u32 net_my_ip, net_netmask, net_gateway, net_dns;
+extern const char *net_if_name;                   // the name of the interface, as the BSDs call a virtio network card: "vioif0"
+int  net_init (void);                             // card, addresses: 0 = the network is up
+int  net_poll_once (void);                        // take one frame from the card and handle it: 1 = there was one
+void net_run (int ms);                            // handle frames for 'ms' milliseconds
+u64  net_now_ms (void);                           // milliseconds since an arbitrary start (the counter of the timer)
+int  net_ping (u32 ip, int timeout_ms);           // round trip time in ms, or -1
+int  ip_send (u32 dst, u8 protocol, const u8 *data, int len);
+u16  net_checksum (const u8 *data, int len, u32 sum);       // the Internet checksum (RFC 1071); 'sum' continues an earlier part
+u32  net_pseudo_sum (u32 src, u32 dst, u8 protocol, int length);   // the start of the checksum of a UDP or TCP segment
+extern int net_drop_tx;                           // for tests: the next frames that are sent are thrown away instead (a lost packet)
+
+// raw ICMP sockets for programs (net.c; the system calls are in net_syscalls.c)
+int  icmp_open (int owner, int (*alive) (int owner));         // a socket number, -1 = none free (a socket of a dead owner is taken over)
+void icmp_close (int socket);
+int  icmp_send (int socket, u32 ip, const u8 *message, int len);       // an ICMP message that the caller has built, checksum included
+int  icmp_get (int socket, u8 *buf, int max, u32 *from);      // the oldest message that arrived: its length, 0 = none
+
+typedef void (*udp_handler) (u32 src_ip, u16 src_port, const u8 *data, int len);
+int  udp_bind (u16 port, udp_handler handler);
+int  udp_send (u32 dst_ip, u16 dst_port, u16 src_port, const u8 *data, int len);
+
+// ---- configuration (netconf.c, dhcp.c) ----
+// The address of this computer comes from one of three places: fixed values in net.c (what qemu's user network expects), the kernel
+// command line ("ip=10.0.0.5/24 gw=10.0.0.1 dns=10.0.0.1", or "ip=dhcp"), or later from programs (ifconfig, route, dhclient).
+const char *plat_cmdline (void);                  // dt.c
+int  net_parse_ip (const char *s, u32 *ip, const char **end);       // "10.0.2.2" -> number; 0 = ok, *end is the character after it
+void net_configure_from_command_line (void);     // called once at boot after net_init ()
+
+struct dhcp_result { u32 server, address, netmask, gateway, dns, lease_seconds; };
+extern struct dhcp_result dhcp_last;              // what the last successful dhcp_run () got
+int  dhcp_run (int timeout_ms, void (*idle) (void));    // ask a DHCP server for an address and use it: 0 = done; 'idle' is called while waiting
+
+// ---- TCP (tcp.c) ----
+void tcp_input (u32 src_ip, const u8 *segment, int len);      // called by net.c for every TCP segment that arrives
+void tcp_timer (void);                                        // called by net.c all the time: retransmissions and timeouts
+
+typedef struct tcp_conn tcp_conn;                             // one connection (the structure is private to tcp.c)
+int  tcp_listen (u16 port);                                   // accept connections to this port: 0 = ok
+tcp_conn *tcp_accept (u16 port);                              // a new connection to a listening port, or 0 if none is waiting
+tcp_conn *tcp_connect (u32 ip, u16 port);                     // start a connection (tcp_established () tells when it is up), 0 = no room
+int  tcp_established (tcp_conn *c);                           // 1 = data can be sent and received
+int  tcp_closed (tcp_conn *c);                                // 1 = the connection is gone: do not use the pointer any more
+int  tcp_read (tcp_conn *c, u8 *buf, int max);                // bytes received (0: nothing now), -1: the other side has closed (and all was read)
+int  tcp_write (tcp_conn *c, const u8 *data, int len);        // bytes accepted into the send buffer (may be fewer than len), -1: cannot send
+void tcp_close (tcp_conn *c);                                 // we have nothing more to send
+
+// ---- numbers in the headers are big endian ("network byte order") ----
+static inline u16 get16 (const u8 *p) { return (u16)((p[0] @<< 8) | p[1]); }
+static inline u32 get32 (const u8 *p) { return ((u32)p[0] @<< 24) | ((u32)p[1] @<< 16) | ((u32)p[2] @<< 8) | p[3]; }
+static inline void put16 (u8 *p, u16 v) { p[0] = v >> 8; p[1] = v & 0xff; }
+static inline void put32 (u8 *p, u32 v) { p[0] = v >> 24; p[1] = (v >> 16) & 0xff; p[2] = (v >> 8) & 0xff; p[3] = v & 0xff; }
+#endif
+
+@
+\section{Which network card is there: tries the drivers in turn and passes the work on to the one that finds its card}
+\label{src:netdev.c}
+
+
+@
+
+The complete file is put together from these parts:
+
+<<netdev.c>>=
+<<netdev.c: includes>>
+@
+
+<<netdev.c: includes>>=
+#include "net.h"
+
+static const struct net_driver *drivers[] = { &genet_driver, &virtio_net_driver };       // the Pi's Ethernet, the card of qemu
+static const struct net_driver *card = 0;                                                // the driver in use
+
+int net_drop_tx = 0;                                           // tests: while > 0, a frame to send is thrown away (as if the network lost it)
+
+int net_dev_init (void) {
+  for (unsigned i = 0; i < sizeof drivers / sizeof drivers[0]; i++)
+    if (drivers[i]->init () == 0) { card = drivers[i]; net_if_name = card->name; return 0; }
+  return -1;
+}
+
+const u8 *net_dev_mac (void) { return card->mac (); }
+int net_dev_recv (void *out, int max) { return card ? card->recv (out, max) : 0; }
+int net_dev_start_irq (void) { return card && card->start_irq ? card->start_irq () : 0; }
+void net_dev_ack (void) { if (card && card->ack) card->ack (); }
+
+int net_dev_send (const void *frame, int len) {
+  if (!card) return -1;
+  if (net_drop_tx > 0) { net_drop_tx--; return 0; }
+  return card->send (frame, len);
+}
+
+@
+\section{The network card of the qemu ``virt'' machine: a virtio network device (polling)}
+\label{src:virtionet.c}
+
+This is the lowest layer of the network: it moves complete Ethernet frames between memory and the card. It knows nothing about
+ARP, IP or TCP (those are in [[net.c]]). It works like the virtio disk driver in [[virtio.c]]: the driver and the card share ``queues'' in
+memory; the driver puts the addresses of buffers into a queue and tells the card, the card works on them and reports which
+buffers are finished. A network card has two queues: queue 0 holds empty buffers for frames that arrive (receive queue), queue 1
+holds frames that are to be sent (transmit queue).
+
+The driver polls: it looks into the queue whenever somebody asks for a frame ([[net_dev_recv]]) or waits for a frame to be sent.
+
+@
+
+The complete file is put together from these parts:
+
+<<virtionet.c>>=
+<<virtionet.c: includes>>
+
+<<virtionet.c: queue_init>>
+
+<<virtionet.c: rx_post>>
+
+<<virtionet.c: init>>
+
+<<virtionet.c: send_frame>>
+
+<<virtionet.c: recv_frame>>
+
+<<virtionet.c: R_INTERRUPT_STATUS>>
+@
+
+<<virtionet.c: includes>>=
+#include "ulix.h"
+#include "net.h"
+#include "plat.h"
+#include "cache.h"
+
+#define R_MAGIC         0x000
+#define R_VERSION       0x004
+#define R_DEVICE_ID     0x008
+#define R_DEV_FEATURES  0x010
+#define R_DEV_FEAT_SEL  0x014
+#define R_DRV_FEATURES  0x020
+#define R_DRV_FEAT_SEL  0x024
+#define R_GUEST_PGSIZE  0x028       // legacy
+#define R_QUEUE_SEL     0x030
+#define R_QUEUE_NUM_MAX 0x034
+#define R_QUEUE_NUM     0x038
+#define R_QUEUE_ALIGN   0x03c       // legacy
+#define R_QUEUE_PFN     0x040       // legacy
+#define R_QUEUE_READY   0x044       // modern
+#define R_QUEUE_NOTIFY  0x050
+#define R_STATUS        0x070
+#define R_DESC_LO       0x080       // modern
+#define R_DESC_HI       0x084
+#define R_AVAIL_LO      0x090
+#define R_AVAIL_HI      0x094
+#define R_USED_LO       0x0a0
+#define R_USED_HI       0x0a4
+#define R_CONFIG        0x100       // virtio-net: the MAC address (6 bytes)
+
+#define ST_ACK          1
+#define ST_DRIVER       2
+#define ST_DRIVER_OK    4
+#define ST_FEATURES_OK  8
+
+#define VIRTQ_DESC_F_WRITE  2       // the card writes into this buffer (a received frame)
+#define FEATURE_MAC         (1u @<< 5)   // the card has a MAC address of its own
+
+#define VIRTIO_ID_NET   1
+#define QSIZE           16          // buffers in a queue
+#define RX_QUEUE        0
+#define TX_QUEUE        1
+#define BUF_SIZE        2048        // every buffer holds the card's header and one frame (at most 1514 bytes)
+#define FRAME_MAX       1514
+
+struct desc  { u64 addr; u32 len; unsigned short flags, next; };
+struct avail { unsigned short flags, idx, ring[QSIZE]; };
+struct used  { unsigned short flags, idx; struct { u32 id, len; } ring[QSIZE]; };
+
+struct queue {
+  volatile struct desc  *desc;
+  volatile struct avail *avail;
+  volatile struct used  *used;
+  unsigned short used_seen;         // how many finished buffers the driver has already taken from the used ring
+};
+
+static volatile u8 *dev = 0;        // MMIO base of the card (0: there is none)
+static struct queue rxq, txq;
+static u64 rx_pa;                   // the 16 receive buffers: one contiguous area of 16 * 2048 bytes
+static u64 tx_pa;                   // the transmit buffer (one frame at a time)
+static int hdr_len;                 // the card puts a header before every frame: 10 bytes (legacy transport), 12 bytes (modern)
+static int dev_irq = 0;             // the interrupt number from the device tree (0: not known)
+static u8 mac[6] = { 0x52, 0x54, 0x00, 0x12, 0x34, 0x56 };       // (qemu's default, in case the card does not say)
+
+static u32  rd (int off)        { return *(volatile u32 *)(dev + off); }
+static void wr (int off, u32 v) { *(volatile u32 *)(dev + off) = v; }
+
+@
+Set up one queue: memory for the three tables, and tell the card where they are.
+
+<<virtionet.c: queue_init>>=
+static void queue_init (struct queue *q, int number, int version) {
+  wr (R_QUEUE_SEL, number);
+  wr (R_QUEUE_NUM, QSIZE);
+  u64 pa = alloc_frames_contig (2);          // descriptors and available ring in page 0, used ring in page 1
+  q->desc  = KVA (pa);
+  q->avail = KVA (pa + sizeof (struct desc) * QSIZE);
+  q->used  = KVA (pa + PAGE_SIZE);
+  q->used_seen = 0;
+  if (version == 1) {
+    wr (R_GUEST_PGSIZE, PAGE_SIZE);
+    wr (R_QUEUE_ALIGN, PAGE_SIZE);
+    wr (R_QUEUE_PFN, pa / PAGE_SIZE);
+  } else {
+    u64 a = pa + sizeof (struct desc) * QSIZE, u = pa + PAGE_SIZE;
+    wr (R_DESC_LO, (u32)pa);  wr (R_DESC_HI, pa >> 32);
+    wr (R_AVAIL_LO, (u32)a);  wr (R_AVAIL_HI, a >> 32);
+    wr (R_USED_LO, (u32)u);   wr (R_USED_HI, u >> 32);
+    wr (R_QUEUE_READY, 1);
+  }
+}
+
+@
+Give buffer number 'id' to the card to receive a frame into.
+
+<<virtionet.c: rx_post>>=
+static void rx_post (int id) {
+  rxq.desc[id].addr = rx_pa + (u64)id * BUF_SIZE;
+  rxq.desc[id].len = BUF_SIZE;
+  rxq.desc[id].flags = VIRTQ_DESC_F_WRITE;
+  rxq.desc[id].next = 0;
+  cache_clean ((const void *)&rxq.desc[id], sizeof (struct desc));
+  rxq.avail->ring[rxq.avail->idx % QSIZE] = id;
+  __asm__ volatile ("dmb ish" ::: "memory");
+  rxq.avail->idx++;
+  cache_clean ((const void *)rxq.avail, sizeof (struct avail));
+  wr (R_QUEUE_NOTIFY, RX_QUEUE);
+}
+
+@
+Look for the card among the virtio slots; returns 0 if it was found and initialised.
+
+<<virtionet.c: init>>=
+static int init (void) {
+  int slots = plat.nvirtio ? plat.nvirtio : 32;                  // without a device tree: the 32 slots of qemu virt
+  for (int i = slots - 1; i >= 0; i--) {
+    volatile u8 *s = (volatile u8 *)(plat.nvirtio ? KERNEL_VA + plat.virtio[i] : KERNEL_VA + 0x0a000000UL + i * 0x200);
+    if (*(volatile u32 *)(s + R_MAGIC) == 0x74726976 && *(volatile u32 *)(s + R_DEVICE_ID) == VIRTIO_ID_NET) { dev = s; dev_irq = plat.nvirtio ? plat.virtio_irq[i] : 0; break; }
+  }
+  if (!dev) return -1;
+  u32 version = rd (R_VERSION);
+
+  wr (R_STATUS, 0);                                              // reset
+  wr (R_STATUS, ST_ACK);
+  wr (R_STATUS, ST_ACK | ST_DRIVER);
+  wr (R_DEV_FEAT_SEL, 0);
+  u32 features = rd (R_DEV_FEATURES) & FEATURE_MAC;              // the only thing we want: the MAC address
+  wr (R_DRV_FEAT_SEL, 0);  wr (R_DRV_FEATURES, features);
+  if (version == 2) {                                            // a modern device must be told that we speak VERSION_1 (bit 32)
+    wr (R_DRV_FEAT_SEL, 1);  wr (R_DRV_FEATURES, 1);
+    wr (R_STATUS, ST_ACK | ST_DRIVER | ST_FEATURES_OK);
+    if (!(rd (R_STATUS) & ST_FEATURES_OK)) { printf ("net: features rejected\n"); dev = 0; return -1; }
+  }
+  hdr_len = version == 2 ? 12 : 10;
+
+  queue_init (&rxq, RX_QUEUE, version);
+  queue_init (&txq, TX_QUEUE, version);
+  rx_pa = alloc_frames_contig (QSIZE * BUF_SIZE / PAGE_SIZE);
+  tx_pa = alloc_frame ();
+  wr (R_STATUS, rd (R_STATUS) | ST_DRIVER_OK);
+  for (int i = 0; i < QSIZE; i++) rx_post (i);                   // all receive buffers are handed to the card
+
+  if (features & FEATURE_MAC) for (int i = 0; i < 6; i++) mac[i] = *(volatile u8 *)(dev + R_CONFIG + i);
+  printf ("net: virtio network card, MAC %02x:%02x:%02x:%02x:%02x:%02x\n", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  return 0;
+}
+
+static const u8 *mac_address (void) { return mac; }
+
+@
+Send one frame (Ethernet header and data, without the checksum at the end: the card adds it). Returns 0 if it has been sent.
+
+<<virtionet.c: send_frame>>=
+static int send_frame (const void *frame, int len) {
+  if (!dev || len < 14 || len > FRAME_MAX) return -1;
+  u8 *buf = KVA (tx_pa);
+  for (int i = 0; i < hdr_len; i++) buf[i] = 0;                  // the card's header: no offloading, nothing special
+  for (int i = 0; i < len; i++) buf[hdr_len + i] = ((const u8 *)frame)[i];
+  cache_clean (buf, hdr_len + len);
+
+  txq.desc[0].addr = tx_pa;
+  txq.desc[0].len = hdr_len + len;
+  txq.desc[0].flags = 0;                                         // (the card only reads this buffer)
+  txq.desc[0].next = 0;
+  cache_clean ((const void *)&txq.desc[0], sizeof (struct desc));
+  txq.avail->ring[txq.avail->idx % QSIZE] = 0;
+  __asm__ volatile ("dmb ish" ::: "memory");
+  txq.avail->idx++;
+  cache_clean ((const void *)txq.avail, sizeof (struct avail));
+  wr (R_QUEUE_NOTIFY, TX_QUEUE);
+
+  for (long spins = 0; spins < 5000000; spins++) {               // wait until the card says "sent"
+    cache_flush_inval ((const void *)txq.used, sizeof (struct used));
+    if (txq.used->idx != txq.used_seen) { txq.used_seen++; return 0; }
+  }
+  printf ("net: the card does not send\n");
+  return -1;
+}
+
+@
+Has a frame arrived? If so, copy it to 'out' (at most 'max' bytes) and return its length; 0 if nothing has arrived.
+
+<<virtionet.c: recv_frame>>=
+static int recv_frame (void *out, int max) {
+  if (!dev) return 0;
+  cache_flush_inval ((const void *)rxq.used, sizeof (struct used));
+  if (rxq.used->idx == rxq.used_seen) return 0;
+  u32 id = rxq.used->ring[rxq.used_seen % QSIZE].id;
+  int len = (int)rxq.used->ring[rxq.used_seen % QSIZE].len - hdr_len;
+  rxq.used_seen++;
+  u8 *buf = KVA (rx_pa + (u64)id * BUF_SIZE);
+  cache_flush_inval (buf, BUF_SIZE);
+  if (len > max) len = max;
+  for (int i = 0; i < len; i++) ((u8 *)out)[i] = buf[hdr_len + i];
+  rx_post (id);                                                  // the buffer goes back to the card
+  return len > 0 ? len : 0;
+}
+
+@
+The card raises its interrupt whenever it has put a buffer into a used ring (a frame has arrived, or one has been sent); the driver
+has to say ``I have seen it'' by writing the interrupt status back into the acknowledge register.
+
+<<virtionet.c: R_INTERRUPT_STATUS>>=
+#define R_INTERRUPT_STATUS 0x060
+#define R_INTERRUPT_ACK    0x064
+static int start_irq (void) { return dev_irq; }
+static void ack (void) { wr (R_INTERRUPT_ACK, rd (R_INTERRUPT_STATUS)); }
+
+const struct net_driver virtio_net_driver = { "vioif0", init, mac_address, send_frame, recv_frame, start_irq, ack };
+
+@
+\section{\texttt{genet.c}}
+\label{src:genet.c}
+
+@
+
+The complete file is put together from these parts:
+
+<<genet.c>>=
+<<genet.c: part 1>>
+
+<<genet.c: includes>>
+
+<<genet.c: SYS_REV_CTRL>>
+
+<<genet.c: mdio_wait>>
+
+<<genet.c: phy_link>>
+
+<<genet.c: reset>>
+
+<<genet.c: send_frame>>
+
+<<genet.c: recv_frame>>
+
+<<genet.c: start_irq>>
+@
+
+<<genet.c: part 1>>=
+/*-
+ * Ulix ARM64 -- the Ethernet controller of the Raspberry Pi 4B ("GENET", Broadcom GENETv5)
+ *
+ * The register names, the register layout and the order of the steps that set the controller up are those of the FreeBSD driver
+ * sys/arm64/broadcom/genet/if_genet.c and its header if_genetreg.h, which derive from NetBSD's bcmgenet.c. The code below is
+ * written new for Ulix (one ring each for sending and receiving, no filters; polling or interrupts); the FreeBSD files are
+ * under this licence:
+ *
+ * Copyright (c) 2020 Michael J Karels
+ * Copyright (c) 2016, 2020 Jared McNeill <jmcneill@invisible.ca>
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
+ * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+ * OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+ * IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
+ * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+ * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
+ * AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
+ *
+ * NOT TESTED ON THE REAL BOARD: qemu has no model of this controller. What is written here follows the FreeBSD driver; the first
+ * start on a Raspberry Pi will show what is missing.
+ */
+
+@
+How the controller works, in short. It has two parts: the MAC (``UMAC'', it sends and receives frames) and the DMA engine that
+moves frames between memory and the MAC. Both directions have a ring of 256 descriptors. A descriptor says where a frame is in
+memory (or where one may be put) and how long it is; unusually, the descriptors do not live in RAM but in registers of the
+controller (12 bytes each). Two numbers per ring tell whom the next descriptor belongs to: for sending, the driver writes the
+``producer index'' when it has filled descriptors and the controller advances the ``consumer index'' when it has sent them; for
+receiving, the controller advances the producer index when it has stored frames and the driver the consumer index when it has
+taken them. The indexes count up to [[0xffff]] and wrap; the descriptor in use is the index modulo 256.
+
+The cable is not connected to the controller but to a separate chip, the PHY (a Broadcom BCM54213PE). The PHY is configured
+over a two-wire bus (``MDIO'') whose registers are the same on all Ethernet PHYs (IEEE 802.3, clause 22): register 0 control,
+1 status, 4 and 5 what we and the partner can do, 9 and 10 the same for gigabit speed. The firmware has already started the PHY;
+here it is told to negotiate with the other side and we read what speed came out.
+
+<<genet.c: includes>>=
+#include "net.h"
+#include "plat.h"
+#include "delay.h"
+#include "cache.h"
+
+@
+\subsection{registers (offsets from the base address)}
+
+<<genet.c: SYS_REV_CTRL>>=
+#define SYS_REV_CTRL        0x000          // bits 27..24: major version, 6 = GENET v5
+#define SYS_PORT_CTRL       0x004
+#define  PORT_MODE_EXT_GPHY 3              // an external PHY chip
+#define SYS_RBUF_FLUSH_CTRL 0x008
+#define  RBUF_FLUSH_RESET   (1 @<< 1)
+#define EXT_RGMII_OOB_CTRL  0x08c
+#define  RGMII_ID_MODE_DISABLE (1 @<< 16)
+#define  RGMII_MODE_EN      (1 @<< 6)
+#define  RGMII_OOB_DISABLE  (1 @<< 5)
+#define  RGMII_LINK         (1 @<< 4)
+#define INTRL2_CPU_STAT       0x200        // which interrupts are pending
+#define INTRL2_CPU_CLEAR      0x208        // writing a bit here clears that interrupt
+#define INTRL2_CPU_STAT_MASK  0x20c        // which interrupts are off
+#define INTRL2_CPU_SET_MASK   0x210        // bits set here are interrupts that stay off
+#define INTRL2_CPU_CLEAR_MASK 0x214        // bits set here turn those interrupts on
+#define  IRQ_TXDMA_DONE       (1 @<< 16)    // frames have been sent
+#define  IRQ_RXDMA_DONE       (1 @<< 13)    // frames have arrived
+#define RBUF_CTRL           0x300
+#define  RBUF_ALIGN_2B      (1 @<< 1)       // two bytes of padding before the frame, so that the IP header is aligned
+#define  RBUF_64B_EN        (1 @<< 0)       // a 64-byte status block before the frame (we do not want it)
+#define RBUF_TBUF_SIZE_CTRL 0x3b4
+#define TBUF_CTRL           0x600
+#define UMAC_CMD            0x808
+#define  CMD_LCL_LOOP_EN    (1 @<< 15)
+#define  CMD_SW_RESET       (1 @<< 13)
+#define  CMD_PROMISC        (1 @<< 4)       // receive every frame, whatever its destination address
+#define  CMD_SPEED          (3 @<< 2)
+#define  CMD_SPEED_10       (0 @<< 2)
+#define  CMD_SPEED_100      (1 @<< 2)
+#define  CMD_SPEED_1000     (2 @<< 2)
+#define  CMD_RXEN           (1 @<< 1)
+#define  CMD_TXEN           (1 @<< 0)
+#define UMAC_MAC0           0x80c          // our Ethernet address: first four bytes
+#define UMAC_MAC1           0x810          // ... last two bytes
+#define UMAC_MAX_FRAME_LEN  0x814
+#define UMAC_MIB_CTRL       0xd80          // the statistics counters
+#define MDIO_CMD            0xe14
+#define  MDIO_START_BUSY    (1 @<< 29)
+#define  MDIO_READ_FAILED   (1 @<< 28)
+#define  MDIO_READ          (1 @<< 27)
+#define  MDIO_WRITE         (1 @<< 26)
+
+#define DESCRIPTORS  256                   // descriptors of a ring (the hardware's size)
+#define DESC_SIZE    12                    // bytes of a descriptor: status, address low, address high
+#define QUEUE        16                    // the hardware has 17 rings; the "default" one, number 16, is all we use
+#define RING_SIZE    0x40                  // bytes of registers of a ring
+#define BUFFER       2048                  // room for one frame (at most 1514 bytes plus the padding)
+
+#define RX_BASE 0x2000                     // descriptors (12 bytes each) from here; the rings' registers from +0xc00; the DMA's from +0x1040
+#define TX_BASE 0x4000
+#define RING(base, q)       ((base) + 0xc00 + RING_SIZE * (q))
+// registers of a ring, the same offsets in the receive and the transmit part where they mean the same
+#define RX_PROD_INDEX(q)    (RING (RX_BASE, q) + 0x08)
+#define RX_CONS_INDEX(q)    (RING (RX_BASE, q) + 0x0c)
+#define TX_CONS_INDEX(q)    (RING (TX_BASE, q) + 0x08)
+#define TX_PROD_INDEX(q)    (RING (TX_BASE, q) + 0x0c)
+#define DMA_RING_CFG(base)  ((base) + 0x1040 + 0x00)       // which rings are on (bit n = ring n)
+#define DMA_CTRL(base)      ((base) + 0x1040 + 0x04)
+#define  DMA_CTRL_EN        (1 @<< 0)
+#define  DMA_CTRL_RING(q)   (1 @<< ((q) + 1))
+#define SCB_BURST_SIZE(base) ((base) + 0x1040 + 0x0c)
+
+#define DESC_STATUS(base, i)  ((base) + DESC_SIZE * (i) + 0x00)
+#define DESC_ADDR_LO(base, i) ((base) + DESC_SIZE * (i) + 0x04)
+#define DESC_ADDR_HI(base, i) ((base) + DESC_SIZE * (i) + 0x08)
+#define DESC_BUFLEN_SHIFT   16             // the length is in bits 27..16 of the status
+#define DESC_EOP            (1 @<< 14)      // last descriptor of a frame
+#define DESC_SOP            (1 @<< 13)      // first descriptor of a frame
+#define TX_DESC_CRC         (1 @<< 6)       // the controller adds the checksum at the end of the frame
+#define TX_DESC_QTAG_MASK   0x1f80
+#define RX_DESC_ERROR       (1 @<< 2)
+
+#define PHY_ADDRESS 1                      // the PHY of the Raspberry Pi 4 answers on MDIO address 1 (ethernet-phy@1 in its device tree)
+
+static u64 base = 0;                       // virtual address of the controller
+static u8 mac[6];
+static u64 rx_pa, tx_pa;                   // the 256 receive buffers (one area), the one buffer for sending
+static u32 rx_cons, tx_prod;               // our side of the indexes
+
+static u32  rd (int off)        { return *(volatile u32 *)(base + off); }
+static void wr (int off, u32 v) { *(volatile u32 *)(base + off) = v; }
+
+@
+\subsection{the PHY, over MDIO}
+
+<<genet.c: mdio_wait>>=
+static int mdio_wait (void) {
+  for (int i = 0; i < 1000; i++) { if (!(rd (MDIO_CMD) & MDIO_START_BUSY)) return 0; delay_us (10); }
+  return -1;
+}
+
+static int phy_read (int reg) {                                    // the 16 bit register 'reg' of the PHY, or -1
+  wr (MDIO_CMD, MDIO_READ | (PHY_ADDRESS @<< 21) | (reg @<< 16));
+  wr (MDIO_CMD, rd (MDIO_CMD) | MDIO_START_BUSY);                  // (the command is written first, then started)
+  if (mdio_wait () != 0 || (rd (MDIO_CMD) & MDIO_READ_FAILED)) return -1;
+  return rd (MDIO_CMD) & 0xffff;
+}
+
+static void phy_write (int reg, int value) {
+  wr (MDIO_CMD, MDIO_WRITE | (PHY_ADDRESS @<< 21) | (reg @<< 16) | (value & 0xffff));
+  wr (MDIO_CMD, rd (MDIO_CMD) | MDIO_START_BUSY);
+  mdio_wait ();
+}
+
+@
+Let the PHY negotiate with the other end of the cable and wait (at most five seconds) until there is a link.
+Returns the speed in Mbit/s (10, 100, 1000), or 0 if there is no link (no cable, or nobody at the other end).
+
+<<genet.c: phy_link>>=
+static int phy_link (void) {
+  phy_write (0, 0x1200);                                           // control: autonegotiation on (bit 12), start again (bit 9)
+  for (int ms = 0; ms < 5000; ms += 10) {
+    int status = phy_read (1);                                     // status: bit 2 link is up, bit 5 negotiation is complete
+    if (status > 0 && (status & 0x0004) && (status & 0x0020)) {
+      int partner_gigabit = phy_read (10), partner = phy_read (5);
+      if (partner_gigabit > 0 && (partner_gigabit & (1 @<< 11))) return 1000;       // the partner can do gigabit, full duplex
+      if (partner > 0 && (partner & ((1 @<< 8) | (1 @<< 7)))) return 100;           // 100 Mbit/s, full or half duplex
+      return 10;
+    }
+    delay_us (10000);
+  }
+  return 0;
+}
+
+@
+---- the controller ----
+Back to the state after power-on: the buffers of the MAC, then the MAC itself, then the statistics.
+
+<<genet.c: reset>>=
+static void reset (void) {
+  u32 v = rd (SYS_RBUF_FLUSH_CTRL);
+  wr (SYS_RBUF_FLUSH_CTRL, v | RBUF_FLUSH_RESET);  delay_us (10);
+  wr (SYS_RBUF_FLUSH_CTRL, v & ~RBUF_FLUSH_RESET);  delay_us (10);
+  wr (SYS_RBUF_FLUSH_CTRL, 0);                      delay_us (10);
+  wr (UMAC_CMD, 0);
+  wr (UMAC_CMD, CMD_LCL_LOOP_EN | CMD_SW_RESET);    delay_us (10);
+  wr (UMAC_CMD, 0);
+  wr (UMAC_MIB_CTRL, 7);  wr (UMAC_MIB_CTRL, 0);    // reset and then count again: receive, transmit, runt frames
+}
+
+static void dma_off (void) {
+  wr (TX_BASE + 0x1040 + 0x04, rd (TX_BASE + 0x1040 + 0x04) & ~(DMA_CTRL_EN | DMA_CTRL_RING (QUEUE)));
+  wr (RX_BASE + 0x1040 + 0x04, rd (RX_BASE + 0x1040 + 0x04) & ~(DMA_CTRL_EN | DMA_CTRL_RING (QUEUE)));
+}
+
+static void tx_ring_init (void) {
+  int q = QUEUE;
+  tx_prod = 0;
+  wr (SCB_BURST_SIZE (TX_BASE), 0x08);
+  wr (RING (TX_BASE, q) + 0x00, 0);  wr (RING (TX_BASE, q) + 0x04, 0);          // read pointer
+  wr (TX_CONS_INDEX (q), 0);  wr (TX_PROD_INDEX (q), 0);
+  wr (RING (TX_BASE, q) + 0x10, (DESCRIPTORS @<< 16) | BUFFER);                  // number of descriptors, size of a buffer
+  wr (RING (TX_BASE, q) + 0x14, 0);  wr (RING (TX_BASE, q) + 0x18, 0);          // start address
+  wr (RING (TX_BASE, q) + 0x1c, DESCRIPTORS * DESC_SIZE / 4 - 1);  wr (RING (TX_BASE, q) + 0x20, 0);     // end address (in words)
+  wr (RING (TX_BASE, q) + 0x24, 1);                                             // interrupt after every frame (not used)
+  wr (RING (TX_BASE, q) + 0x28, 0);
+  wr (RING (TX_BASE, q) + 0x2c, 0);  wr (RING (TX_BASE, q) + 0x30, 0);          // write pointer
+  wr (DMA_RING_CFG (TX_BASE), 1 @<< q);                                          // this ring is on
+  wr (DMA_CTRL (TX_BASE), rd (DMA_CTRL (TX_BASE)) | DMA_CTRL_EN | DMA_CTRL_RING (q));
+}
+
+static void rx_ring_init (void) {
+  int q = QUEUE;
+  rx_cons = 0;
+  wr (SCB_BURST_SIZE (RX_BASE), 0x08);
+  wr (RING (RX_BASE, q) + 0x00, 0);  wr (RING (RX_BASE, q) + 0x04, 0);          // write pointer
+  wr (RX_PROD_INDEX (q), 0);  wr (RX_CONS_INDEX (q), 0);
+  wr (RING (RX_BASE, q) + 0x10, (DESCRIPTORS @<< 16) | BUFFER);
+  wr (RING (RX_BASE, q) + 0x14, 0);  wr (RING (RX_BASE, q) + 0x18, 0);
+  wr (RING (RX_BASE, q) + 0x1c, DESCRIPTORS * DESC_SIZE / 4 - 1);  wr (RING (RX_BASE, q) + 0x20, 0);
+  wr (RING (RX_BASE, q) + 0x28, (5 @<< 16) | (DESCRIPTORS >> 4));                // flow control thresholds
+  wr (RING (RX_BASE, q) + 0x2c, 0);  wr (RING (RX_BASE, q) + 0x30, 0);          // read pointer
+  wr (DMA_RING_CFG (RX_BASE), 1 @<< q);
+  for (int i = 0; i < DESCRIPTORS; i++) {                                       // every descriptor gets its own buffer, for good
+    u64 buffer = rx_pa + (u64)i * BUFFER;
+    wr (DESC_ADDR_LO (RX_BASE, i), (u32)buffer);
+    wr (DESC_ADDR_HI (RX_BASE, i), buffer >> 32);
+  }
+  wr (DMA_CTRL (RX_BASE), rd (DMA_CTRL (RX_BASE)) | DMA_CTRL_EN | DMA_CTRL_RING (q));
+}
+
+static int init (void) {
+  if (!plat.genet) return -1;
+  base = KERNEL_VA + plat.genet;
+  u32 major = (rd (SYS_REV_CTRL) >> 24) & 0xf;
+  if (major != 6) { printf ("genet: unknown controller (revision register 0x%x)\n", rd (SYS_REV_CTRL)); return -1; }
+  printf ("genet: Ethernet controller GENET v5.%d\n", (rd (SYS_REV_CTRL) >> 16) & 0xf);
+
+  // our Ethernet address: from the device tree (the firmware puts the one of the board there), else what the controller still holds
+  if (plat.genet_has_mac) for (int i = 0; i < 6; i++) mac[i] = plat.genet_mac[i];
+  else {
+    u32 lo = rd (UMAC_MAC0), hi = rd (UMAC_MAC1);
+    mac[0] = lo >> 24;  mac[1] = lo >> 16;  mac[2] = lo >> 8;  mac[3] = lo;  mac[4] = hi >> 8;  mac[5] = hi;
+  }
+
+  reset ();
+  dma_off ();
+  wr (INTRL2_CPU_SET_MASK, 0xffffffff);                                         // all interrupts off (start_irq () turns two on, later)
+  wr (SYS_PORT_CTRL, PORT_MODE_EXT_GPHY);
+
+  wr (UMAC_MAC0, ((u32)mac[0] @<< 24) | (mac[1] @<< 16) | (mac[2] @<< 8) | mac[3]);
+  wr (UMAC_MAC1, (mac[4] @<< 8) | mac[5]);
+  wr (UMAC_CMD, rd (UMAC_CMD) | CMD_PROMISC);                                   // no address filter: everything comes in, net.c picks
+
+  rx_pa = alloc_frames_contig (DESCRIPTORS * BUFFER / PAGE_SIZE);
+  tx_pa = alloc_frame ();
+  tx_ring_init ();
+  rx_ring_init ();
+
+  wr (UMAC_MAX_FRAME_LEN, 1536);
+  wr (RBUF_CTRL, (rd (RBUF_CTRL) | RBUF_ALIGN_2B) & ~RBUF_64B_EN);              // two bytes of padding, no status block
+  wr (TBUF_CTRL, rd (TBUF_CTRL) & ~RBUF_64B_EN);
+  wr (RBUF_TBUF_SIZE_CTRL, 1);
+  wr (UMAC_CMD, rd (UMAC_CMD) | CMD_TXEN | CMD_RXEN);
+
+  // the link: speed from the PHY, then tell the MAC (the "RGMII" connection between MAC and PHY) what the PHY has decided.
+  // The PHY of the Pi 4 adds the clock delay for the received data itself ("rgmii-rxid"), so the MAC does not.
+  int speed = phy_link ();
+  if (speed == 0) printf ("genet: no link (is the cable connected?)\n");
+  else {
+    printf ("genet: link up, %d Mbit/s\n", speed);
+    u32 v = rd (EXT_RGMII_OOB_CTRL);
+    v &= ~(RGMII_OOB_DISABLE | RGMII_ID_MODE_DISABLE);
+    wr (EXT_RGMII_OOB_CTRL, v | RGMII_LINK | RGMII_MODE_EN);
+    wr (UMAC_CMD, (rd (UMAC_CMD) & ~CMD_SPEED) | (speed == 1000 ? CMD_SPEED_1000 : speed == 100 ? CMD_SPEED_100 : CMD_SPEED_10));
+  }
+  return 0;
+}
+
+static const u8 *mac_address (void) { return mac; }
+
+@
+Send one frame: copy it into the buffer, fill the next descriptor, tell the controller (producer index), wait until it has gone.
+
+<<genet.c: send_frame>>=
+static int send_frame (const void *frame, int len) {
+  if (len < 14 || len > 1514) return -1;
+  u8 *buffer = KVA (tx_pa);
+  for (int i = 0; i < len; i++) buffer[i] = ((const u8 *)frame)[i];
+  while (len < 60) buffer[len++] = 0;                                           // a frame has at least 60 bytes (without the checksum)
+  cache_clean (buffer, len);
+  int i = tx_prod & (DESCRIPTORS - 1);
+  wr (DESC_ADDR_LO (TX_BASE, i), (u32)tx_pa);
+  wr (DESC_ADDR_HI (TX_BASE, i), tx_pa >> 32);
+  wr (DESC_STATUS (TX_BASE, i), TX_DESC_QTAG_MASK | DESC_SOP | DESC_EOP | TX_DESC_CRC | ((u32)len @<< DESC_BUFLEN_SHIFT));
+  tx_prod = (tx_prod + 1) & 0xffff;
+  wr (TX_PROD_INDEX (QUEUE), tx_prod);
+  for (int us = 0; us < 100000; us += 10) {                                     // the controller is done when its consumer index has caught up
+    if ((rd (TX_CONS_INDEX (QUEUE)) & 0xffff) == tx_prod) return 0;
+    delay_us (10);
+  }
+  printf ("genet: the frame is not sent\n");
+  return -1;
+}
+
+@
+Has a frame arrived? The controller advances its producer index for every frame it has stored; we are behind by [[rx_cons]].
+
+<<genet.c: recv_frame>>=
+static int recv_frame (void *out, int max) {
+  u32 produced = rd (RX_PROD_INDEX (QUEUE)) & 0xffff;
+  if (produced == rx_cons) return 0;
+  int i = rx_cons & (DESCRIPTORS - 1);
+  u32 status = rd (DESC_STATUS (RX_BASE, i));
+  int len = (status >> DESC_BUFLEN_SHIFT) & 0xfff;
+  u8 *buffer = KVA (rx_pa + (u64)i * BUFFER);
+  int result = 0;
+  if ((status & (DESC_SOP | DESC_EOP | RX_DESC_ERROR)) == (DESC_SOP | DESC_EOP) && len > 2) {     // one whole frame, no error
+    cache_flush_inval (buffer, BUFFER);
+    len -= 2;                                                                   // the two bytes of padding before the frame
+    if (len > max) len = max;
+    for (int k = 0; k < len; k++) ((u8 *)out)[k] = buffer[2 + k];
+    result = len;
+  }
+  rx_cons = (rx_cons + 1) & 0xffff;
+  wr (RX_CONS_INDEX (QUEUE), rx_cons);                                          // the descriptor (and its buffer) goes back to the controller
+  return result;
+}
+
+@
+Interrupts: the controller has many; we want two, ``frames have arrived'' and ``frames have been sent''. The handler clears whatever is
+pending; the work itself is done by the network thread ([[netd.c]]), which finds the frames by looking at the indexes.
+
+<<genet.c: start_irq>>=
+static int start_irq (void) {
+  if (!plat.genet_irq) return 0;
+  wr (INTRL2_CPU_CLEAR_MASK, IRQ_RXDMA_DONE | IRQ_TXDMA_DONE);
+  return plat.genet_irq;
+}
+
+static void ack (void) { wr (INTRL2_CPU_CLEAR, rd (INTRL2_CPU_STAT) & ~rd (INTRL2_CPU_STAT_MASK)); }
+
+const struct net_driver genet_driver = { "genet0", init, mac_address, send_frame, recv_frame, start_irq, ack };
+
+@
+\section{The network layers below TCP: Ethernet, ARP, IPv4, ICMP and UDP}
+\label{src:net.c}
+
+A frame that comes from the network card is an Ethernet frame:
+
+\begin{quote}\begin{verbatim}
+    | destination MAC (6) | source MAC (6) | type (2) | data ...
+\end{verbatim}\end{quote}
+
+The type says what the data is: [[0x0806]] = ARP (who has this IP address?), [[0x0800]] = an IPv4 packet. An IPv4 packet has a header of
+(usually) 20 bytes with the addresses and the protocol of its data: 1 = ICMP (ping), 17 = UDP, 6 = TCP.
+
+Everything is deliberately plain: one frame at a time, no fragmentation, no IP options, a table of eight neighbours. The layers are
+called in a chain, like in the books about TCP/IP: [[net_poll_once ()]] -> [[frame_input ()]] -> [[arp_input ()]] or [[ip_input ()]] ->
+[[icmp_input ()]], [[udp_input ()]] or [[tcp_input ()]].
+
+@
+
+The complete file is put together from these parts:
+
+<<net.c>>=
+<<net.c: includes>>
+
+<<net.c: net_my_ip>>
+
+<<net.c: net_checksum>>
+
+<<net.c: ARP_ENTRIES>>
+
+<<net.c: arp_resolve>>
+
+<<net.c: ip_send>>
+
+<<net.c: ping_seq_seen>>
+
+<<net.c: ICMP_SOCKETS>>
+
+<<net.c: icmp_open>>
+
+<<net.c: icmp_get>>
+
+<<net.c: UDP_PORTS>>
+
+<<net.c: net_pseudo_sum>>
+
+<<net.c: ip_input>>
+
+<<net.c: frame_input>>
+@
+
+<<net.c: includes>>=
+#include "net.h"
+
+void tcp_input (u32 src_ip, const u8 *segment, int len) __attribute__ ((weak));      // tcp.c (if it is part of the kernel)
+void tcp_timer (void) __attribute__ ((weak));
+
+@
+\subsection{the addresses of this computer: the ones that qemu's user-mode network expects}
+
+<<net.c: net_my_ip>>=
+u32 net_my_ip   = IP (10, 0, 2, 15);
+u32 net_netmask = IP (255, 255, 255, 0);
+u32 net_gateway = IP (10, 0, 2, 2);          // the router (qemu answers for it: ARP, ping, and it forwards to the outside)
+u32 net_dns     = IP (10, 0, 2, 3);          // the name server (not used yet: there is no DNS client)
+const char *net_if_name = "vioif0";          // NetBSD calls the virtio network interface vioif0 (FreeBSD: vtnet0)
+
+#define ETH_ARP  0x0806
+#define ETH_IP   0x0800
+#define IP_ICMP  1
+#define IP_TCP   6
+#define IP_UDP   17
+
+static const u8 broadcast_mac[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+static u8 rxframe[1518];                     // the frame that is being handled (handlers may send, so sending has its own buffer)
+static u8 txframe[1518];
+
+static void copy (u8 *to, const u8 *from, int n) { for (int i = 0; i < n; i++) to[i] = from[i]; }
+static int  same (const u8 *a, const u8 *b, int n) { for (int i = 0; i < n; i++) if (a[i] != b[i]) return 0; return 1; }
+
+u64 net_now_ms (void) {                       // the counter of the generic timer runs at a fixed frequency
+  u64 freq, count;
+  __asm__ volatile ("mrs %0, cntfrq_el0" : "=r" (freq));
+  __asm__ volatile ("mrs %0, cntpct_el0" : "=r" (count));
+  return count / (freq / 1000);
+}
+
+@
+The checksum of the Internet protocols: the sum of all 16 bit words (a last single byte counts as the high half of a word),
+carries added back in, then all bits turned around. 'sum' lets the caller start with a part that is somewhere else (the
+``pseudo header'' of UDP and TCP). A packet that contains its own checksum gives 0 when it is checked.
+
+<<net.c: net_checksum>>=
+u16 net_checksum (const u8 *data, int len, u32 sum) {
+  for (int i = 0; i + 1 < len; i += 2) sum += get16 (data + i);
+  if (len & 1) sum += (u32)data[len - 1] @<< 8;
+  while (sum >> 16) sum = (sum & 0xffff) + (sum >> 16);
+  return (u16)~sum;
+}
+
+@
+---------------------------------------------------------------- ARP
+ARP finds out which Ethernet address belongs to an IP address: ask everybody (``who has 10.0.2.2?''), the owner answers.
+
+\begin{quote}\begin{verbatim}
+    | hardware type 1 (2) | protocol 0x0800 (2) | 6 (1) | 4 (1) | operation 1 = request, 2 = reply (2) |
+    | sender MAC (6) | sender IP (4) | target MAC (6) | target IP (4) |
+\end{verbatim}\end{quote}
+
+<<net.c: ARP_ENTRIES>>=
+#define ARP_ENTRIES 8
+static struct { u32 ip; u8 mac[6]; int valid; } arp_cache[ARP_ENTRIES];
+static int arp_next = 0;
+
+static void arp_remember (u32 ip, const u8 *mac) {
+  for (int i = 0; i < ARP_ENTRIES; i++)
+    if (arp_cache[i].valid && arp_cache[i].ip == ip) { copy (arp_cache[i].mac, mac, 6); return; }
+  arp_cache[arp_next].ip = ip;  copy (arp_cache[arp_next].mac, mac, 6);  arp_cache[arp_next].valid = 1;
+  arp_next = (arp_next + 1) % ARP_ENTRIES;                       // when the table is full the oldest entry goes
+}
+
+static void arp_send (int operation, const u8 *target_mac, u32 target_ip) {
+  u8 *f = txframe;
+  copy (f, operation == 1 ? broadcast_mac : target_mac, 6);      // a request goes to everybody, a reply to the one who asked
+  copy (f + 6, net_dev_mac (), 6);
+  put16 (f + 12, ETH_ARP);
+  put16 (f + 14, 1);  put16 (f + 16, ETH_IP);  f[18] = 6;  f[19] = 4;  put16 (f + 20, operation);
+  copy (f + 22, net_dev_mac (), 6);  put32 (f + 28, net_my_ip);
+  copy (f + 32, operation == 1 ? (const u8 *)"\0\0\0\0\0\0" : target_mac, 6);  put32 (f + 38, target_ip);
+  net_dev_send (f, 42);
+}
+
+static void arp_input (const u8 *f, int len) {
+  if (len < 42 || get16 (f + 14) != 1 || get16 (f + 16) != ETH_IP || f[18] != 6 || f[19] != 4) return;
+  u32 sender_ip = get32 (f + 28), target_ip = get32 (f + 38);
+  int operation = get16 (f + 20);
+  if (sender_ip) arp_remember (sender_ip, f + 22);               // whoever speaks to us: we learn how to answer
+  if (operation == 1 && target_ip == net_my_ip) arp_send (2, f + 22, sender_ip);
+}
+
+static int arp_lookup (u32 ip, u8 *mac) {                         // 0 = it is in the table
+  for (int i = 0; i < ARP_ENTRIES; i++)
+    if (arp_cache[i].valid && arp_cache[i].ip == ip) { copy (mac, arp_cache[i].mac, 6); return 0; }
+  return -1;
+}
+
+@
+the Ethernet address for an IP address on our network: look in the table, else ask (up to four times, waiting a second each
+time for the answer, which [[arp_input]] puts into the table); 0 = found
+
+<<net.c: arp_resolve>>=
+static int arp_resolve (u32 ip, u8 *mac) {
+  for (int attempt = 0; attempt < 4; attempt++) {
+    if (arp_lookup (ip, mac) == 0) return 0;
+    arp_send (1, 0, ip);
+    u64 start = net_now_ms ();
+    while (net_now_ms () - start < 1000) {
+      net_poll_once ();
+      if (arp_lookup (ip, mac) == 0) return 0;
+    }
+  }
+  return -1;
+}
+
+@
+---------------------------------------------------------------- IPv4
+\begin{quote}\begin{verbatim}
+    | version 4 and header length in words (1) | type of service (1) | total length (2) |
+    | identification (2) | flags and fragment offset (2) | time to live (1) | protocol (1) | header checksum (2) |
+    | source IP (4) | destination IP (4) | data ...
+\end{verbatim}\end{quote}
+The data of the packet is what follows the header; ``total length'' says where it ends (Ethernet may pad short frames).
+
+<<net.c: ip_send>>=
+int ip_send (u32 dst, u8 protocol, const u8 *data, int len) {
+  static u16 identification = 1;
+  if (len > 1480) return -1;                                      // no fragmentation: a packet must fit into one frame
+  u8 mac[6];
+  if (dst == 0xffffffff) copy (mac, broadcast_mac, 6);
+  else {
+    u32 next_hop = ((dst ^ net_my_ip) & net_netmask) == 0 ? dst : net_gateway;      // on our network: direct, else via the router
+    if (next_hop == 0) return -1;                                 // not on our network and no router: "network is unreachable"
+    if (arp_resolve (next_hop, mac) != 0) return -1;
+  }
+  u8 *f = txframe;
+  copy (f, mac, 6);  copy (f + 6, net_dev_mac (), 6);  put16 (f + 12, ETH_IP);
+  u8 *ip = f + 14;
+  ip[0] = 0x45;  ip[1] = 0;  put16 (ip + 2, 20 + len);
+  put16 (ip + 4, identification++);  put16 (ip + 6, 0x4000);     // "don't fragment"
+  ip[8] = 64;  ip[9] = protocol;  put16 (ip + 10, 0);
+  put32 (ip + 12, net_my_ip);  put32 (ip + 16, dst);
+  put16 (ip + 10, net_checksum (ip, 20, 0));
+  copy (ip + 20, data, len);
+  return net_dev_send (f, 14 + 20 + len);
+}
+
+@
+---------------------------------------------------------------- ICMP
+ICMP carries messages about the network. We only know the echo request (type 8) and its answer (type 0): ``ping''.
+\begin{quote}\begin{verbatim}
+    | type (1) | code (1) | checksum (2) | identifier (2) | sequence number (2) | data ...
+\end{verbatim}\end{quote}
+
+<<net.c: ping_seq_seen>>=
+static volatile int ping_seq_seen = -1;                          // the sequence number of the last echo reply that arrived
+
+@
+---- raw ICMP sockets, for programs (see [[net_syscalls.c]]): a program builds its own ICMP messages, sends them with [[icmp_send ()]]
+and picks up the answers with [[icmp_get ()]]. That is what the program ``ping'' does. Everything that arrives and is not an echo
+request (those the kernel answers itself) is put into the queue of every open socket: echo replies (type 0), ``destination
+unreachable'' (3), ``time exceeded'' (11), ... The program looks at the type and at the identifier to find its own.
+
+<<net.c: ICMP_SOCKETS>>=
+#define ICMP_SOCKETS 4
+#define ICMP_QUEUE   8
+#define ICMP_MAX     256                                         // longer messages are cut off
+static struct {
+  int used, owner;
+  int first, count;                                              // the queue is a ring: 'count' messages, the oldest at 'first'
+  struct { u32 from; int len; u8 data[ICMP_MAX]; } queue[ICMP_QUEUE];
+} icmp_sockets[ICMP_SOCKETS];
+
+@
+A free socket, or one whose owner has gone ('alive' tells whether a process still exists): its number, -1 = none.
+
+<<net.c: icmp_open>>=
+int icmp_open (int owner, int (*alive) (int owner)) {
+  for (int i = 0; i < ICMP_SOCKETS; i++)
+    if (!icmp_sockets[i].used || !alive (icmp_sockets[i].owner)) {
+      u8 *p = (u8 *)&icmp_sockets[i];
+      for (unsigned k = 0; k < sizeof icmp_sockets[i]; k++) p[k] = 0;
+      icmp_sockets[i].used = 1;  icmp_sockets[i].owner = owner;
+      return i;
+    }
+  return -1;
+}
+
+void icmp_close (int h) { if (h >= 0 && h < ICMP_SOCKETS) icmp_sockets[h].used = 0; }
+
+int icmp_send (int h, u32 ip, const u8 *msg, int len) {
+  if (h < 0 || h >= ICMP_SOCKETS || !icmp_sockets[h].used || len < 8 || len > 1480) return -1;
+  return ip_send (ip, IP_ICMP, msg, len);
+}
+
+@
+the oldest waiting message: its length (and the sender in *from), 0 = none, -1 = no such socket
+
+<<net.c: icmp_get>>=
+int icmp_get (int h, u8 *buf, int max, u32 *from) {
+  if (h < 0 || h >= ICMP_SOCKETS || !icmp_sockets[h].used) return -1;
+  if (icmp_sockets[h].count == 0) return 0;
+  int i = icmp_sockets[h].first;
+  int len = icmp_sockets[h].queue[i].len < max ? icmp_sockets[h].queue[i].len : max;
+  for (int k = 0; k < len; k++) buf[k] = icmp_sockets[h].queue[i].data[k];
+  *from = icmp_sockets[h].queue[i].from;
+  icmp_sockets[h].first = (i + 1) % ICMP_QUEUE;
+  icmp_sockets[h].count--;
+  return len;
+}
+
+static void icmp_deliver (u32 from, const u8 *icmp, int len) {
+  for (int h = 0; h < ICMP_SOCKETS; h++) {
+    if (!icmp_sockets[h].used || icmp_sockets[h].count == ICMP_QUEUE) continue;     // (a full queue loses the newest message)
+    int i = (icmp_sockets[h].first + icmp_sockets[h].count) % ICMP_QUEUE;
+    int n = len < ICMP_MAX ? len : ICMP_MAX;
+    for (int k = 0; k < n; k++) icmp_sockets[h].queue[i].data[k] = icmp[k];
+    icmp_sockets[h].queue[i].len = n;  icmp_sockets[h].queue[i].from = from;
+    icmp_sockets[h].count++;
+  }
+}
+
+static void icmp_input (u32 src, const u8 *icmp, int len) {
+  if (len < 8 || net_checksum (icmp, len, 0) != 0) return;
+  if (icmp[0] == 8) {                                            // echo request: send the same data back as an echo reply
+    static u8 reply[1480];
+    if (len > (int)sizeof reply) return;
+    copy (reply, icmp, len);
+    reply[0] = 0;  put16 (reply + 2, 0);
+    put16 (reply + 2, net_checksum (reply, len, 0));
+    ip_send (src, IP_ICMP, reply, len);
+  } else {
+    if (icmp[0] == 0) ping_seq_seen = get16 (icmp + 6);
+    icmp_deliver (src, icmp, len);                               // ... and the programs that have a socket may want it, too
+  }
+}
+
+int net_ping (u32 ip, int timeout_ms) {
+  static u16 sequence = 0;
+  u8 echo[8 + 32];
+  echo[0] = 8;  echo[1] = 0;  put16 (echo + 2, 0);
+  put16 (echo + 4, 0x756c);  put16 (echo + 6, ++sequence);       // identifier "ul", our sequence number
+  for (int i = 0; i < 32; i++) echo[8 + i] = 'a' + i % 26;
+  put16 (echo + 2, net_checksum (echo, sizeof echo, 0));
+  ping_seq_seen = -1;
+  u64 start = net_now_ms();
+  if (ip_send (ip, IP_ICMP, echo, sizeof echo) != 0) return -1;
+  while (net_now_ms () - start < (u64)timeout_ms) {
+    net_poll_once ();
+    if (ping_seq_seen == sequence) return (int)(net_now_ms () - start);
+  }
+  return -1;
+}
+
+@
+---------------------------------------------------------------- UDP
+UDP sends single messages (``datagrams'') to a port of another computer. No connection, no guarantee that it arrives.
+\begin{quote}\begin{verbatim}
+    | source port (2) | destination port (2) | length of header and data (2) | checksum (2) | data ...
+\end{verbatim}\end{quote}
+The checksum also covers a ``pseudo header'' with the IP addresses and the protocol, so that a datagram that was delivered to
+the wrong address is noticed.
+
+<<net.c: UDP_PORTS>>=
+#define UDP_PORTS 8
+static struct { u16 port; udp_handler handler; } udp_ports[UDP_PORTS];
+
+int udp_bind (u16 port, udp_handler handler) {
+  for (int i = 0; i < UDP_PORTS; i++)
+    if (!udp_ports[i].handler) { udp_ports[i].port = port; udp_ports[i].handler = handler; return 0; }
+  return -1;
+}
+
+@
+the sum of the pseudo header, to be continued with the checksum of the UDP (or TCP) segment itself
+
+<<net.c: net_pseudo_sum>>=
+u32 net_pseudo_sum (u32 src, u32 dst, u8 protocol, int length) {
+  return (src >> 16) + (src & 0xffff) + (dst >> 16) + (dst & 0xffff) + protocol + length;
+}
+
+int udp_send (u32 dst_ip, u16 dst_port, u16 src_port, const u8 *data, int len) {
+  static u8 datagram[1480];
+  if (len > 1472) return -1;
+  put16 (datagram, src_port);  put16 (datagram + 2, dst_port);  put16 (datagram + 4, 8 + len);  put16 (datagram + 6, 0);
+  copy (datagram + 8, data, len);
+  u16 sum = net_checksum (datagram, 8 + len, net_pseudo_sum (net_my_ip, dst_ip, IP_UDP, 8 + len));
+  put16 (datagram + 6, sum ? sum : 0xffff);                       // (0 means "no checksum", so a real 0 is sent as all ones)
+  return ip_send (dst_ip, IP_UDP, datagram, 8 + len);
+}
+
+static void udp_input (u32 src, u32 dst, const u8 *udp, int len) {
+  if (len < 8) return;
+  int length = get16 (udp + 4);
+  if (length < 8 || length > len) return;
+  if (get16 (udp + 6) != 0 && net_checksum (udp, length, net_pseudo_sum (src, dst, IP_UDP, length)) != 0) return;
+  for (int i = 0; i < UDP_PORTS; i++)
+    if (udp_ports[i].handler && udp_ports[i].port == get16 (udp + 2)) {
+      udp_ports[i].handler (src, get16 (udp), udp + 8, length - 8);
+      return;
+    }
+}
+
+@
+\subsection{IPv4, receiving}
+
+<<net.c: ip_input>>=
+static void ip_input (const u8 *f, int len) {
+  const u8 *ip = f + 14;
+  if (len < 14 + 20 || (ip[0] >> 4) != 4) return;
+  int header = (ip[0] & 15) * 4, total = get16 (ip + 2);
+  if (header < 20 || total < header || 14 + total > len) return;
+  if (net_checksum (ip, header, 0) != 0) return;                  // damaged header
+  if (get16 (ip + 6) & 0x3fff) return;                            // a fragment (more fragments or an offset): not supported
+  u32 src = get32 (ip + 12), dst = get32 (ip + 16);
+  if (dst != net_my_ip && dst != 0xffffffff) return;              // not for us
+  const u8 *data = ip + header;
+  int data_len = total - header;
+  switch (ip[9]) {
+    case IP_ICMP: icmp_input (src, data, data_len); break;
+    case IP_UDP:  udp_input (src, dst, data, data_len); break;
+    case IP_TCP:  if (tcp_input) tcp_input (src, data, data_len); break;
+  }
+}
+
+@
+\subsection{the frame}
+
+<<net.c: frame_input>>=
+static void frame_input (const u8 *f, int len) {
+  if (len < 14) return;
+  const u8 *own = net_dev_mac ();
+  if (!same (f, own, 6) && !same (f, broadcast_mac, 6)) return;   // not for this card
+  switch (get16 (f + 12)) {
+    case ETH_ARP: arp_input (f, len); break;
+    case ETH_IP:  ip_input (f, len); break;
+  }
+}
+
+int net_poll_once (void) {
+  if (tcp_timer) tcp_timer ();                                   // (retransmissions are due while we look for frames)
+  int len = net_dev_recv (rxframe, sizeof rxframe);
+  if (len <= 0) return 0;
+  frame_input (rxframe, len);
+  return 1;
+}
+
+void net_run (int ms) {
+  u64 start = net_now_ms();
+  while (net_now_ms () - start < (u64)ms) net_poll_once ();
+}
+
+int net_init (void) {
+  if (net_dev_init () != 0) return -1;
+  printf ("net: IP address %u.%u.%u.%u, router %u.%u.%u.%u\n", net_my_ip >> 24, (net_my_ip >> 16) & 255, (net_my_ip >> 8) & 255, net_my_ip & 255,
+          net_gateway >> 24, (net_gateway >> 16) & 255, (net_gateway >> 8) & 255, net_gateway & 255);
+  return 0;
+}
+
+@
+\section{A small TCP}
+\label{src:tcp.c}
+
+TCP gives two programs a reliable stream of bytes in both directions, on top of IP packets that can get lost, arrive twice or in
+the wrong order. The ideas, in the order in which they appear in this file:
+
+\begin{itemize}
+\item Every byte has a sequence number. A segment says ``my first byte has number SEQ'' and ``I have received everything before number ACK from you''. The numbers of the two directions are independent. SYN (opening) and FIN (closing) each use up one number.
+\item The sender keeps what it has sent until it is acknowledged, and sends it again if no acknowledgement arrives in time (retransmission). The receiver only accepts the bytes that come next in the sequence; everything else it ignores and repeats which number it expects, so that the sender notices.
+\item The receiver tells how much room it has left in every segment (the ``window''); the sender never has more bytes on the way.
+\item A connection goes through states: first the ``three-way handshake'' (SYN, SYN+ACK, ACK), then data, then both sides close with a FIN each.
+\end{itemize}
+
+What is left out, to keep it readable: congestion control (the sender only respects the receiver's window), the ``slow start'' and
+``fast retransmit'' tricks, selective acknowledgements, window scaling and every other option except the segment size, urgent data,
+and zero window probes. Segments that arrive out of order are dropped, not kept. That is enough for a telnet session.
+
+@
+
+The complete file is put together from these parts:
+
+<<tcp.c>>=
+<<tcp.c: includes>>
+
+<<tcp.c: part 2>>
+
+<<tcp.c: emit>>
+
+<<tcp.c: output>>
+
+<<tcp.c: find>>
+
+<<tcp.c: reset_for>>
+
+<<tcp.c: tcp_timer>>
+@
+
+<<tcp.c: includes>>=
+#include "net.h"
+
+#define BUFFER      4096                  // bytes of the receive buffer and of the send buffer of every connection
+#define CONNS       8
+#define LISTENERS   4
+#define MSS         1460                  // the largest segment we send or accept (Ethernet 1500 - IP 20 - TCP 20)
+#define RTO_MS      250                   // how long to wait for an acknowledgement before sending again (doubles with every retry)
+#define MAX_RETRIES 8
+#define TIME_WAIT_MS 1000                 // the closing side stays a moment in TIME_WAIT (RFC 793: twice the segment lifetime)
+
+#define FIN 0x01
+#define SYN 0x02
+#define RST 0x04
+#define PSH 0x08
+#define ACK 0x10
+
+enum { CLOSED, SYN_RCVD, SYN_SENT, ESTABLISHED, FIN_WAIT_1, FIN_WAIT_2, CLOSE_WAIT, CLOSING, LAST_ACK, TIME_WAIT };
+
+struct tcp_conn {
+  int state;
+  u32 remote_ip;  u16 local_port, remote_port;
+  int from_listener, accepted;            // opened by a listening port; has tcp_accept () returned it yet?
+
+  u32 snd_una;                            // the oldest sequence number that has been sent but not acknowledged
+  u32 snd_nxt;                            // the next sequence number to send
+  u32 rcv_nxt;                            // the next sequence number we expect from the other side
+  u32 peer_window;                        // how many bytes the other side can take (from its last segment)
+  u32 mss;                                // the largest segment the other side accepts
+
+  u8  tx[BUFFER];  u32 tx_pos, tx_len;    // the send buffer (a ring): tx_len bytes, the first one has sequence number snd_una
+  u8  rx[BUFFER];  u32 rx_pos, rx_len;    // the receive buffer (a ring): bytes that have arrived and wait for tcp_read ()
+  int fin_pending, fin_sent, fin_received;       // we want to close / our FIN has been sent / the other side's FIN has arrived
+
+  u64 timer_at;  int retries;             // retransmission timer: when it runs out (0: not running), how many times it has
+  u64 time_wait_until;
+};
+
+static struct tcp_conn conns[CONNS];
+static u16 listeners[LISTENERS];
+static u16 next_port = 49152;             // local ports of connections that we open (the "ephemeral" ports)
+
+static int seq_lt (u32 a, u32 b) { return (int)(a - b) < 0; }                // sequence numbers wrap around: compare the difference
+static int seq_le (u32 a, u32 b) { return (int)(a - b) <= 0; }
+static u32 minimum (u32 a, u32 b) { return a < b ? a : b; }
+
+@
+---------------------------------------------------------------- sending segments
+\begin{quote}\begin{verbatim}
+    | source port (2) | destination port (2) | sequence number (4) | acknowledgement number (4) |
+    | header length in words (4 bits), 0 (4 bits), flags (1) | window (2) | checksum (2) | urgent pointer (2) | options | data
+\end{verbatim}\end{quote}
+
+<<tcp.c: part 2>>=
+static u32 free_window (tcp_conn *c) { return BUFFER - c->rx_len; }
+
+@
+build and send one segment; 'data' may be 0. The data comes in two parts because it may wrap around the end of a ring buffer.
+
+<<tcp.c: emit>>=
+static void emit (u32 dst_ip, u16 src_port, u16 dst_port, u32 seq, u32 ack, int flags, u32 window, const u8 *d1, int n1, const u8 *d2, int n2) {
+  static u8 seg[20 + 4 + MSS];
+  int header = (flags & SYN) ? 24 : 20;                            // a SYN carries the option "maximum segment size"
+  put16 (seg, src_port);  put16 (seg + 2, dst_port);  put32 (seg + 4, seq);  put32 (seg + 8, ack);
+  seg[12] = (header / 4) @<< 4;  seg[13] = flags;  put16 (seg + 14, window);  put16 (seg + 16, 0);  put16 (seg + 18, 0);
+  if (flags & SYN) { seg[20] = 2;  seg[21] = 4;  put16 (seg + 22, MSS); }
+  for (int i = 0; i < n1; i++) seg[header + i] = d1[i];
+  for (int i = 0; i < n2; i++) seg[header + n1 + i] = d2[i];
+  int len = header + n1 + n2;
+  put16 (seg + 16, net_checksum (seg, len, net_pseudo_sum (net_my_ip, dst_ip, 6, len)));
+  ip_send (dst_ip, 6, seg, len);
+}
+
+static void send_flags (tcp_conn *c, u32 seq, int flags) {
+  emit (c->remote_ip, c->local_port, c->remote_port, seq, (flags & ACK) ? c->rcv_nxt : 0, flags, free_window (c), 0, 0, 0, 0);
+}
+
+static void arm_timer (tcp_conn *c) { c->timer_at = net_now_ms () + ((u64)RTO_MS @<< c->retries); }
+
+@
+Send what the window allows: first new data from the send buffer, then (when all data is out and the program has closed) our FIN.
+
+<<tcp.c: output>>=
+static void output (tcp_conn *c) {
+  if (c->state == CLOSED || c->state == SYN_SENT || c->state == SYN_RCVD || c->state == TIME_WAIT) return;
+  for (;;) {
+    u32 in_flight = c->snd_nxt - c->snd_una;                      // sent, not acknowledged (the FIN counts as one)
+    u32 data_sent = in_flight - (c->fin_sent ? 1 : 0);
+    u32 unsent = c->tx_len - data_sent;
+    u32 room = c->peer_window > in_flight ? c->peer_window - in_flight : 0;
+    u32 n = minimum (minimum (unsent, room), c->mss);
+    if (n == 0) break;
+    u32 from = (c->tx_pos + data_sent) % BUFFER;
+    u32 first = minimum (n, BUFFER - from);                       // the ring wraps: one or two pieces
+    emit (c->remote_ip, c->local_port, c->remote_port, c->snd_nxt, c->rcv_nxt, ACK | PSH, free_window (c), c->tx + from, first, c->tx, n - first);
+    c->snd_nxt += n;
+    if (!c->timer_at) arm_timer (c);
+  }
+  u32 data_sent = c->snd_nxt - c->snd_una - (c->fin_sent ? 1 : 0);
+  if (c->fin_pending && !c->fin_sent && data_sent == c->tx_len) {
+    send_flags (c, c->snd_nxt, FIN | ACK);
+    c->snd_nxt++;  c->fin_sent = 1;
+    if (!c->timer_at) arm_timer (c);
+  }
+}
+
+@
+\subsection{connections}
+
+<<tcp.c: find>>=
+static tcp_conn *find (u32 ip, u16 remote_port, u16 local_port) {
+  for (int i = 0; i < CONNS; i++)
+    if (conns[i].state != CLOSED && conns[i].remote_ip == ip && conns[i].remote_port == remote_port && conns[i].local_port == local_port)
+      return &conns[i];
+  return 0;
+}
+
+static tcp_conn *allocate (void) {
+  for (int i = 0; i < CONNS; i++)
+    if (conns[i].state == CLOSED) {
+      u8 *p = (u8 *)&conns[i];
+      for (unsigned k = 0; k < sizeof conns[i]; k++) p[k] = 0;
+      return &conns[i];
+    }
+  return 0;
+}
+
+static u32 new_sequence (void) { return (u32)net_now_ms () * 250000 + 12345; }       // (the first sequence number should be hard to guess)
+
+int tcp_listen (u16 port) {
+  for (int i = 0; i < LISTENERS; i++) if (!listeners[i]) { listeners[i] = port; return 0; }
+  return -1;
+}
+
+tcp_conn *tcp_connect (u32 ip, u16 port) {
+  tcp_conn *c = allocate ();
+  if (!c) return 0;
+  c->remote_ip = ip;  c->remote_port = port;  c->local_port = next_port++;
+  c->snd_una = new_sequence ();  c->snd_nxt = c->snd_una + 1;  c->mss = 536;  c->peer_window = 0;
+  c->state = SYN_SENT;
+  emit (ip, c->local_port, port, c->snd_una, 0, SYN, free_window (c), 0, 0, 0, 0);
+  arm_timer (c);
+  return c;
+}
+
+tcp_conn *tcp_accept (u16 port) {
+  for (int i = 0; i < CONNS; i++)
+    if (conns[i].state >= ESTABLISHED && conns[i].from_listener && !conns[i].accepted && conns[i].local_port == port) {
+      conns[i].accepted = 1;
+      return &conns[i];
+    }
+  return 0;
+}
+
+int tcp_established (tcp_conn *c) { return c->state == ESTABLISHED || c->state == CLOSE_WAIT; }
+int tcp_closed (tcp_conn *c) { return c->state == CLOSED; }
+
+int tcp_read (tcp_conn *c, u8 *buf, int max) {
+  u32 before = free_window (c);
+  int n = (int)minimum (c->rx_len, (u32)max);
+  for (int i = 0; i < n; i++) buf[i] = c->rx[(c->rx_pos + i) % BUFFER];
+  c->rx_pos = (c->rx_pos + n) % BUFFER;
+  c->rx_len -= n;
+  if (n > 0 && before < c->mss && free_window (c) >= c->mss) send_flags (c, c->snd_nxt, ACK);     // tell the sender that there is room again
+  if (n == 0 && (c->fin_received || c->state == CLOSED)) return -1;
+  return n;
+}
+
+int tcp_write (tcp_conn *c, const u8 *data, int len) {
+  if (c->state != ESTABLISHED && c->state != CLOSE_WAIT) return -1;
+  int n = (int)minimum ((u32)len, BUFFER - c->tx_len);
+  for (int i = 0; i < n; i++) c->tx[(c->tx_pos + c->tx_len + i) % BUFFER] = data[i];
+  c->tx_len += n;
+  output (c);
+  return n;
+}
+
+void tcp_close (tcp_conn *c) {
+  if (c->state == ESTABLISHED) c->state = FIN_WAIT_1;
+  else if (c->state == CLOSE_WAIT) c->state = LAST_ACK;
+  else if (c->state == SYN_SENT || c->state == SYN_RCVD) { c->state = CLOSED; return; }
+  else return;
+  c->fin_pending = 1;
+  output (c);
+}
+
+@
+\subsection{segments that arrive}
+
+<<tcp.c: reset_for>>=
+static void reset_for (u32 src, const u8 *seg, int len, int header) {       // a segment for a connection that does not exist: tell the sender
+  int flags = seg[13];
+  if (flags & RST) return;
+  u16 sport = get16 (seg), dport = get16 (seg + 2);
+  if (flags & ACK) emit (src, dport, sport, get32 (seg + 8), 0, RST, 0, 0, 0, 0, 0);
+  else {
+    u32 consumed = (len - header) + ((flags & SYN) ? 1 : 0) + ((flags & FIN) ? 1 : 0);
+    emit (src, dport, sport, 0, get32 (seg + 4) + consumed, RST | ACK, 0, 0, 0, 0, 0);
+  }
+}
+
+void tcp_input (u32 src, const u8 *seg, int len) {
+  if (len < 20 || net_checksum (seg, len, net_pseudo_sum (src, net_my_ip, 6, len)) != 0) return;
+  int header = (seg[12] >> 4) * 4, flags = seg[13];
+  if (header < 20 || header > len) return;
+  u16 sport = get16 (seg), dport = get16 (seg + 2);
+  u32 seq = get32 (seg + 4), ack = get32 (seg + 8), window = get16 (seg + 14);
+  const u8 *data = seg + header;
+  int dlen = len - header;
+
+  tcp_conn *c = find (src, sport, dport);
+  if (!c) {
+    int listening = 0;
+    for (int i = 0; i < LISTENERS; i++) if (listeners[i] == dport) listening = 1;
+    if ((flags & SYN) && !(flags & ACK) && listening && (c = allocate ())) {      // a new connection: answer with SYN+ACK
+      c->remote_ip = src;  c->remote_port = sport;  c->local_port = dport;  c->from_listener = 1;
+      c->rcv_nxt = seq + 1;  c->snd_una = new_sequence ();  c->snd_nxt = c->snd_una + 1;
+      c->peer_window = window;  c->mss = 536;
+      for (int o = 20; o + 1 < header && seg[o] != 0; ) {                         // the options: only the maximum segment size is of interest
+        if (seg[o] == 1) { o++; continue; }
+        if (seg[o] == 2 && seg[o + 1] == 4 && o + 4 <= header) c->mss = minimum (get16 (seg + o + 2), MSS);
+        o += seg[o + 1] < 2 ? 2 : seg[o + 1];
+      }
+      c->state = SYN_RCVD;
+      send_flags (c, c->snd_una, SYN | ACK);
+      arm_timer (c);
+    } else {
+      reset_for (src, seg, len, header);
+    }
+    return;
+  }
+
+  if (flags & RST) {                                                              // the other side has dropped the connection
+    c->state = CLOSED;
+    return;
+  }
+
+  if (c->state == SYN_SENT) {                                                     // waiting for SYN+ACK
+    if ((flags & (SYN | ACK)) != (SYN | ACK) || ack != c->snd_nxt) { reset_for (src, seg, len, header); return; }
+    c->rcv_nxt = seq + 1;  c->snd_una = ack;  c->peer_window = window;  c->timer_at = 0;  c->retries = 0;
+    for (int o = 20; o + 1 < header && seg[o] != 0; ) {
+      if (seg[o] == 1) { o++; continue; }
+      if (seg[o] == 2 && seg[o + 1] == 4 && o + 4 <= header) c->mss = minimum (get16 (seg + o + 2), MSS);
+      o += seg[o + 1] < 2 ? 2 : seg[o + 1];
+    }
+    c->state = ESTABLISHED;
+    send_flags (c, c->snd_nxt, ACK);
+    output (c);
+    return;
+  }
+
+  if (c->state == SYN_RCVD && (flags & ACK) && ack == c->snd_nxt) {              // the third packet of the handshake
+    c->snd_una = ack;  c->timer_at = 0;  c->retries = 0;
+    c->state = ESTABLISHED;
+  }
+  if (c->state == SYN_RCVD) return;                                               // (the SYN was repeated or the ACK is wrong: ignore)
+
+  // ---- acknowledgements: the other side has received bytes, they can leave the send buffer
+  if ((flags & ACK) && seq_lt (c->snd_una, ack) && seq_le (ack, c->snd_nxt)) {
+    u32 acked = ack - c->snd_una;
+    int fin_acked = c->fin_sent && ack == c->snd_nxt;
+    if (fin_acked) acked--;                                                       // the last number was our FIN, not a data byte
+    acked = minimum (acked, c->tx_len);
+    c->tx_pos = (c->tx_pos + acked) % BUFFER;
+    c->tx_len -= acked;
+    c->snd_una = ack;
+    c->retries = 0;
+    c->timer_at = 0;
+    if (c->snd_una != c->snd_nxt) arm_timer (c);
+    if (fin_acked) {
+      if (c->state == FIN_WAIT_1) c->state = FIN_WAIT_2;
+      else if (c->state == CLOSING) { c->state = TIME_WAIT; c->time_wait_until = net_now_ms () + TIME_WAIT_MS; }
+      else if (c->state == LAST_ACK) { c->state = CLOSED; return; }
+    }
+  }
+  if (flags & ACK) c->peer_window = window;
+
+  // ---- data: only the bytes that come next are accepted, all else is dropped and the sender is told what we expect
+  int must_ack = 0;
+  if (dlen > 0 || (flags & FIN)) {
+    if (seq == c->rcv_nxt && (c->state == ESTABLISHED || c->state == FIN_WAIT_1 || c->state == FIN_WAIT_2)) {
+      u32 n = minimum ((u32)dlen, free_window (c));
+      for (u32 i = 0; i < n; i++) c->rx[(c->rx_pos + c->rx_len + i) % BUFFER] = data[i];
+      c->rx_len += n;
+      c->rcv_nxt += n;
+      if (n == (u32)dlen && (flags & FIN)) {                                      // the other side is done
+        c->rcv_nxt++;
+        c->fin_received = 1;
+        if (c->state == ESTABLISHED) c->state = CLOSE_WAIT;
+        else if (c->state == FIN_WAIT_1) c->state = c->fin_sent && c->snd_una == c->snd_nxt ? TIME_WAIT : CLOSING;
+        else if (c->state == FIN_WAIT_2) c->state = TIME_WAIT;
+        if (c->state == TIME_WAIT) c->time_wait_until = net_now_ms () + TIME_WAIT_MS;
+      }
+    }
+    must_ack = 1;                                                                 // always answer: it tells what we expect next
+  }
+  if (must_ack) send_flags (c, c->snd_nxt, ACK);
+  output (c);
+}
+
+@
+---------------------------------------------------------------- time
+Called all the time: when an acknowledgement does not arrive in time, everything that is not acknowledged is sent again.
+
+<<tcp.c: tcp_timer>>=
+void tcp_timer (void) {
+  u64 now = net_now_ms ();
+  for (int i = 0; i < CONNS; i++) {
+    tcp_conn *c = &conns[i];
+    if (c->state == CLOSED) continue;
+    if (c->state == TIME_WAIT && now >= c->time_wait_until) { c->state = CLOSED; continue; }
+    if (!c->timer_at || now < c->timer_at) continue;
+    if (++c->retries > MAX_RETRIES) { c->state = CLOSED; continue; }              // the other side does not answer: give up
+    if (c->state == SYN_SENT) emit (c->remote_ip, c->local_port, c->remote_port, c->snd_una, 0, SYN, free_window (c), 0, 0, 0, 0);
+    else if (c->state == SYN_RCVD) send_flags (c, c->snd_una, SYN | ACK);
+    else { c->snd_nxt = c->snd_una;  c->fin_sent = 0;  output (c); }              // go back to the first unacknowledged byte and send again
+    arm_timer (c);
+  }
+}
+
+@
+\section{A DHCP client: asks a server on the network for an IP address}
+\label{src:dhcp.c}
+
+A computer that has just been plugged into a network does not know its address. It asks everybody (broadcast), and a DHCP server
+(usually the router) answers. Four messages, all of them UDP datagrams (the server listens on port 67, the client on port 68):
+
+\begin{quote}\begin{verbatim}
+    client -> everybody   DISCOVER   "is there a DHCP server?"
+    server -> client      OFFER      "you could have the address 10.0.2.15, netmask ..., router ..., for 86400 seconds"
+    client -> everybody   REQUEST    "I take the address 10.0.2.15 from the server 10.0.2.2"   (everybody: other servers may have offered, too)
+    server -> client      ACK        "it is yours"           (or NAK: "no")
+\end{verbatim}\end{quote}
+
+The messages have the format of BOOTP (RFC 951) with a list of ``options'' at the end (RFC 2131, 2132):
+
+\begin{quote}\begin{verbatim}
+    | op (1) 1 = request, 2 = reply | hardware type 1 | address length 6 | hops | transaction id (4) | seconds (2) | flags (2) |
+    | client IP (4) | "your" IP (4) | server IP (4) | relay IP (4) | client hardware address (16) | server name (64) | file (128) |
+    | magic cookie 0x63825363 (4) | options: code (1), length (1), data ... | 255 |
+\end{verbatim}\end{quote}
+
+While the client has no address its IP address is 0.0.0.0, and the server cannot send to it by its Ethernet address as usual
+(ARP does not work yet): the client sets the ``broadcast'' flag, so that the server answers to everybody.
+Not done: renewing the lease (the address is simply kept), several interfaces, the options that are not needed here.
+
+@
+
+The complete file is put together from these parts:
+
+<<dhcp.c>>=
+<<dhcp.c: includes>>
+
+<<dhcp.c: option>>
+
+<<dhcp.c: send_message>>
+
+<<dhcp.c: wait_for>>
+@
+
+<<dhcp.c: includes>>=
+#include "net.h"
+
+#define OP_REQUEST 1
+#define OP_REPLY   2
+#define MAGIC      0x63825363u
+#define OPT_NETMASK 1
+#define OPT_ROUTER  3
+#define OPT_DNS     6
+#define OPT_REQUESTED_IP 50
+#define OPT_LEASE   51
+#define OPT_TYPE    53
+#define OPT_SERVER  54
+#define OPT_PARAMETERS 55
+#define OPT_CLIENT_ID  61
+#define OPT_END     255
+#define DISCOVER 1
+#define OFFER    2
+#define REQUEST  3
+#define NAK      6
+#define ACK      5
+
+struct dhcp_result dhcp_last;
+
+static u32 transaction;                                   // identifies our conversation: replies for other ids are not for us
+static u8 answer[600];  static int answer_len;            // the last reply that belongs to us
+static volatile int answered;
+static int bound_port = 0;
+
+static void copy (u8 *to, const u8 *from, int n) { for (int i = 0; i < n; i++) to[i] = from[i]; }
+
+@
+the data of option 'code' in a message, or 0
+
+<<dhcp.c: option>>=
+static const u8 *option (const u8 *msg, int len, int code, int *option_len) {
+  for (int i = 240; i + 1 < len; ) {
+    int c = msg[i];
+    if (c == OPT_END) break;
+    if (c == 0) { i++; continue; }                        // padding
+    int l = msg[i + 1];
+    if (i + 2 + l > len) break;
+    if (c == code) { if (option_len) *option_len = l; return msg + i + 2; }
+    i += 2 + l;
+  }
+  return 0;
+}
+
+static int message_type (const u8 *msg, int len) {
+  const u8 *t = option (msg, len, OPT_TYPE, 0);
+  return t ? t[0] : 0;
+}
+
+static void on_datagram (u32 src, u16 src_port, const u8 *data, int len) {      // UDP port 68: DHCP replies
+  if (src_port != 67 || len < 241 || len > (int)sizeof answer || data[0] != OP_REPLY) return;
+  if (get32 (data + 4) != transaction || get32 (data + 236) != MAGIC) return;
+  copy (answer, data, len);  answer_len = len;  answered = 1;
+}
+
+@
+DISCOVER (type 1) or REQUEST (type 3, with the address that was offered and the server that offered it)
+
+<<dhcp.c: send_message>>=
+static void send_message (int type, u32 wanted, u32 server) {
+  u8 m[300];
+  for (int i = 0; i < (int)sizeof m; i++) m[i] = 0;
+  m[0] = OP_REQUEST;  m[1] = 1;  m[2] = 6;                                       // Ethernet, 6 bytes of hardware address
+  put32 (m + 4, transaction);
+  put16 (m + 10, 0x8000);                                                        // flags: please answer by broadcast
+  copy (m + 28, net_dev_mac (), 6);
+  put32 (m + 236, MAGIC);
+  u8 *o = m + 240;
+  *o++ = OPT_TYPE;  *o++ = 1;  *o++ = type;
+  *o++ = OPT_CLIENT_ID;  *o++ = 7;  *o++ = 1;  copy (o, net_dev_mac (), 6);  o += 6;       // "I am Ethernet card 52:54:..."
+  if (type == REQUEST) {
+    *o++ = OPT_REQUESTED_IP;  *o++ = 4;  put32 (o, wanted);  o += 4;
+    *o++ = OPT_SERVER;  *o++ = 4;  put32 (o, server);  o += 4;
+  }
+  *o++ = OPT_PARAMETERS;  *o++ = 4;  *o++ = OPT_NETMASK;  *o++ = OPT_ROUTER;  *o++ = OPT_DNS;  *o++ = OPT_LEASE;     // what we would like to know
+  *o++ = OPT_END;
+  udp_send (0xffffffff, 67, 68, m, (int)(o - m));
+}
+
+@
+wait up to 'ms' for a reply of the given kind (types are OFFER, or ACK/NAK for 'kind' == ACK); 0 = got it
+
+<<dhcp.c: wait_for>>=
+static int wait_for (int kind, int ms, void (*idle) (void)) {
+  u64 start = net_now_ms ();
+  while (net_now_ms () - start < (u64)ms) {
+    answered = 0;
+    net_poll_once ();
+    if (answered) {
+      int type = message_type (answer, answer_len);
+      if (type == kind || (kind == ACK && type == NAK)) return 0;
+    }
+    if (idle) idle ();
+  }
+  return -1;
+}
+
+int dhcp_run (int timeout_ms, void (*idle) (void)) {
+  u32 old_ip = net_my_ip;
+  if (!bound_port) { udp_bind (68, on_datagram); bound_port = 1; }
+  const u8 *mac = net_dev_mac ();
+  transaction = (u32)net_now_ms () * 2654435761u ^ (mac[4] @<< 8 | mac[5]);      // hard to guess, different for every start
+  net_my_ip = 0;                                                                 // we have no address until the server says so
+
+  u64 deadline = net_now_ms () + (u64)timeout_ms;
+  int result = -1;
+  for (int round = 0; round < 4 && net_now_ms () < deadline; round++) {
+    send_message (DISCOVER, 0, 0);
+    if (wait_for (OFFER, 1000 @<< round, idle) != 0) continue;                    // no offer: ask again, waiting a little longer each time
+    u32 offered = get32 (answer + 16);
+    const u8 *s = option (answer, answer_len, OPT_SERVER, 0);
+    u32 server = s ? get32 (s) : get32 (answer + 20);
+
+    send_message (REQUEST, offered, server);
+    if (wait_for (ACK, 2000, idle) != 0) continue;
+    if (message_type (answer, answer_len) != ACK) continue;                      // NAK: the server has changed its mind
+
+    dhcp_last.server = server;
+    dhcp_last.address = get32 (answer + 16);
+    int l;
+    const u8 *o;
+    dhcp_last.netmask = (o = option (answer, answer_len, OPT_NETMASK, &l)) && l >= 4 ? get32 (o) : IP (255, 255, 255, 0);
+    dhcp_last.gateway = (o = option (answer, answer_len, OPT_ROUTER, &l)) && l >= 4 ? get32 (o) : 0;
+    dhcp_last.dns = (o = option (answer, answer_len, OPT_DNS, &l)) && l >= 4 ? get32 (o) : 0;
+    dhcp_last.lease_seconds = (o = option (answer, answer_len, OPT_LEASE, &l)) && l >= 4 ? get32 (o) : 0;
+    net_my_ip = dhcp_last.address;
+    net_netmask = dhcp_last.netmask;
+    if (dhcp_last.gateway) net_gateway = dhcp_last.gateway;
+    if (dhcp_last.dns) net_dns = dhcp_last.dns;
+    result = 0;
+    break;
+  }
+  if (result != 0) net_my_ip = old_ip;                                           // nobody answered: the old address stays
+  return result;
+}
+
+@
+\section{The configuration of the network at boot: from the kernel command line}
+\label{src:netconf.c}
+
+The command line (the Raspberry Pi: the file [[cmdline.txt]]; qemu: -append) can say how the network is set up. The words are
+separated by blanks; what is not mentioned stays as [[net.c]] has it (the address that qemu's user network expects):
+
+\begin{quote}\begin{verbatim}
+    ip=dhcp                  ask a DHCP server for the address, the netmask, the router and the name server
+    ip=10.0.0.5/24           a fixed address, the number after the slash is the length of the netmask in bits
+    gw=10.0.0.1              the router (the "default gateway")
+    dns=10.0.0.1             the name server
+    netecho                  switch on the echo service on port 7 (a test: UDP and TCP send back what they get)
+\end{verbatim}\end{quote}
+
+Later the programs ifconfig, route and dhclient can change all this while the system runs (like on the BSDs).
+
+@
+
+The complete file is put together from these parts:
+
+<<netconf.c>>=
+<<netconf.c: includes>>
+@
+
+<<netconf.c: includes>>=
+#include "net.h"
+
+int net_echo = 0;                       // "netecho" on the command line: the echo service is on
+
+int net_parse_ip (const char *s, u32 *ip, const char **end) {
+  u32 value = 0;
+  for (int part = 0; part < 4; part++) {
+    if (*s < '0' || *s > '9') return -1;
+    u32 n = 0;
+    while (*s >= '0' && *s <= '9') n = n * 10 + (*s++ - '0');
+    if (n > 255) return -1;
+    value = (value @<< 8) | n;
+    if (part < 3) { if (*s != '.') return -1; s++; }
+  }
+  *ip = value;
+  if (end) *end = s;
+  return 0;
+}
+
+static void print_ip (u32 ip) { printf ("%u.%u.%u.%u", ip >> 24, (ip >> 16) & 255, (ip >> 8) & 255, ip & 255); }
+
+void net_configure_from_command_line (void) {
+  const char *p = plat_cmdline ();
+  int use_dhcp = 0, set_by_hand = 0;
+  while (*p) {
+    while (*p == ' ') p++;
+    const char *word = p;
+    while (*p && *p != ' ') p++;
+    if (p - word > 3 && word[0] == 'i' && word[1] == 'p' && word[2] == '=') {
+      if (word[3] == 'd' && word[4] == 'h' && word[5] == 'c' && word[6] == 'p') use_dhcp = 1;
+      else {
+        const char *end;
+        u32 ip;
+        if (net_parse_ip (word + 3, &ip, &end) == 0) {
+          net_my_ip = ip;  set_by_hand = 1;
+          if (*end == '/') {                                                     // the length of the netmask in bits
+            int bits = 0;
+            for (end++; *end >= '0' && *end <= '9'; end++) bits = bits * 10 + (*end - '0');
+            net_netmask = bits >= 32 ? 0xffffffff : bits <= 0 ? 0 : ~((1u @<< (32 - bits)) - 1);
+          }
+        }
+      }
+    } else if (p - word == 7 && word[0] == 'n' && word[1] == 'e' && word[2] == 't' && word[3] == 'e' && word[4] == 'c' && word[5] == 'h' && word[6] == 'o') {
+      net_echo = 1;
+    } else if (p - word > 3 && word[0] == 'g' && word[1] == 'w' && word[2] == '=') {
+      net_parse_ip (word + 3, &net_gateway, 0);  set_by_hand = 1;
+    } else if (p - word > 4 && word[0] == 'd' && word[1] == 'n' && word[2] == 's' && word[3] == '=') {
+      net_parse_ip (word + 4, &net_dns, 0);  set_by_hand = 1;
+    }
+  }
+  if (set_by_hand) {
+    printf ("net: address ");  print_ip (net_my_ip);  printf (" netmask ");  print_ip (net_netmask);
+    printf (" router ");  print_ip (net_gateway);  printf (" name server ");  print_ip (net_dns);  printf (" (from the command line)\n");
+  }
+  if (use_dhcp) {
+    printf ("net: asking a DHCP server for an address ...\n");
+    if (dhcp_run (8000, 0) == 0) { printf ("net: DHCP: address ");  print_ip (net_my_ip);  printf (", router ");  print_ip (net_gateway);  printf ("\n"); }
+    else printf ("net: no answer from a DHCP server, keeping the address that was set\n");
+  }
+}
+
+@
+\section{The ``echo'' service (port 7): sends back what it gets. The oldest and simplest network service, and so a good test:}
+\label{src:echo.c}
+
+a program on another computer sends something and sees whether the network stack of Ulix gives it back unchanged.
+
+UDP: every datagram is sent back to its sender. TCP: one connection at a time is served: what is read is written back, and when
+the other side closes, we close, too. Where it is started: by the network thread ([[netd.c]]) when the kernel command line says
+``netecho'', and by the network test ([[net_test.c]]).
+
+@
+
+The complete file is put together from these parts:
+
+<<echo.c>>=
+<<echo.c: includes>>
+
+<<echo.c: echo_step>>
+@
+
+<<echo.c: includes>>=
+#include "net.h"
+
+int echo_udp_datagrams = 0, echo_tcp_connections = 0;      // how many were served (the test looks at them)
+long echo_tcp_bytes = 0;
+
+static tcp_conn *conn = 0;                                 // the connection that is being served
+static u8 pending[1024];  static int pending_len = 0;      // bytes that were read but did not fit into the send buffer yet
+
+static void udp_echo (u32 src, u16 src_port, const u8 *data, int len) {
+  udp_send (src, src_port, 7, data, len);
+  echo_udp_datagrams++;
+}
+
+int echo_start (void) {                                    // 0 = port 7 is open for UDP and TCP
+  if (udp_bind (7, udp_echo) != 0) return -1;
+  return tcp_listen (7);
+}
+
+@
+Do what there is to do for the TCP part; returns 1 if anything was moved (so the caller looks again at once).
+
+<<echo.c: echo_step>>=
+int echo_step (void) {
+  int moved = 0;
+  if (!conn) conn = tcp_accept (7);
+  if (!conn) return 0;
+  if (pending_len == 0) {
+    int n = tcp_read (conn, pending, sizeof pending);
+    if (n > 0) { pending_len = n;  echo_tcp_bytes += n;  moved = 1; }
+    else if (n < 0) { tcp_close (conn);  conn = 0;  echo_tcp_connections++;  return 1; }       // the other side has closed: so do we
+  }
+  if (pending_len > 0) {
+    int sent = tcp_write (conn, pending, pending_len);
+    if (sent > 0) {                                        // (it may take only a part: the rest stays for the next time)
+      for (int i = sent; i < pending_len; i++) pending[i - sent] = pending[i];
+      pending_len -= sent;
+      moved = 1;
+    }
+  }
+  return moved;
+}
+
+@
+\section{The network thread}
+\label{src:netd.c}
+
+Frames arrive at any time, and somebody has to look at them: answer ARP and ping, hand data to TCP, run the timers of TCP. This
+is the job of a kernel thread, ``netd''. It does the same as the disk driver of the book: it sleeps in a blocked queue, and the
+interrupt of the network card wakes it up. It also wakes up by itself twenty times a second (from the timer interrupt): TCP needs
+that to send data again that was not acknowledged, and a card without an interrupt number in the device tree is served this way, too.
+
+(The queue and the state of the floppy disk are used for the sleeping: this machine has no floppy, and the thread then shows up
+in ``ps'' with a state the book knows.)
+
+@
+
+The complete file is put together from these parts:
+
+<<netd.c>>=
+<<netd.c: includes>>
+@
+
+<<netd.c: includes>>=
+#include "ulix-api.h"
+
+extern int  net_poll_once (void);
+extern int  net_dev_start_irq (void);
+extern void net_dev_ack (void);
+extern int  echo_start (void);
+extern int  echo_step (void);
+extern int  net_echo;
+extern void gic_enable (int irq);
+extern void arch_resign (void);
+extern int  arch_thread_create_high (void (*entry) (void *), void *arg, const char *name);
+
+int netd_irq = 0;
+static int running = 0, ticks_seen = 0;
+
+static void wake (void) {
+  thread_id t = front_of_blocked_queue (floppy_queue);
+  if (t) deblock (t, &floppy_queue);
+}
+
+void netd_interrupt (void) {                  // the card has something: say so to the card, wake the thread
+  net_dev_ack ();
+  wake ();
+}
+
+void netd_tick (void) {                       // every 10 ms; the thread gets a nudge every 50 ms
+  if (running && ++ticks_seen >= 5) { ticks_seen = 0; wake (); }
+}
+
+static void netd (void *arg) {
+  for (;;) {
+    int moved;
+    do { moved = net_poll_once (); if (net_echo) moved |= echo_step (); } while (moved);       // everything that is there
+    block (&floppy_queue, TSTATE_WAITFLP);                                                    // then sleep until we are woken
+    arch_resign ();
+  }
+}
+
+void netd_start (void) {
+  netd_irq = net_dev_start_irq ();
+  if (netd_irq) gic_enable (netd_irq);
+  if (net_echo && echo_start () != 0) printf ("netd: cannot open port 7\n");
+  arch_thread_create_high (netd, 0, "netd");                       // (a high thread number: see arch_thread_create_high)
+  running = 1;
+  printf ("netd: network thread started (%s)%s\n", netd_irq ? "woken by the interrupt of the card" : "polling every 50 ms", net_echo ? ", echo service on port 7" : "");
+}
+
+@
+\section{System calls for the network (AArch64 only, numbers 602 and up; the programs use them through userland/arm64-extra.h)}
+\label{src:net_syscalls.c}
+
+Programs get raw ICMP sockets: they build ICMP messages themselves, the kernel puts them into IP packets ([[net.c]]). That is all
+that ``ping'' needs. TCP and UDP sockets for programs come later (then telnet can be a program, too).
+
+\begin{quote}\begin{verbatim}
+    icmp_open ()           a socket number, or -1
+    icmp_send (&m)         m.handle, m.ip, m.buf, m.len: send the ICMP message in m.buf to m.ip (0 = sent)
+    icmp_recv (&m)         m.handle, m.buf, m.len (room), m.timeout_ms: wait for a message; m.ip = sender; returns its length, 0 = timeout
+    icmp_close (handle)
+    clock_us ()            microseconds since the start of the machine (wraps after 71 minutes; programs subtract two values)
+    net_info (&i)          the interface: name, Ethernet address, IP address, netmask, router, name server (ifconfig, route)
+    net_set (&s)           change address and netmask, or the router (only root; ifconfig, route)
+    net_dhcp (&d)          ask a DHCP server and use what it says (only root; dhclient)
+\end{verbatim}\end{quote}
+
+A program that waits for an answer gives the CPU to the others in between ([[arch_resign]]), and looks into the network card each
+time it gets the CPU back: for now there is no thread that does this for everybody (that needs an interrupt of the card).
+
+@
+
+The complete file is put together from these parts:
+
+<<net_syscalls.c>>=
+<<net_syscalls.c: includes>>
+
+<<net_syscalls.c: net_info>>
+
+<<net_syscalls.c: part 3>>
+
+<<net_syscalls.c: syscall_poweroff>>
+
+<<net_syscalls.c: syscall_reboot>>
+
+<<net_syscalls.c: syscall_net_info>>
+@
+
+<<net_syscalls.c: includes>>=
+#include "ulix-api.h"
+
+extern int  icmp_open (int owner, int (*alive) (int owner));
+extern void icmp_close (int h);
+extern int  icmp_send (int h, unsigned ip, const unsigned char *msg, int len);
+extern int  icmp_get (int h, unsigned char *buf, int max, unsigned *from);
+extern int  net_poll_once (void);
+extern unsigned long long net_now_ms (void);
+extern void arch_resign (void);
+
+struct icmp_msg { int handle; unsigned int ip; char *buf; int len; int timeout_ms; };       // the same as in userland/arm64-extra.h
+
+@
+The interface and its settings (the same structures are in userland/[[arm64-extra.h]]).
+
+<<net_syscalls.c: net_info>>=
+struct net_info { char name[16]; unsigned char mac[6]; unsigned short mtu; unsigned flags; unsigned address, netmask, gateway, dns, dhcp_server, dhcp_lease; };
+struct net_set  { unsigned what; unsigned address, netmask, gateway; };         // what: 1 = address and netmask, 2 = router, 4 = remove the router
+struct net_dhcp_args { int timeout_ms; unsigned server, address, netmask, gateway, dns, lease; };
+struct dhcp_result { unsigned server, address, netmask, gateway, dns, lease_seconds; };
+extern unsigned net_my_ip, net_netmask, net_gateway, net_dns;
+extern const char *net_if_name;
+extern const unsigned char *net_dev_mac (void);
+extern int dhcp_run (int timeout_ms, void (*idle) (void));
+extern struct dhcp_result dhcp_last;
+
+static int alive (int tid) { return tid > 0 && tid < MAX_THREADS && thread_table[tid].used; }
+
+void syscall_icmp_open (context_t *r)  { eax_return (icmp_open (current_task, alive)); }
+void syscall_icmp_close (context_t *r) { icmp_close ((int)r->ebx); r->eax = 0; }
+
+void syscall_icmp_send (context_t *r) {
+  struct icmp_msg *m = (struct icmp_msg *)r->ebx;
+  eax_return (icmp_send (m->handle, m->ip, (unsigned char *)m->buf, m->len));
+}
+
+void syscall_icmp_recv (context_t *r) {
+  struct icmp_msg *m = (struct icmp_msg *)r->ebx;
+  unsigned long long start = net_now_ms ();
+  for (;;) {
+    unsigned from = 0;
+    int n = icmp_get (m->handle, (unsigned char *)m->buf, m->len, &from);
+    if (n != 0) { m->ip = from; eax_return (n); }                    // a message (or -1: no such socket)
+    if (net_now_ms () - start >= (unsigned)m->timeout_ms) eax_return (0);
+    net_poll_once ();
+    arch_resign ();
+  }
+}
+
+void syscall_clock_us (context_t *r) {
+  unsigned long long freq, count;
+  __asm__ volatile ("mrs %0, cntfrq_el0" : "=r" (freq));
+  __asm__ volatile ("mrs %0, cntpct_el0" : "=r" (count));
+  eax_return ((unsigned)(count * 1000000 / freq));
+}
+
+@
+\subsection{switching off (not about the network, but the system calls of the port are kept together here)}
+
+<<net_syscalls.c: part 3>>=
+extern void smp_poweroff (void);
+extern int  smp_reboot (void);
+
+@
+First everything that is only in the buffer cache goes to the disks (what the system call sync does), then the machine is switched
+off by the firmware. Under qemu that ends qemu. A machine without that function (the Raspberry Pi: no PSCI) stops here instead.
+
+<<net_syscalls.c: syscall_poweroff>>=
+void syscall_poweroff (context_t *r) {
+  buffer_sync (1);
+  printf ("System halted.\n");
+  smp_poweroff ();
+  for (;;) __asm__ volatile ("msr daifset, #3; wfi");           // (no interrupts, wait forever; the power button is the way out)
+}
+
+@
+The same, but the firmware starts the machine again (PSCI [[SYSTEM_RESET]]): the kernel boots from the beginning. -1 if that is not possible.
+
+<<net_syscalls.c: syscall_reboot>>=
+void syscall_reboot (context_t *r) {
+  buffer_sync (1);
+  printf ("Rebooting ...\n");
+  eax_return (smp_reboot ());
+}
+
+@
+\subsection{the configuration. Changing it is for root only, as on the BSDs (euid 0). -2 = not allowed}
+
+<<net_syscalls.c: syscall_net_info>>=
+static int is_root (void) { return thread_table[current_task].euid == 0; }
+
+void syscall_net_info (context_t *r) {
+  struct net_info *i = (struct net_info *)r->ebx;
+  for (int k = 0; k < 16; k++) i->name[k] = net_if_name[k] ? net_if_name[k] : 0;
+  const unsigned char *mac = net_dev_mac ();
+  for (int k = 0; k < 6; k++) i->mac[k] = mac[k];
+  i->mtu = 1500;  i->flags = 1;
+  i->address = net_my_ip;  i->netmask = net_netmask;  i->gateway = net_gateway;  i->dns = net_dns;
+  i->dhcp_server = dhcp_last.server;  i->dhcp_lease = dhcp_last.lease_seconds;
+  r->eax = 0;
+}
+
+void syscall_net_set (context_t *r) {
+  struct net_set *s = (struct net_set *)r->ebx;
+  if (!is_root ()) eax_return (-2);
+  if (s->what & 1) { net_my_ip = s->address;  net_netmask = s->netmask; }
+  if (s->what & 2) net_gateway = s->gateway;
+  if (s->what & 4) net_gateway = 0;
+  r->eax = 0;
+}
+
+void syscall_net_dhcp (context_t *r) {
+  struct net_dhcp_args *d = (struct net_dhcp_args *)r->ebx;
+  if (!is_root ()) eax_return (-2);
+  int result = dhcp_run (d->timeout_ms, arch_resign);                  // (the program that waits gives the CPU to the others)
+  d->server = dhcp_last.server;  d->address = dhcp_last.address;  d->netmask = dhcp_last.netmask;
+  d->gateway = dhcp_last.gateway;  d->dns = dhcp_last.dns;  d->lease = dhcp_last.lease_seconds;
+  eax_return (result);
+}

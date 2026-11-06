@@ -18,6 +18,14 @@ that differed in the last comparison (`../ARM64-PORT.md`, section 18) were the o
 [Bugs found in the book](#bugs-found-in-the-book)); that comparison has not been repeated for the later changes (swap, pthreads, the
 serial disk), which were written in the same way.
 
+## The sources are a literate program
+
+The source files of the port (`*.c`, `*.h`, `*.S` here and in `user/` and `userland/`) are **generated** from the chapters in
+[`lit/`](lit/) (noweb files, one per topic: booting, hardware, memory, processes, console, disks, network, kernel tests, user
+programs). `make` runs `tools/tangle.sh` first, which writes the files with `notangle`; they are not tracked by git. Edit
+`lit/*.nw`, never the generated files. `make book` weaves the chapters into a book, `lit/build/ulix-arm64.pdf` (needs `tectonic`
+or `xelatex`: `brew install tectonic`). A new source file is added to a chapter and to `lit/FILES`.
+
 ## Quick start (macOS)
 
 ```sh

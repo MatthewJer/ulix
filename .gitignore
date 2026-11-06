@@ -1,0 +1,6 @@
+tex-build/tmp.*
+tex-build/noweb.defs
+tex-build/noweb.filtered.defs
+tex-build/ulix-book-tectonic.pdf
+tex-build/*.mtc*
+tex-build/*.bak

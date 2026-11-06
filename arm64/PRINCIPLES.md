@@ -24,7 +24,12 @@ See the notice in `README.md`.)
    the boot code poll. New drivers follow that pattern instead of inventing another one.
 6. **Everything is tested, and the test says what it proves.** New code comes with a check in the kernel tests or a host-side
    test (like `make sdisk-test`), and `make pcheck` stays green.
-7. **Document as a log of reasoning**, not only of results: `ARM64-PORT.md` (German) says why each step was done; `TODO.md` says
+7. **Literate programming: the chapters in `lit/` are the source.** The files of the port (`*.c`, `*.h`, `*.S` in `arm64/`,
+   `user/`, `userland/`) are *generated* from `lit/*.nw` with `notangle` (`tools/tangle.sh`, run by `make`) and are not tracked by git.
+   Change the chapter, not the generated file. Explanations go into the text between the chunks, so that the book of the ARM64 part
+   (`make book`, `lit/build/ulix-arm64.pdf`) stays complete: every new file becomes a section of a chapter and is listed in
+   `lit/FILES`. Comments inside functions stay short; the long explanation is text.
+8. **Document as a log of reasoning**, not only of results: `ARM64-PORT.md` (German) says why each step was done; `TODO.md` says
    what is open.
 
 ## Code from the BSD kernels (decision of 2026-11-03)

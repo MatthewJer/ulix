@@ -1,0 +1,478 @@
+\chapter{Console, Terminals and Clock}
+\label{ch:console}
+
+The x86 version has a VGA screen and a keyboard with ten virtual terminals. Here there is one UART. The port keeps the
+terminals of the book as buffers, switches between them with Ctrl-T and a digit, and translates the screen functions of the book
+(\texttt{set\_xy}, \texttt{clrscr}, \texttt{write\_screen}) into ANSI sequences, so that \texttt{vi} works. The clock reads the
+PL031 RTC if the board has one; the Raspberry Pi has none, and time then starts at a fixed date.
+
+@
+\section{The console: keyboard input comes from the PL011 UART instead of the PS/2 keyboard}
+\label{src:arch_console.c}
+
+On the [[x86]] the keyboard interrupt handler turns scan codes into characters and stores them in the
+input buffer of the current virtual terminal (terminals[[[cur_vt]]]); processes that wait for a key sit
+in [[keyboard_queue]].  Here the UART receive interrupt does the same job; everything behind the
+buffer (kgetch, [[syscall_readchar]], kreadline, the kernel shell) is the code from the book.
+
+  Enter          -> '\textbackslash{}n'                (terminals send CR)
+  Backspace/DEL  -> '\textbackslash{}b'
+  Ctrl-C         -> kill the foreground process of the terminal (like the [[x86]] keyboard handler)
+  Ctrl-]         -> stop the scheduler and enter the kernel shell ([[x86]]: Shift-Esc)
+
+@
+
+The complete file is put together from these parts:
+
+<<arch_console.c>>=
+<<arch_console.c: includes>>
+
+<<arch_console.c: console_enqueue>>
+
+<<arch_console.c: console_interrupt>>
+
+<<arch_console.c: uart_rx_irq>>
+
+<<arch_console.c: arch_kernel_fault_shell>>
+@
+
+<<arch_console.c: includes>>=
+#include "ulix-api.h"
+
+extern unsigned long uart_base;
+#define UART_BASE   (0xffff000000000000UL + uart_base)
+#define UART_DR     (*(volatile unsigned int *)(UART_BASE + 0x00))
+#define UART_FR     (*(volatile unsigned int *)(UART_BASE + 0x18))
+#define UART_IMSC   (*(volatile unsigned int *)(UART_BASE + 0x38))
+#define UART_ICR    (*(volatile unsigned int *)(UART_BASE + 0x44))
+#define UART_FR_RXFE (1 @<< 4)
+
+void kernel_shell (void);
+extern void irq_uart_to_cpu (int cpu);
+extern int smp_cpu (void);
+
+#include "ulix-init.c"                     // arch_setup_keyboard(): the book's @<<setup keyboard>> chunk
+
+void uart_rx_enable (void) {
+  arch_setup_keyboard ();                   // empty input buffers (kbd_lastread = -1, ...)
+  UART_ICR  = 0x7ff;
+  UART_IMSC = (1 @<< 4) | (1 @<< 6);          // receive interrupt and receive timeout interrupt
+}
+
+@
+the character is complete (already translated): put it where the book's keyboard handler puts it
+
+<<arch_console.c: console_enqueue>>=
+static void console_enqueue (char c) {
+  terminal_t *term = &terminals[cur_vt];
+  if (term->kbd_count >= SYSTEM_KBD_BUFLEN) return;
+  term->kbd[term->kbd_pos] = c;
+  term->kbd_pos = (term->kbd_pos + 1) % SYSTEM_KBD_BUFLEN;
+  term->kbd_count++;
+  if (scheduler_is_active) {                // wake up a process that waits for a key on this terminal
+    thread_id start_pid = keyboard_queue.next;
+    if (start_pid != 0) {
+      thread_id search_pid = start_pid;
+      do {
+        if (thread_table[search_pid].terminal == cur_vt) {
+          deblock (search_pid, &keyboard_queue);
+          break;
+        } else {
+          search_pid = thread_table[search_pid].next;
+        }
+      } while (search_pid != start_pid && search_pid != 0);
+    }
+  }
+}
+
+@
+Ctrl-C: the last process of the terminal that has no children (the foreground process)
+
+<<arch_console.c: console_interrupt>>=
+static void console_interrupt (void) {
+  int target_pid = 0;
+  for (int i = 3; i < MAX_THREADS; i++) {
+    if (thread_table[i].used && thread_table[i].terminal == cur_vt) {
+      int is_candidate = true;
+      for (int j = 3; j < MAX_THREADS; j++) {
+        if (thread_table[j].used && thread_table[j].ppid == i) { is_candidate = false; break; }
+      }
+      if (is_candidate) { target_pid = i; break; }
+    }
+  }
+  u_kill (target_pid, SIGKILL);
+}
+
+void arch_vt_switch (int n);
+
+void arch_console_input (unsigned char c) {
+  static int vt_prefix = 0;                  // after Ctrl-T the next digit selects a terminal
+  if (vt_prefix) {
+    vt_prefix = 0;
+    if (c >= '0' && c <= '9') { arch_vt_switch ((c - '0' + 9) % 10); return; }   // like Alt-1..Alt-0 of the book
+  }
+  if (c == 0x14) { vt_prefix = 1; return; }                                       // Ctrl-T
+  if (c == '\r') c = '\n';
+  if (c == 0x7f) c = 0x08;
+  if (c == 0x03) { console_interrupt (); return; }
+  if (c == 0x1d) {                          // Ctrl-]
+    if (scheduler_is_active) {
+      scheduler_is_active = false;
+      printf ("\nGoing to kernel shell\n");
+      irq_uart_to_cpu (smp_cpu ());
+      kernel_shell ();
+      irq_uart_to_cpu (0);
+      printf ("returning from kernel shell\n");
+    }
+    return;
+  }
+  console_enqueue ((char)c);
+}
+
+@
+called by the interrupt handler
+
+<<arch_console.c: uart_rx_irq>>=
+void uart_rx_irq (void) {
+  while (!(UART_FR & UART_FR_RXFE)) {
+    unsigned char c = UART_DR & 0xff;
+    UART_ICR = 0x7ff;
+    arch_console_input (c);
+  }
+  UART_ICR = 0x7ff;
+}
+
+@
+An exception inside the kernel cannot be fixed (for example a bad user pointer in a system call).  Like the
+page fault handler of the book: stop the scheduler, enable interrupts and jump to the kernel shell, which
+is never left again.
+
+<<arch_console.c: arch_kernel_fault_shell>>=
+void arch_kernel_fault_shell (void) {
+  scheduler_is_active = false;
+  __asm__ volatile ("msr daifclr, #2");
+  printf ("\n");
+  irq_uart_to_cpu (smp_cpu ());                  // the keys must come to this CPU
+  kernel_shell ();
+  for (;;) __asm__ volatile ("wfe");
+}
+
+@
+\section{Virtual terminals (ulix-book.nw: ``Virtual Terminals'', ``Terminal Output'')}
+\label{src:arch_vt.c}
+
+The book keeps for every terminal a screen of 80 x 24 characters, each a 16-bit word (ASCII value and VGA
+color attribute), plus a cursor position, and copies the screen of the visible terminal to the VGA text
+memory.  The same data structures (vt[], [[term_buffer]]) are used here.  The ``screen'' is the serial console,
+a terminal emulator that understands ANSI escape sequences, so
+\begin{itemize}
+\item [[kputch ()]] updates the model of the terminal it writes to (cursor, wrapping, scrolling: as in the book) and sends the character on if that terminal is the visible one;
+\item [[set_xy ()]], [[clrscr ()]], [[write_screen ()]] and switching terminals repaint the visible terminal from its model with cursor positioning and color sequences (``synchronized'' mode: the console has a scroll region of the 24 lines, so that scrolling there is the same as in the model).
+\end{itemize}
+Until a program uses one of those functions the console just receives the characters.
+The status line (line 25) does not exist.
+
+@
+
+The complete file is put together from these parts:
+
+<<arch_vt.c>>=
+<<arch_vt.c: hash>>
+
+<<arch_vt.c: num>>
+
+<<arch_vt.c: sl_text>>
+
+<<arch_vt.c: host_repaint>>
+
+<<arch_vt.c: kputch>>
+
+<<arch_vt.c: process_terminal>>
+
+<<arch_vt.c: arch_vt_switch>>
+
+<<arch_vt.c: VGA_BASE>>
+@
+
+<<arch_vt.c: hash>>=
+#define hash arch_vt_hash                          // the book defines hash() in the header: keep this copy private
+#include "ulix-api.h"
+
+extern void putch (char c);
+void vt_scroll_mem (word *address);                // the book defines it without a prototype
+
+#define BLANK       (0x20 | VT_NORMAL_BACKGROUND)
+static int vt_ready = 0;
+static int synced = 0;                             // the console shows the model of the visible terminal exactly
+
+static void vt_setup (void) {
+  for (int t = 0; t <= MAX_VT; t++) {
+    memsetw ((word *)vt[t].mem, BLANK, VT_SIZE / 2);
+    vt[t].x = vt[t].y = 0;
+  }
+  vt_ready = 1;
+}
+
+@
+\subsection{the console}
+
+<<arch_vt.c: num>>=
+static void esc (const char *s) { while (*s) putch (*s++); }
+
+static void num (int n) {
+  char b[12]; int i = 0;
+  if (n == 0) b[i++] = '0';
+  while (n > 0) { b[i++] = '0' + n % 10; n /= 10; }
+  while (i > 0) putch (b[--i]);
+}
+
+static void host_move (int x, int y) {             // cursor to column x, line y (both from 0)
+  esc ("\033["); num (y + 1); putch (';'); num (x + 1); putch ('H');
+}
+
+static void host_attr (int attr) {                 // VGA attribute -> ANSI colors
+  static const char ansi[8] = { 0, 4, 2, 6, 1, 5, 3, 7 };      // VGA color number -> ANSI color number
+  if ((attr & 0xff) == 0x0F || (attr & 0xff) == 0) { esc ("\033[0m"); return; }
+  int fg = attr & 15, bg = (attr >> 4) & 7;
+  esc ("\033[0;"); num ((fg < 8 ? 30 : 90) + ansi[fg & 7]); putch (';'); num (40 + ansi[bg]); putch ('m');
+}
+
+@
+---- the status line (line 25 of the [[x86]] screen) ----
+The book keeps a line of text at the bottom of the video memory ([[set_statusline]], \_set\_statusline; [[statusline_red]]/blue
+for the kernel shell).  Here it is a buffer of 80 characters that is painted on line 25 of the console, below the
+scroll region of the 24 lines.  Changes only mark it dirty (the callers may be timer tasks or interrupt handlers);
+it is painted when a new line starts on the visible terminal and when the screen is painted completely, so that the
+escape sequences never split a line of output.
+
+<<arch_vt.c: sl_text>>=
+static char sl_text[80];
+static int  sl_red = 0, sl_dirty = 1;
+
+static void host_status_draw (void) {
+  esc ("\0337\033[25;1H");                        // save the cursor, go to line 25
+  esc (sl_red ? "\033[0;97;41m" : "\033[0;97;44m");
+  for (int i = 0; i < 80; i++) putch (sl_text[i] >= ' ' ? sl_text[i] : ' ');
+  esc ("\033[0m\0338");                           // restore the cursor
+  sl_dirty = 0;
+}
+
+void _set_statusline (char *text, int offset) {
+  if (sl_text[0] == 0) memset (sl_text, ' ', sizeof sl_text);
+  for (int i = 0; text[i] && offset + i < 80; i++) sl_text[offset + i] = text[i];
+  sl_dirty = 1;
+}
+void set_statusline (char *text) { _set_statusline (text, 0); }
+void statusline_red (void)  { memset (sl_text, ' ', sizeof sl_text); sl_red = 1; sl_dirty = 1; }
+void statusline_blue (void) { memset (sl_text, ' ', sizeof sl_text); sl_red = 0; set_statusline (UNAME); }
+
+@
+paint the whole model of terminal t on the console
+
+<<arch_vt.c: host_repaint>>=
+static void host_repaint (int t) {
+  word *mem = (word *)vt[t].mem;
+  if (!synced) esc ("\033[2J\033[1;24r");          // first time: clear, scroll region = the 24 lines of the terminal
+  for (int row = 0; row < VT_HEIGHT; row++) {
+    int last = -1;
+    for (int col = 0; col < VT_WIDTH; col++) {
+      word w = mem[row * VT_WIDTH + col];
+      if ((w & 0xff) > ' ' || (w >> 8 & 0xff) != 0x0F) last = col;
+    }
+    if (row == vt[t].y && last < vt[t].x - 1) last = vt[t].x - 1;     // text up to the cursor (a prompt ends with a blank)
+    host_move (0, row);
+    int cur_attr = -1;
+    for (int col = 0; col <= last; col++) {
+      word w = mem[row * VT_WIDTH + col];
+      int attr = w >> 8, ch = w & 0xff;
+      if (ch < ' ') ch = ' ';
+      if (attr != cur_attr) { host_attr (attr); cur_attr = attr; }
+      putch (ch);
+    }
+    esc ("\033[0m\033[K");                         // the rest of the line is empty
+  }
+  host_status_draw ();
+  host_move (vt[t].x, vt[t].y);
+  synced = 1;
+}
+
+@
+\subsection{output}
+
+<<arch_vt.c: kputch>>=
+void kputch (byte c) {
+  if (!vt_ready) vt_setup ();
+  // a process writes to its terminal; the kernel (no scheduler yet, kernel shell) writes to the visible one
+  int t = scheduler_is_active ? thread_table[current_task].terminal : cur_vt;
+  if (t < 0 || t > MAX_VT) t = cur_vt;
+  term_buffer *term = &vt[t];
+  int wrapped = 0;
+
+  switch (c) {
+    case '\b': if (term->x != 0) term->x--; break;
+    case '\r': term->x = 0; break;
+    case '\n': term->x = 0; term->y++; break;
+  }
+  if (c >= ' ') {                                  // normal character
+    ((word *)term->mem)[term->y * VT_WIDTH + term->x] = c | VT_NORMAL_BACKGROUND;
+    term->x++;
+  }
+  if (term->x >= VT_WIDTH) { term->x = 0; term->y++; wrapped = 1; }     // end of line reached
+  if (term->y >= VT_HEIGHT) {                      // scroll if necessary
+    vt_scroll_mem ((word *)term->mem);
+    term->y = VT_HEIGHT - 1;
+  }
+
+  if (t == cur_vt) {                               // the visible terminal: the console shows it, too
+    putch ((char)c);
+    if (wrapped) putch ('\n');                     // (putch sends CR LF)
+    if ((c == '\n' || wrapped) && sl_dirty && synced) host_status_draw ();
+  }
+}
+
+@
+\subsection{terminal functions of the book}
+
+<<arch_vt.c: process_terminal>>=
+static int process_terminal (void) {
+  int t = scheduler_is_active ? thread_table[current_task].terminal : cur_vt;
+  return (t < 0 || t > MAX_VT) ? cur_vt : t;
+}
+
+void vt_clrscr (void) {
+  if (!vt_ready) vt_setup ();
+  int t = process_terminal ();
+  memsetw ((word *)vt[t].mem, BLANK, VT_SIZE / 2);
+  vt[t].x = vt[t].y = 0;
+  if (t == cur_vt) host_repaint (t);
+}
+
+void vt_get_xy (char *x, char *y) {
+  if (!vt_ready) vt_setup ();
+  int t = process_terminal ();
+  *x = vt[t].x;
+  *y = vt[t].y;
+}
+
+void vt_set_xy (char x, char y) {
+  if (!vt_ready) vt_setup ();
+  int t = process_terminal ();
+  if (x < 0 || x >= VT_WIDTH) x = VT_WIDTH - 1;    // (the book does not check)
+  if (y < 0 || y >= VT_HEIGHT) y = VT_HEIGHT - 1;
+  vt[t].x = x;
+  vt[t].y = y;
+  if (t == cur_vt) { if (synced) host_move (x, y); else host_repaint (t); }
+}
+
+void read_write_screen (char *buf, boolean read_flag) {
+  if (!vt_ready) vt_setup ();
+  int t = process_terminal ();
+  char *video_address = (char *)vt[t].mem;
+  if (read_flag) {
+    memcpy (buf, video_address, VT_SIZE);          // read the screen
+  } else {
+    memcpy (video_address, buf, VT_SIZE);          // write the screen
+    if (t == cur_vt) host_repaint (t);
+  }
+}
+
+@
+[[make terminal]] n the visible one: the console shows its screen (the [[x86]] copies it to the video memory)
+
+<<arch_vt.c: arch_vt_switch>>=
+void arch_vt_switch (int n) {
+  if (!vt_ready) vt_setup ();
+  if (n < 0 || n > MAX_VT || n == cur_vt) return;
+  cur_vt = n;
+  host_repaint (n);
+}
+
+@
+---- /dev/kmem ----
+On the [[x86]] the device is the physical memory, from address 0, and the VGA text memory sits in it at [[0xb8000]] (80 x 25
+characters of 2 bytes). Here byte 0 is the first byte of RAM, and the window at [[0xb8000]] is the screen of the visible
+terminal (24 lines; the 25th line, the status line of the [[x86]], reads as blanks and ignores writes).
+
+<<arch_vt.c: VGA_BASE>>=
+extern unsigned long arch_ram_base (void), arch_ram_size (void);
+#define VGA_BASE   0xb8000UL
+#define VGA_BYTES  (80 * 25 * 2)
+
+static void kmem_copy_ram (char *buf, unsigned long off, int n, int write) {
+  unsigned long base = arch_ram_base (), size = arch_ram_size ();
+  if (off >= size) { if (!write) memset (buf, 0, n); return; }
+  if (off + n > size) { if (!write) memset (buf + (size - off), 0, off + n - size); n = size - off; }
+  if (write) memcpy ((char *)PHYSICAL (base + off), buf, n);
+  else       memcpy (buf, (char *)PHYSICAL (base + off), n);
+}
+
+static void kmem_access (char *buf, unsigned long off, int n, int write) {
+  if (!vt_ready) vt_setup ();
+  while (n > 0) {
+    unsigned long end = off + n;
+    if (off < VGA_BASE) {                                  // RAM below the window
+      int part = end > VGA_BASE ? (int)(VGA_BASE - off) : n;
+      kmem_copy_ram (buf, off, part, write);
+      off += part; buf += part; n -= part;
+    } else if (off < VGA_BASE + VGA_BYTES) {               // the screen
+      int part = end > VGA_BASE + VGA_BYTES ? (int)(VGA_BASE + VGA_BYTES - off) : n;
+      for (int i = 0; i < part; i++) {
+        unsigned long idx = off - VGA_BASE + i;
+        if (idx < VT_SIZE) { if (write) vt[cur_vt].mem[idx] = buf[i]; else buf[i] = vt[cur_vt].mem[idx]; }
+        else if (!write) buf[i] = (idx & 1) ? 0x1f : ' ';
+      }
+      if (write) host_repaint (cur_vt);
+      off += part; buf += part; n -= part;
+    } else {                                               // RAM above it
+      kmem_copy_ram (buf, off, n, write);
+      return;
+    }
+  }
+}
+
+void arch_kmem_read (char *buf, unsigned long offset, int n)  { kmem_access (buf, offset, n, 0); }
+void arch_kmem_write (unsigned long offset, char *buf, int n) { kmem_access (buf, offset, n, 1); }
+
+@
+\section{The clock.  The x86 kernel reads the CMOS clock once at boot (system\_start\_time) and counts}
+\label{src:arch_clock.c}
+
+timer ticks; the book's timer handler then does
+\begin{quote}\begin{verbatim}
+    system_ticks++;  system_time = system_ticks / 100 + system_start_time;
+\end{verbatim}\end{quote}
+Here the start time comes from the PL031 real-time clock of the board (seconds since 1 January 1970),
+the tick counting is the same, driven by the generic timer at 100 Hz.
+
+@
+
+The complete file is put together from these parts:
+
+<<arch_clock.c>>=
+<<arch_clock.c: includes>>
+
+<<arch_clock.c: NO_CLOCK_START_TIME>>
+@
+
+<<arch_clock.c: includes>>=
+#include "ulix-api.h"
+
+extern unsigned long plat_rtc (void);                                          // from the device tree
+#define RTC_DR  (*(volatile unsigned int *)(0xffff000000000000UL + plat_rtc ()))     // data register: seconds
+
+@
+A board without a real-time clock (the Raspberry Pi 4B has none) starts at this date: 1 January 2026, 00:00 UTC.
+
+<<arch_clock.c: NO_CLOCK_START_TIME>>=
+#define NO_CLOCK_START_TIME 1767225600U
+
+void arch_clock_init (void) {
+  system_start_time = plat_rtc () ? RTC_DR : NO_CLOCK_START_TIME;
+  system_ticks = 0;
+  system_time  = system_start_time;
+}
+
+void arch_clock_tick (void) {                 // called from the timer interrupt, 100 times a second
+  system_ticks++;
+  system_time = (uint)(system_ticks / 100) + system_start_time;
+}

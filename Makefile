@@ -3,6 +3,10 @@ all: tools bin
 pdf: ulix-book.nw
 	make -C tex-build
 
+# the same with tectonic instead of xelatex (see tex-build/tectonic.sh)
+pdf-tectonic: ulix-book.nw
+	make -C tex-build pdf-tectonic
+
 bin: ulix-book.nw
 	make -C bin-build
 

@@ -1,0 +1,775 @@
+\chapter{Tests Inside the Kernel}
+\label{ch:kerneltests}
+
+A principle of the port: everything is tested, and the test says what it proves. These files hold the checks that run inside
+the kernel (file system code of the book against an independent image checker, threads, processes, the network). \texttt{make check}
+and \texttt{make pcheck} run them together with the host-side tests.
+
+@
+\section{Test of the Minix file system code that is compiled unchanged from ulix-book.nw}
+\label{src:bookfs_test.c}
+
+([[mx_open]], [[mx_read]], [[mx_write]], ...) on top of the virtio disk.  The results are checked here
+and, for the files that stay on the disk, once more on the host by tools/[[minix_check.py]].
+
+@
+
+The complete file is put together from these parts:
+
+<<bookfs_test.c>>=
+<<bookfs_test.c: includes>>
+
+<<bookfs_test.c: write_pattern>>
+
+<<bookfs_test.c: same_bytes>>
+
+<<bookfs_test.c: count_entries>>
+@
+
+<<bookfs_test.c: includes>>=
+#include "ulix-api.h"
+
+#define DEV DEV_HDA
+#define DEV_SDISK 0x2a00                 // /dev/sdisk: major 42, minor 0 (the book's table of devices)
+
+static int fails = 0;
+#define CHECK(cond, msg) do { if (cond) printf ("  ok:   %s\n", msg); \
+                              else { printf ("  FAIL: %s\n", msg); fails++; } } while (0)
+
+static byte buf[4096];
+
+static unsigned pattern (unsigned i) { return (i * 31 + 7) & 0xff; }
+
+@
+write n bytes of the pattern in chunks of 'chunk' bytes
+
+<<bookfs_test.c: write_pattern>>=
+static long write_pattern (int mfd, unsigned n, unsigned chunk) {
+  unsigned done = 0;
+  while (done < n) {
+    unsigned c = n - done < chunk ? n - done : chunk;
+    for (unsigned i = 0; i < c; i++) buf[i] = pattern (done + i);
+    if (mx_write (mfd, buf, c) != (int)c) return -1;
+    done += c;
+  }
+  return done;
+}
+
+@
+compare file contents with the pattern, return the number of bytes that were read
+
+<<bookfs_test.c: same_bytes>>=
+static int same_bytes (const char *a, const char *b, int n) {
+  for (int i = 0; i < n; i++) if (a[i] != b[i]) return 0;
+  return 1;
+}
+
+static long verify_pattern (int mfd, unsigned n) {
+  unsigned done = 0;
+  while (done < n) {
+    unsigned c = n - done < 1000 ? n - done : 1000;
+    if (mx_read (mfd, buf, c) != (int)c) return -1;
+    for (unsigned i = 0; i < c; i++) if (buf[i] != pattern (done + i)) return -2 - done - i;
+    done += c;
+  }
+  return done;
+}
+
+static int free_blocks (void) {
+  struct diskfree_query q;
+  q.device = DEV;
+  mx_diskfree (&q);
+  return q.free;
+}
+
+@
+[[mx_getdent]] returns every 32-byte slot of the directory, including unused ones (inode 0)
+
+<<bookfs_test.c: count_entries>>=
+static int count_entries (const char *dir) {
+  struct dir_entry e;
+  int n = 0, used = 0;
+  while (mx_getdent (DEV, dir, n, &e) == 0) { n++; if (e.inode) used++; }
+  return used;
+}
+
+extern void arch_buffer_init (void);
+
+int bookfs_test (void) {
+  arch_buffer_init ();                    // the threads are not up yet, but the file system needs the buffer cache:
+  scheduler_is_active = true;             // (the book's buffer functions do nothing before the scheduler runs)
+  struct stat st;
+  fails = 0;
+  int mfd;
+
+  // ---- reading what the x86 version of Ulix put on the disk ----
+  mfd = mx_open (DEV, "/hello.c", O_RDONLY);
+  CHECK (mfd >= 0, "mx_open (/hello.c)");
+  CHECK (mx_read (mfd, buf, 4096) == 316, "mx_read returns the 316 bytes of /hello.c");
+  unsigned sum = 0; for (int i = 0; i < 316; i++) sum += buf[i];
+  CHECK (sum == 22888, "checksum of /hello.c matches the host");
+  CHECK (mx_read (mfd, buf, 100) == 0, "mx_read at end of file returns 0");
+  mx_close (mfd);
+  CHECK (mx_stat (DEV, "/hello.c", &st) == 0 && st.st_size == 316 && (st.st_mode & S_IFMT) == S_IFREG,
+         "mx_stat: regular file, 316 bytes");
+  CHECK (mx_stat (DEV, "/bin", &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR, "mx_stat: /bin is a directory");
+  CHECK (mx_stat (DEV, "/nonexistent", &st) == -1, "mx_stat: missing file");
+  CHECK (count_entries ("/") == 31, "mx_getdent: / has 31 used entries (16 from x86 Ulix + 15 AArch64 files)");
+  CHECK (count_entries ("/bin") == 70, "mx_getdent: /bin has 70 entries");
+  CHECK (mx_file_exists (DEV, "/bin/vi") && mx_file_is_directory (DEV, "/bin") &&
+         !mx_file_is_directory (DEV, "/bin/vi"), "mx_file_exists / mx_file_is_directory");
+
+  int free0 = free_blocks ();
+  struct stat root0;  mx_stat (DEV, "/", &root0);                                   // size of the root directory
+  printf ("  info: %d free blocks before the write tests\n", free0);
+
+  // ---- create and write a file that stays on the disk (checked on the host later) ----
+  mfd = mx_open (DEV, "/keep.bin", O_CREAT | O_RDWR);
+  CHECK (mfd >= 0, "mx_open (O_CREAT) creates /keep.bin");
+  CHECK (write_pattern (mfd, 40000, 700) == 40000, "mx_write: 40000 bytes in 700-byte chunks (uses the indirect zone)");
+  mx_close (mfd);
+  CHECK (mx_stat (DEV, "/keep.bin", &st) == 0 && st.st_size == 40000 && st.st_nlink == 1, "size 40000, 1 link");
+  mfd = mx_open (DEV, "/keep.bin", O_RDONLY);
+  CHECK (verify_pattern (mfd, 40000) == 40000, "read back: every byte matches the pattern");
+  CHECK (mx_lseek (mfd, 12345, SEEK_SET) == 12345 && mx_read (mfd, buf, 8) == 8 && buf[0] == pattern (12345),
+         "mx_lseek + mx_read in the middle of the file");
+  mx_close (mfd);
+
+  // ---- overwrite in the middle, truncate, extend ----
+  mfd = mx_open (DEV, "/keep.bin", O_RDWR);
+  mx_lseek (mfd, 5000, SEEK_SET);
+  for (int i = 0; i < 100; i++) buf[i] = 0xAA;
+  CHECK (mx_write (mfd, buf, 100) == 100, "overwrite 100 bytes at offset 5000");
+  mx_lseek (mfd, 4990, SEEK_SET);
+  mx_read (mfd, buf, 120);
+  CHECK (buf[0] == pattern (4990) && buf[10] == 0xAA && buf[109] == 0xAA && buf[110] == pattern (5100),
+         "only those 100 bytes changed");
+  mx_lseek (mfd, 5000, SEEK_SET);                       // restore the pattern for the host check
+  for (int i = 0; i < 100; i++) buf[i] = pattern (5000 + i);
+  mx_write (mfd, buf, 100);
+  mx_close (mfd);
+
+  // ---- a temporary file that is deleted again: all blocks must come back ----
+  mfd = mx_open (DEV, "/tmp.bin", O_CREAT | O_RDWR);
+  CHECK (write_pattern (mfd, 20000, 1024) == 20000, "second file, 20000 bytes");
+  CHECK (mx_ftruncate (mfd, 3000) == 0, "mx_ftruncate to 3000 bytes");
+  mx_close (mfd);
+  CHECK (mx_stat (DEV, "/tmp.bin", &st) == 0 && st.st_size == 3000, "size is now 3000");
+  mfd = mx_open (DEV, "/tmp.bin", O_RDONLY);
+  CHECK (verify_pattern (mfd, 3000) == 3000, "the first 3000 bytes survived the truncation");
+  mx_close (mfd);
+  CHECK (mx_unlink (DEV, "/tmp.bin") == 0 && !mx_file_exists (DEV, "/tmp.bin"), "mx_unlink");
+
+  // ---- big file through the double indirect zone (> 7 + 256 KByte) ----
+  mfd = mx_open (DEV, "/big.bin", O_CREAT | O_RDWR);
+  CHECK (write_pattern (mfd, 300000, 4096) == 300000, "300000 bytes (needs the double indirect zone)");
+  mx_close (mfd);
+  mfd = mx_open (DEV, "/big.bin", O_RDONLY);
+  CHECK (verify_pattern (mfd, 300000) == 300000, "read back: 300000 bytes match");
+  mx_close (mfd);
+  CHECK (mx_unlink (DEV, "/big.bin") == 0, "delete the big file again");
+
+  // ---- directories and links ----
+  CHECK (mx_mkdir (DEV, "/d1", 0755) == 0 && mx_file_is_directory (DEV, "/d1"), "mx_mkdir /d1");
+  CHECK (count_entries ("/d1") == 2, "new directory contains only . and ..");
+  mfd = mx_open (DEV, "/d1/inner.txt", O_CREAT | O_RDWR);
+  static const char text[] = "hello from the book's mx_write on AArch64\n";
+  CHECK (mx_write (mfd, (void *)text, sizeof text - 1) == (int)sizeof text - 1, "write a text file inside /d1");
+  mx_close (mfd);
+  CHECK (mx_link (DEV, "/d1/inner.txt", "/d1/hard.txt") == 0, "mx_link: hard link");
+  CHECK (mx_stat (DEV, "/d1/hard.txt", &st) == 0 && st.st_nlink == 2 && st.st_size == sizeof text - 1,
+         "the link shares inode and size, link count 2");
+  CHECK (mx_unlink (DEV, "/d1/hard.txt") == 0 && mx_stat (DEV, "/d1/inner.txt", &st) == 0 && st.st_nlink == 1,
+         "unlink one name: the other stays, link count 1");
+  CHECK (mx_mkdir (DEV, "/d1/sub", 0755) == 0 && mx_file_is_directory (DEV, "/d1/sub"), "nested directory /d1/sub");
+  // (mx_mkdir itself does not check whether the directory exists; u_mkdir above it does)
+  CHECK (mx_open (DEV, "/missing/x", O_RDONLY) == -1, "open in a missing directory fails");
+
+  // ---- rmdir: the removed directory goes away, the one that contained it keeps . and .. ----
+  {
+    int before = count_entries ("/");
+    mx_mkdir (DEV, "/rmme", 0755);
+    mx_stat (DEV, "/", &st);
+    int root_links = st.st_nlink;
+    CHECK (count_entries ("/") == before + 1, "mkdir /rmme adds an entry to /");
+    CHECK (mx_rmdir (DEV, "/rmme", "/rmme") == 0 && !mx_file_exists (DEV, "/rmme"), "mx_rmdir removes the directory");
+    struct dir_entry e;
+    CHECK (count_entries ("/") == before, "/ has the same entries as before");
+    CHECK (mx_getdent (DEV, "/", 0, &e) == 0 && strequal ((char *)e.filename, ".") &&
+           mx_getdent (DEV, "/", 1, &e) == 0 && strequal ((char *)e.filename, ".."),
+           "/ still has its . and .. entries (the book's mx_rmdir used to unlink those of the parent)");
+    mx_stat (DEV, "/", &st);
+    CHECK (st.st_nlink == root_links - 1 || st.st_nlink == root_links,
+           "link count of / is consistent");
+  }
+
+  // ---- a new file that gets the inode number of a deleted one must start empty ----
+  {
+    int other = mx_open (DEV, "/hello.c", O_RDONLY);       // some file must be open, otherwise mx_open skips the table lookup
+    mfd = mx_open (DEV, "/reuse1.bin", O_CREAT | O_RDWR);
+    write_pattern (mfd, 5000, 1000);
+    mx_stat (DEV, "/reuse1.bin", &st);
+    int first_ino = st.st_ino;
+    mx_close (mfd);
+    mx_unlink (DEV, "/reuse1.bin");
+    mfd = mx_open (DEV, "/reuse2.bin", O_CREAT | O_RDWR);
+    mx_stat (DEV, "/reuse2.bin", &st);
+    int second_ino = st.st_ino;
+    int size_now = mx_lseek (mfd, 0, SEEK_END);
+    mx_close (mfd);
+    mx_unlink (DEV, "/reuse2.bin");
+    mx_close (other);
+    CHECK (second_ino == first_ino, "the second file reuses the inode number of the deleted one");
+    CHECK (size_now == 0, "... and starts with size 0 (no stale cached inode of the old file)");
+  }
+
+  // ---- block accounting: only keep.bin, d1, inner.txt and d1/sub may remain ----
+  int free1 = free_blocks ();
+  struct stat root1;  mx_stat (DEV, "/", &root1);
+  int expected = (40000 + 1023) / 1024 + 1                 // keep.bin: data + indirect block
+               + 1 + 1                                      // /d1 and /d1/sub: one directory block each
+               + 1                                          // inner.txt
+               + ((root1.st_size + 1023) / 1024 - (root0.st_size + 1023) / 1024);   // the root directory needs another block when it is full
+  printf ("  info: %d free blocks after (expected %d fewer than before)\n", free1, expected);
+  CHECK (free0 - free1 == expected, "free block count matches exactly what the remaining files need");
+
+  // test of the buffer cache: until buffer_sync the disk still has the old contents of a block
+  {
+    static char blk_a[1024], blk_b[1024], on_disk[1024];
+#define same(x, y) (same_bytes ((x), (y), 1024))
+    for (int i = 0; i < 1024; i++) blk_a[i] = (char)(i * 7 + 1);
+    readblock_hd (0, 4095, blk_b);                                // the original block, directly from the disk
+    memcpy (on_disk, blk_b, 1024);
+    writeblock (DEV_HDA, 4095, blk_a);
+    readblock_hd (0, 4095, blk_b);
+    CHECK (same (blk_b, on_disk), "buffer cache: writeblock does not touch the disk yet");
+    readblock (DEV_HDA, 4095, blk_b);
+    CHECK (same (blk_b, blk_a) && buffer_contains (DEV_HDA, 4095), "buffer cache: readblock returns the new data from the cache");
+    buffer_sync (1);
+    readblock_hd (0, 4095, blk_b);
+    CHECK (same (blk_b, blk_a), "buffer_sync writes the dirty block to the disk");
+    writeblock (DEV_HDA, 4095, on_disk);                          // put the original block back
+  }
+
+  // ---- the serial disk (/dev/sdisk): only with a second serial port, see tools/sdisk_test.py ----
+  extern unsigned long plat_uart2 (void);
+  if (plat_uart2 ()) {
+    static char s1[1024], s2[1024], s3[1024];
+    printf ("serial disk (second PL011, served by tools/serial_disk.py):\n");
+    readblock_serial (1, s1);
+    CHECK ((byte)s1[16] == 0x78 && (byte)s1[17] == 0x24, "serial disk: block 1 is a Minix v2 superblock (magic 0x2478)");
+    for (int i = 0; i < 1024; i++) s2[i] = (char)(i * 13 + 5);
+    writeblock_serial (1439, s2);
+    readblock_serial (1439, s3);
+    CHECK (same (s2, s3), "serial disk: block 1439 written and read back");
+    CHECK (mx_stat (DEV_SDISK, "/a.txt", &st) == 0 && (st.st_mode & S_IFMT) == S_IFREG && st.st_size > 1000,
+           "serial disk: file system on it: /a.txt is a regular file");
+    mfd = mx_open (DEV_SDISK, "/a.txt", O_RDONLY);
+    unsigned sum = 0; int total = 0, got;
+    while (mfd >= 0 && (got = mx_read (mfd, buf, 1000)) > 0) { for (int i = 0; i < got; i++) sum += buf[i]; total += got; }
+    printf ("  info: serial disk /a.txt: %d bytes, byte sum %u\n", total, sum);
+    CHECK (mfd >= 0 && total == st.st_size, "serial disk: /a.txt read completely");
+    mx_close (mfd);
+    mfd = mx_open (DEV_SDISK, "/new.txt", O_CREAT | O_WRONLY);
+    CHECK (mfd >= 0 && mx_write (mfd, (void *)"hello via serial", 16) == 16, "serial disk: /new.txt created and written");
+    mx_close (mfd);
+    for (int i = 0; i < 1024; i++) s2[i] = (char)(i * 3 + 9);
+    writeblock (DEV_SDISK, 1438, s2);
+    buffer_sync (1);
+    CHECK (buffer_contains (DEV_SDISK, 1438), "serial disk: writeblock goes through the buffer cache, buffer_sync flushes it");
+  }
+
+  buffer_sync (1);                                                // the disk image is checked from outside afterwards (make verify)
+  scheduler_is_active = false;            // thread_test starts the scheduler properly
+  return fails;
+}
+
+@
+\section{Test of the book's thread code (scheduler, ready/blocked queues, mutexes and}
+\label{src:thread_test.c}
+
+kernel semaphores from [[ulix-book.nw]]) with kernel threads.
+
+@
+
+The complete file is put together from these parts:
+
+<<thread_test.c>>=
+<<thread_test.c: includes>>
+
+<<thread_test.c: run_until_done>>
+
+<<thread_test.c: counter_lock>>
+
+<<thread_test.c: SLOTS>>
+
+<<thread_test.c: sem_go>>
+
+<<thread_test.c: sd_readers_ok>>
+@
+
+<<thread_test.c: includes>>=
+#include "ulix-api.h"
+
+extern void arch_threads_init (void);
+extern void arch_idle (void);
+extern int  arch_thread_create (void (*entry)(void *), void *arg, const char *name);
+extern int  arch_threads_reap (void);
+extern void arch_resign (void);
+extern int  arch_switch_count;
+extern long frames_in_use;
+
+static int fails = 0;
+#define CHECK(cond, msg) do { if (cond) printf ("  ok:   %s\n", msg); \
+                              else { printf ("  FAIL: %s\n", msg); fails++; } } while (0)
+
+static int live_threads (void) {
+  int n = 0;
+  for (thread_id t = 2; t < MAX_THREADS; t++) if (thread_table[t].used) n++;
+  return n;
+}
+
+@
+the main thread of the test is thread 1, the idle thread: it waits for the timer interrupt,
+which makes the scheduler switch to the ready worker threads
+
+<<thread_test.c: run_until_done>>=
+static void run_until_done (void) {
+  while (live_threads () > 0) {
+    arch_idle ();
+  }
+}
+
+@
+\subsection{test 1: a mutex protects a counter, although every thread gives up the CPU while holding it}
+
+<<thread_test.c: counter_lock>>=
+static lock counter_lock;
+static volatile int counter = 0, in_critical = 0, max_in_critical = 0;
+#define ROUNDS 150
+
+static void counter_worker (void *arg) {
+  for (int i = 0; i < ROUNDS; i++) {
+    mutex_lock (counter_lock);
+    in_critical++;
+    if (in_critical > max_in_critical) max_in_critical = in_critical;
+    int tmp = counter;
+    arch_resign ();                      // others run now and must block on the mutex
+    counter = tmp + 1;
+    in_critical--;
+    mutex_unlock (counter_lock);
+    arch_resign ();
+  }
+}
+
+@
+\subsection{test 2: bounded buffer with two counting semaphores}
+
+<<thread_test.c: SLOTS>>=
+#define SLOTS 4
+#define ITEMS 60
+static kl_semaphore_id sem_items, sem_space;
+static int ring[SLOTS], head = 0, tail = 0, consumed_sum = 0, consumed_in_order = 1, consumed_n = 0;
+
+static void producer (void *arg) {
+  for (int i = 1; i <= ITEMS; i++) {
+    wait_semaphore (sem_space);
+    ring[head] = i; head = (head + 1) % SLOTS;
+    signal_semaphore (sem_items);
+  }
+}
+
+static void consumer (void *arg) {
+  int expect = 1;
+  for (int i = 1; i <= ITEMS; i++) {
+    wait_semaphore (sem_items);
+    int v = ring[tail]; tail = (tail + 1) % SLOTS;
+    signal_semaphore (sem_space);
+    if (v != expect++) consumed_in_order = 0;
+    consumed_sum += v;
+    consumed_n++;
+  }
+}
+
+@
+\subsection{test 3: a thread that only finishes after another one signalled it}
+
+<<thread_test.c: sem_go>>=
+static kl_semaphore_id sem_go;
+static volatile int stage = 0;
+static void waiter (void *arg)   { stage = 1; wait_semaphore (sem_go); stage = 2; }
+static void releaser (void *arg) { while (stage != 1) arch_resign (); arch_resign (); signal_semaphore (sem_go); }
+
+@
+\subsection{test 4: processes that read the serial disk at the same time sleep until the receive interrupt has brought the block}
+
+<<thread_test.c: sd_readers_ok>>=
+extern unsigned long plat_uart2 (void);
+extern int sd_sleeps, sd_blocks_read;
+static volatile int sd_readers_ok = 0;
+static void sd_reader (void *arg) {
+  static char blk[2][1024];
+  int me = (int)(long)arg, good = 1;
+  for (int round = 0; round < 4; round++) {
+    readblock_serial (me == 0 ? 1 : 1439, blk[me]);
+    if (me == 0 && !((byte)blk[0][16] == 0x78 && (byte)blk[0][17] == 0x24)) good = 0;     // Minix superblock
+    if (me == 1) for (int i = 0; i < 1024; i++) if (blk[1][i] != (char)(i * 13 + 5)) good = 0;   // what bookfs_test wrote there
+  }
+  if (good) sd_readers_ok++;
+}
+
+int thread_test (void) {
+  fails = 0;
+  long frames_before = frames_in_use;
+  arch_threads_init ();
+  CHECK (system_start_time > 1700000000UL && system_time >= system_start_time,
+         "the clock starts at a plausible Unix time (after November 2023)");
+  CHECK (current_task == 1 && thread_table[0].next == 1 && thread_table[1].next == 0,
+         "idle thread 1 is the only entry of the ready queue");
+
+  counter_lock = get_new_lock ("counter");
+  CHECK (counter_lock != NULL, "get_new_lock");
+  // (interrupts masked: a timer tick between two creates would start the first worker early and make the check flaky)
+  __asm__ volatile ("msr daifset, #2" ::: "memory");
+  for (int i = 0; i < 3; i++) arch_thread_create (counter_worker, 0, "counter");
+  CHECK (live_threads () == 3 && thread_table[1].next == 2, "3 worker threads are in the ready queue");
+  int switches0 = arch_switch_count;
+  __asm__ volatile ("msr daifclr, #2" ::: "memory");
+  run_until_done ();
+  CHECK (counter == 3 * ROUNDS, "mutex: counter is exactly 3 * 150 although threads yield inside the critical section");
+  CHECK (max_in_critical == 1, "mutex: never more than one thread inside the critical section");
+  CHECK (arch_switch_count - switches0 > 3 * ROUNDS, "many context switches happened (workers switched among each other)");
+  printf ("  info: %d context switches\n", arch_switch_count - switches0);
+  CHECK (thread_table[1].next == 0 && thread_table[0].next == 1, "ready queue is back to just the idle thread");
+
+  sem_items = get_new_semaphore (0);
+  sem_space = get_new_semaphore (SLOTS);
+  arch_thread_create (consumer, 0, "consumer");           // consumer first: it must block at once
+  arch_thread_create (producer, 0, "producer");
+  run_until_done ();
+  CHECK (consumed_n == ITEMS && consumed_sum == ITEMS * (ITEMS + 1) / 2, "semaphores: 60 items passed through a 4-slot buffer, sum correct");
+  CHECK (consumed_in_order, "semaphores: items arrived in order");
+
+  sem_go = get_new_semaphore (0);
+  arch_thread_create (waiter, 0, "waiter");
+  arch_thread_create (releaser, 0, "releaser");
+  run_until_done ();
+  CHECK (stage == 2, "a blocked thread continues after the other signalled its semaphore");
+
+  CHECK (live_threads () == 0, "all threads finished, zombies removed from the thread table");
+
+  if (plat_uart2 ()) {
+    int slept = sd_sleeps, reads = sd_blocks_read;
+    arch_thread_create (sd_reader, (void *)0L, "sdisk0");
+    arch_thread_create (sd_reader, (void *)1L, "sdisk1");
+    run_until_done ();
+    CHECK (sd_readers_ok == 2 && sd_blocks_read - reads == 8, "serial disk: two threads read 4 blocks each at the same time, all data correct");
+    CHECK (sd_sleeps > slept, "serial disk: the threads slept until the receive interrupt delivered the block");
+  }
+  arch_threads_reap ();                                    // stacks of IDs that were not reused
+  CHECK (frames_in_use == frames_before, "no frame leaked");
+  return fails;
+}
+
+@
+\section{Test of processes: system calls of the book (fork, exec, waitpid, exit, open, read,}
+\label{src:proc_test.c}
+
+write, ...) with user programs that were compiled for AArch64 and are loaded from the disk.
+
+@
+
+The complete file is put together from these parts:
+
+<<proc_test.c>>=
+<<proc_test.c: includes>>
+
+<<proc_test.c: run>>
+@
+
+<<proc_test.c: includes>>=
+#include "ulix-api.h"
+
+extern int  arch_start_user (const char *path, int argc, char **argv);
+extern int  arch_threads_reap (void);
+extern void arch_idle (void);
+extern void capture_start (void);
+extern int  capture_stop (char **text);
+extern long frames_in_use;
+extern volatile int procs_killed;
+
+static int fails = 0;
+#define CHECK(cond, msg) do { if (cond) printf ("  ok:   %s\n", msg); \
+                              else { printf ("  FAIL: %s\n", msg); fails++; } } while (0)
+
+static int count_in (const char *hay, const char *needle) {
+  int n = 0, nl = strlen (needle);
+  for (int i = 0; hay[i]; i++) {
+    int j = 0;
+    while (j < nl && hay[i + j] == needle[j]) j++;
+    if (j == nl) n++;
+  }
+  return n;
+}
+
+static int live_threads (void) {
+  int n = 0;
+  for (thread_id t = 2; t < MAX_THREADS; t++) if (thread_table[t].used) n++;
+  return n;
+}
+
+@
+start a program and wait until every process is gone; returns its pid (-1: could not be started)
+
+<<proc_test.c: run>>=
+static int run (const char *path, int argc, char **argv) {
+  int pid = arch_start_user (path, argc, argv);
+  if (pid < 0) return pid;
+  while (live_threads () > 0) arch_idle ();
+  return pid;
+}
+
+int proc_test (void) {
+  fails = 0;
+  long frames_before = frames_in_use;
+  char *out;
+  int pid;
+
+  char *hello_argv[] = { "hello64", "foo", "bar", 0 };
+  capture_start ();
+  pid = run ("/hello64", 3, hello_argv);
+  capture_stop (&out);
+  CHECK (pid > 0 && thread_table[pid].exitcode == 0, "/hello64 started from the disk, exit status 0");
+  CHECK (count_in (out, "hello from an AArch64 ELF") == 1 && count_in (out, "argv[2]=bar") == 1,
+         "its output reached the console, argv delivered");
+  CHECK (count_in (out, "user ok:") == 7 && count_in (out, "user FAIL") == 0,
+         "7 checks inside the program passed: .data, .bss, .rodata, stack, argv");
+
+  char *cat_argv[] = { "cat64", "/hello.c", 0 };
+  capture_start ();
+  pid = run ("/cat64", 2, cat_argv);
+  capture_stop (&out);
+  CHECK (thread_table[pid].exitcode == 0 && count_in (out, "-- 316 bytes") == 1 &&
+         count_in (out, "#include \"../ulixlib.h\"") == 1,
+         "/cat64 /hello.c: open/read/close system calls deliver the 316-byte file");
+
+  cat_argv[1] = "/test.txt";
+  capture_start ();
+  pid = run ("/cat64", 2, cat_argv);
+  capture_stop (&out);
+  CHECK (thread_table[pid].exitcode == 0 && count_in (out, "-- 1680 bytes") == 1, "/cat64 /test.txt: 1680 bytes");
+
+  cat_argv[1] = "/nonexistent";
+  capture_start ();
+  pid = run ("/cat64", 2, cat_argv);
+  capture_stop (&out);
+  CHECK (thread_table[pid].exitcode == 1 && count_in (out, "cannot open") == 1, "open of a missing file fails cleanly");
+
+  char *crash_argv[] = { "crash64", 0 };
+  int killed = procs_killed;
+  capture_start ();
+  pid = run ("/crash64", 1, crash_argv);
+  capture_stop (&out);
+  CHECK (procs_killed == killed + 1 && thread_table[pid].exitcode == -1 && count_in (out, "not reached") == 0,
+         "write to the read-only code page: process killed, exit status -1, kernel keeps running");
+
+  capture_start ();
+  CHECK (arch_start_user ("/badarch64", 1, crash_argv) == -1, "ELF with e_machine = x86 is refused");
+  CHECK (arch_start_user ("/badwx64", 1, crash_argv) == -1, "ELF with a writable+executable segment is refused");
+  CHECK (arch_start_user ("/ascii.txt", 1, crash_argv) == -1, "another text file (/ascii.txt) is refused");
+  CHECK (arch_start_user ("/hello.c", 1, crash_argv) == -1, "text file is refused");
+  CHECK (arch_start_user ("/nonexistent", 1, crash_argv) == -1, "missing file is refused");
+  capture_stop (&out);
+  CHECK (count_in (out, "not an AArch64 executable") == 1 && count_in (out, "writable and executable") == 1 &&
+         count_in (out, "not an ELF file") == 2, "each refusal printed the right reason");
+
+  // fork, exec, waitpid, separate address spaces, several processes, grandchildren
+  char *fork_argv[] = { "forktest64", 0 };
+  capture_start ();
+  pid = run ("/forktest64", 1, fork_argv);
+  capture_stop (&out);
+  printf ("%s", "");                                  // keep the output of the program out of the check lines
+  CHECK (pid > 0 && thread_table[pid].exitcode == 0, "/forktest64 finished with exit status 0 (no failed checks)");
+  CHECK (count_in (out, "user FAIL") == 0, "no check failed inside any of the processes");
+  CHECK (count_in (out, "user ok:") == 16, "16 checks passed: 9 in forktest64 and 7 in the exec'ed /hello64");
+  CHECK (count_in (out, "worker 2 round 2") == 1 && count_in (out, "child: pid") == 1, "children printed their lines");
+  CHECK (live_threads () == 0, "all processes are gone");
+
+  // copy-on-write fork
+  char *cow_argv[] = { "cowtest64", 0 };
+  capture_start ();
+  pid = run ("/cowtest64", 1, cow_argv);
+  capture_stop (&out);
+  CHECK (pid > 0 && thread_table[pid].exitcode == 0, "/cowtest64 finished with exit status 0 (no failed checks)");
+  CHECK (count_in (out, "user FAIL") == 0 && count_in (out, "user ok:") == 10, "all 10 copy-on-write checks passed");
+  CHECK (live_threads () == 0, "no process is left");
+
+  // threads: pthread_create/exit, mutexes, exit() while another thread runs
+  char *th_argv[] = { "thtest64", 0 };
+  capture_start ();
+  pid = run ("/thtest64", 1, th_argv);
+  capture_stop (&out);
+  CHECK (pid > 0 && thread_table[pid].exitcode == 0, "/thtest64 finished with exit status 0 (no failed checks)");
+  CHECK (count_in (out, "user FAIL") == 0 && count_in (out, "user ok:") == 14, "all 14 thread checks passed");
+  CHECK (live_threads () == 0, "all threads are gone, also the one that was spinning");
+
+  // swapping: page_out / page_in, access by the kernel, fork, page replacement
+  char *swap_argv[] = { "swaptest64", 0 };
+  capture_start ();
+  pid = run ("/swaptest64", 1, swap_argv);
+  capture_stop (&out);
+  CHECK (pid > 0 && thread_table[pid].exitcode == 0, "/swaptest64 finished with exit status 0 (no failed checks)");
+  CHECK (count_in (out, "user FAIL") == 0 && count_in (out, "user ok:") == 14, "all 14 swap checks passed (one of them is the line that write () printed from a paged-out page)");
+  int swap_used = 0;
+  for (int i = 0; i < MAX_SWAP_FRAMES; i++) if (paging[i].used) swap_used++;
+  CHECK (swap_used == 0, "the swap file entries of the finished processes are released");
+  CHECK (live_threads () == 0, "no process is left");
+
+  // screen functions: clrscr, set_xy, get_xy, read_screen, write_screen, wrapping, scrolling
+  char *scr_argv[] = { "screentest64", 0 };
+  capture_start ();
+  pid = run ("/screentest64", 1, scr_argv);
+  capture_stop (&out);
+  CHECK (pid > 0 && thread_table[pid].exitcode == 0, "/screentest64 finished with exit status 0 (no failed checks)");
+  CHECK (count_in (out, "user FAIL") == 0 && count_in (out, "user ok:") == 9, "all 9 screen checks passed");
+  CHECK ((vt[0].mem[(3 * 80 + 2) * 2] == 'D') && (vt[0].mem[(3 * 80 + 5) * 2] == 'E') && vt[0].x == 6 && vt[0].y == 3,
+         "the terminal model of the kernel holds the final screen: DONE at column 2 of line 3, cursor behind it");
+  CHECK (count_in (out, "\033[") > 0, "the visible terminal was repainted on the console with ANSI sequences");
+  CHECK (live_threads () == 0, "no process is left");
+
+  // the book's thread program: 3 threads and a mutex, the main thread waits for two of them in a loop
+  {
+    char *thr_argv[] = { "thread", "1", 0 };
+    int thr_pid = run ("/bin/thread", 2, thr_argv);
+    CHECK (thr_pid > 0 && thread_table[thr_pid].exitcode == 0 && live_threads () == 0,
+           "the book's /bin/thread 1 (3 threads, mutex) finishes: all threads are gone");
+  }
+
+  // stack growth
+  char *stk_argv[] = { "stacktest64", 0 };
+  int killed_before = procs_killed;
+  capture_start ();
+  pid = run ("/stacktest64", 1, stk_argv);
+  capture_stop (&out);
+  CHECK (pid > 0 && thread_table[pid].exitcode == 0, "/stacktest64 finished with exit status 0 (no failed checks)");
+  CHECK (count_in (out, "user FAIL") == 0 && count_in (out, "user ok:") == 4, "all 4 stack checks passed");
+  CHECK (procs_killed == killed_before + 1, "exactly one process was killed: the one that touched memory far below its stack");
+  CHECK (live_threads () == 0, "no process is left");
+
+  // memory runs out (twice: the second run must get as much as the first, so everything was given back)
+  int mem_mb[2] = { 0, 0 };
+  for (int round = 0; round < 2; round++) {
+    char *mem_argv[] = { "memtest64", 0 };
+    capture_start ();
+    pid = run ("/memtest64", 1, mem_argv);
+    capture_stop (&out);
+    arch_threads_reap ();                                // (a process would do this when it forks: the swap file is cut back)
+    CHECK (pid > 0 && thread_table[pid].exitcode == 0, "/memtest64 finished with exit status 0 (no failed checks)");
+    CHECK (count_in (out, "user FAIL") == 0 && count_in (out, "user ok:") == 3, "all 3 memory checks passed: sbrk fails cleanly, fork returns, the process ends");
+    for (int i = 0; out[i]; i++) if (out[i] == 'i' && count_in (out + i, "info: ") && out[i + 1] == 'n' && out[i + 2] == 'f' && out[i + 3] == 'o')
+      { mem_mb[round] = 0; for (int k = i + 6; out[k] >= '0' && out[k] <= '9'; k++) mem_mb[round] = mem_mb[round] * 10 + out[k] - '0'; break; }
+  }
+  CHECK (mem_mb[0] > 20 && mem_mb[1] >= mem_mb[0] - 2, "after the process has ended all memory is available again (second run gets as much)");
+  CHECK (live_threads () == 0, "no process is left");
+
+  // the disk: processes that read and write sleep until the interrupt of the device wakes them up
+  // (the SD card of the Raspberry Pi is read by polling for now: blk_irq is 0 and a process does not sleep)
+  extern int hd_sleeps, hd_interrupts, blk_irq;
+  if (blk_irq) CHECK (hd_sleeps > 0 && hd_interrupts > 0, "disk transfers of processes were interrupt driven (they slept and were woken by the device)");
+  else printf ("  info: the disk has no interrupt (SD card, polled): processes do not sleep for it\n");
+
+  // signals: handler with exact register restore, SIG_IGN, default action, SIGSTOP/SIGCONT/SIGKILL
+  char *sig_argv[] = { "sigtest64", 0 };
+  capture_start ();
+  pid = run ("/sigtest64", 1, sig_argv);
+  capture_stop (&out);
+  CHECK (pid > 0 && thread_table[pid].exitcode == 0, "/sigtest64 finished with exit status 0 (no failed checks)");
+  CHECK (count_in (out, "user FAIL") == 0 && count_in (out, "user ok:") == 8, "all 8 signal checks passed");
+  CHECK (count_in (out, "Replacing signal 15") == 1, "the book's kill() turned SIGTERM into SIGKILL (no handler)");
+  CHECK (live_threads () == 0, "no process is left, also not the ones killed by signals");
+
+  arch_threads_reap ();
+  CHECK (frames_in_use == frames_before, "no frame leaked: address spaces and kernel stacks freed");
+  return fails;
+}
+
+@
+\section{Test of the network (make net-test): runs in its own kernel image (kmain.c with -DNET\_MODE) without disk and}
+\label{src:net_test.c}
+
+without processes, and talks to tools/[[net_test.py]] on the host through qemu's user-mode network: qemu is the router (10.0.2.2) and
+forwards ports of the host to this kernel (the host connects to 127.0.0.1:5556 and 5555, which become 10.0.2.15:7 here).
+
+@
+
+The complete file is put together from these parts:
+
+<<net_test.c>>=
+<<net_test.c: includes>>
+
+<<net_test.c: WAIT>>
+@
+
+<<net_test.c: includes>>=
+#include "net.h"
+
+static int fails = 0;
+#define CHECK(cond, msg) do { if (cond) printf ("  ok:   %s\n", msg); \
+                              else { printf ("  FAIL: %s\n", msg); fails++; } } while (0)
+
+@
+run the network until 'done' is true or 'ms' have passed
+
+<<net_test.c: WAIT>>=
+#define WAIT(cond, ms) do { u64 t0 = net_now_ms (); while (!(cond) && net_now_ms () - t0 < (u64)(ms)) { net_poll_once (); echo_step (); } } while (0)
+
+int net_test (void) {
+  printf ("network test:\n");
+  CHECK (net_init () == 0, "virtio network card found and initialised");
+
+  // DHCP: first put a wrong address and router into the kernel, then ask. qemu's user network has a DHCP server (the router, 10.0.2.2),
+  // which gives 10.0.2.15, netmask 255.255.255.0, router 10.0.2.2 and the name server 10.0.2.3.
+  net_my_ip = IP (192, 168, 77, 5);  net_netmask = IP (255, 255, 0, 0);  net_gateway = IP (192, 168, 77, 1);  net_dns = 0;
+  CHECK (dhcp_run (8000, 0) == 0, "DHCP: DISCOVER, OFFER, REQUEST and ACK with the server of qemu");
+  CHECK (net_my_ip == IP (10, 0, 2, 15) && net_netmask == IP (255, 255, 255, 0), "DHCP: the address 10.0.2.15 and the netmask 255.255.255.0 are used");
+  CHECK (net_gateway == IP (10, 0, 2, 2) && net_dns == IP (10, 0, 2, 3), "DHCP: the router 10.0.2.2 and the name server 10.0.2.3 are used");
+  CHECK (dhcp_last.server == IP (10, 0, 2, 2) && dhcp_last.lease_seconds > 0, "DHCP: the answer came from 10.0.2.2 and has a lease time");
+
+  int rtt = net_ping (net_gateway, 3000);
+  CHECK (rtt >= 0, "ping of the router: ARP request and reply, ICMP echo request and reply");
+  printf ("  info: round trip %d ms\n", rtt);
+
+  const char *hello = "hello from Ulix";
+  CHECK (udp_send (IP (10, 0, 2, 2), 5557, 4000, (const u8 *)hello, 15) == 0, "UDP datagram sent to the host (10.0.2.2 is the host, port 5557)");
+
+  CHECK (echo_start () == 0, "the echo service is open on port 7 (UDP and TCP)");
+  printf ("net: ready for the host\n");                    // tools/net_test.py waits for this line
+  WAIT (echo_udp_datagrams == 3 && echo_tcp_connections == 2, 60000);
+  CHECK (echo_udp_datagrams == 3, "three UDP datagrams from the host arrived and were echoed");
+  CHECK (echo_tcp_connections == 2, "two TCP connections from the host were served until the host closed them");
+  printf ("  info: %ld bytes echoed over TCP\n", echo_tcp_bytes);
+
+  // the kernel as the client: connect to the host (port 5558), lose the SYN and the first data segment on the way (they are sent
+  // again after the retransmission timeout), send a line, read the answer, close
+  net_drop_tx = 1;
+  tcp_conn *c = tcp_connect (IP (10, 0, 2, 2), 5558);
+  CHECK (c != 0, "tcp_connect to the host (the first SYN is lost on purpose)");
+  WAIT (c && tcp_established (c), 10000);
+  CHECK (c && tcp_established (c), "the connection is established although the SYN was lost (retransmission)");
+  if (c && tcp_established (c)) {
+    net_drop_tx = 1;
+    CHECK (tcp_write (c, (const u8 *)"ping from Ulix", 14) == 14, "14 bytes accepted for sending (the first segment is lost on purpose)");
+    u8 answer[32];  int got = 0, n;
+    u64 t0 = net_now_ms ();
+    while (got < 4 && net_now_ms () - t0 < 10000) {
+      net_poll_once ();
+      n = tcp_read (c, answer + got, (int)sizeof answer - got);
+      if (n > 0) got += n; else if (n < 0) break;
+    }
+    CHECK (got == 4 && answer[0] == 'p' && answer[1] == 'o' && answer[2] == 'n' && answer[3] == 'g', "the answer \"pong\" arrived (data was sent again after the loss)");
+    tcp_close (c);
+    WAIT (tcp_closed (c), 10000);
+    CHECK (tcp_closed (c), "the connection was closed by both sides");
+  }
+  return fails;
+}

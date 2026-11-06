@@ -1,0 +1,24 @@
+% The ARM64 part of Ulix as a book of its own: "make book" (woven from the chapters in this directory).
+\documentclass[a4paper,11pt]{book}
+\usepackage[T1]{fontenc}
+\usepackage[a4paper,margin=25mm]{geometry}
+\usepackage{noweb}
+\noweboptions{smallcode,longchunks}
+\usepackage{hyperref}
+\title{Ulix on ARM64 and the Raspberry Pi 4B}
+\author{An unofficial extension of the Ulix book}
+\date{\today}
+\begin{document}
+\maketitle
+\chapter*{Notice}
+This text was \emph{not} written by the authors of the Ulix book, Hans-Georg E\ss er and Felix Freiling. It documents a
+port of the Ulix kernel of the book to the 64-bit ARM architecture and to the Raspberry Pi~4B, made in a fork of the book's
+sources. The authors have nothing to do with it and are not responsible for it. The port reuses the kernel chunks of the
+book; this text holds the code that is new: it is the \emph{source} of the files in the directory \texttt{arm64/}, written
+as a literate program in the style of the book (the files are produced from it with \texttt{notangle}).
+
+Principles: Ulix is a teaching system, so being easy to understand wins over being fast or clever; simple first, then better;
+every step small and tested. See \texttt{arm64/PRINCIPLES.md}.
+\tableofcontents
+\input{build/body.tex}
+\end{document}

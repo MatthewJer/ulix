@@ -1,0 +1,1118 @@
+\chapter{The Device Tree, Interrupts and More Than One CPU}
+\label{ch:hardware}
+
+The kernel does not hard-code where devices are. The firmware (or qemu) passes a device tree, and \texttt{dt.c} reads it:
+memory, the interrupt controller, the UART, disks, network cards, including the address translation (\texttt{ranges}) that the
+Raspberry Pi's tree uses. The interrupt controller (GICv2 or GICv3, found from the tree), the generic timer and the start of the
+other CPUs are the other hardware pieces this chapter describes.
+
+@
+\section{Flattened device tree reader}
+\label{src:dt.c}
+
+Reads the device tree that the boot loader (qemu) hands over and fills struct platform with the values the
+kernel needs: memory, interrupt controller, console, clock, timer, CPUs, PSCI and virtio devices.
+Without a device tree the defaults of the qemu ``virt'' machine are used.
+
+@
+
+The complete file is put together from these parts:
+
+<<dt.c>>=
+<<dt.c: includes>>
+
+<<dt.c: compat_has>>
+
+<<dt.c: address>>
+
+<<dt.c: command_line>>
+
+<<dt.c: part 5>>
+@
+
+<<dt.c: includes>>=
+#include "plat.h"
+
+struct platform plat = {
+  .dt_ok = 0,
+  .ram_base = 0x40000000UL, .ram_size = 128UL @<< 20,
+  .gic_version = 0, .gicd = 0x08000000UL, .gicc = 0x08010000UL, .gicr = 0x080a0000UL, .gicr_size = 0xf60000UL,
+  .uart = 0x09000000UL, .uart_irq = 33, .rtc = 0x09010000UL, .timer_irq = 30,
+  .ncpus = 1, .psci = 0, .psci_hvc = 0, .psci_cpu_on = 0xc4000003U,
+  .nvirtio = 0, .virtio_coherent = 0,
+};
+
+#define FDT_BEGIN_NODE 1
+#define FDT_END_NODE   2
+#define FDT_PROP       3
+#define FDT_NOP        4
+#define FDT_END        9
+
+static u32 be32 (const u8 *p) { return ((u32)p[0] @<< 24) | ((u32)p[1] @<< 16) | ((u32)p[2] @<< 8) | p[3]; }
+static u64 cells (const u8 *p, int n) { u64 v = 0; for (int i = 0; i < n; i++) v = (v @<< 32) | be32 (p + 4 * i); return v; }
+
+static int str_eq (const char *a, const char *b) { while (*a && *a == *b) { a++; b++; } return *a == *b; }
+static int str_starts (const char *a, const char *prefix) { while (*prefix) if (*a++ != *prefix++) return 0; return 1; }
+
+struct node {
+  const char *name;
+  int pac, psc;                  // address and size cells for this node's "reg" (from the parent)
+  int ac, sc;                    // #address-cells, #size-cells for the children
+  const u8 *reg;  int reglen;
+  const u8 *ranges;  int rangeslen;   // how this node's children's addresses map into this node's own address space
+  const u8 *compat;  int clen;
+  const u8 *irq;  int irqlen;
+  const u8 *mac;  int maclen;               // "mac-address" or "local-mac-address": the Ethernet address of a network controller
+  const char *devtype, *method, *bootargs;
+  int coherent, has_cpu_on;  u32 cpu_on;
+};
+
+@
+does the ``compatible'' string list contain a string that starts with prefix (or equals it)?
+
+<<dt.c: compat_has>>=
+static int compat_has (const struct node *n, const char *s, int exact) {
+  for (int i = 0; i < n->clen; ) {
+    const char *c = (const char *)n->compat + i;
+    if (exact ? str_eq (c, s) : str_starts (c, s)) return 1;
+    while (i < n->clen && n->compat[i]) i++;
+    i++;
+  }
+  return 0;
+}
+
+static int irq_number (const u8 *p) {                // three cells: type (0 = SPI, 1 = PPI), number, flags
+  u32 type = be32 (p), num = be32 (p + 4);
+  return type == 0 ? (int)num + 32 : (int)num + 16;
+}
+
+@
+The ``reg'' of a device holds an address in the address space of the bus it sits on. On the Raspberry Pi 4 that is the bus
+address [[0x7e201000]] for the UART, which the ARM cores see at [[0xfe201000]]: the ``ranges'' of the bus (here ``soc'') say so. Each entry
+is (child address, parent address, size), with as many cells as the child bus, the parent bus and the size need. The address is
+translated up through all buses until it is an address of the CPU. A bus without ``ranges'' (or with an empty one) changes nothing.
+
+<<dt.c: address>>=
+static u64 address (const struct node *stack, int depth, const u8 *reg) {
+  u64 a = cells (reg, stack[depth].pac);
+  for (int d = depth - 1; d >= 0; d--) {
+    const struct node *bus = &stack[d];
+    int entry = 4 * (bus->ac + bus->pac + bus->sc);
+    for (int off = 0; bus->ranges && off + entry <= bus->rangeslen; off += entry) {
+      u64 child = cells (bus->ranges + off, bus->ac);
+      u64 parent = cells (bus->ranges + off + 4 * bus->ac, bus->pac);
+      u64 size = cells (bus->ranges + off + 4 * (bus->ac + bus->pac), bus->sc);
+      if (a >= child && a - child < size) { a = a - child + parent; break; }
+    }
+  }
+  return a;
+}
+
+static const char *bootargs = 0;                     // the kernel command line from /chosen (it points into the device tree: only used in dt_init)
+static char cmdline[256];                            // ... and a copy of it for later (plat_cmdline ())
+
+@
+``maxcpus=N'' on the kernel command line limits the number of CPUs that are started. On the Raspberry Pi the other three cores
+wait in a spin table of the firmware, not behind PSCI; until that is implemented the command line says ``maxcpus=1''.
+
+<<dt.c: command_line>>=
+static void command_line (const char *args) {
+  for (const char *p = args; *p; p++) {
+    if (str_starts (p, "maxcpus=") && (p == args || p[-1] == ' ')) {
+      int n = 0;
+      for (const char *d = p + 8; *d >= '0' && *d <= '9'; d++) n = n * 10 + (*d - '0');
+      if (n >= 1 && n < plat.ncpus) plat.ncpus = n;
+    }
+  }
+}
+
+static void classify (const struct node *stack, int depth) {
+  const struct node *n = &stack[depth];
+  if (n->bootargs) { bootargs = n->bootargs; return; }
+  if (n->devtype && str_eq (n->devtype, "memory") && n->reg && n->reglen >= 4 * (n->pac + n->psc)) {
+    plat.ram_base = cells (n->reg, n->pac);
+    plat.ram_size = cells (n->reg + 4 * n->pac, n->psc);
+    return;
+  }
+  if (n->devtype && str_eq (n->devtype, "cpu") && n->reg && plat.ncpus < MAX_CPUS + 1) {
+    static int ncpu_nodes = 0;
+    if (ncpu_nodes < MAX_CPUS) plat.cpu_mpidr[ncpu_nodes++] = cells (n->reg, n->pac) & 0xff00ffffffUL;
+    plat.ncpus = ncpu_nodes;
+    return;
+  }
+  if (!n->compat) return;
+  int entry = 4 * (n->pac + n->psc);
+  if (compat_has (n, "arm,gic-v3", 1) && n->reg && n->reglen >= 2 * entry) {
+    plat.gic_version = 3;
+    plat.gicd = address (stack, depth, n->reg);
+    plat.gicr = address (stack, depth, n->reg + entry);
+    plat.gicr_size = cells (n->reg + entry + 4 * n->pac, n->psc);
+  } else if ((compat_has (n, "arm,cortex-a15-gic", 1) || compat_has (n, "arm,gic-400", 1) ||
+              compat_has (n, "arm,cortex-a9-gic", 1) || compat_has (n, "arm,cortex-a7-gic", 1)) &&
+             n->reg && n->reglen >= 2 * entry) {
+    plat.gic_version = 2;
+    plat.gicd = address (stack, depth, n->reg);
+    plat.gicc = address (stack, depth, n->reg + entry);
+  } else if (compat_has (n, "arm,pl011", 1) && n->reg) {
+    static int uarts = 0;                                     // the first PL011 is the console, the second one the serial disk
+    if (uarts == 0) {
+      plat.uart = address (stack, depth, n->reg);
+      if (n->irq && n->irqlen >= 12) plat.uart_irq = irq_number (n->irq);
+    } else if (uarts == 1) {
+      plat.uart2 = address (stack, depth, n->reg);
+      plat.uart2_irq = (n->irq && n->irqlen >= 12) ? irq_number (n->irq) : 0;
+    }
+    uarts++;
+  } else if ((compat_has (n, "brcm,bcm2711-genet-v5", 1) || compat_has (n, "brcm,genet-v5", 1)) && n->reg) {
+    plat.genet = address (stack, depth, n->reg);
+    plat.genet_irq = (n->irq && n->irqlen >= 12) ? irq_number (n->irq) : 0;          // (the first of its two interrupts: frames sent and received)
+    if (n->mac && n->maclen == 6) { for (int i = 0; i < 6; i++) plat.genet_mac[i] = n->mac[i]; plat.genet_has_mac = 1; }
+  } else if (compat_has (n, "brcm,bcm2711-emmc2", 1) && n->reg) {
+    plat.sdhci = address (stack, depth, n->reg);
+    plat.sdhci_irq = (n->irq && n->irqlen >= 12) ? irq_number (n->irq) : 0;
+  } else if (compat_has (n, "arm,pl031", 1) && n->reg) {
+    plat.rtc = address (stack, depth, n->reg);
+  } else if (compat_has (n, "virtio,mmio", 1) && n->reg) {
+    if (plat.nvirtio < MAX_VIRTIO) {
+      plat.virtio_irq[plat.nvirtio] = (n->irq && n->irqlen >= 12) ? irq_number (n->irq) : 0;
+      plat.virtio[plat.nvirtio++] = address (stack, depth, n->reg);
+    }
+    if (!n->coherent) plat.virtio_coherent = 0;
+  } else if (compat_has (n, "arm,psci", 0)) {
+    plat.psci = 1;
+    plat.psci_hvc = n->method && str_eq (n->method, "hvc");
+    if (n->has_cpu_on) plat.psci_cpu_on = n->cpu_on;
+  } else if (compat_has (n, "arm,armv8-timer", 1) && n->irq && n->irqlen >= 24) {
+    plat.timer_irq = irq_number (n->irq + 12);       // second entry: non-secure physical timer
+  }
+}
+
+void dt_init (u64 blob_pa) {
+  const u8 *h = KVA (blob_pa);
+  if (be32 (h) != 0xd00dfeed) {                      // not where the boot loader said: qemu puts it at the start of RAM
+    h = KVA (0x40000000UL);
+    if (be32 (h) != 0xd00dfeed) return;
+  }
+  u32 total = be32 (h + 4), off_struct = be32 (h + 8), off_strings = be32 (h + 12);
+  if (total > (1 @<< 20) || off_struct >= total || off_strings >= total) return;
+  const u8 *p = h + off_struct;
+  const char *strings = (const char *)h + off_strings;
+
+  struct node stack[12];
+  int depth = -1;
+  plat.virtio_coherent = 1;                          // cleared by the first virtio node without "dma-coherent"
+  plat.ncpus = 0;
+  plat.rtc = 0;                                      // a board without a PL031 (the Raspberry Pi) has no clock: arch_clock.c copes
+  for (;;) {
+    u32 tok = be32 (p);  p += 4;
+    if (tok == FDT_BEGIN_NODE) {
+      const char *name = (const char *)p;
+      int len = 0; while (name[len]) len++;
+      p += (len + 1 + 3) & ~3;
+      if (depth + 1 >= 12) return;
+      depth++;
+      struct node *n = &stack[depth];
+      *n = (struct node){ 0 };
+      n->name = name;
+      n->pac = depth > 0 ? stack[depth - 1].ac : 2;
+      n->psc = depth > 0 ? stack[depth - 1].sc : 1;
+      n->ac = 2; n->sc = 1;
+    } else if (tok == FDT_PROP) {
+      u32 len = be32 (p), nameoff = be32 (p + 4);
+      const u8 *val = p + 8;
+      p += 8 + ((len + 3) & ~3);
+      if (depth < 0) return;
+      struct node *n = &stack[depth];
+      const char *pn = strings + nameoff;
+      if      (str_eq (pn, "reg"))             { n->reg = val; n->reglen = len; }
+      else if (str_eq (pn, "compatible"))      { n->compat = val; n->clen = len; }
+      else if (str_eq (pn, "interrupts"))      { n->irq = val; n->irqlen = len; }
+      else if (str_eq (pn, "ranges"))          { n->ranges = val; n->rangeslen = len; }
+      else if (str_eq (pn, "device_type"))     n->devtype = (const char *)val;
+      else if (str_eq (pn, "method"))          n->method = (const char *)val;
+      else if (str_eq (pn, "mac-address") || str_eq (pn, "local-mac-address")) { n->mac = val; n->maclen = len; }
+      else if (str_eq (pn, "bootargs"))        n->bootargs = (const char *)val;     // the command line (cmdline.txt on the Pi)
+      else if (str_eq (pn, "dma-coherent"))    n->coherent = 1;
+      else if (str_eq (pn, "cpu_on"))          { n->cpu_on = be32 (val); n->has_cpu_on = 1; }
+      else if (str_eq (pn, "#address-cells"))  n->ac = be32 (val);
+      else if (str_eq (pn, "#size-cells"))     n->sc = be32 (val);
+    } else if (tok == FDT_END_NODE) {
+      if (depth < 0) return;
+      classify (stack, depth);
+      depth--;
+    } else if (tok == FDT_END) {
+      break;
+    } else if (tok != FDT_NOP) {
+      return;                                        // damaged
+    }
+  }
+  plat.dt_ok = 1;
+  if (plat.ncpus == 0) plat.ncpus = 1;
+  if (bootargs) { int i = 0; while (bootargs[i] && i < (int)sizeof cmdline - 1) { cmdline[i] = bootargs[i]; i++; } cmdline[i] = 0; }
+  if (bootargs) command_line (bootargs);                  // (the CPU nodes come before or after /chosen: look at the end)
+  if (plat.nvirtio == 0) plat.virtio_coherent = 0;
+}
+
+@
+accessors for files that do not include [[plat.h]] (they use the book's headers)
+
+<<dt.c: part 5>>=
+int  plat_psci (void)          { return plat.psci; }
+const char *plat_cmdline (void) { return cmdline; }       // the kernel command line ("maxcpus=1 ip=dhcp"), empty if there is none
+int  plat_psci_hvc (void)      { return plat.psci_hvc; }
+unsigned plat_psci_cpu_on (void) { return plat.psci_cpu_on; }
+int  plat_ncpus (void)         { return plat.ncpus; }
+unsigned long plat_cpu_mpidr (int i) { return plat.cpu_mpidr[i]; }
+unsigned long plat_rtc (void)  { return plat.rtc; }
+unsigned long plat_ram_size (void) { return plat.ram_size; }
+int  plat_uart_irq (void)      { return plat.uart_irq; }
+unsigned long plat_uart2 (void) { return plat.uart2; }
+int  plat_uart2_irq (void)     { return plat.uart2_irq; }
+unsigned long arch_ram_base (void) { return plat.ram_base; }
+unsigned long arch_ram_size (void) { return plat.ram_size; }
+
+@
+\section{Interrupt controller (GICv2 and GICv3)}
+\label{src:gic.h}
+
+
+@
+
+The complete file is put together from these parts:
+
+<<gic.h>>=
+<<gic.h: GIC_H>>
+@
+
+<<gic.h: GIC_H>>=
+#ifndef GIC_H
+#define GIC_H
+#include "plat.h"
+
+#define SGI_STOP    1                      // software generated interrupts used by the kernel
+#define SGI_WAKE    2
+
+void gic_init (void);                      // boot CPU: distributor and the interface of this CPU
+void gic_init_cpu (void);                  // every other CPU, for itself
+void gic_enable (int irq);                 // enable an interrupt (a PPI for the calling CPU, an SPI is sent to CPU 0)
+u32  gic_ack (void);                       // acknowledge: returns the raw value, GIC_INTID () is the interrupt number
+void gic_eoi (u32 iar);                    // end of interrupt (pass the value of gic_ack)
+void gic_send_sgi (int cpu, int sgi);      // software interrupt to the CPU with this number
+void gic_route (int irq, int cpu);         // deliver a shared peripheral interrupt (SPI) to this CPU
+#define GIC_INTID(iar)  ((iar) & 0x3ff)
+#endif
+
+@
+\section{Interrupt controller: GICv2 (memory mapped CPU interface) and GICv3 (system registers,}
+\label{src:gic.c}
+
+redistributors).  The version comes from the device tree (plat.[[gic_version]]); without one it is read from the
+distributor.  Replaces the 8259 PIC of the [[x86]] version.
+
+@
+
+The complete file is put together from these parts:
+
+<<gic.c>>=
+<<gic.c: includes>>
+
+<<gic.c: D_CTLR>>
+
+<<gic.c: ICC_SRE_EL1>>
+@
+
+<<gic.c: includes>>=
+#include "gic.h"
+
+extern u64 smp_mpidr (int cpu);            // MPIDR of a CPU number (smp.c)
+extern int smp_cpu (void);                 // number of the calling CPU
+
+static u64 gicd_va, gicc_va, gicr_va;
+static u64 rd_va[MAX_CPUS];                // redistributor frame of each CPU (GICv3)
+static int version;
+
+#define R32(a)      (*(volatile u32 *)(a))
+#define W32(a, v)   (*(volatile u32 *)(a) = (v))
+
+@
+GICD register offsets (both versions)
+
+<<gic.c: D_CTLR>>=
+#define D_CTLR          0x000
+#define D_TYPER         0x004
+#define D_IGROUPR(n)    (0x080 + 4 * (n))
+#define D_ISENABLER(n)  (0x100 + 4 * (n))
+#define D_ICENABLER(n)  (0x180 + 4 * (n))
+#define D_IPRIORITYR(n) (0x400 + 4 * (n))
+#define D_ITARGETSR(n)  (0x800 + 4 * (n))      // GICv2
+#define D_ICFGR(n)      (0xc00 + 4 * (n))
+#define D_SGIR          0xf00                  // GICv2
+#define D_PIDR2         0xfe8
+#define D_IROUTER(n)    (0x6000 + 8 * (n))     // GICv3
+// GICv2 CPU interface
+#define C_CTLR          0x000
+#define C_PMR           0x004
+#define C_IAR           0x00c
+#define C_EOIR          0x010
+// GICv3 redistributor: RD frame and SGI frame (64 KByte further)
+#define R_WAKER         0x014
+#define R_TYPER         0x008
+#define S_BASE          0x10000
+
+static void dsb_isb (void) { __asm__ volatile ("dsb sy; isb" ::: "memory"); }
+
+@
+\subsection{GICv3 CPU interface system registers}
+
+<<gic.c: ICC_SRE_EL1>>=
+#define ICC_SRE_EL1     "S3_0_C12_C12_5"
+#define ICC_IAR1_EL1    "S3_0_C12_C12_0"
+#define ICC_EOIR1_EL1   "S3_0_C12_C12_1"
+#define ICC_PMR_EL1     "S3_0_C4_C6_0"
+#define ICC_BPR1_EL1    "S3_0_C12_C12_3"
+#define ICC_IGRPEN1_EL1 "S3_0_C12_C12_7"
+#define ICC_SGI1R_EL1   "S3_0_C12_C11_5"
+
+static void d_wait_rwp (void) { while (R32 (gicd_va + D_CTLR) & (1u @<< 31)) ; }
+
+static u64 mpidr_affinity (u64 mpidr) { return (mpidr & 0xffffff) | ((mpidr >> 32 & 0xff) @<< 32); }
+
+static void v3_find_redistributor (void) {
+  u64 mpidr;
+  __asm__ volatile ("mrs %0, mpidr_el1" : "=r" (mpidr));
+  u64 want = mpidr_affinity (mpidr), p = gicr_va;
+  for (u64 off = 0; off < plat.gicr_size; ) {
+    u64 typer = *(volatile u64 *)(p + off + R_TYPER);
+    if (((typer >> 32) & 0xffffffff) == ((want & 0xffffff) | ((want >> 32) @<< 24))) { rd_va[smp_cpu ()] = p + off; return; }
+    if (typer & (1 @<< 4)) break;                         // last redistributor
+    off += (typer & (1 @<< 1)) ? 0x40000 : 0x20000;       // with virtual LPI frames each one is larger
+  }
+  printf ("gic: no redistributor for CPU %d\n", smp_cpu ());
+}
+
+static void v3_cpu_init (void) {
+  v3_find_redistributor ();
+  u64 rd = rd_va[smp_cpu ()];
+  if (!rd) return;
+  u32 waker = R32 (rd + R_WAKER);                        // wake the redistributor up
+  W32 (rd + R_WAKER, waker & ~(1u @<< 1));
+  while (R32 (rd + R_WAKER) & (1u @<< 2)) ;
+  u64 sgi = rd + S_BASE;
+  W32 (sgi + D_IGROUPR (0), 0xffffffff);                 // group 1
+  W32 (sgi + D_ICENABLER (0), 0xffffffff);
+  for (int i = 0; i < 8; i++) W32 (sgi + D_IPRIORITYR (i), 0xa0a0a0a0);
+  W32 (sgi + D_ISENABLER (0), 0xffff);                   // SGIs 0..15 on
+  dsb_isb ();
+  u64 sre;
+  __asm__ volatile ("mrs %0, " ICC_SRE_EL1 : "=r" (sre));
+  sre |= 1;                                              // system register interface
+  __asm__ volatile ("msr " ICC_SRE_EL1 ", %0; isb" :: "r" (sre));
+  __asm__ volatile ("msr " ICC_PMR_EL1 ", %0" :: "r" (0xffUL));
+  __asm__ volatile ("msr " ICC_BPR1_EL1 ", %0" :: "r" (0UL));
+  __asm__ volatile ("msr " ICC_IGRPEN1_EL1 ", %0; isb" :: "r" (1UL));
+}
+
+static void v2_cpu_init (void) {
+  W32 (gicc_va + C_PMR, 0xff);
+  W32 (gicc_va + C_CTLR, 1);
+  W32 (gicd_va + D_ISENABLER (0), 0xffff);               // SGIs (banked per CPU)
+  for (int i = 0; i < 8; i++) W32 (gicd_va + D_IPRIORITYR (i), 0xa0a0a0a0);
+}
+
+void gic_init (void) {
+  gicd_va = KERNEL_VA + plat.gicd;
+  gicc_va = KERNEL_VA + plat.gicc;
+  gicr_va = KERNEL_VA + plat.gicr;
+  version = plat.gic_version;
+  if (!version) {                                        // no device tree: ask the distributor (ArchRev in GICD_PIDR2)
+    u32 rev = (R32 (gicd_va + D_PIDR2) >> 4) & 15;
+    version = rev >= 3 ? 3 : 2;
+  }
+  u32 lines = ((R32 (gicd_va + D_TYPER) & 31) + 1) * 32;
+  if (lines > 1020) lines = 1020;
+  if (version == 3) {
+    W32 (gicd_va + D_CTLR, 0);
+    d_wait_rwp ();
+    for (u32 i = 1; i < lines / 32; i++) { W32 (gicd_va + D_IGROUPR (i), 0xffffffff); W32 (gicd_va + D_ICENABLER (i), 0xffffffff); }
+    for (u32 i = 8; i < lines / 4; i++) W32 (gicd_va + D_IPRIORITYR (i), 0xa0a0a0a0);
+    W32 (gicd_va + D_CTLR, (1 @<< 4) | (1 @<< 1) | 1);     // ARE, enable group 1 (written like Linux does)
+    d_wait_rwp ();
+    v3_cpu_init ();
+  } else {
+    W32 (gicd_va + D_CTLR, 1);
+    v2_cpu_init ();
+  }
+  dsb_isb ();
+  printf ("GIC: version %d%s, distributor at 0x%lx, %u interrupt lines\n", version, plat.gic_version ? "" : " (detected)", plat.gicd, lines);
+}
+
+void gic_init_cpu (void) {
+  if (version == 3) v3_cpu_init (); else v2_cpu_init ();
+  dsb_isb ();
+}
+
+void gic_enable (int irq) {
+  if (irq < 32) {                                        // SGI/PPI: the registers of the calling CPU
+    if (version == 3) {
+      u64 rd = rd_va[smp_cpu ()];
+      if (rd) { u64 sgi = rd + S_BASE; W32 (sgi + D_IPRIORITYR (irq / 4), (R32 (sgi + D_IPRIORITYR (irq / 4)) & ~(0xffu @<< (irq % 4 * 8))) | (0x80u @<< (irq % 4 * 8))); W32 (sgi + D_ISENABLER (0), 1u @<< irq); }
+    } else {
+      W32 (gicd_va + D_IPRIORITYR (irq / 4), R32 (gicd_va + D_IPRIORITYR (irq / 4)) & ~(0xffu @<< (irq % 4 * 8)));
+      W32 (gicd_va + D_ISENABLER (0), 1u @<< irq);
+    }
+  } else {                                               // SPI: goes to CPU 0
+    W32 (gicd_va + D_IPRIORITYR (irq / 4), R32 (gicd_va + D_IPRIORITYR (irq / 4)) & ~(0xffu @<< (irq % 4 * 8)));
+    if (version == 3) {
+      *(volatile u64 *)(gicd_va + D_IROUTER (irq)) = mpidr_affinity (smp_mpidr (0));
+    } else {
+      W32 (gicd_va + D_ITARGETSR (irq / 4), (R32 (gicd_va + D_ITARGETSR (irq / 4)) & ~(0xffu @<< (irq % 4 * 8))) | (1u @<< (irq % 4 * 8)));
+    }
+    W32 (gicd_va + D_ISENABLER (irq / 32), 1u @<< (irq % 32));
+  }
+  dsb_isb ();
+}
+
+void gic_route (int irq, int cpu) {
+  if (irq < 32) return;
+  if (version == 3) {
+    *(volatile u64 *)(gicd_va + D_IROUTER (irq)) = mpidr_affinity (smp_mpidr (cpu));
+  } else {
+    u32 v = R32 (gicd_va + D_ITARGETSR (irq / 4)) & ~(0xffu @<< (irq % 4 * 8));
+    W32 (gicd_va + D_ITARGETSR (irq / 4), v | ((1u @<< cpu) @<< (irq % 4 * 8)));
+  }
+  dsb_isb ();
+}
+
+u32 gic_ack (void) {
+  if (version == 3) { u64 v; __asm__ volatile ("mrs %0, " ICC_IAR1_EL1 : "=r" (v)); return (u32)v; }
+  return R32 (gicc_va + C_IAR);
+}
+
+void gic_eoi (u32 iar) {
+  if (version == 3) __asm__ volatile ("msr " ICC_EOIR1_EL1 ", %0; isb" :: "r" ((u64)iar));
+  else              W32 (gicc_va + C_EOIR, iar);
+}
+
+void gic_send_sgi (int cpu, int sgi) {
+  if (version == 3) {
+    u64 m = smp_mpidr (cpu);
+    u64 v = (1UL @<< (m & 0xf)) | ((m >> 8 & 0xff) @<< 16) | ((u64)sgi @<< 24) | ((m >> 16 & 0xff) @<< 32) | ((m >> 32 & 0xff) @<< 48);
+    __asm__ volatile ("dsb sy; msr " ICC_SGI1R_EL1 ", %0; isb" :: "r" (v));
+  } else {
+    W32 (gicd_va + D_SGIR, ((1u @<< cpu) @<< 16) | sgi);
+    dsb_isb ();
+  }
+}
+
+@
+\section{Exceptions, GICv2, the ARM generic timer, system calls}
+\label{src:irq.c}
+
+(replace IDT, 8259 PIC, 8253 PIT and the int [[0x80]] handler of the [[x86]] version)
+
+@
+
+The complete file is put together from these parts:
+
+<<irq.c>>=
+<<irq.c: includes>>
+
+<<irq.c: IRQ_TIMER>>
+
+<<irq.c: HZ>>
+
+<<irq.c: expect_fault>>
+
+<<irq.c: exc_handler>>
+
+<<irq.c: part 6>>
+
+<<irq.c: console_irq_init>>
+@
+
+<<irq.c: includes>>=
+#include "ulix.h"
+#include "plat.h"
+#include "gic.h"
+#include "smp.h"
+
+extern char vectors[];
+extern int  book_scheduler_on;
+extern void book_timer_tick (void);
+extern void book_syscall (void *frame);
+extern void book_user_fault (void *frame);
+extern int  book_current_pid (void);
+extern void arch_signal_check (void *frame);
+extern void uart_rx_irq (void);
+extern void uart_rx_enable (void);
+extern void sdisk_irq (void);
+extern int  netd_irq;
+extern void netd_interrupt (void), netd_tick (void);
+extern void sdisk_init (void);
+extern void arch_clock_tick (void);
+extern int  arch_cow_fault (u64 va);
+extern void smp_before_return (void *frame);
+extern int  blk_irq;
+extern int  blk_is_irq (int irq);
+extern void blk_irq_ack (void);
+extern void hd_interrupt (void);
+extern void arch_kernel_fault_shell (void);
+extern int  arch_user_fault (u64 va);
+
+@
+\subsection{the interrupt controller is in gic.c; the interrupt numbers come from the device tree}
+
+<<irq.c: IRQ_TIMER>>=
+#define IRQ_TIMER   (plat.timer_irq)    // EL1 physical timer (a PPI; 30 on qemu)
+#define IRQ_UART    (plat.uart_irq)     // PL011 UART (an SPI; 33 on qemu)
+
+@
+\subsection{generic timer}
+
+<<irq.c: HZ>>=
+#define HZ 100
+static u64 timer_ticks_per_irq;
+volatile u64 ticks = 0;
+
+static void timer_reload (void) {
+  __asm__ volatile ("msr cntp_tval_el0, %0" :: "r" (timer_ticks_per_irq));
+}
+
+static void timer_enable (void) {                            // for the calling CPU
+  timer_reload ();
+  __asm__ volatile ("msr cntp_ctl_el0, %0" :: "r" (1UL));    // enable, unmasked
+  gic_enable (IRQ_TIMER);
+}
+
+static void timer_init (int hz) {
+  u64 freq;
+  __asm__ volatile ("mrs %0, cntfrq_el0" : "=r" (freq));
+  timer_ticks_per_irq = freq / hz;
+  printf ("Timer: %lu Hz counter, %d interrupts/s\n", freq, hz);
+  timer_enable ();
+}
+
+void irq_init_cpu (void) {                                   // vector table and timer of a secondary CPU
+  __asm__ volatile ("msr vbar_el1, %0; isb" :: "r" (vectors));
+  timer_enable ();
+}
+
+@
+\subsection{exception entry}
+
+<<irq.c: expect_fault>>=
+volatile int expect_fault = 0, faults = 0, procs_killed = 0;
+volatile u64 fault_esr, fault_far;
+
+static void exc_handler_locked (struct frame *f, int kind) {
+  int from_user = (f->spsr & 0xf) == 0;     // M[3:0] == EL0t
+
+  if (kind == 1) {                          // IRQ
+    int disk_woke_someone = 0;
+    u32 iar = gic_ack ();
+    u32 irq = GIC_INTID (iar);
+    if (irq < 1020) gic_eoi (iar);          // acknowledge first: nested interrupts must be possible
+                                            // (the kernel shell waits for keys inside the UART handler)
+    if (irq == IRQ_TIMER) { if (smp_cpu () == 0) { ticks++; arch_clock_tick (); if (book_scheduler_on) netd_tick (); } timer_reload (); }
+    else if (irq == IRQ_UART) { if (book_scheduler_on) uart_rx_irq (); }
+    else if (netd_irq && irq == (u32)netd_irq) { if (book_scheduler_on) { netd_interrupt (); disk_woke_someone = 1; } }      // the network card
+    else if (plat.uart2 && irq == (u32)plat.uart2_irq) sdisk_irq ();          // the serial disk
+    else if (blk_is_irq ((int)irq)) { if (book_scheduler_on) { hd_interrupt (); disk_woke_someone = 1; } else blk_irq_ack (); }   // the disk
+    else if (irq < 16) ;                    // software interrupt from another CPU: entering the kernel was the point
+    else if (irq < 1020) printf ("spurious IRQ %u\n", irq);
+    if (irq == IRQ_TIMER && book_scheduler_on) book_timer_tick ();   // time slice over (10 ms)
+    else if (disk_woke_someone && book_scheduler_on && book_current_pid () == 1) book_timer_tick ();   // a process waited for the disk and the CPU is idle: run it now, not at the next tick
+    if (from_user && book_scheduler_on) arch_signal_check (f);       // deliver pending signals
+    return;
+  }
+
+  u64 esr, far;
+  __asm__ volatile ("mrs %0, esr_el1" : "=r" (esr));
+  __asm__ volatile ("mrs %0, far_el1" : "=r" (far));
+  u32 ec = esr >> 26;
+
+  // write to a copy-on-write page (a permission fault on a write): from user mode, or from the kernel while
+  // it writes into a user buffer during a system call. After the copy the instruction is simply repeated.
+  if (kind == 0 && (ec == 0x24 || ec == 0x25) && (esr & (1 @<< 6)) && (esr & 0x3c) == 0x0c &&
+      far < 0x80000000UL && book_scheduler_on && arch_cow_fault (far))
+    return;
+
+  // a page that was paged out (translation fault) or whose access flag was cleared for the page replacement
+  // counters (access flag fault); from user mode, or from the kernel while it uses a user pointer
+  if (kind == 0 && (ec == 0x20 || ec == 0x21 || ec == 0x24 || ec == 0x25) && far < 0x80000000UL && book_scheduler_on &&
+      (((esr & 0x3c) == 0x04) || ((esr & 0x3c) == 0x08)) && arch_user_fault (far))
+    return;
+
+  if (kind == 0 && ec == 0x15) {            // SVC from AArch64
+    if (from_user) { book_syscall (f); arch_signal_check (f); return; }       // the book's system call dispatcher
+    printf ("SVC #%u at 0x%lx (from the kernel)\n", (u32)(esr & 0xffff), f->elr - 4);
+    return;
+  }
+  if (expect_fault && !from_user && kind == 0 && ec == 0x25) {  // data abort from a kernel self-test
+    fault_esr = esr; fault_far = far; faults++;
+    f->elr += 4;                            // skip the faulting instruction
+    return;
+  }
+  if (from_user && kind == 0) {             // user mistake: kill the process, not the kernel
+    printf ("[kernel] process %d killed: EC=0x%x ESR=0x%lx FAR=0x%lx ELR=0x%lx\n",
+            book_current_pid (), ec, esr, far, f->elr);
+    procs_killed++;
+    book_user_fault (f);                            // exit(-1) through the book's syscall_exit
+  }
+  printf ("\n*** KERNEL EXCEPTION kind=%d ESR=0x%lx (EC=0x%x) FAR=0x%lx ELR=0x%lx\n",
+          kind, esr, ec, far, f->elr);
+  if (!from_user) arch_kernel_fault_shell ();       // as on the x86: the kernel shell, no way back to user mode
+  for (;;) __asm__ volatile ("wfe");
+}
+
+@
+Every exception is handled with the big kernel lock (see [[smp.c]])
+
+<<irq.c: exc_handler>>=
+void exc_handler (struct frame *f, int kind) {
+  bkl_lock ();
+  exc_handler_locked (f, kind);
+  if ((f->spsr & 0xf) == 0 && book_scheduler_on) smp_before_return (f);     // returning to user mode
+  bkl_unlock ();
+}
+
+@
+The kernel shell runs inside an interrupt handler and waits for keys there: the UART interrupt must come to
+the CPU that runs it (the others wait for the kernel lock).  Afterwards it goes back to CPU 0.
+
+<<irq.c: part 6>>=
+void irq_uart_to_cpu (int cpu) { gic_route (IRQ_UART, cpu); }
+
+@
+receive interrupts of the UART (console input), enabled once the book's thread data structures exist
+
+<<irq.c: console_irq_init>>=
+void console_irq_init (void) {
+  uart_rx_enable ();
+  gic_enable (IRQ_UART);
+}
+
+void irq_init (void) {
+  __asm__ volatile ("msr vbar_el1, %0; isb" :: "r" (vectors));
+  gic_init ();
+  timer_init (HZ);
+  if (plat.uart2 && plat.uart2_irq) { sdisk_init (); gic_enable (plat.uart2_irq); }   // the serial disk, if qemu was given a second serial port
+  __asm__ volatile ("msr daifclr, #2");     // unmask IRQs
+}
+
+@
+\section{More than one CPU}
+\label{src:smp.h}
+
+
+@
+
+The complete file is put together from these parts:
+
+<<smp.h>>=
+<<smp.h: SMP_H>>
+@
+
+<<smp.h: SMP_H>>=
+#ifndef SMP_H
+#define SMP_H
+#include "plat.h"
+
+int  smp_cpu (void);                       // number of the calling CPU (TPIDR_EL1)
+u64  smp_mpidr (int cpu);
+void smp_boot_init (void);                 // the boot CPU takes the kernel lock
+void smp_start (void);                     // bring the other CPUs up (PSCI), once the scheduler runs
+int  smp_online_cpus (void);
+void bkl_lock (void);                      // the big kernel lock: the code of the book runs on one CPU at a time
+void bkl_unlock (void);
+int  bkl_depth (void);
+void bkl_set_depth (int d);
+void arch_idle (void);                     // give the lock away, wait for an interrupt, take it back
+#endif
+
+@
+\section{More than one CPU}
+\label{src:smp.c}
+
+The kernel of the book was written for one CPU: its queues, tables and the scheduler have no locks.  The
+processors share it with a big kernel lock (BKL):
+\begin{itemize}
+\item a CPU takes the lock when it enters the kernel (every exception) and gives it back when it returns to user mode or waits for an interrupt; user programs run in parallel on all CPUs;
+\item [[current_task]] and [[current_as]] of the book are per CPU: they are swapped in when a CPU takes the lock and saved when it gives it back, so the code of the book sees ``its'' thread, as on one CPU;
+\item the book's scheduler picks the next thread from the ready queue.  Threads that run on another CPU are in that queue, too: while the scheduler chooses, they are marked [[TSTATE_ONCPU]], which the scheduler skips (it only takes threads in state READY).  The book's [[scheduler ()]] is wrapped, see ``scheduler'' below;
+\item every CPU has its own idle context (the idle thread 1 of the book is the boot CPU's);
+\item a signal for a thread that runs on another CPU is handed to that CPU (an interrupt makes it enter the kernel), so that a thread is never ended or its address space freed under the feet of another CPU.
+\end{itemize}
+Secondary CPUs are started with PSCI ([[CPU_ON]]), as the device tree says.
+
+@
+
+The complete file is put together from these parts:
+
+<<smp.c>>=
+<<smp.c: hash>>
+
+<<smp.c: bkl_word>>
+
+<<smp.c: arch_idle>>
+
+<<smp.c: marked>>
+
+<<smp.c: smp_unmark>>
+
+<<smp.c: scheduler>>
+
+<<smp.c: smp_running_elsewhere>>
+
+<<smp.c: deferred_sig>>
+
+<<smp.c: smp_run_deferred>>
+
+<<smp.c: smp_stop_others>>
+
+<<smp.c: psci_call_conduit>>
+
+<<smp.c: part 12>>
+
+<<smp.c: secondary_main>>
+
+<<smp.c: smp_before_return>>
+@
+
+<<smp.c: hash>>=
+#define hash smp_hash                      // (the book defines hash () in its header: keep this copy private)
+#include "ulix-api.h"
+#undef hash
+#include "smp.h"
+#include "gic.h"
+
+#define TSTATE_ONCPU 20
+
+extern int plat_psci (void), plat_psci_hvc (void), plat_ncpus (void);   // dt.c
+extern unsigned plat_psci_cpu_on (void);
+extern unsigned long plat_cpu_mpidr (int i);
+#define MAX_CPUS    8
+
+struct percpu {
+  u64 mpidr;
+  volatile int online;
+  volatile int in_kernel;                  // between the start of an exception and the return to user mode
+  volatile u32 entries;                    // number of kernel entries
+  volatile u32 switches;                   // context switches made on this CPU
+  thread_id cur_task;  addr_space_id cur_as;
+  int depth;                               // how often this CPU took the lock (nested exceptions)
+};
+static struct percpu pc[MAX_CPUS];
+static int ncpus_online = 1;
+
+extern void secondary_entry (void);
+extern u64  secondary_tcr;
+extern void book_scheduler (context_t *r, int source);
+extern int  book_u_kill (int pid, int signo);
+extern void arch_sync_ttbr0 (void);
+extern void irq_init_cpu (void);
+
+int smp_cpu (void) { u64 v; __asm__ volatile ("mrs %0, tpidr_el1" : "=r" (v)); return (int)v; }
+u64 smp_mpidr (int cpu) { return pc[cpu].mpidr; }
+int smp_online_cpus (void) { return ncpus_online; }
+
+@
+\subsection{the big kernel lock}
+
+<<smp.c: bkl_word>>=
+static volatile int bkl_word = 0;
+static volatile int bkl_owner = -1;
+
+void bkl_lock (void) {
+  int c = smp_cpu ();
+  if (bkl_owner == c) { pc[c].depth++; return; }                 // nested exception, or kernel code taking it again
+  pc[c].in_kernel = 1;
+  pc[c].entries++;
+  while (__sync_lock_test_and_set (&bkl_word, 1)) {
+    for (u64 spin = 0; bkl_word; spin++) {
+      __asm__ volatile ("yield");
+      if (spin == 4000000000UL && scheduler_is_active) { u64 elr; __asm__ volatile ("mrs %0, elr_el1" : "=r" (elr));
+        printf ("BKL: CPU %d waits for CPU %d (elr 0x%lx, its task %d, depth %d)\n", c, bkl_owner, elr, pc[bkl_owner].cur_task, pc[bkl_owner].depth); }
+    }
+  }
+  bkl_owner = c;
+  pc[c].depth = 1;
+  current_task = pc[c].cur_task;                                 // the book's view of "this CPU"
+  current_as   = pc[c].cur_as;
+  arch_sync_ttbr0 ();                                            // another CPU may have replaced the address space (exec)
+}
+
+void bkl_unlock (void) {
+  int c = smp_cpu ();
+  if (--pc[c].depth > 0) return;
+  pc[c].cur_task = current_task;
+  pc[c].cur_as   = current_as;
+  bkl_owner = -1;
+  pc[c].in_kernel = 0;
+  __sync_lock_release (&bkl_word);
+}
+
+int  bkl_depth (void) { return pc[smp_cpu ()].depth; }
+void bkl_set_depth (int d) { pc[smp_cpu ()].depth = d; }
+
+void smp_boot_init (void) {
+  u64 m;
+  __asm__ volatile ("mrs %0, mpidr_el1" : "=r" (m));
+  pc[0].mpidr = m & 0xff00ffffffUL;
+  pc[0].online = 1;
+  pc[0].cur_task = current_task;
+  pc[0].cur_as = current_as;
+  bkl_lock ();
+}
+
+@
+wait for an interrupt without holding the kernel lock
+
+<<smp.c: arch_idle>>=
+void arch_idle (void) {
+  bkl_unlock ();
+  __asm__ volatile ("msr daifclr, #2; wfi; msr daifset, #2" ::: "memory");
+  bkl_lock ();
+}
+
+@
+\subsection{the scheduler of the book, for several CPUs}
+
+<<smp.c: marked>>=
+static thread_id marked[MAX_CPUS];
+static int nmarked = 0;
+
+@
+The book's scheduler walks the ready queue and expects every thread in it to be ready to run (it never gives
+up looking at a thread that is not).  So the threads of other CPUs are taken out of the queue while the
+scheduler chooses, and put back (at the end) afterwards.
+
+<<smp.c: smp_unmark>>=
+void smp_unmark (void) {
+  while (nmarked > 0) {
+    thread_id t = marked[--nmarked];
+    add_to_ready_queue (t);
+  }
+}
+
+static void smp_mark_others (void) {
+  int me = smp_cpu ();
+  for (int c = 0; c < MAX_CPUS; c++) {
+    if (c == me || !pc[c].online) continue;
+    thread_id t = pc[c].cur_task;
+    if (t > 1 && thread_table[t].used && thread_table[t].state == TSTATE_READY) {
+      int dup = 0;
+      for (int k = 0; k < nmarked; k++) if (marked[k] == t) dup = 1;
+      if (dup) continue;
+      remove_from_ready_queue (t);
+      marked[nmarked++] = t;
+    }
+  }
+}
+
+@
+ulix-port.o defines the book's scheduler as [[book_scheduler]] (renamed by the Makefile); all calls land here
+
+<<smp.c: scheduler>>=
+void scheduler (context_t *r, int source) {
+  if (ncpus_online > 1) smp_mark_others ();
+  book_scheduler (r, source);                // (if it switches threads, arch_context_switch unmarks before the switch)
+  smp_unmark ();
+}
+
+@
+is the thread running on another CPU?
+
+<<smp.c: smp_running_elsewhere>>=
+int smp_running_elsewhere (thread_id t) {
+  int me = smp_cpu ();
+  for (int c = 0; c < MAX_CPUS; c++) if (c != me && pc[c].online && pc[c].cur_task == t) return 1;
+  return 0;
+}
+
+@
+\subsection{signals for threads on other CPUs}
+
+<<smp.c: deferred_sig>>=
+static volatile u32 deferred_sig[MAX_THREADS];
+
+int u_kill (int pid, int signo) {            // the book's u_kill is book_u_kill
+  if (ncpus_online > 1 && pid > 1 && pid < MAX_THREADS && signo >= 0 && signo <= 31 && thread_table[pid].used) {
+    int me = smp_cpu ();
+    for (int c = 0; c < MAX_CPUS; c++) {
+      if (c != me && pc[c].online && pc[c].cur_task == pid) {
+        deferred_sig[pid] |= 1u @<< signo;
+        gic_send_sgi (c, SGI_WAKE);          // makes that CPU enter the kernel, where it ends/stops/signals the thread itself
+        return 0;
+      }
+    }
+  }
+  return book_u_kill (pid, signo);
+}
+
+@
+called by a CPU that holds the lock, for the thread it runs
+
+<<smp.c: smp_run_deferred>>=
+void smp_run_deferred (void) {
+  thread_id t = current_task;
+  while (t > 1 && deferred_sig[t]) {
+    u32 bits = deferred_sig[t];
+    deferred_sig[t] = 0;
+    for (int s = 0; s < 32; s++) if (bits & (1u @<< s)) book_u_kill (t, s);
+    if (thread_table[t].state != TSTATE_READY) return;
+  }
+}
+
+@
+[[make every]] other CPU leave user mode (it enters the kernel and waits for the lock, which the caller holds)
+
+<<smp.c: smp_stop_others>>=
+void smp_stop_others (void) {
+  int me = smp_cpu();
+  for (int c = 0; c < MAX_CPUS; c++) {
+    if (c == me || !pc[c].online) continue;
+    u32 e0 = pc[c].entries;
+    gic_send_sgi (c, SGI_STOP);
+    for (long spin = 0; spin < 100000000 && !pc[c].in_kernel && pc[c].entries == e0; spin++) __asm__ volatile ("yield");
+  }
+}
+
+@
+\subsection{starting the other CPUs}
+
+<<smp.c: psci_call_conduit>>=
+static long psci_call_conduit (int hvc, u32 fn, u64 a1, u64 a2, u64 a3) {
+  register u64 x0 __asm__ ("x0") = fn;
+  register u64 x1 __asm__ ("x1") = a1;
+  register u64 x2 __asm__ ("x2") = a2;
+  register u64 x3 __asm__ ("x3") = a3;
+  if (hvc) __asm__ volatile ("hvc #0" : "+r" (x0) : "r" (x1), "r" (x2), "r" (x3) : "memory");
+  else                  __asm__ volatile ("smc #0" : "+r" (x0) : "r" (x1), "r" (x2), "r" (x3) : "memory");
+  return (long)x0;
+}
+
+static long psci_call (u32 fn, u64 a1, u64 a2, u64 a3) { return psci_call_conduit (plat_psci_hvc (), fn, a1, a2, a3); }
+
+@
+Switch the machine off: the firmware function [[SYSTEM_OFF]] of PSCI (under qemu this ends qemu). Returns if there is no PSCI.
+
+<<smp.c: part 12>>=
+void smp_poweroff (void) { if (plat_psci ()) psci_call (0x84000008, 0, 0, 0); }
+
+@
+Start the machine again: PSCI [[SYSTEM_RESET]]. Returns -1 (if it returns at all) when there is no PSCI.
+
+<<smp.c: secondary_main>>=
+int smp_reboot (void) { if (plat_psci ()) psci_call (0x84000009, 0, 0, 0); return -1; }
+
+void secondary_main (int cpu) {
+  gic_init_cpu ();
+  irq_init_cpu ();                           // this CPU's timer
+  pc[cpu].cur_task = 1;                      // idle
+  pc[cpu].cur_as = 1;
+  __sync_synchronize ();
+  pc[cpu].online = 1;
+  for (;;) __asm__ volatile ("msr daifclr, #2; wfi");     // all work happens in the interrupt handler
+}
+
+void smp_start (void) {
+  static int started = 0;
+  if (started || !plat_psci () || plat_ncpus () <= 1) return;
+  started = 1;
+  u64 boot = pc[0].mpidr;
+  int n = 1;
+  __asm__ volatile ("mrs %0, tcr_el1" : "=r" (secondary_tcr));
+  __asm__ volatile ("dc civac, %0; dsb sy" :: "r" (&secondary_tcr) : "memory");
+  for (int i = 0; i < plat_ncpus () && n < MAX_CPUS; i++) {
+    u64 m = plat_cpu_mpidr (i);
+    if (m == boot) continue;
+    pc[n].mpidr = m;
+    long r = psci_call (plat_psci_cpu_on (), m, (u64)secondary_entry - KERNEL_VA, n);
+    if (r != 0) { printf ("SMP: CPU_ON for CPU %d (MPIDR 0x%lx) failed: %ld\n", n, m, r); continue; }
+    u64 t0, now, freq;
+    __asm__ volatile ("mrs %0, cntpct_el0; mrs %1, cntfrq_el0" : "=r" (t0), "=r" (freq));
+    do {
+      __asm__ volatile ("mrs %0, cntpct_el0" : "=r" (now));
+    } while (!pc[n].online && now - t0 < freq);        // up to one second
+    if (pc[n].online) { printf ("SMP: CPU %d online (MPIDR 0x%lx)\n", n, m); ncpus_online++; n++; }
+    else printf ("SMP: CPU %d did not start\n", n);
+  }
+}
+
+@
+before a CPU returns to user mode: signals that were handed over, and a thread that was ended or stopped meanwhile
+
+<<smp.c: smp_before_return>>=
+extern void arch_signal_check (context_t *f);
+void smp_before_return (void *f) {
+  smp_run_deferred ();
+  arch_signal_check ((context_t *)f);                      // a signal that was handed over is delivered now, not at the next entry
+  while (current_task > 1 && thread_table[current_task].state != TSTATE_READY)
+    scheduler ((context_t *)f, SCHED_SRC_RESIGN);
+}
+
+void smp_count_switch (void) { pc[smp_cpu ()].switches++; }
+
+void smp_print_stats (void) {
+  for (int c = 0; c < MAX_CPUS; c++)
+    if (pc[c].online) printf ("SMP: CPU %d: %u kernel entries, %u context switches\n", c, pc[c].entries, pc[c].switches);
+}
+
+@
+\section{Waiting a number of microseconds (for the drivers of hardware that needs a moment)}
+\label{src:delay.h}
+
+
+@
+
+The complete file is put together from these parts:
+
+<<delay.h>>=
+<<delay.h: DELAY_H>>
+@
+
+<<delay.h: DELAY_H>>=
+#ifndef DELAY_H
+#define DELAY_H
+#include "ulix.h"
+
+// The counter of the generic timer runs at a fixed frequency, whatever the CPU does.
+static inline void delay_us (u32 us) {
+  u64 freq, start, now;
+  __asm__ volatile ("mrs %0, cntfrq_el0" : "=r" (freq));
+  __asm__ volatile ("mrs %0, cntpct_el0" : "=r" (start));
+  do __asm__ volatile ("mrs %0, cntpct_el0" : "=r" (now)); while ((now - start) * 1000000 / freq < us);
+}
+#endif
+
+@
+\section{The CPU cache and DMA: what a device reads must first be written back from the cache to memory, and what a}
+\label{src:cache.h}
+
+device has written must be read again from memory (the cache may hold an old copy). qemu's memory is coherent, so these do
+nothing visible there; on the Raspberry Pi they matter.
+
+@
+
+The complete file is put together from these parts:
+
+<<cache.h>>=
+<<cache.h: CACHE_H>>
+@
+
+<<cache.h: CACHE_H>>=
+#ifndef CACHE_H
+#define CACHE_H
+#include "ulix.h"
+
+static inline void cache_clean (const void *p, u64 len) {                 // before the device reads: write back to memory
+  for (u64 a = (u64)p & ~63UL; a < (u64)p + len; a += 64) __asm__ volatile ("dc cvac, %0" :: "r" (a) : "memory");
+  __asm__ volatile ("dsb sy" ::: "memory");
+}
+
+static inline void cache_flush_inval (const void *p, u64 len) {           // before the CPU reads what the device wrote: forget the cached copy
+  for (u64 a = (u64)p & ~63UL; a < (u64)p + len; a += 64) __asm__ volatile ("dc civac, %0" :: "r" (a) : "memory");
+  __asm__ volatile ("dsb sy" ::: "memory");
+}
+#endif

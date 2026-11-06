@@ -1,0 +1,760 @@
+\chapter{Booting the Machine}
+\label{ch:boot}
+
+This chapter follows the processor from the first instruction to the kernel's \texttt{kmain}. On the PC, GRUB loads the kernel
+and starts it in 32-bit protected mode; here the emulator or the Raspberry Pi firmware starts it directly, with the MMU off, at
+exception level EL1 or EL2. The boot code builds the first page tables, drops to EL1, jumps to the high addresses at which the
+kernel is linked, and sets up the exception vectors. Platform differences between qemu's \texttt{virt} machine and the
+Raspberry Pi 4B are kept small (\texttt{plat.h}); everything else comes from the device tree at run time.
+
+@
+\section{Boot code for qemu-system-aarch64 -M virt and for the Raspberry Pi 4B}
+\label{src:start.S}
+
+qemu enters at the *physical* address [[0x40080000]] with the MMU off, at EL1 (or EL2); the Pi firmware loads
+[[kernel8.img]] at [[0x80000]] and starts it at EL2 (see [[ulix.ld]] and "[[make PLATFORM]]=rpi4" in the Makefile).
+The kernel is linked at [[0xFFFF000000000000]] + PA, so everything up to the jump to
+the high address must be position independent (adr, no absolute symbol loads).
+
+@
+
+The complete file is put together from these parts:
+
+<<start.S>>=
+<<start.S: KERNEL_VA>>
+
+<<start.S: BOOT_DEV_GB>>
+
+<<start.S: D_BLOCK>>
+@
+
+<<start.S: KERNEL_VA>>=
+#define KERNEL_VA   0xFFFF000000000000
+
+@
+Number of the 1 GByte block in which the console UART sits; mapped as device memory in the boot tables so that the
+first messages can be printed. qemu ``virt'': the UART is at [[0x09000000]] (block 0); Raspberry Pi 4B: [[0xFE201000]] (block 3).
+
+<<start.S: BOOT_DEV_GB>>=
+#ifndef BOOT_DEV_GB
+#define BOOT_DEV_GB 0
+#endif
+
+@
+descriptor bits
+
+<<start.S: D_BLOCK>>=
+#define D_BLOCK     0x1
+#define D_TABLE     0x3
+#define D_ATTR(n)   ((n) @<< 2)       // MAIR index
+#define D_SH_INNER  (3 @<< 8)
+#define D_AF        (1 @<< 10)
+#define D_PXN       (1 @<< 53)
+#define D_UXN       (1 @<< 54)
+
+        // Drop from EL2 to EL1 if we were started there; continue at 'target'.
+        // EL1 may use the physical timer and the GICv3 system registers (ICC_SRE_EL2: SRE, DFB, DIB, Enable).
+        .macro  drop_to_el1 target
+        mrs     x0, CurrentEL
+        lsr     x0, x0, #2
+        cmp     x0, #2
+        b.ne    \target
+        mov     x0, #(1 @<< 31)          // HCR_EL2.RW: EL1 is AArch64
+        msr     hcr_el2, x0
+        mov     x0, #3                  // CNTHCTL_EL2: EL1 may use the physical counter and timer
+        msr     cnthctl_el2, x0
+        msr     cntvoff_el2, xzr
+        mrs     x0, id_aa64pfr0_el1
+        ubfx    x0, x0, #24, #4         // GIC system register interface present?
+        cbz     x0, 9f
+        mov     x0, #0xf
+        msr     S3_4_C12_C9_5, x0       // ICC_SRE_EL2
+        isb
+9:      mov     x0, #0x3c5              // SPSR: EL1h, DAIF masked
+        msr     spsr_el2, x0
+        adr     x0, \target
+        msr     elr_el2, x0
+        eret
+        .endm
+
+        .section .text.boot
+        .global _start
+_start:
+        // The image starts with the header of the Linux arm64 boot protocol, so that boot loaders (qemu with a
+        // flat image, U-Boot, ...) pass the address of the device tree in x0.
+        b       start_main
+        .long   0
+        .quad   0x80000                 // text_offset: the image is loaded at RAM start + 512 KByte
+        .quad   __image_size            // image_size (with .bss)
+        .quad   0x2                     // flags: little endian, 4 KByte pages
+        .quad   0, 0, 0
+        .long   0x644d5241              // magic "ARM\x64"
+        .long   0
+start_main:
+        mrs     x1, mpidr_el1
+        and     x1, x1, #0xff
+        cbnz    x1, park
+        adr     x1, boot_dtb            // qemu passes the address of the device tree in x0
+        str     x0, [x1]
+        drop_to_el1 at_el1
+
+at_el1:
+        mov     x0, #(3 @<< 20)          // enable FP/SIMD
+        msr     cpacr_el1, x0
+        isb
+
+        // ---- zero the four page-table pages (we are running at the physical address)
+        adr     x1, pg_t0_l0
+        mov     x2, #(4 * 4096 / 8)
+1:      str     xzr, [x1], #8
+        subs    x2, x2, #1
+        b.ne    1b
+
+        // The kernel is somewhere in RAM: on the qemu "virt" machine at 0x40080000, on the Raspberry Pi (RAM starts at 0)
+        // at 0x80000.  The 1 GByte block that contains this code is the RAM block of the boot tables; x6 = its address,
+        // x7 = its number (the index into the level 1 tables).  Everything else (the other RAM, the devices) is mapped
+        // later by platform_map () (mmu.c) from the device tree.
+        adr     x6, _start
+        and     x6, x6, #~0x3fffffff
+        lsr     x7, x6, #30
+
+        // ---- TTBR1 (kernel, upper half): L0[0] -> L1; L1[BOOT_DEV_GB] = the first device GByte (for the first
+        //      messages on the console, until the device tree has been read), L1[x7] = RAM
+        adr     x1, pg_t1_l0
+        adr     x2, pg_t1_l1
+        orr     x3, x2, #D_TABLE
+        str     x3, [x1]
+        ldr     x3, =((BOOT_DEV_GB @<< 30) | D_BLOCK | D_ATTR(0) | D_AF | D_PXN | D_UXN)
+        str     x3, [x2, #(BOOT_DEV_GB * 8)]
+        ldr     x8, =(D_BLOCK | D_ATTR(1) | D_SH_INNER | D_AF)      // RAM: normal memory, write-back
+        orr     x3, x6, x8
+        str     x3, [x2, x7, lsl #3]
+
+        // ---- TTBR0 (identity map of RAM, only needed until we run at the high address)
+        adr     x4, pg_t0_l0
+        adr     x5, pg_t0_l1
+        orr     x3, x5, #D_TABLE
+        str     x3, [x4]
+        orr     x3, x6, x8
+        str     x3, [x5, x7, lsl #3]
+
+        // ---- MMU configuration
+        ldr     x0, =0xff00             // MAIR: attr0 = device-nGnRnE, attr1 = normal write-back
+        msr     mair_el1, x0
+        ldr     x0, =((16) | (1 @<< 8) | (1 @<< 10) | (3 @<< 12) | (0 @<< 14) | \
+                      (16 @<< 16) | (1 @<< 24) | (1 @<< 26) | (3 @<< 28) | (2 @<< 30))
+        mrs     x6, id_aa64mmfr0_el1
+        and     x6, x6, #7              // PARange -> IPS
+        orr     x0, x0, x6, lsl #32
+        msr     tcr_el1, x0
+        msr     ttbr0_el1, x4
+        msr     ttbr1_el1, x1
+        isb
+        tlbi    vmalle1
+        dsb     nsh
+        isb
+        mrs     x0, sctlr_el1
+        orr     x0, x0, #(1 @<< 0)       // M: MMU on
+        orr     x0, x0, #(1 @<< 2)       // C: data cache
+        orr     x0, x0, #(1 @<< 12)      // I: instruction cache
+        msr     sctlr_el1, x0
+        isb
+
+        ldr     x0, =high_entry         // absolute (link-time) high address
+        br      x0
+
+        // ---- secondary CPUs: started by PSCI CPU_ON with the MMU off; x0 = CPU number (context ID)
+        .global secondary_entry
+secondary_entry:
+        mov     x19, x0
+        drop_to_el1 sec_at_el1
+sec_at_el1:
+        mov     x0, #(3 @<< 20)          // enable FP/SIMD
+        msr     cpacr_el1, x0
+        isb
+        ldr     x0, =0xff00
+        msr     mair_el1, x0
+        adr     x1, secondary_tcr       // the boot CPU's TCR_EL1 (saved after it set everything up)
+        ldr     x0, [x1]
+        msr     tcr_el1, x0
+        adr     x4, pg_t0_l0            // the boot identity map is still there
+        adr     x1, pg_t1_l0
+        msr     ttbr0_el1, x4
+        msr     ttbr1_el1, x1
+        isb
+        tlbi    vmalle1
+        dsb     nsh
+        isb
+        mrs     x0, sctlr_el1
+        orr     x0, x0, #(1 @<< 0)
+        orr     x0, x0, #(1 @<< 2)
+        orr     x0, x0, #(1 @<< 12)
+        msr     sctlr_el1, x0
+        isb
+        ldr     x0, =sec_high
+        br      x0
+
+        .text
+sec_high:
+        ldr     x0, =secondary_stacks
+        mov     x1, #0x4000
+        add     x2, x19, #1
+        madd    x0, x1, x2, x0
+        mov     sp, x0
+        msr     tpidr_el1, x19          // CPU number
+        mov     x0, x19
+        bl      secondary_main
+1:      wfe
+        b       1b
+
+high_entry:
+        ldr     x0, =stack_top
+        mov     sp, x0
+        msr     tpidr_el1, xzr          // CPU number 0
+        ldr     x0, =__bss_start
+        ldr     x1, =__bss_end
+1:      cmp     x0, x1
+        b.hs    2f
+        str     xzr, [x0], #8
+        b       1b
+2:      bl      kmain
+park:   wfe
+        b       park
+
+        // 4 page-table pages; kernel_l0 lets C code walk the kernel tables
+        .section .pgtbl, "aw", @nobits
+        .balign 4096
+pg_t0_l0:  .skip 4096
+pg_t0_l1:  .skip 4096
+        .global kernel_l0
+kernel_l0:
+pg_t1_l0:  .skip 4096
+        .global kernel_l1
+kernel_l1:
+pg_t1_l1:  .skip 4096
+
+        .data
+        .balign 8
+        .global boot_dtb
+boot_dtb:       .quad 0                 // address of the device tree blob (from x0 at entry)
+        .global secondary_tcr
+secondary_tcr:  .quad 0
+
+        .section .bss
+        .balign 16
+        .global secondary_stacks
+secondary_stacks:
+        .skip 8 * 0x4000                // 16 KByte for each of up to 8 CPUs (CPU n uses the n-th block from the start + 1)
+        .skip 0x4000
+stack_top:
+
+@
+\section{Exception vector table (replaces the x86 IDT)}
+\label{src:vectors.S}
+
+Every entry saves the full register frame and calls [[exc_handler]] (frame, kind).
+kind: 0 = synchronous, 1 = IRQ, 2 = FIQ, 3 = SError.
+
+@
+
+The complete file is put together from these parts:
+
+<<vectors.S>>=
+<<vectors.S: vector>>
+
+<<vectors.S: cpu_switch>>
+@
+
+<<vectors.S: vector>>=
+        .macro  vector kind
+        .balign 128
+        sub     sp, sp, #288
+        stp     x0,  x1,  [sp, #0]
+        mov     x0, #\kind
+        b       save_and_call
+        .endm
+
+        .section .text
+        .balign 2048
+        .global vectors
+vectors:
+        // current EL, SP_EL0
+        vector 0
+        vector 1
+        vector 2
+        vector 3
+        // current EL, SP_ELx  (the kernel runs here)
+        vector 0
+        vector 1
+        vector 2
+        vector 3
+        // lower EL, AArch64
+        vector 0
+        vector 1
+        vector 2
+        vector 3
+        // lower EL, AArch32 (unused)
+        vector 0
+        vector 1
+        vector 2
+        vector 3
+
+save_and_call:
+        // x0 = kind, original x0/x1 already stored at [sp,#0]
+        stp     x2,  x3,  [sp, #16]
+        stp     x4,  x5,  [sp, #32]
+        stp     x6,  x7,  [sp, #48]
+        stp     x8,  x9,  [sp, #64]
+        stp     x10, x11, [sp, #80]
+        stp     x12, x13, [sp, #96]
+        stp     x14, x15, [sp, #112]
+        stp     x16, x17, [sp, #128]
+        stp     x18, x19, [sp, #144]
+        stp     x20, x21, [sp, #160]
+        stp     x22, x23, [sp, #176]
+        stp     x24, x25, [sp, #192]
+        stp     x26, x27, [sp, #208]
+        stp     x28, x29, [sp, #224]
+        mrs     x1, elr_el1
+        mrs     x2, spsr_el1
+        stp     x30, x1,  [sp, #240]
+        str     x2,       [sp, #256]
+        mrs     x3, sp_el0
+        str     x3,       [sp, #264]
+        mov     x1, x0              // kind
+        mov     x0, sp              // frame
+        bl      exc_handler
+        .global exit_exception
+exit_exception:                     // also the first "return" of every new process
+        ldr     x2,       [sp, #256]
+        ldp     x30, x1,  [sp, #240]
+        msr     elr_el1, x1
+        msr     spsr_el1, x2
+        ldr     x3,       [sp, #264]
+        msr     sp_el0, x3
+        ldp     x28, x29, [sp, #224]
+        ldp     x26, x27, [sp, #208]
+        ldp     x24, x25, [sp, #192]
+        ldp     x22, x23, [sp, #176]
+        ldp     x20, x21, [sp, #160]
+        ldp     x18, x19, [sp, #144]
+        ldp     x16, x17, [sp, #128]
+        ldp     x14, x15, [sp, #112]
+        ldp     x12, x13, [sp, #96]
+        ldp     x10, x11, [sp, #80]
+        ldp     x8,  x9,  [sp, #64]
+        ldp     x6,  x7,  [sp, #48]
+        ldp     x4,  x5,  [sp, #32]
+        ldp     x2,  x3,  [sp, #16]
+        ldp     x0,  x1,  [sp, #0]
+        add     sp, sp, #288
+        eret
+
+@
+void [[cpu_switch]] (struct ctx *old, struct ctx *new)  -- kernel context switch.
+Saves callee-saved registers, SP and [[SP_EL0]] of the old context and loads the new ones.
+
+<<vectors.S: cpu_switch>>=
+        .global cpu_switch
+cpu_switch:
+        stp     x19, x20, [x0, #0]
+        stp     x21, x22, [x0, #16]
+        stp     x23, x24, [x0, #32]
+        stp     x25, x26, [x0, #48]
+        stp     x27, x28, [x0, #64]
+        stp     x29, x30, [x0, #80]
+        mov     x9, sp
+        str     x9, [x0, #96]
+        mrs     x9, sp_el0
+        str     x9, [x0, #104]
+        ldp     x19, x20, [x1, #0]
+        ldp     x21, x22, [x1, #16]
+        ldp     x23, x24, [x1, #32]
+        ldp     x25, x26, [x1, #48]
+        ldp     x27, x28, [x1, #64]
+        ldp     x29, x30, [x1, #80]
+        ldr     x9, [x1, #96]
+        mov     sp, x9
+        ldr     x9, [x1, #104]
+        msr     sp_el0, x9
+        ret
+
+@
+\section{What the device tree says about the machine (see dt.c)}
+\label{src:plat.h}
+
+
+@
+
+The complete file is put together from these parts:
+
+<<plat.h>>=
+<<plat.h: PLAT_H>>
+@
+
+<<plat.h: PLAT_H>>=
+#ifndef PLAT_H
+#define PLAT_H
+#include "ulix.h"
+
+#define MAX_CPUS    8
+#define MAX_VIRTIO  32
+
+struct platform {
+  int dt_ok;                     // 1: values come from a device tree, 0: defaults of the qemu "virt" machine
+  u64 ram_base, ram_size;
+  int gic_version;               // 2 or 3
+  u64 gicd, gicc, gicr, gicr_size;
+  u64 uart;  int uart_irq;       // PL011 and its interrupt number (INTID)
+  u64 uart2; int uart2_irq;      // the second PL011 (0: none), where the serial disk is connected
+  u64 sdhci;  int sdhci_irq;     // SD host controller (the Raspberry Pi's EMMC2), 0: none, and its interrupt number
+  u64 genet;  int genet_irq;     // the Raspberry Pi 4's Ethernet controller (GENET), 0: none, and its interrupt number
+  u8  genet_mac[6];  int genet_has_mac;           // its Ethernet address as the firmware wrote it into the device tree
+  u64 rtc;                       // PL031
+  int timer_irq;                 // INTID of the EL1 physical timer (a PPI)
+  int ncpus;  u64 cpu_mpidr[MAX_CPUS];
+  int psci_hvc;  u32 psci_cpu_on;  int psci;      // PSCI present, conduit (0 = smc, 1 = hvc), function ID of CPU_ON
+  int nvirtio;  u64 virtio[MAX_VIRTIO];           // base addresses of the virtio-mmio devices
+  int virtio_irq[MAX_VIRTIO];                     // and their interrupt numbers
+  int virtio_coherent;                            // all devices say "dma-coherent"
+};
+extern struct platform plat;
+extern u64 boot_dtb;
+
+void dt_init (u64 blob_pa);
+#endif
+
+@
+\section{Kernel entry, PL011 console, minimal printf}
+\label{src:kmain.c}
+
+
+@
+
+The complete file is put together from these parts:
+
+<<kmain.c>>=
+<<kmain.c: includes>>
+
+<<kmain.c: uart_init>>
+
+<<kmain.c: sink>>
+
+<<kmain.c: vformat>>
+@
+
+<<kmain.c: includes>>=
+#include "ulix.h"
+#include "plat.h"
+#include "disk_expected.h"       // sizes and checksums of files on the disk, from the independent Python parser
+
+
+u64 uart_base = 0x09000000UL;                // PL011 (physical address; the device tree may say something else)
+#define UART0_BASE  (KERNEL_VA + uart_base)
+#define UART_DR     (*(volatile u32 *)(UART0_BASE + 0x00))
+#define UART_FR     (*(volatile u32 *)(UART0_BASE + 0x18))
+#define UART_FR_TXFF (1 @<< 5)
+#define UART_IBRD   (*(volatile u32 *)(UART0_BASE + 0x24))     // baud rate divisor, integer part
+#define UART_FBRD   (*(volatile u32 *)(UART0_BASE + 0x28))     // ... and fractional part (in 1/64)
+#define UART_LCRH   (*(volatile u32 *)(UART0_BASE + 0x2c))     // line control: word length, FIFOs
+#define UART_CR     (*(volatile u32 *)(UART0_BASE + 0x30))     // control: UART, transmitter, receiver on
+
+static char cap_buf[8192];
+static int  cap_len = 0, cap_on = 0;
+void capture_start (void) { cap_len = 0; cap_on = 1; }
+int  capture_stop (char **text) { cap_on = 0; cap_buf[cap_len] = 0; *text = cap_buf; return cap_len; }
+
+@
+qemu does not care how the PL011 is set up, a real one does: it sends 115200 baud, 8 bits, no parity, one stop bit only if
+the divisor is programmed. The Raspberry Pi's firmware does that when it uses the UART itself ([[enable_uart]]=1); if the divisor is
+still 0 we do it: the UART clock is 48 MHz there, divisor = 48000000 / (16 * 115200) = 26.04 = 26 + 3/64.
+The FIFOs stay off: qemu's PL011 has no receive timeout, so a character below the FIFO trigger level would never be seen.
+
+<<kmain.c: uart_init>>=
+void uart_init (void) {
+  if (UART_IBRD == 0 && UART_FBRD == 0) { UART_CR = 0; UART_IBRD = 26; UART_FBRD = 3; }
+  UART_LCRH = 0x60;                           // 8 bits, FIFOs off (writing LCRH latches the divisor)
+  UART_CR = 0x301;                            // UART, transmitter and receiver on
+}
+
+int console_quiet = 0;                       // 1: output is dropped (for noisy debugging output of the book's code)
+void putch (char c) {
+  if (console_quiet) return;
+  if (cap_on && cap_len < (int)sizeof cap_buf - 1) cap_buf[cap_len++] = c;
+  if (c == '\n') putch ('\r');
+  while (UART_FR & UART_FR_TXFF) ;
+  UART_DR = c;
+}
+
+@
+\subsection{formatted output: one formatter for printf (console) and sprintf (memory)}
+
+<<kmain.c: sink>>=
+struct sink { char *buf; int n; };                 // buf == 0: write to the console
+
+static void emit (struct sink *s, char c) {
+  if (s->buf) s->buf[s->n++] = c;
+  else        putch (c);
+}
+
+static void emit_padded (struct sink *s, const char *text, int len, int width, int left, char pad) {
+  if (!left) for (int i = len; i < width; i++) emit (s, pad);
+  for (int i = 0; i < len; i++) emit (s, text[i]);
+  if (left)  for (int i = len; i < width; i++) emit (s, ' ');
+}
+
+static void emit_num (struct sink *s, u64 v, int base, int neg, int width, int left, char pad) {
+  char t[32]; int n = 0;
+  do { t[n++] = "0123456789abcdef"[v % base]; v /= base; } while (v);
+  if (neg) t[n++] = '-';
+  char r[32];
+  for (int i = 0; i < n; i++) r[i] = t[n - 1 - i];
+  emit_padded (s, r, n, width, left, pad);
+}
+
+@
+supports \%s \%c \%d \%u \%x \%p \%\% with the flags '-' and '0', a width, and the length modifier 'l'
+
+<<kmain.c: vformat>>=
+static void vformat (struct sink *s, const char *fmt, __builtin_va_list ap) {
+  for (; *fmt; fmt++) {
+    if (*fmt != '%') { emit (s, *fmt); continue; }
+    fmt++;
+    char pad = ' '; int width = 0, lng = 0, left = 0;
+    for (;; fmt++) { if (*fmt == '-') left = 1; else if (*fmt == '0') pad = '0'; else break; }
+    while (*fmt >= '0' && *fmt <= '9') width = width * 10 + (*fmt++ - '0');
+    while (*fmt == 'l') { lng = 1; fmt++; }
+    switch (*fmt) {
+      case 's': { const char *t = __builtin_va_arg (ap, const char *); if (!t) t = "(null)";
+                  int len = 0; while (t[len]) len++;
+                  emit_padded (s, t, len, width, left, ' '); break; }
+      case 'c': { char c = (char)__builtin_va_arg (ap, int); emit_padded (s, &c, 1, width, left, ' '); break; }
+      case 'd': { long v = lng ? __builtin_va_arg (ap, long) : __builtin_va_arg (ap, int);
+                  emit_num (s, v < 0 ? -(u64)v : (u64)v, 10, v < 0, width, left, pad); break; }
+      case 'u': emit_num (s, lng ? __builtin_va_arg (ap, u64) : __builtin_va_arg (ap, u32), 10, 0, width, left, pad); break;
+      case 'x': emit_num (s, lng ? __builtin_va_arg (ap, u64) : __builtin_va_arg (ap, u32), 16, 0, width, left, pad); break;
+      case 'p': emit_num (s, __builtin_va_arg (ap, u64), 16, 0, width, left, pad); break;
+      case '%': emit (s, '%'); break;
+      case 0:   return;
+      default:  emit (s, '%'); emit (s, *fmt); break;
+    }
+  }
+}
+
+int printf (const char *fmt, ...) {
+  struct sink s = { 0, 0 };
+  __builtin_va_list ap;
+  __builtin_va_start (ap, fmt);
+  vformat (&s, fmt, ap);
+  __builtin_va_end (ap);
+  return 0;
+}
+
+int sprintf (char *out, const char *fmt, ...) {
+  struct sink s = { out, 0 };
+  __builtin_va_list ap;
+  __builtin_va_start (ap, fmt);
+  vformat (&s, fmt, ap);
+  __builtin_va_end (ap);
+  out[s.n] = 0;
+  return s.n;
+}
+
+
+extern volatile u64 ticks;
+
+#define CHECK(cond, msg) do { if (cond) printf ("  ok:   %s\n", msg); \
+                              else { printf ("  FAIL: %s\n", msg); fails++; } } while (0)
+
+static int fails = 0;
+
+static void mmu_selftest (void) {
+  const u64 va = 0xFFFF008000000000UL;           // not covered by the boot map
+  u64 pa = alloc_frame ();
+  CHECK (map_page (va, pa, PAGE_RW) == 0, "map_page (RW)");
+  CHECK (virt_to_phys (va + 0x123) == pa + 0x123, "AT translation matches");
+  *(volatile u64 *)va = 0x1122334455667788UL;
+  CHECK (*(volatile u64 *)KVA (pa) == 0x1122334455667788UL, "write via mapping visible via linear map");
+  CHECK (map_page (va, pa, PAGE_RW) == -1, "double map rejected");
+
+  CHECK (unmap_page (va) == pa, "unmap_page returns frame");
+  expect_fault = 1; faults = 0;
+  (void)*(volatile u64 *)va;
+  expect_fault = 0;
+  CHECK (faults == 1 && fault_far == va && (fault_esr & 0x3f) == 0x07,
+         "read of unmapped page -> translation fault level 3");
+
+  CHECK (map_page (va, pa, PAGE_RO) == 0, "map_page (RO)");
+  expect_fault = 1; faults = 0;
+  *(volatile u64 *)va = 1;
+  expect_fault = 0;
+  CHECK (faults == 1 && (fault_esr & 0x3f) == 0x0f, "write to RO page -> permission fault level 3");
+  CHECK (*(volatile u64 *)va == 0x1122334455667788UL, "RO page still readable, data intact");
+
+  unmap_page (va);
+  free_frame (pa);
+  CHECK (alloc_frame () == pa, "freed frame is reused (and zeroed)");
+  free_frame (pa);
+}
+
+static u32 file_sum (const char *path, u32 *size_out) {
+  static u8 buf[65536] __attribute__ ((aligned (16)));
+  u32 ino = minix_lookup (path), sum = 0;
+  if (!ino) { *size_out = 0; return 0; }
+  long n = minix_read (ino, 0, buf, sizeof buf);
+  *size_out = n < 0 ? 0 : n;
+  for (long i = 0; i < n; i++) sum += buf[i];
+  return sum;
+}
+
+static void count_cb (u32 ino, const char *name, void *arg) { (*(int *)arg)++; }
+
+static void disk_test (void) {
+  static u8 a[1024] __attribute__ ((aligned (16))), b[1024] __attribute__ ((aligned (16)));
+  CHECK (blk_init () == 0, "virtio-blk device found and initialised");
+  CHECK (blk_capacity () == 8192, "capacity is 8192 sectors (4 MByte: x86 image grown by tools/minix_add.py)");
+
+  CHECK (blk_read (2, a, 2) == 0 && a[16] == 0x78 && a[17] == 0x24, "superblock read, Minix v2 magic 0x2478");
+  CHECK (blk_read (blk_capacity (), a, 1) == -1, "read beyond the end of the disk is rejected");
+
+  for (int i = 0; i < 1024; i++) a[i] = (u8)(i * 7 + 3);
+  CHECK (blk_write (8190, a, 2) == 0 && blk_read (8190, b, 2) == 0, "write 2 sectors and read them back");
+  int same = 1;
+  for (int i = 0; i < 1024; i++) if (a[i] != b[i]) same = 0;
+  CHECK (same, "read-back data identical (disk is run with -snapshot, image file stays untouched)");
+
+  CHECK (minix_mount () == 0, "Minix file system mounted");
+  extern int blk_disks;  extern u64 blk_capacity_of (int n);  extern int blk_read_n (int n, u64 sector, void *buf, u32 cnt);
+  if (blk_disks >= 3) {                                    // a third disk: stands in for the floppy /dev/fd1 (/mnt)
+    CHECK (blk_capacity_of (2) == 2880, "third disk (fd1) found: 2880 sectors (1440 KByte, like a floppy)");
+    CHECK (blk_read_n (2, 2, a, 2) == 0 && a[16] == 0x78 && a[17] == 0x24, "third disk: Minix v2 superblock read");
+  }
+  if (blk_disks >= 2) {                                    // a second disk was given to qemu: /dev/hdb (see "make pcheck")
+    CHECK (blk_capacity_of (1) == 65536, "second disk (hdb) found: 65536 sectors (32 MByte)");
+    CHECK (blk_read_n (1, 2, a, 2) == 0 && a[16] == 0x78 && a[17] == 0x24, "second disk: Minix v2 superblock read");
+    CHECK (blk_read_n (1, blk_capacity_of (1), a, 1) == -1, "second disk: read beyond its end is rejected");
+  }
+  int n = 0;
+  minix_readdir (1, count_cb, &n);
+  CHECK (n == 31, "root directory has 31 entries (16 from x86 Ulix + 15 AArch64 files)");
+  n = 0;
+  minix_readdir (minix_lookup ("/bin"), count_cb, &n);
+  CHECK (n == 70, "/bin has 70 entries (the programs of lib-build/tools, init, ping, ifconfig, route, dhclient, shutdown, poweroff and reboot)");
+  CHECK (minix_lookup ("/nonexistent") == 0, "unknown path not found");
+
+  // reference values computed on the host from the same image with an independent parser
+  u32 size, sum;
+  sum = file_sum ("/hello.c", &size);
+  CHECK (size == EXPECT_HELLO_C_SIZE && sum == EXPECT_HELLO_C_SUM, "/hello.c: size and checksum match");
+  sum = file_sum ("/test.txt", &size);
+  CHECK (size == EXPECT_TEST_TXT_SIZE && sum == EXPECT_TEST_TXT_SUM, "/test.txt: two zones, size and checksum match");
+  sum = file_sum ("/init", &size);
+  CHECK (size == EXPECT_INIT_SIZE && sum == EXPECT_INIT_SUM && size > 7 * 1024, "/init: more than 7 KByte (indirect zone), checksum matches");
+  sum = file_sum ("/bin/vi", &size);
+  CHECK (size == EXPECT_BIN_VI_SIZE && sum == EXPECT_BIN_VI_SUM && size > 7 * 1024, "/bin/vi: through a subdirectory, checksum matches");
+
+  u8 text[64];
+  long got = minix_read (minix_lookup ("/hello.c"), 0, text, 40);
+  text[got > 0 ? got : 0] = 0;
+  printf ("  info: /hello.c starts with: %s\n", text);
+}
+
+#ifdef CONSOLE_MODE
+// Interactive mode (ulix-console.elf): no test suites. The kernel starts /contest64 and then
+// waits; the UART is the console. Ctrl-C ends the foreground process, Ctrl-] opens the kernel shell.
+extern void console_irq_init (void);
+extern void arch_threads_init (void);
+extern int  arch_start_user (const char *path, int argc, char **argv);
+
+static void console_main (void) {
+  frames_init ();
+  user_mm_init ();
+  blk_init ();
+  minix_mount ();
+  extern int net_init (void);
+  extern void net_configure_from_command_line (void);
+  int net_ok = net_init () == 0;                                  // the network card, if there is one (silent if not)
+  if (net_ok) net_configure_from_command_line ();                 // ip=, gw=, dns=, netecho of the command line
+  arch_threads_init ();
+  console_irq_init ();
+  extern void netd_start (void);
+  if (net_ok) netd_start ();                                      // the network thread: frames are handled as they arrive
+  printf ("console ready (Ctrl-C: end the running program, Ctrl-]: kernel shell)\n");
+#ifndef CONSOLE_PROGRAM
+#define CONSOLE_PROGRAM "/contest64"
+#endif
+  char *argv[] = { CONSOLE_PROGRAM, 0 };
+  arch_start_user (CONSOLE_PROGRAM, 1, argv);
+  extern void arch_next_pid_is_2 (void);
+  arch_next_pid_is_2 ();                           // on the x86 the first fork of the first process (login's swapper) gets PID 2
+  extern void arch_idle (void);
+  for (;;) arch_idle ();
+}
+#endif
+
+#ifdef NET_MODE
+// Network test (ulix-net.elf): no disk, no processes; the test is in net_test.c and talks to tools/net_test.py on the host.
+extern int net_test (void);
+static void net_main (void) {
+  frames_init ();
+  user_mm_init ();
+  int fails = net_test ();
+  printf (fails ? "RESULT: %d check(s) FAILED\n" : "RESULT: all checks passed\n", fails);
+  for (;;) __asm__ volatile ("wfe");
+}
+#endif
+
+extern void smp_boot_init (void);
+extern void platform_map (void);
+
+void kmain (void) {
+  u64 el;
+  smp_boot_init ();                                // this CPU takes the kernel lock (smp.c)
+  dt_init (boot_dtb);                              // what is where: from the device tree of the boot loader
+  uart_base = plat.uart;
+  platform_map ();
+  uart_init ();
+  __asm__ volatile ("mrs %0, CurrentEL" : "=r" (el));
+  printf ("Ulix-arm64 (work in progress)\n");
+  printf ("Running at EL%d, sizeof(void*) = %d, kmain at 0x%lx (upper half)\n",
+          (int)(el >> 2), (int)sizeof (void *), (u64)kmain);
+  if (plat.dt_ok)
+    printf ("Device tree: %d MByte RAM at 0x%lx, %d CPU(s), GICv%d, %d virtio device(s)\n", (int)(plat.ram_size >> 20), plat.ram_base,
+            plat.ncpus, plat.gic_version, plat.nvirtio);
+  else
+    printf ("No device tree: using the defaults of the qemu virt machine\n");
+  irq_init ();
+#ifdef CONSOLE_MODE
+  console_main ();
+#endif
+#ifdef NET_MODE
+  net_main ();
+#endif
+  __asm__ volatile ("svc #0");                    // kernel-mode svc: handler just reports it
+
+  frames_init ();
+  user_mm_init ();                                // TTBR0 is now free for user processes
+  printf ("MMU self-test:\n");
+  mmu_selftest ();
+
+  printf ("disk test:\n");
+  disk_test ();
+
+  printf ("book file system test (mx_* from ulix-book.nw):\n");
+  extern int bookfs_test (void);
+  fails += bookfs_test ();
+
+  printf ("thread and process tests (book scheduler, system calls, fork, exec):\n");
+  extern int thread_test (void);
+  extern int proc_test (void);
+  fails += thread_test ();
+  printf ("process test (fork, exec, waitpid, files, faults):\n");
+  fails += proc_test ();
+
+  extern void smp_print_stats (void);
+  smp_print_stats ();
+  extern void buffer_sync (int);
+  buffer_sync (1);                                // write what the tests changed (make verify looks at the image)
+  printf (fails ? "RESULT: %d check(s) FAILED\n" : "RESULT: all checks passed\n", fails);
+  for (;;) __asm__ volatile ("wfe");
+}
