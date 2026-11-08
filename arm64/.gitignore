@@ -9,6 +9,7 @@ disk-after.img
 verify.log
 ulix-console.elf
 ulix-shell.elf
+ulix-net.elf
 userland/build/
 check-el*.log
 *.bin

@@ -11,7 +11,7 @@ CFLAGS = -I$(GENDIR) -mno-outline-atomics -O0 -g -ffreestanding -nostdlib -fno-b
 # "-snapshot" keeps the file unmodified when running.
 DISK ?= disk.img
 
-OBJS = start.o vectors.o irq.o mmu.o virtio.o minixfs.o elf.o ulix-port.o glue.o arch_thread.o arch_console.o arch_clock.o arch_swap.o arch_vt.o dt.o gic.o smp.o \
+OBJS = start.o vectors.o irq.o mmu.o virtio.o virtionet.o netdev.o net.o tcp.o dhcp.o netconf.o echo.o net_test.o net_syscalls.o netd.o minixfs.o elf.o ulix-port.o glue.o arch_thread.o arch_console.o arch_clock.o arch_swap.o arch_vt.o dt.o gic.o smp.o \
        bookfs_test.o thread_test.o proc_test.o kmain.o
 
 all: ulix.elf ulix-console.elf ulix-shell.elf ulix.bin ulix-console.bin ulix-shell.bin $(DISK) $(GENDIR)/disk_expected.h
@@ -70,6 +70,13 @@ ulix-shell.elf: $(filter-out kmain.o,$(OBJS)) kmain-shell.o ulix.ld
 kmain-shell.o: kmain.c ulix.h
 	$(CC) $(CFLAGS) -DCONSOLE_MODE -DCONSOLE_PROGRAM='"/init"' -c -o $@ $<
 
+# ulix-net.elf: the kernel for the network test (no disk, no processes, see net_test.c); "make net-test" runs it
+kmain-net.o: kmain.c ulix.h
+	$(CC) $(CFLAGS) -DNET_MODE -c -o $@ $<
+
+ulix-net.elf: $(filter-out kmain.o,$(OBJS)) kmain-net.o ulix.ld
+	$(LD) -T ulix.ld -o $@ $(filter-out kmain.o,$(OBJS)) kmain-net.o
+
 # qemu boots flat images in the format of the Linux arm64 boot protocol (and then passes the device tree in x0), not ELF files
 %.bin: %.elf
 	$(OBJCOPY) -O binary $< $@
@@ -107,6 +114,12 @@ bookfs_test.o: bookfs_test.c $(GENFILES) $(GENDIR)/ulix-api.h
 arch_thread.o: arch_thread.c $(GENFILES) $(GENDIR)/ulix-api.h
 	$(CC) $(BOOKFLAGS) -Dhash=arch_unused_hash -c -o $@ $<
 
+netd.o: netd.c $(GENFILES) $(GENDIR)/ulix-api.h
+	$(CC) $(BOOKFLAGS) -Dhash=netd_unused_hash -c -o $@ $<
+
+net_syscalls.o: net_syscalls.c $(GENFILES) $(GENDIR)/ulix-api.h
+	$(CC) $(BOOKFLAGS) -Dhash=netsys_unused_hash -c -o $@ $<
+
 arch_clock.o: arch_clock.c $(GENFILES) $(GENDIR)/ulix-api.h
 	$(CC) $(BOOKFLAGS) -Dhash=clock_unused_hash -c -o $@ $<
 
@@ -123,7 +136,8 @@ proc_test.o: proc_test.c $(GENFILES) $(GENDIR)/ulix-api.h
 glue.o: glue.c $(GENFILES) $(GENDIR)/ulix-api.h
 	$(CC) $(BOOKFLAGS) -Dhash=glue_unused_hash -c -o $@ $<
 
-irq.o mmu.o virtio.o dt.o gic.o smp.o kmain.o kmain-console.o kmain-shell.o: plat.h gic.h smp.h ulix.h arch_pte.h
+irq.o mmu.o virtio.o dt.o gic.o smp.o kmain.o kmain-console.o kmain-shell.o kmain-net.o: plat.h gic.h smp.h ulix.h arch_pte.h
+virtionet.o netdev.o net.o tcp.o dhcp.o netconf.o echo.o net_test.o: net.h plat.h ulix.h cache.h
 
 %.o: %.S
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -164,7 +178,8 @@ machines: ulix.bin ulix-console.bin ulix-shell.bin $(DISK)
 # to terminal 2, Ctrl-] opens the kernel shell, Ctrl-A X leaves qemu. Changes to the disk are discarded (-snapshot).
 run-shell: ulix-shell.bin $(DISK)
 	qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128 -nographic -kernel ulix-shell.bin -snapshot \
-		-drive file=$(DISK),format=raw,if=none,id=hd0 -device virtio-blk-device,drive=hd0
+		-drive file=$(DISK),format=raw,if=none,id=hd0 -device virtio-blk-device,drive=hd0 \
+		-netdev user,id=n0 -device virtio-net-device,netdev=n0
 
 # Everything: kernel test suites (EL1 with the legacy and EL2 with the modern virtio transport), the file system
 # check of the modified image, the console test and the complete shell session.
@@ -185,12 +200,20 @@ check: ulix.bin ulix-console.bin ulix-shell.bin $(DISK)
 
 # The same tests as "check", all at once: one qemu per test, JOBS of them in parallel (make pcheck JOBS=8), logs in check-logs/
 JOBS ?= 6
-pcheck: ulix.bin ulix-console.bin ulix-shell.bin $(DISK) $(DISK2) $(DISK3)
+pcheck: ulix.bin ulix-console.bin ulix-shell.bin ulix-net.bin $(DISK) $(DISK2) $(DISK3)
 	DISK=$(DISK) DISK2=$(DISK2) DISK3=$(DISK3) tools/parallel_check.sh $(JOBS)
 
 # The serial disk: the kernel tests with a second serial port, which tools/serial_disk.py serves from a copy of disk3.img
 sdisk-test: ulix.bin $(DISK) $(DISK3)
 	python3 tools/sdisk_test.py ulix.bin $(DISK) $(DISK3)
+
+# the network thread (netd): the console kernel with "netecho" answers on port 7 while it runs its program
+netd-test: ulix-console.bin $(DISK)
+	python3 tools/netd_test.py ulix-console.bin $(DISK)
+
+# The network: the net test kernel talks to a Python program on the host through qemu's user-mode network
+net-test: ulix-net.bin
+	python3 tools/net_test.py ulix-net.bin
 
 # Interactive console test: types into the UART of a second kernel image and checks the answers
 console-test: ulix-console.bin $(DISK)

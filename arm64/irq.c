@@ -16,6 +16,8 @@ extern void arch_signal_check (void *frame);
 extern void uart_rx_irq (void);
 extern void uart_rx_enable (void);
 extern void sdisk_irq (void);
+extern int  netd_irq;
+extern void netd_interrupt (void), netd_tick (void);
 extern void sdisk_init (void);
 extern void arch_clock_tick (void);
 extern int  arch_cow_fault (u64 va);
@@ -72,8 +74,9 @@ static void exc_handler_locked (struct frame *f, int kind) {
     u32 irq = GIC_INTID (iar);
     if (irq < 1020) gic_eoi (iar);          // acknowledge first: nested interrupts must be possible
                                             // (the kernel shell waits for keys inside the UART handler)
-    if (irq == IRQ_TIMER) { if (smp_cpu () == 0) { ticks++; arch_clock_tick (); } timer_reload (); }
+    if (irq == IRQ_TIMER) { if (smp_cpu () == 0) { ticks++; arch_clock_tick (); if (book_scheduler_on) netd_tick (); } timer_reload (); }
     else if (irq == IRQ_UART) { if (book_scheduler_on) uart_rx_irq (); }
+    else if (netd_irq && irq == (u32)netd_irq) { if (book_scheduler_on) { netd_interrupt (); disk_woke_someone = 1; } }      // the network card
     else if (plat.uart2 && irq == (u32)plat.uart2_irq) sdisk_irq ();          // the serial disk
     else if (blk_is_irq ((int)irq)) { if (book_scheduler_on) { hd_interrupt (); disk_woke_someone = 1; } else blk_irq_ack (); }   // the disk
     else if (irq < 16) ;                    // software interrupt from another CPU: entering the kernel was the point

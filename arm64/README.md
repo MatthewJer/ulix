@@ -16,7 +16,7 @@ with types and macros that mean the same on both processors. After every change 
 was compared function by function with the original, and the x86 kernel was booted in qemu. The only functions
 that differed in the last comparison (`../ARM64-PORT.md`, section 18) were the ones in which a bug was fixed (see
 [Bugs found in the book](#bugs-found-in-the-book)); that comparison has not been repeated for the later changes (swap, pthreads, the
-serial disk), which were written in the same way.
+serial disk, the network), which were written in the same way. (The network changes nothing in the book; it is only in `arm64/`.)
 
 ## Quick start (macOS)
 
@@ -24,12 +24,12 @@ serial disk), which were written in the same way.
 brew install qemu noweb aarch64-elf-gcc aarch64-elf-binutils   # python3 is needed, too
 cd arm64
 make                 # kernel images, user programs, disk image (disk.img)
-make run-shell       # boots to the shell; Ctrl-A X leaves qemu
+make run-shell       # boots to the shell, with a network card (try  ping 10.0.2.2  or  ifconfig ); Ctrl-A X leaves qemu
 make check           # all test suites one after the other (slow)
 make pcheck          # the same tests as parallel qemu instances (about 3 minutes)
 ```
 
-In the shell: `ls`, `cat`, `cd`, `cp`, `rm`, `mkdir`, `rmdir`, `touch`, `wc`, `grep`, `stat`, `ps`, `df`, `free`, …
+In the shell: `ls`, `cat`, `cd`, `cp`, `rm`, `mkdir`, `rmdir`, `touch`, `wc`, `grep`, `stat`, `ps`, `df`, `free`, `ping`, `ifconfig`, `route`, `dhclient`, `shutdown`, `poweroff`, `reboot`, …
 (it is Ulix, so `echo` copies its input until you press Ctrl-C). `>` and `<` redirect. Keys:
 
 | Key | Effect |
@@ -37,6 +37,8 @@ In the shell: `ls`, `cat`, `cd`, `cp`, `rm`, `mkdir`, `rmdir`, `touch`, `wc`, `g
 | Ctrl-C | ends the foreground program (like on x86) |
 | Ctrl-T, then 1…9 or 0 | switches to another terminal (x86: Alt-1…0); other terminals buffer their output |
 | Ctrl-] | stops the scheduler and opens the kernel shell (x86: Shift-Esc); `help`, `ps`, `queues`, `exit` |
+
+To leave qemu: `poweroff` (or `shutdown now`) in the shell; `reboot` starts the system again. (qemu's own Ctrl-A X works in most terminals.)
 
 Changes to the disk are discarded when qemu ends (`-snapshot`).
 
@@ -68,6 +70,7 @@ The port keeps the book as the single source:
 | device detection by BIOS/ports, one CPU | `dt.c`: device tree; `smp.c`: more than one CPU (PSCI, big kernel lock) |
 | swap file, page replacement | `arch_swap.c`: for the 4-level tables, with the access flag as accessed bit |
 | CMOS clock | PL031 RTC (`arch_clock.c`) |
+| no network in the book | an extension: virtio-net (`virtionet.c`), Ethernet, ARP, IPv4, ICMP, UDP, TCP (`net.c`, `tcp.c`), DHCP, a network thread (`netd.c`), BSD-style `ifconfig`/`route`/`dhclient`/`ping` (`userland/`) |
 
 The kernel runs with interrupts masked, like the x86 kernel: the queues and tables of the book need no extra
 locking. A timer interrupt switches threads when it arrives in user mode or in the idle thread.
@@ -86,6 +89,10 @@ userland/        user library, init, programs       user/           small test p
 tools/           minix_add.py, minix_check.py (host-side file system tools), disk_expected.py, test drivers,
                  serial_disk.py (the host end of the serial disk), sdisk_test.py
 *_test.c         kernel test suites
+virtionet.c      network card (qemu virt)           netdev.c        which network card is there
+net.c  tcp.c     Ethernet, ARP, IP, ICMP, UDP, TCP  net.h           what the network layers offer each other
+dhcp.c netconf.c DHCP client, kernel command line   netd.c  echo.c  network thread, echo service
+net_syscalls.c   system calls for ping, ifconfig, route, dhclient, poweroff, reboot
 ```
 
 ## Tests (`make check`, or `make pcheck` for the parallel version)
@@ -98,6 +105,15 @@ tools/           minix_add.py, minix_check.py (host-side file system tools), dis
   implementation, checks the file system (tree, bitmaps, link counts, leaked blocks) and the contents of the files.
 * **`make console-test`** (34 checks) types into the UART like a person; **`make shell-test`** (93 checks) runs a whole
   session: boot, auto login, the programs of `lib-build/tools`, Ctrl-C, terminal switching, `exit`, login with password.
+* **`poweroff_test.py`** (job `poweroff`): `shutdown` and `poweroff` end qemu by themselves, `reboot` starts the kernel again.
+* The shell test has a variant with a network card (`make pcheck`, job `shellnet`): the program `ping` in the Ulix shell.
+* The network is configured like on a BSD: the kernel command line (`ip=dhcp`, `ip=10.0.0.5/24 gw=… dns=…`), and as root (`su`) the
+  programs `ifconfig`, `route` and `dhclient`; the tests are the `shellnet` and `netconf` jobs of `make pcheck`.
+* **`make netd-test`**: the network thread. The console kernel with the command line `netecho` has nothing but the thread to answer; Python
+  sockets of the host get UDP and TCP echo back (up to 20000 bytes) while the kernel runs its program.
+* **`make net-test`**: the network. The kernel (own image `ulix-net.bin`) runs on qemu's user-mode network and a Python program on the
+  host talks to it with ordinary sockets: ping of the router, UDP echo, TCP echo of 100 and 20000 bytes, and the kernel as a TCP client
+  that loses its first SYN and its first data segment on purpose and must send them again.
 * **`make sdisk-test`**: the kernel tests with a second serial port that `tools/serial_disk.py` serves as a disk (the book's serial
   disk, `/dev/sdisk`); block I/O, the Minix code of the book on it, the buffer cache, two threads reading at the same time, and a
   check of the image on the host afterwards.
@@ -138,6 +154,12 @@ Found while porting, present on the x86 as well, left as they are in the book:
 * Everything has only been run on qemu (`-M virt`, GICv2 and GICv3, 1 to 4 CPUs, EL1 and EL2). Real boards are untested: the device
   tree reader, the cache maintenance for DMA and the PSCI start of the other CPUs are written for them but could not be tried.
   VirtualBox cannot run this on an ARM host; use qemu.
+* The network is small on purpose: no UDP or TCP sockets for user programs (only raw ICMP, which is what `ping` needs), the DHCP lease is not
+  renewed, no name resolution, one interface, no fragmentation, no congestion control in TCP.
+* `/dev/fd0` has no drive behind it (a stand-in for the second floppy, `/dev/fd1`, is the only one).
+* Not checked: the x86 build with the compiler that the makefiles name (`gcc-4.4`); all checks used GCC 16 (`i686-elf-gcc`). `ulixlib.c` still
+  passes pointers as `uint` to the system call functions; that works because user addresses are below 2 GByte, and changing it would touch the
+  x86 build.
 * No `pthread_join` (the book has none either); `exit ()` and `exec ()` in threads behave like in the book.
 * The book's kernel is single-processor code. More than one CPU is done with one big kernel lock (see `smp.c`): user programs run in
   parallel, the kernel does not.

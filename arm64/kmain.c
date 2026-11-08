@@ -172,7 +172,7 @@ static void disk_test (void) {
   CHECK (n == 31, "root directory has 31 entries (16 from x86 Ulix + 15 AArch64 files)");
   n = 0;
   minix_readdir (minix_lookup ("/bin"), count_cb, &n);
-  CHECK (n == 63, "/bin has 63 entries");
+  CHECK (n == 70, "/bin has 70 entries (the programs of lib-build/tools, init, ping, ifconfig, route, dhclient, shutdown, poweroff and reboot)");
   CHECK (minix_lookup ("/nonexistent") == 0, "unknown path not found");
 
   // reference values computed on the host from the same image with an independent parser
@@ -204,8 +204,14 @@ static void console_main (void) {
   user_mm_init ();
   blk_init ();
   minix_mount ();
+  extern int net_init (void);
+  extern void net_configure_from_command_line (void);
+  int net_ok = net_init () == 0;                                  // the network card, if there is one (silent if not)
+  if (net_ok) net_configure_from_command_line ();                 // ip=, gw=, dns=, netecho of the command line
   arch_threads_init ();
   console_irq_init ();
+  extern void netd_start (void);
+  if (net_ok) netd_start ();                                      // the network thread: frames are handled as they arrive
   printf ("console ready (Ctrl-C: end the running program, Ctrl-]: kernel shell)\n");
 #ifndef CONSOLE_PROGRAM
 #define CONSOLE_PROGRAM "/contest64"
@@ -216,6 +222,18 @@ static void console_main (void) {
   arch_next_pid_is_2 ();                           // on the x86 the first fork of the first process (login's swapper) gets PID 2
   extern void arch_idle (void);
   for (;;) arch_idle ();
+}
+#endif
+
+#ifdef NET_MODE
+// Network test (ulix-net.elf): no disk, no processes; the test is in net_test.c and talks to tools/net_test.py on the host.
+extern int net_test (void);
+static void net_main (void) {
+  frames_init ();
+  user_mm_init ();
+  int fails = net_test ();
+  printf (fails ? "RESULT: %d check(s) FAILED\n" : "RESULT: all checks passed\n", fails);
+  for (;;) __asm__ volatile ("wfe");
 }
 #endif
 
@@ -240,6 +258,9 @@ void kmain (void) {
   irq_init ();
 #ifdef CONSOLE_MODE
   console_main ();
+#endif
+#ifdef NET_MODE
+  net_main ();
 #endif
   __asm__ volatile ("svc #0");                    // kernel-mode svc: handler just reports it
 

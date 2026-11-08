@@ -6,7 +6,7 @@
 > Das Originalprojekt: <https://github.com/hgesser/ulix>. Lizenz: GNU GPL Version 3 wie beim Original (siehe `LICENSE`).
 
 
-Stand: Branch `arm64-port`. Dieses Dokument ist ein **Arbeitsprotokoll**: Die Abschnitte 1 bis 4 sind die Analyse, die vor dem Port nötig war; ab Abschnitt 5 folgt das Protokoll der Etappen. Zahlen, Testzahlen und Aussagen wie "fehlt noch" gelten jeweils für den Stand der Etappe, in der sie stehen. Der Port läuft inzwischen vollständig in qemu; den heutigen Stand beschreiben `arm64/README.md` und `arm64/TODO.md`.
+Stand: Branch `arm64-port`. Dieses Dokument ist ein **Arbeitsprotokoll**: Die Abschnitte 1 bis 4 sind die Analyse, die vor dem Port nötig war; ab Abschnitt 5 folgt das Protokoll der Etappen. Zahlen, Testzahlen und Aussagen wie "fehlt noch" gelten jeweils für den Stand der Etappe, in der sie stehen. Der Port läuft inzwischen vollständig in qemu; den heutigen Stand beschreiben `arm64/README.md` und der letzte Abschnitt dieser Datei (Abschnitt 21: offene Punkte; eine `TODO.md` gibt es nicht mehr). Der Netzwerkstack (Abschnitt 20) kommt aus dem Branch `rpi4`, der den Raspberry Pi 4B vorbereitet.
 Alle Zeilennummern beziehen sich auf den **ursprünglichen** `ulix-book.nw` (32 557 Zeilen, Upstream-Commit `32535a1`; das Buch in diesem Fork ist inzwischen länger). Das Buch ist die einzige Quelle: `ulix.c`, `start.asm` und `ulix.ld` werden per `notangle` daraus erzeugt.
 
 ## 1. Warum das kein "Befehle übersetzen" ist
@@ -369,7 +369,7 @@ x86: Von 353 Funktionen im Kernel-Objekt unterscheiden sich nur `hexdump`, `mx_o
   `make run-shell` startet das System zum Selbstbedienen.
 - **Dokumentation:** `arm64/README.md` (Englisch, im Stil des Repositorys), Abschnitt im Haupt-`README.md`, dieser Bericht.
 
-**Bewusst nicht gemacht (Stand dieser Etappe; Buffer Cache, Pthreads, Swap und das Kapitel im Buch sind inzwischen erledigt, siehe `arm64/TODO.md`):**
+**Bewusst nicht gemacht (Stand dieser Etappe; Buffer Cache, Pthreads, Swap und das Kapitel im Buch sind inzwischen erledigt, siehe Abschnitt 21):**
 - **Buffer Cache des Buchs:** Er verzögert Schreibzugriffe (ein Flush-Thread schreibt später). Die Tests, die das Image von außen prüfen,
   setzen voraus, dass geschrieben ist; der Gewinn (weniger Plattenzugriffe) ist unter qemu gering. `writeblock` schreibt durch.
 - **Pthreads** (`u_pthread_create` baut x86-Stacks): bräuchte einen ARM64-Entwurf für mehrere Threads je Adressraum
@@ -382,3 +382,41 @@ x86: Von 353 Funktionen im Kernel-Objekt unterscheiden sich nur `hexdump`, `mx_o
 - **Echte Hardware:** GICv3, Device-Tree, Cache-Wartung für DMA, andere Boards. (Inzwischen geschrieben und in qemu getestet, auf echter Hardware nicht ausprobiert.)
 
 **Zählung des Umfangs** (ursprünglich nach Schritt 7, aktualisiert am 2026-11-04, ohne den Commit der seriellen Platte): 31 Commits auf dem Branch `arm64-port` seit dem Upstream-Stand `32535a1`; im Buch 361 Zeilen hinzugefügt und 51 entfernt (der Anhang über den Port eingeschlossen, sonst x86-neutral oder Fehlerkorrekturen); im Verzeichnis `arm64/` rund 4 700 Zeilen C, Assembler und Header (ohne die aus dem Buch erzeugten Teile), dazu rund 1 000 Zeilen Python und Shell in `arm64/tools/` und 700 Zeilen Testprogramme in `arm64/user/`.
+
+## 19a. Nachtrag: die serielle Platte (2026-11-04)
+
+Das Buch hat neben IDE und Diskette eine dritte Platte, die „serielle Festplatte“ (`/dev/sdisk`): Ein Rechner am anderen Ende einer seriellen Leitung spielt die Platte. Sie ist auf ARM64 nachgebaut, ohne dass das Buch dafür geändert wurde.
+
+- `readblock_serial` / `writeblock_serial` in `glue.c` sprechen das Protokoll des Buchs (CMD_GET / CMD_PUT, die Blocknummer als 4 Byte, 1024 Byte Daten) über eine zweite PL011 (`plat.uart2`: der zweite `pl011`-Knoten des Device Trees; qemu legt ihn an, wenn es ein zweites `-serial` bekommt). Ein lesender Prozess schläft in `serial_disk_queue`, bis der Empfangs-Interrupt den Block gesammelt hat; der Idle-Thread pollt, weil er nie schlafen darf.
+- Die Gegenstelle ist `tools/serial_disk.py` (bedient ein Image über qemus TCP-Port für die serielle Schnittstelle). `make sdisk-test` (auch Job `sdisk` in `make pcheck`) lässt die Kerneltests damit laufen: Block-I/O, der Minix-Code des Buchs auf dem Gerät `0x2a00` (`mx_stat`, `mx_read`, `mx_open`/`mx_write`), der Buffer Cache, zwei Threads, die gleichzeitig lesen (Schlafen und Aufwecken durch den Interrupt), und danach eine Prüfung des Images auf dem Host mit `minix_check.py`.
+- Nichts im Buch benutzt `/dev/sdisk` (die Gerätetabelle sagt, die Gerätedatei existiere nicht); deshalb ist die Platte weder gemountet noch hat sie hier eine Gerätedatei.
+- qemus PL011 hat keinen Receive-Timeout, also läuft der Port mit ausgeschalteten FIFOs (ein Interrupt je Byte). Die Baudrate dieser Leitung wird nicht eingestellt (qemu ignoriert sie, eine echte UART bräuchte sie).
+
+## 20. Netzwerk, zurückportiert aus dem Branch `rpi4` (2026-11-08)
+
+Der Netzwerkstack ist auf dem Branch `rpi4` entstanden (dort Abschnitt 21 der Datei, dort mit der Vorbereitung für den Raspberry Pi 4B). Er hängt nicht an der Pi-Hardware und läuft in qemu `virt` mit virtio-net; deshalb steht er jetzt auch auf `arm64-port`. Auf `rpi4` ist der Port ein literate Programm (`arm64/lit/*.nw`); hier bleiben die Quellen gewöhnliche, kommentierte C-Dateien in `arm64/`. Der Code ist derselbe: die Dateien stammen aus dem Stand von `rpi4` vor der Umstellung auf Literate Programming (`f9e9c50`), mit zwei Änderungen: der GENET-Treiber fehlt in der Liste der Treiber (`netdev.c`), und die Pi-Hinweise in den Kommentaren sind weg.
+
+**Was übernommen wurde:**
+
+- `virtionet.c` (die Netzwerkkarte von qemu `virt`: zwei Warteschlangen), `netdev.c` (welche Karte da ist), `net.h` (was die Schichten einander anbieten), `net.c` (Ethernet, ARP, IPv4 ohne Fragmente, ICMP-Echo, UDP), `tcp.c` (Auf- und Abbau, Daten in beide Richtungen, Neusenden mit Zeitgeber und wachsender Wartezeit, Fenster des Empfängers; keine Überlastkontrolle, Segmente außer der Reihe werden verworfen), `cache.h` (Cache-Wartung für DMA).
+- DHCP-Client (`dhcp.c`), Einstellungen von der Kernel-Kommandozeile (`netconf.c`: `ip=dhcp`, `ip=10.0.0.5/24`, `gw=`, `dns=`, `netecho`). Dafür liest `dt.c` jetzt `/chosen/bootargs` (bei qemu: `-append`) und bietet `plat_cmdline ()` an.
+- Der Netzwerk-Thread `netd.c`: schläft in einer Warteschlange und wird vom Interrupt der Karte geweckt (`irq.c`), zusätzlich vom Timer alle 50 ms für die Zeitgeber von TCP; mit `netecho` auf der Kommandozeile bedient er den Echo-Dienst (`echo.c`, Port 7). `arch_thread_create_high` (`arch_thread.c`) legt ihn auf eine der höchsten Thread-Nummern, damit die niedrigen den Prozessen bleiben (das Buch erwartet `/bin/swapper` als Prozess 2).
+- Systemaufrufe 602 bis 611 (`net_syscalls.c`, `arch_thread.c`, `userland/arm64-extra.h`): rohe ICMP-Sockets, Zeit in Mikrosekunden, Netzwerkeinstellungen lesen und ändern (nur root: `euid == 0`), DHCP, dazu `poweroff` und `reboot` (Puffer-Cache auf die Platten, dann PSCI `SYSTEM_OFF` oder `SYSTEM_RESET`; `smp_poweroff`/`smp_reboot` in `smp.c`).
+- Die Programme in `/bin`: `ping`, `ifconfig`, `route`, `dhclient` (nach dem Vorbild der BSD-Programme; die Schnittstelle heißt `vioif0` wie bei NetBSD) und `shutdown` (mit den Namen `poweroff` und `reboot`). `/bin` hat damit 70 statt 63 Einträge (`bookfs_test.c`, `kmain.c`). `make run-shell` startet qemu mit Netzwerkkarte: `ping 10.0.2.2`, `ifconfig`.
+- Das Buch (`ulix-book.nw`) ist nur im Anhang geändert (neuer Abschnitt „The Network“, die serielle Platte, die Liste der Unterschiede); der x86-Kernel bleibt, wie er war.
+
+**Was nicht übernommen wurde** (bleibt auf `rpi4`): alles, was nur für das Board da ist: SD-Karte (`sdcard.c`, `make_sdcard.py`), der GENET-Treiber, Device Tree mit `ranges` und die Datei `rpi4-qemu.dts`, `uart_init`, `maxcpus=`, die Boot-Abbilder für den Pi und das Literate-Programming-Gerüst (`lit/`).
+
+**Tests:** `make pcheck` besteht mit 26 Jobs in 238 Sekunden (alle Kerneltests mit 129, 132 und 134 Prüfungen, die Shell-Sitzungen, der Konsolentest, die Prüfung des Dateisystems und die Jobs `net`, `netd`, `netconf`, `poweroff`, `shellnet` und `sdisk`). Die neuen Tests im Einzelnen: `make net-test` (der Kernel mit eigenem Image `ulix-net.bin`, ohne Platte und Prozesse, redet über qemus User-Netzwerk mit gewöhnlichen Python-Sockets: Ping des Routers, UDP-Echo, TCP-Echo mit 100 und 20 000 Byte, und der Kernel als TCP-Client, bei dem das erste SYN und das erste Datensegment absichtlich verloren gehen und neu gesendet werden müssen; dazu die DHCP-Prüfungen), `make netd-test` (der Thread antwortet auf UDP- und TCP-Echo, während der Kernel sein Programm ausführt; der Interrupt, nicht das Abfragen, weckt ihn), der Job `shellnet` im Shell-Test (`ping`, `ifconfig`, `route`, `dhclient`; Ändern nur als root) und der Job `netconf` (Kommandozeile mit fester Adresse und mit `ip=dhcp`).
+
+## 21. Offene Punkte (ersetzt `arm64/TODO.md`)
+
+Eine `TODO.md` gibt es nicht mehr; die dauerhaften Einschränkungen stehen in der Rubrik „Not done“ von `arm64/README.md`, der Rest hier.
+
+- **Netzwerk:** UDP- und TCP-Sockets für Benutzerprogramme (rohes ICMP gibt es), Ping von außen (der Thread beantwortet ihn, aber qemus User-Netzwerk kann keinen senden, ein `-netdev dgram`-Partner könnte es), Verlängern der DHCP-Gültigkeit, vielleicht DNS, bei Bedarf schnelles Neusenden und Überlastkontrolle in TCP; bei `ifconfig` und `route` mehrere Schnittstellen (`-a`), Aliase, `up`/`down` und andere Routen als die Standardroute.
+- **Echte Hardware:** Alles lief nur in qemu. Für ein echtes Board sind Device-Tree-Leser, Cache-Wartung für DMA und der PSCI-Start der anderen CPUs geschrieben, aber nicht probiert. Der Branch `rpi4` bereitet den Raspberry Pi 4B vor (Boot, SD-Karte, GENET; Checkliste für den Tag, an dem das Board ankommt, dort in Abschnitt 23).
+- `/dev/fd0` hat kein Laufwerk (ein vierter virtio-Datenträger würde reichen; klein).
+- Unterschiede zum x86, die bleiben: `df` zeigt `/dev/hdb` und `/dev/fd1` mit den Nummern von `/dev/hda`; die Swap-Datei wächst nach Bedarf statt 64 MByte im Voraus zu belegen.
+- Nicht prüfbar auf dieser Maschine: der x86-Build mit dem Compiler, den die Makefiles nennen (`gcc-4.4`); alle Prüfungen nutzten GCC 16 (`i686-elf-gcc`). `ulixlib.c` übergibt Zeiger noch als `uint` an die Systemaufruf-Funktionen; das geht, weil Benutzeradressen unter 2 GByte liegen, und eine Änderung träfe auch den x86-Build. Das ganze Buch wurde auf dieser Seite des Forks nicht gesetzt (`make pdf`); auf `rpi4` geht es mit `tectonic`.
+- Die Fehler des Buchs, die auch auf dem x86 stehen und nicht geändert wurden (`mx_ftruncate`, `mx_unlink` großer Dateien, `u_write`, `mx_mkdir`, `u_kill`), stehen mit Fundstellen im Originalbuch in `arm64/README.md`. Die Swap-Datei wird deshalb auf der zweiten Platte nie verkürzt.
+- Veröffentlichung: `origin` ist das Originalprojekt (`hgesser/ulix`) und wird nie beschrieben; Sicherungen gehen in das private Repository `MatthewJer/ulix-arm64` (Remote `backup`; kein GitHub-Fork, weil ein Fork eines öffentlichen Repositorys nicht privat sein kann). Öffentlich erst, wenn die Hinweise „nicht das Werk der Autoren“ (READMEs, diese Datei, Anhang des Buchs) noch einmal geprüft sind; dabei bedenken, dass `bin-build/bigdisk.img` (98 MByte) in der Historie des Originals liegt.

@@ -33,7 +33,7 @@ struct node {
   const u8 *reg;  int reglen;
   const u8 *compat;  int clen;
   const u8 *irq;  int irqlen;
-  const char *devtype, *method;
+  const char *devtype, *method, *bootargs;
   int coherent, has_cpu_on;  u32 cpu_on;
 };
 
@@ -53,7 +53,11 @@ static int irq_number (const u8 *p) {                // three cells: type (0 = S
   return type == 0 ? (int)num + 32 : (int)num + 16;
 }
 
+static const char *bootargs = 0;                     // the kernel command line from /chosen (it points into the device tree: only used in dt_init)
+static char cmdline[256];                            // ... and a copy of it for later (plat_cmdline ())
+
 static void classify (const struct node *n) {
+  if (n->bootargs) { bootargs = n->bootargs; return; }
   if (n->devtype && str_eq (n->devtype, "memory") && n->reg && n->reglen >= 4 * (n->pac + n->psc)) {
     plat.ram_base = cells (n->reg, n->pac);
     plat.ram_size = cells (n->reg + 4 * n->pac, n->psc);
@@ -144,6 +148,7 @@ void dt_init (u64 blob_pa) {
       if      (str_eq (pn, "reg"))             { n->reg = val; n->reglen = len; }
       else if (str_eq (pn, "compatible"))      { n->compat = val; n->clen = len; }
       else if (str_eq (pn, "interrupts"))      { n->irq = val; n->irqlen = len; }
+      else if (str_eq (pn, "bootargs"))        n->bootargs = (const char *)val;     // the command line (qemu: -append)
       else if (str_eq (pn, "device_type"))     n->devtype = (const char *)val;
       else if (str_eq (pn, "method"))          n->method = (const char *)val;
       else if (str_eq (pn, "dma-coherent"))    n->coherent = 1;
@@ -162,11 +167,13 @@ void dt_init (u64 blob_pa) {
   }
   plat.dt_ok = 1;
   if (plat.ncpus == 0) plat.ncpus = 1;
+  if (bootargs) { int i = 0; while (bootargs[i] && i < (int)sizeof cmdline - 1) { cmdline[i] = bootargs[i]; i++; } cmdline[i] = 0; }
   if (plat.nvirtio == 0) plat.virtio_coherent = 0;
 }
 
 // accessors for files that do not include plat.h (they use the book's headers)
 int  plat_psci (void)          { return plat.psci; }
+const char *plat_cmdline (void) { return cmdline; }       // the kernel command line ("ip=dhcp"), empty if there is none
 int  plat_psci_hvc (void)      { return plat.psci_hvc; }
 unsigned plat_psci_cpu_on (void) { return plat.psci_cpu_on; }
 int  plat_ncpus (void)         { return plat.ncpus; }
