@@ -29,7 +29,7 @@ See the notice in `README.md`.)
    Change the chapter, not the generated file. Explanations go into the text between the chunks, so that the book of the ARM64 part
    (`make book`, `lit/build/ulix-arm64.pdf`) stays complete: every new file becomes a section of a chapter and is listed in
    `lit/FILES`. Comments inside functions stay short; the long explanation is text.
-8. **Document as a log of reasoning**, not only of results: `ARM64-PORT.md` (German) says why each step was done, and its last
+8. **Document as a log of reasoning**, not only of results: `ARM64-PORT.md` says why each step was done, and its last
    section says what is open. There is no separate TODO file: a list of open points that nobody reads is worse than none.
 
 ## Code from the BSD kernels (decision of 2026-11-03)
