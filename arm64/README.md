@@ -26,7 +26,7 @@ cd arm64
 make                 # kernel images, user programs, disk image (disk.img)
 make run-shell       # boots to the shell, with a network card (try  ping 10.0.2.2  or  ifconfig ); Ctrl-A X leaves qemu
 make check           # all test suites one after the other (slow)
-make pcheck          # the same tests as parallel qemu instances (about 3 minutes)
+make pcheck          # the same tests as parallel qemu instances (about 4 minutes)
 ```
 
 In the shell: `ls`, `cat`, `cd`, `cp`, `rm`, `mkdir`, `rmdir`, `touch`, `wc`, `grep`, `stat`, `ps`, `df`, `free`, `ping`, `ifconfig`, `route`, `dhclient`, `shutdown`, `poweroff`, `reboot`, …
@@ -163,6 +163,6 @@ Found while porting, present on the x86 as well, left as they are in the book:
 * No `pthread_join` (the book has none either); `exit ()` and `exec ()` in threads behave like in the book.
 * The book's kernel is single-processor code. More than one CPU is done with one big kernel lock (see `smp.c`): user programs run in
   parallel, the kernel does not.
-* The book has one appendix about the port ("The ARM64 Port (an Unofficial Extension)"); `ulix-arm64.nw` and `../ARM64-PORT.md` (in
-  German, a log of the work with the reasoning behind each step) go into more detail. The whole book could not be typeset on the machine
+* The book has one appendix about the port ("The ARM64 Port (an Unofficial Extension)"); `ulix-arm64.nw` and `../ARM64-PORT.md` (a log of
+  the work with the reasoning behind each step, translated from German) go into more detail. The whole book could not be typeset on the machine
   used for the port (`make pdf` was not run).
