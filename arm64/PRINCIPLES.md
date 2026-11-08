@@ -29,8 +29,8 @@ See the notice in `README.md`.)
    Change the chapter, not the generated file. Explanations go into the text between the chunks, so that the book of the ARM64 part
    (`make book`, `lit/build/ulix-arm64.pdf`) stays complete: every new file becomes a section of a chapter and is listed in
    `lit/FILES`. Comments inside functions stay short; the long explanation is text.
-8. **Document as a log of reasoning**, not only of results: `ARM64-PORT.md` (German) says why each step was done; `TODO.md` says
-   what is open.
+8. **Document as a log of reasoning**, not only of results: `ARM64-PORT.md` (German) says why each step was done, and its last
+   section says what is open. There is no separate TODO file: a list of open points that nobody reads is worse than none.
 
 ## Code from the BSD kernels (decision of 2026-11-03)
 
@@ -51,8 +51,8 @@ Order decided on 2026-11-04: **first make Ulix run on the board, then networking
 Pi and a user can log in over telnet.
 
 1. **Boot and console on the board.** `kernel8.img` at `0x80000`, device tree from the firmware (`dt.c`), RAM from address 0,
-   peripherals at `0xFE000000`, the PL011 (or mini UART) on GPIO 14/15, GIC-400, generic timer. Steps 1 to 3 of `TODO.md`.
-2. **SD card** (SDHCI/Arasan, polling first) instead of virtio-blk; then CPUs, clock without RTC. Steps 4 to 6 of `TODO.md`.
+   peripherals at `0xFE000000`, the PL011 (or mini UART) on GPIO 14/15, GIC-400, generic timer. Done in qemu; the checklist for the board is section 23 of `ARM64-PORT.md`.
+2. **SD card** (SDHCI/Arasan, polling first) instead of virtio-blk; then CPUs, clock without RTC. Also done in qemu; see the same section.
 3. **Networking** (first in qemu `virt` with virtio-net, then the GENET driver of the Pi): Ethernet, ARP, IPv4, ICMP, UDP, a small
    TCP, each layer small and testable. Written as a literate chapter in the style of the book if possible.
 4. **Telnet server** that attaches a session to a virtual terminal (the book already has ten of them).

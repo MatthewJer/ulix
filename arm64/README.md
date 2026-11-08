@@ -172,12 +172,22 @@ Ulix is a teaching system; what the port and the Raspberry Pi work follow from t
 
 ## Not done
 
-* Everything has only been run on qemu (`-M virt`, GICv2 and GICv3, 1 to 4 CPUs, EL1 and EL2). Real boards are untested: the device
-  tree reader, the cache maintenance for DMA and the PSCI start of the other CPUs are written for them but could not be tried.
-  VirtualBox cannot run this on an ARM host; use qemu.
+* Everything has only been run on qemu (`-M virt`, GICv2 and GICv3, 1 to 4 CPUs, EL1 and EL2, and `-M raspi4b`). Real boards are untested: the
+  device tree reader, the cache maintenance for DMA, the SD card on the real controller, the PSCI start of the other CPUs and the whole
+  GENET driver are written for the Raspberry Pi but could not be tried. What happens when the board arrives is in section 23 of
+  `../ARM64-PORT.md`. VirtualBox cannot run this on an ARM host; use qemu.
+* On the Raspberry Pi only one CPU is used (the firmware parks the other three; no PSCI), the machine cannot be switched off or restarted
+  by software yet (no PSCI; the watchdog registers would do), and the 4 and 8 GByte models are not supported (RAM and peripherals share one
+  GByte of the boot tables). The SD card driver has no DMA and no 1.8 V mode.
+* The network is small on purpose: no UDP or TCP sockets for user programs (only raw ICMP, which is what `ping` needs), the DHCP lease is not
+  renewed, no name resolution, one interface, no fragmentation, no congestion control in TCP. No telnet server yet (the next step of the plan).
+* `/dev/fd0` has no drive behind it (a stand-in for the second floppy, `/dev/fd1`, is the only one).
+* Not checked: the x86 build with the compiler that the makefiles name (`gcc-4.4`); all checks used GCC 16 (`i686-elf-gcc`). `ulixlib.c` still
+  passes pointers as `uint` to the system call functions; that works because user addresses are below 2 GByte, and changing it would touch the
+  x86 build.
 * No `pthread_join` (the book has none either); `exit ()` and `exec ()` in threads behave like in the book.
 * The book's kernel is single-processor code. More than one CPU is done with one big kernel lock (see `smp.c`): user programs run in
   parallel, the kernel does not.
 * The book has one appendix about the port ("The ARM64 Port (an Unofficial Extension)"); `ulix-arm64.nw` and `../ARM64-PORT.md` (in
-  German, a log of the work with the reasoning behind each step) go into more detail. The whole book could not be typeset on the machine
-  used for the port (`make pdf` was not run).
+  German, a log of the work with the reasoning behind each step) go into more detail. The whole book (and the book of the port, `make book`) can be typeset with
+  `tectonic` (`make pdf-tectonic` in the top-level directory, `tex-build/tectonic.sh`); the original `make pdf` was not run.

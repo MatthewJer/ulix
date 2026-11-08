@@ -31065,9 +31065,14 @@ The port is described by the files in the directory \path!arm64/! of the sources
 \path!arch_thread.c! & processes, threads, fork, exec, signals, system calls \\
 \path!smp.c! & more than one CPU \\
 \path!arch_console.c!, \path!arch_vt.c! & UART console and virtual terminals \\
-\path!virtio.c!, \path!glue.c!, \path!minixfs.c! & disk, glue to the book's block layer, ELF loader support \\
+\path!virtio.c!, \path!glue.c!, \path!minixfs.c! & disks (and the serial disk), glue to the book's block layer, ELF loader support \\
+\path!virtionet.c!, \path!netdev.c!, \path!net.c!, \path!tcp.c! & network card, Ethernet, ARP, IP, ICMP, UDP, TCP \\
+\path!dhcp.c!, \path!netconf.c!, \path!netd.c!, \path!net_syscalls.c! & DHCP, network setup, network thread, system calls \\
+\path!sdcard.c!, \path!genet.c! & SD card and Ethernet of the Raspberry Pi 4B \\
 \end{tabular}
 \end{center}
+
+The sources of the port are a literate program of their own: the files in \path!arm64/! are generated with [[notangle]] from the chapters in \path!arm64/lit/! (booting, hardware, memory, processes, console, disks, network, kernel tests, user programs), and [[make book]] typesets those chapters as a second, smaller book. This appendix is only the summary.
 
 \section{Booting}
 
@@ -31121,9 +31126,32 @@ The functions [[u_fork]] and [[u_execv]] are written for the new page tables; [[
 
 \textbf{Console and terminals.} The keyboard and the VGA screen are replaced by a serial port (a PL011 UART) whose receive interrupt does what the keyboard handler of the book does. The virtual terminals keep their book data structure: a screen of 80 by 24 characters with a color attribute for each terminal, plus a cursor. [[kputch]], [[clrscr]], [[set_xy]], [[get_xy]], [[read_screen]] and [[write_screen]] work on this model, and the screen of the visible terminal is shown on the serial console with ANSI escape sequences (cursor positioning and colors), so that \verb#vi# works. Switching the terminal paints the new terminal's screen. The status line of the book is kept as a line of 80 characters and painted on the 25th line of the console, below the scroll region; it is painted when a new output line starts, so that its escape sequences never cut a line of output in two.
 
-\textbf{Disks.} The IDE driver is replaced by a driver for virtio-blk. Up to three such devices are used, numbered from the one that the emulator gives the highest address: the first is \path!/dev/hda!, the second is \path!/dev/hdb! and is mounted on \path!/tmp! as in the book, and the third stands in for the second floppy disk \path!/dev/fd1!, which the book mounts on \path!/mnt!. Without the second and third disk, \path!/tmp! and \path!/mnt! are ordinary directories of the root file system. The directory \path!/dev! is mounted as well, so that the device files can be opened. A process that reads or writes a block takes the lock [[hd_lock]], starts the request and sleeps in [[harddisk_queue]]; the interrupt of the device wakes it up. This is the scheme of the IDE driver in Chapter~\ref{chap:ulix:disk-i-o}; if the CPU is idle when the interrupt arrives, the scheduler runs at once and the process continues without waiting for the next timer tick. The idle thread and the boot code poll instead, because the idle thread must never sleep. Before the device is used, the data cache lines that it reads are cleaned, and those that it writes are invalidated, so that the driver also works with devices that are not cache coherent.
+\textbf{Disks.} The IDE driver is replaced by a driver for virtio-blk. Up to three such devices are used, numbered from the one that the emulator gives the highest address: the first is \path!/dev/hda!, the second is \path!/dev/hdb! and is mounted on \path!/tmp! as in the book, and the third stands in for the second floppy disk \path!/dev/fd1!, which the book mounts on \path!/mnt!. Without the second and third disk, \path!/tmp! and \path!/mnt! are ordinary directories of the root file system. The directory \path!/dev! is mounted as well, so that the device files can be opened. A process that reads or writes a block takes the lock [[hd_lock]], starts the request and sleeps in [[harddisk_queue]]; the interrupt of the device wakes it up. This is the scheme of the IDE driver in Chapter~\ref{chap:ulix:disk-i-o}; if the CPU is idle when the interrupt arrives, the scheduler runs at once and the process continues without waiting for the next timer tick. The idle thread and the boot code poll instead, because the idle thread must never sleep. The serial disk of Chapter~\ref{chap:ulix:disk-i-o} (\path!/dev/sdisk!) is there as well: a second UART carries the book's protocol, a reading process sleeps in [[serial_disk_queue]] until the receive interrupt has collected the block, and a program on the host (\path!tools/serial_disk.py!) plays the disk. Before the device is used, the data cache lines that it reads are cleaned, and those that it writes are invalidated, so that the driver also works with devices that are not cache coherent.
 
 \textbf{Clock.} The CMOS clock is replaced by the PL031 real-time clock; the tick counting is that of the book.
+
+\section{The Network}
+
+The book's \UlixI{} has no network. The port adds a small TCP/IP stack that is not part of the original system, written in the same spirit: each layer is small and can be tested by itself. It runs on the virtio network card of the emulator, which the device tree announces like the disks, and on the Raspberry Pi 4B it has a driver for the Ethernet controller of the board (see below).
+
+\begin{itemize}
+\item \path!virtionet.c! is the driver (two queues, one for each direction); \path!netdev.c! asks the drivers in turn which of them finds its card, so that the layers above do not know which card it is. The interface is called \verb#vioif0#, the name that NetBSD gives to a virtio card.
+\item \path!net.c! handles Ethernet frames, ARP (a table of eight entries), IPv4 (without fragments), ICMP echo and UDP with bound ports. \path!tcp.c! adds TCP: opening and closing a connection, data in both directions, retransmission with a timer whose waiting time doubles, and respect for the window of the receiver. Segments that arrive out of order are dropped, and there is no congestion control.
+\item \path!dhcp.c! is a DHCP client (discover, offer, request, acknowledge; address, netmask, router, name server and lease time, without renewal). \path!netconf.c! reads the kernel command line: \verb#ip=dhcp#, \verb#ip=10.0.0.5/24#, \verb#gw=# and \verb#dns=#. In the emulator the command line is the option \verb#-append#; the kernel finds it in the device tree.
+\item \path!netd.c! is a kernel thread that sleeps in a blocked queue, like a process waiting for the disk, and is woken by the interrupt of the card; the timer wakes it every 50 milliseconds for the timers of TCP. It handles each frame when it arrives: ARP, a ping from outside, TCP segments. With the word \verb#netecho# on the command line it also serves the echo service of port 7 (\path!echo.c!), which makes the stack easy to test from the host.
+\end{itemize}
+
+User programs reach the network through system calls that only exist in this port (numbers 602 to 611, see \path!net_syscalls.c! and \path!userland/arm64-extra.h!). The kernel offers \emph{raw ICMP sockets}, and the program \verb#ping# builds its ICMP messages (type, identifier, sequence number, checksum) itself and measures the round trip time. The programs \verb#ifconfig#, \verb#route# and \verb#dhclient# are modelled on the BSD programs of the same names and print what they print; looking is free for everybody, changing anything needs root (the system calls check that the effective user ID is 0). The programs \verb#shutdown#, \verb#poweroff# and \verb#reboot# are not about the network, but their system calls live in the same file: they write the buffer cache to the disks and then ask the firmware (PSCI) to switch the machine off or to start it again; under the emulator this ends the emulator.
+
+The stack is tested against a real TCP/IP implementation: a Python program on the host talks to the kernel through the user-mode network of the emulator with ordinary sockets (ping of the router, UDP echo, TCP echo of 100 and of 20000 bytes, and the kernel as a TCP client that loses its first SYN and its first data segment on purpose and has to send them again). What is not there: UDP and TCP sockets for user programs, renewal of the DHCP lease, name resolution, more than one interface.
+
+\section{The Raspberry Pi 4B}
+
+The same sources also build a kernel image for the Raspberry Pi 4B (\verb#make kernel8.img#). Only the first instructions of the boot code (which gigabyte of the address space holds the console UART) and the load address differ; the firmware of the board loads the image at \hex{80000}, and everything else comes from the device tree that it hands over. The addresses in that tree are bus addresses, which the \verb#ranges# of the buses translate into the addresses that the cores see ([[dt_init]] does that); the RAM starts at address 0 and the peripherals sit at \hex{FE000000}. A board without a real-time clock (the Pi has none) starts its clock on 1 January 2026, the baud rate of the UART is set up if the firmware has not done it, and the kernel command line (\verb#maxcpus=1 ip=dhcp#; the other three cores of the Pi wait in a spin table of the firmware) is read from the device tree.
+
+The disks are partitions of the SD card, whose partition table is the PC's: the partitions of type \hex{81} are \path!/dev/hda!, \path!/dev/hdb! and the stand-in for \path!/dev/fd1!. \path!sdcard.c! is the driver of the SD host controller: first only with polling and one sector per command, then with multi-block commands, the four-bit bus and interrupts, so that a process waiting for the card sleeps in the same queue as for a virtio disk. The Ethernet driver \path!genet.c! is written new for \UlixI{}, but it follows the register layout and the order of the setup steps of the FreeBSD driver; its licence text and copyrights are kept in the file.
+
+The emulator has a model of the board (\verb#qemu-system-aarch64 -M raspi4b#) but no firmware, so the tests give it a device tree that is laid out like the real one (\path!rpi4-qemu.dts!); the kernel tests, the console test and the shell session run on it from an SD card image. The Ethernet controller has no model there: the driver of the board is compiled and linked, but it has never run. Nothing of this has been tried on the real board.
 
 \section{More Than One CPU}
 
@@ -31141,18 +31169,21 @@ The build needs an AArch64 cross compiler and [[qemu-system-aarch64]]. The comma
 \item kernel tests that start the book's code and user programs (file system, threads, processes, signals, swapping, terminals, stack growth, \dots), at EL1 and EL2;
 \item the same tests on several virtual machines: interrupt controller version 2 and 3, one, two and four CPUs, 64 MByte to 3 GByte of RAM, and with one, two and three disks;
 \item an independent check of the Minix file systems on the disk images after the write tests (the checker is written in Python and shares no code with the kernel);
-\item a console test and a session that logs in, runs shell commands, switches terminals, edits a file with \verb#vi# and ends in the kernel shell.
+\item a console test and a session that logs in, runs shell commands, switches terminals, edits a file with \verb#vi# and ends in the kernel shell; a variant of the session with a network card (\verb#ping#, \verb#ifconfig#, \verb#route#, \verb#dhclient#);
+\item the same tests on the emulated Raspberry Pi 4B with its SD card;
+\item the serial disk (\verb#make sdisk-test#) and the network (\verb#make net-test#, \verb#make netd-test#, the network settings of the command line, \verb#poweroff# and \verb#reboot#).
 \end{itemize}
 
 \section{Differences from the x86 Version}
 
 \begin{itemize}
 \item The console must understand ANSI escape sequences (the status line is painted on the 25th line of the terminal).
-\item There is no floppy controller and no serial disk: a virtio disk stands in for the floppy \path!/dev/fd1!, and \path!/dev/fd0! has no drive behind it.
+\item There is no floppy controller: a virtio disk stands in for the floppy \path!/dev/fd1!, and \path!/dev/fd0! has no drive behind it. The serial disk works over a second UART.
+\item The port has a network stack, the programs \verb#ping#, \verb#ifconfig#, \verb#route#, \verb#dhclient#, \verb#shutdown#, \verb#poweroff# and \verb#reboot#, and system calls (numbers from 600 on) that the book does not have.
 \item The swap file is not 64 MByte large but grows on demand; the access bit is emulated.
 \item Integer division by zero does not cause an exception on AArch64; the kernel shell command \verb#div0# raises the exception by hand.
 \item The kernel is single-processor code that runs on several CPUs under one lock (see above).
-\item The port has only been run in an emulator; real boards are untested.
+\item The port has only been run in an emulator (\verb#virt# and \verb#raspi4b#); real boards, including the Raspberry Pi 4B it was prepared for, are untested.
 \item Like the x86 version, it has no \verb#pthread_join#.
 \end{itemize}
 
