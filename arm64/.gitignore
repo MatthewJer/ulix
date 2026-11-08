@@ -66,6 +66,9 @@ dhcp.c
 netconf.c
 echo.c
 netd.c
+rcconf.c
+telnet.c
+stats.c
 net_syscalls.c
 bookfs_test.c
 thread_test.c
@@ -89,6 +92,7 @@ user/stacktest.c
 user/memtest.c
 userland/arm64-extra.h
 userland/ping.c
+userland/top.c
 userland/ifconfig.c
 userland/route.c
 userland/dhclient.c

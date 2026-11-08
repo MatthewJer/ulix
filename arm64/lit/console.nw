@@ -31,7 +31,13 @@ The complete file is put together from these parts:
 
 <<arch_console.c: console_interrupt>>
 
+<<arch_console.c: telnet>>
+
+<<arch_console.c: console_input>>
+
 <<arch_console.c: uart_rx_irq>>
+
+<<arch_console.c: waitkey>>
 
 <<arch_console.c: arch_kernel_fault_shell>>
 @
@@ -50,6 +56,7 @@ extern unsigned long uart_base;
 void kernel_shell (void);
 extern void irq_uart_to_cpu (int cpu);
 extern int smp_cpu (void);
+extern void arch_resign (void);
 
 #include "ulix-init.c"                     // arch_setup_keyboard(): the book's @<<setup keyboard>> chunk
 
@@ -60,49 +67,91 @@ void uart_rx_enable (void) {
 }
 
 @
-the character is complete (already translated): put it where the book's keyboard handler puts it
+the character is complete (already translated): put it where the book's keyboard handler puts it.
+
+The book wakes the process that has waited longest and assumes that only one process per terminal waits for a key.
+A program like [[fork2]] breaks that: several of its processes read from the terminal, and after the shell has its
+prompt back the ones left over would still take the keys that belong to the shell. So the key goes to the process
+that started waiting last: that is the one the user is talking to, normally the shell.
 
 <<arch_console.c: console_enqueue>>=
-static void console_enqueue (char c) {
-  terminal_t *term = &terminals[cur_vt];
+static void console_enqueue_vt (int vt, char c) {         // a key for terminal vt (the console: the visible one; a telnet session: its own)
+  terminal_t *term = &terminals[vt];
   if (term->kbd_count >= SYSTEM_KBD_BUFLEN) return;
   term->kbd[term->kbd_pos] = c;
   term->kbd_pos = (term->kbd_pos + 1) % SYSTEM_KBD_BUFLEN;
   term->kbd_count++;
-  if (scheduler_is_active) {                // wake up a process that waits for a key on this terminal
-    thread_id start_pid = keyboard_queue.next;
-    if (start_pid != 0) {
-      thread_id search_pid = start_pid;
-      do {
-        if (thread_table[search_pid].terminal == cur_vt) {
-          deblock (search_pid, &keyboard_queue);
-          break;
-        } else {
-          search_pid = thread_table[search_pid].next;
-        }
-      } while (search_pid != start_pid && search_pid != 0);
+  if (scheduler_is_active) {                // wake up the process that started waiting for a key on this terminal last
+    thread_id search_pid = keyboard_queue.prev;
+    while (search_pid != 0) {
+      if (thread_table[search_pid].terminal == vt) {
+        deblock (search_pid, &keyboard_queue);
+        break;
+      }
+      search_pid = thread_table[search_pid].prev;
     }
   }
 }
+
+static void console_enqueue (char c) { console_enqueue_vt (cur_vt, c); }
 
 @
-Ctrl-C: the last process of the terminal that has no children (the foreground process)
+Ctrl-C ends the foreground job with all its processes, as the signal of the terminal goes to the whole foreground process
+group on Unix. Ulix has no process groups, so we use what we have: login waits for the shell, the shell waits for the
+program it started (waitpid). Following these waits from [[login]] leads to the foreground process [[fg]]; the
+processes on the way (login, shell) stay. Everything that was started after login on this terminal belongs to the
+job, also processes whose parent has already ended (they are children of process 1 then). Without a login
+process (the kernel tests) all processes of the terminal are the job. The running process is
+killed last: killing it gives up the CPU.
 
 <<arch_console.c: console_interrupt>>=
-static void console_interrupt (void) {
-  int target_pid = 0;
-  for (int i = 3; i < MAX_THREADS; i++) {
-    if (thread_table[i].used && thread_table[i].terminal == cur_vt) {
-      int is_candidate = true;
-      for (int j = 3; j < MAX_THREADS; j++) {
-        if (thread_table[j].used && thread_table[j].ppid == i) { is_candidate = false; break; }
-      }
-      if (is_candidate) { target_pid = i; break; }
-    }
-  }
-  u_kill (target_pid, SIGKILL);
+static int is_job (int pid, int vt) {                   // a living process of terminal vt
+  return pid >= 3 && pid < MAX_THREADS && thread_table[pid].used && thread_table[pid].terminal == vt &&
+         thread_table[pid].state != TSTATE_ZOMBIE && thread_table[pid].state != TSTATE_EXIT;
 }
 
+static void kill_job (int vt, int whole_session) {
+  int login = 3;
+  while (login < MAX_THREADS && !(is_job (login, vt) && strncmp (thread_table[login].cmdline, "login", 5) == 0)) login++;
+  if (login == MAX_THREADS) login = 2;                  // no login (kernel tests): everything on the terminal is the job
+  int fg = login;                                       // follow the waiting: login -> shell -> program
+  while (thread_table[fg].state == TSTATE_WAITFOR && is_job (thread_table[fg].waitfor, vt))
+    fg = thread_table[fg].waitfor;
+  for (int pass = 0; pass < 2; pass++)                  // pass 0: all others, pass 1: the running process
+    for (int i = login + 1; i < MAX_THREADS; i++) {
+      int in_session = false;                           // login, shell: the processes before fg
+      for (int p = login; p != fg && !whole_session; p = thread_table[p].waitfor) if (p == i) in_session = true;
+      if (is_job (i, vt) && !in_session && (i == current_task) == pass) u_kill (i, SIGKILL);
+    }
+}
+
+static void console_interrupt (void) { kill_job (cur_vt, 0); }
+
+@
+A telnet session (see [[telnet.c]]) has its own terminal, which is not necessarily the visible one: its keys go into the
+buffer of that terminal ([[telnet_input]], translated like the keys of the UART), and Ctrl-C ends the job on that terminal.
+When a session begins, [[telnet_attach]] throws away keys that are still in the buffer. When it ends, [[console_hangup]]
+ends \emph{all} programs of the terminal, the shell too, as if a modem line had been hung up: [[login]] then asks for a name again.
+
+<<arch_console.c: telnet>>=
+void telnet_input (int vt, unsigned char c) {
+  if (c == '\r') c = '\n';
+  if (c == 0x7f) c = 0x08;
+  if (c == 0x03) { kill_job (vt, 0); return; }
+  console_enqueue_vt (vt, (char)c);
+}
+
+void telnet_attach (int vt) {
+  terminal_t *term = &terminals[vt];
+  term->kbd_count = 0;  term->kbd_pos = 0;  term->kbd_lastread = -1;
+}
+
+void console_hangup (int vt) { kill_job (vt, 1); }
+
+@
+The characters of the UART, the console, come here from the receive interrupt: special keys first, then the key goes to the visible terminal.
+
+<<arch_console.c: console_input>>=
 void arch_vt_switch (int n);
 
 void arch_console_input (unsigned char c) {
@@ -127,6 +176,36 @@ void arch_console_input (unsigned char c) {
     return;
   }
   console_enqueue ((char)c);
+}
+
+@
+Waiting for a key with a time limit. [[readchar]] of the book waits until a key comes; a program like [[top]] wants to wait
+two seconds, and then draw the screen again, unless a key came earlier. [[waitkey (ms)]] puts the process into the same queue
+as [[readchar]] ([[keyboard_queue]], so that killing the process and the wake-up by a key work as before) and notes when its time
+is over. The timer tick calls [[key_timeouts]], which wakes the processes whose time has come. The system call returns 1 if
+a key is waiting in the buffer of the terminal (then [[readchar]] does not wait), and 0 if the time was over.
+
+<<arch_console.c: waitkey>>=
+static unsigned key_deadline[MAX_THREADS];      // the tick at which a process that waits for a key wants to be woken (0: it waits for ever)
+
+void key_timeouts (void) {                      // from the timer tick
+  thread_id t = keyboard_queue.next;
+  while (t != 0) {
+    thread_id next = thread_table[t].next;      // (deblock changes the links)
+    if (key_deadline[t] != 0 && (unsigned)system_ticks >= key_deadline[t]) deblock (t, &keyboard_queue);
+    t = next;
+  }
+}
+
+void syscall_waitkey (context_t *r) {
+  terminal_t *term = &terminals[thread_table[current_task].terminal];
+  if (term->kbd_count == 0 && current_task > 1 && scheduler_is_active) {
+    key_deadline[current_task] = (unsigned)system_ticks + (unsigned)r->ebx / 10 + 1;
+    block (&keyboard_queue, TSTATE_WAITKEY);
+    arch_resign ();                             // here the process sleeps
+    key_deadline[current_task] = 0;
+  }
+  eax_return (term->kbd_count > 0);
 }
 
 @
@@ -169,7 +248,8 @@ a terminal emulator that understands ANSI escape sequences, so
 \item [[kputch ()]] updates the model of the terminal it writes to (cursor, wrapping, scrolling: as in the book) and sends the character on if that terminal is the visible one;
 \item [[set_xy ()]], [[clrscr ()]], [[write_screen ()]] and switching terminals repaint the visible terminal from its model with cursor positioning and color sequences (``synchronized'' mode: the console has a scroll region of the 24 lines, so that scrolling there is the same as in the model).
 \end{itemize}
-Until a program uses one of those functions the console just receives the characters.
+Until a program uses one of those functions the console just receives the characters. A telnet session (see below, [[telnet.c]]) sees the same terminal
+through the same functions.
 The status line (line 25) does not exist.
 
 @
@@ -184,6 +264,8 @@ The complete file is put together from these parts:
 <<arch_vt.c: sl_text>>
 
 <<arch_vt.c: host_repaint>>
+
+<<arch_vt.c: telnet>>
 
 <<arch_vt.c: kputch>>
 
@@ -200,6 +282,10 @@ The complete file is put together from these parts:
 
 extern void putch (char c);
 void vt_scroll_mem (word *address);                // the book defines it without a prototype
+extern int  telnet_vt;                             // telnet.c: the terminal that a telnet session shows (-1: none)
+extern void telnet_putch (char c);
+
+static void (*out) (char) = putch;                 // where the host_... functions send their characters: the UART, or (for a moment) the telnet session
 
 #define BLANK       (0x20 | VT_NORMAL_BACKGROUND)
 static int vt_ready = 0;
@@ -217,24 +303,24 @@ static void vt_setup (void) {
 \subsection{the console}
 
 <<arch_vt.c: num>>=
-static void esc (const char *s) { while (*s) putch (*s++); }
+static void esc (const char *s) { while (*s) out (*s++); }
 
 static void num (int n) {
   char b[12]; int i = 0;
   if (n == 0) b[i++] = '0';
   while (n > 0) { b[i++] = '0' + n % 10; n /= 10; }
-  while (i > 0) putch (b[--i]);
+  while (i > 0) out (b[--i]);
 }
 
 static void host_move (int x, int y) {             // cursor to column x, line y (both from 0)
-  esc ("\033["); num (y + 1); putch (';'); num (x + 1); putch ('H');
+  esc ("\033["); num (y + 1); out (';'); num (x + 1); out ('H');
 }
 
 static void host_attr (int attr) {                 // VGA attribute -> ANSI colors
   static const char ansi[8] = { 0, 4, 2, 6, 1, 5, 3, 7 };      // VGA color number -> ANSI color number
   if ((attr & 0xff) == 0x0F || (attr & 0xff) == 0) { esc ("\033[0m"); return; }
   int fg = attr & 15, bg = (attr >> 4) & 7;
-  esc ("\033[0;"); num ((fg < 8 ? 30 : 90) + ansi[fg & 7]); putch (';'); num (40 + ansi[bg]); putch ('m');
+  esc ("\033[0;"); num ((fg < 8 ? 30 : 90) + ansi[fg & 7]); out (';'); num (40 + ansi[bg]); out ('m');
 }
 
 @
@@ -252,7 +338,7 @@ static int  sl_red = 0, sl_dirty = 1;
 static void host_status_draw (void) {
   esc ("\0337\033[25;1H");                        // save the cursor, go to line 25
   esc (sl_red ? "\033[0;97;41m" : "\033[0;97;44m");
-  for (int i = 0; i < 80; i++) putch (sl_text[i] >= ' ' ? sl_text[i] : ' ');
+  for (int i = 0; i < 80; i++) out (sl_text[i] >= ' ' ? sl_text[i] : ' ');
   esc ("\033[0m\0338");                           // restore the cursor
   sl_dirty = 0;
 }
@@ -287,13 +373,33 @@ static void host_repaint (int t) {
       int attr = w >> 8, ch = w & 0xff;
       if (ch < ' ') ch = ' ';
       if (attr != cur_attr) { host_attr (attr); cur_attr = attr; }
-      putch (ch);
+      out (ch);
     }
     esc ("\033[0m\033[K");                         // the rest of the line is empty
   }
   host_status_draw ();
   host_move (vt[t].x, vt[t].y);
   synced = 1;
+}
+
+@
+A telnet session ([[telnet.c]]) shows one terminal, just as the console shows the visible one. Its screen is sent with the same
+functions, [[host_move]] and [[host_repaint]]; only the place where the characters go is different. For the moment
+that a function of the session is running, [[out]] is [[telnet_putch]] instead of [[putch]], and [[synced]] is the state of the
+session (does its screen show the model exactly?) instead of that of the console.
+
+<<arch_vt.c: telnet>>=
+static int tsynced = 0;                            // like synced, but for the telnet session
+static int saved_synced;
+
+static void telnet_begin (void) { saved_synced = synced;  synced = tsynced;  out = telnet_putch; }
+static void telnet_end (void)   { tsynced = synced;  synced = saved_synced;  out = putch; }
+
+void arch_vt_telnet_attach (void) {                // a session begins: it gets the whole screen of its terminal
+  tsynced = 0;
+  telnet_begin ();
+  host_repaint (telnet_vt);
+  telnet_end ();
 }
 
 @
@@ -328,6 +434,10 @@ void kputch (byte c) {
     if (wrapped) putch ('\n');                     // (putch sends CR LF)
     if ((c == '\n' || wrapped) && sl_dirty && synced) host_status_draw ();
   }
+  if (t == telnet_vt) {                            // a telnet session shows this terminal, too
+    telnet_putch ((char)c);
+    if (wrapped) telnet_putch ('\n');
+  }
 }
 
 @
@@ -345,6 +455,7 @@ void vt_clrscr (void) {
   memsetw ((word *)vt[t].mem, BLANK, VT_SIZE / 2);
   vt[t].x = vt[t].y = 0;
   if (t == cur_vt) host_repaint (t);
+  if (t == telnet_vt) { telnet_begin ();  host_repaint (t);  telnet_end (); }
 }
 
 void vt_get_xy (char *x, char *y) {
@@ -362,6 +473,7 @@ void vt_set_xy (char x, char y) {
   vt[t].x = x;
   vt[t].y = y;
   if (t == cur_vt) { if (synced) host_move (x, y); else host_repaint (t); }
+  if (t == telnet_vt) { telnet_begin ();  if (synced) host_move (x, y); else host_repaint (t);  telnet_end (); }
 }
 
 void read_write_screen (char *buf, boolean read_flag) {
@@ -373,6 +485,7 @@ void read_write_screen (char *buf, boolean read_flag) {
   } else {
     memcpy (video_address, buf, VT_SIZE);          // write the screen
     if (t == cur_vt) host_repaint (t);
+    if (t == telnet_vt) { telnet_begin ();  host_repaint (t);  telnet_end (); }
   }
 }
 
@@ -472,7 +585,10 @@ void arch_clock_init (void) {
   system_time  = system_start_time;
 }
 
+extern void key_timeouts (void);              // arch_console.c: wake processes whose waiting for a key has timed out
+
 void arch_clock_tick (void) {                 // called from the timer interrupt, 100 times a second
   system_ticks++;
+  key_timeouts ();
   system_time = (uint)(system_ticks / 100) + system_start_time;
 }

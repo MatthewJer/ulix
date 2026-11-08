@@ -39,14 +39,23 @@ make kernel8.img     # image for the Raspberry Pi 4B (work in progress, branch r
 make run-rpi4-shell  # ... and the system with login and shell on qemu's raspi4b machine, with an SD card image (sd.img)
 ```
 
-In the shell: `ls`, `cat`, `cd`, `cp`, `rm`, `mkdir`, `rmdir`, `touch`, `wc`, `grep`, `stat`, `ps`, `df`, `free`, `ping`, `ifconfig`, `route`, `dhclient`, `shutdown`, `poweroff`, `reboot`, …
+In the shell: `ls`, `cat`, `cd`, `cp`, `rm`, `mkdir`, `rmdir`, `touch`, `wc`, `grep`, `stat`, `ps`, `df`, `free`, `top`, `ping`, `ifconfig`, `route`, `dhclient`, `shutdown`, `poweroff`, `reboot`, …
 (it is Ulix, so `echo` copies its input until you press Ctrl-C). `>` and `<` redirect. Keys:
 
 | Key | Effect |
 |---|---|
-| Ctrl-C | ends the foreground program (like on x86) |
+| Ctrl-C | ends the foreground program with all its processes (on x86: only one process) |
 | Ctrl-T, then 1…9 or 0 | switches to another terminal (x86: Alt-1…0); other terminals buffer their output |
 | Ctrl-] | stops the scheduler and opens the kernel shell (x86: Shift-Esc); `help`, `ps`, `queues`, `exit` |
+
+`top` shows the load of every CPU, the memory and the processes (`q` or Ctrl-C ends it).
+
+**Telnet:** the kernel runs a telnet server on port 23. It shows terminal 5 (`tty4`, Ctrl-T 5 on the console): `telnet <address> 23`,
+then log in as on the console. One session at a time; when you hang up, the programs of the session end and `login` asks again.
+(The password goes over the network unencrypted: private networks only.) The server is switched on and off in `/etc/rc.conf`
+(`telnetd_enable="YES"` is the default, `"NO"` switches it off; the file is read at boot; edit it as root with `vi`).
+The address is shown by `ifconfig` (with `status: active` or `no carrier`; the network code writes on the console only during the boot and once when DHCP has given an address, so that nothing is printed into the middle of your typing). The cable may be plugged in after the boot: the network
+thread notices the link (every two seconds) and then asks DHCP by itself.
 
 To leave qemu: `poweroff` (or `shutdown now`) in the shell; `reboot` starts the system again. (qemu's own Ctrl-A X works in most terminals.)
 
@@ -100,7 +109,7 @@ tools/           minix_add.py, minix_check.py (host-side file system tools), dis
                  make_sdcard.py (SD card image)
 *_test.c         kernel test suites
 sdcard.c         SD card (Raspberry Pi)             virtionet.c     network card (qemu virt)
-genet.c          Ethernet (Raspberry Pi 4, untested) netdev.c        which network card is there
+genet.c          Ethernet (Raspberry Pi 4)          netdev.c        which network card is there
 net.c  tcp.c     Ethernet, ARP, IP, ICMP, UDP, TCP  net.h           what the network layers offer each other
 ```
 
@@ -145,6 +154,7 @@ current one.
 | 5 | `syscall_waitpid` wrote through a null status pointer (`waitpid (pid, 0, 0)`, as `login` does). | [11713](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L11713) (`status = r->ecx`) and [11729](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L11729) (`*status = …`) |
 | 6 | `printf` of the user library read its arguments from the stack (x86 calling convention only). | [29393–29399](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L29393-L29399) (`varg = &format`) and `print` at [29356](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L29356) |
 | 7 | Several 32-bit assumptions: `memaddress`, `size_t`, `hexdump`, `eax_return` (pointers cut to 32 bits). | [size_t](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L2217) and [memaddress](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L2228) (typedefs), [eax_return](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L9215) (cast to `unsigned int`), [hexdump](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L29851) (`uint` parameters) |
+| 8 | `u_kill` with `SIGKILL` did not hand the children of the killed process to process 1 (as `exit` does): they kept a dead parent, and their zombies were never removed (Ctrl-C after `fork2` left them in `ps`). | [27781](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L27781) (`case SIGKILL`) |
 
 ### Bugs of the book that are *not* fixed
 
@@ -156,7 +166,7 @@ Found while porting, present on the x86 as well, left as they are in the book:
 | `mx_unlink` of a file with double indirect zones (more than about 263 KByte) leaves zones marked wrongly (found with `tools/minix_check.py`; the cause has not been analysed). | chunk "free this inode: (3) double indirect blocks", [23705–23729](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L23705-L23729) |
 | `u_write` returns -1 after writing to STDOUT/STDERR: the `case` has no `return`/`break` and falls into `default`. The output itself works. | [write: standard I/O](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L20713-L20731) |
 | `mx_mkdir` does not check whether the directory exists (`u_mkdir` does); a second `mx_mkdir` on an existing path would damage the file system. | [23942](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L23942) |
-| `u_kill` on a blocked parent process leaves children that end later as zombies; `SIGKILL` sets `used = false` at once, so a following `waitpid` reports -1. | [27781](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L27781) |
+| `u_kill` sets `used = false` at once, so a following `waitpid` of the parent reports -1. | [27781](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L27781) |
 
 ## Principles
 
@@ -172,15 +182,17 @@ Ulix is a teaching system; what the port and the Raspberry Pi work follow from t
 
 ## Not done
 
-* Everything has only been run on qemu (`-M virt`, GICv2 and GICv3, 1 to 4 CPUs, EL1 and EL2, and `-M raspi4b`). Real boards are untested: the
-  device tree reader, the cache maintenance for DMA, the SD card on the real controller, the PSCI start of the other CPUs and the whole
-  GENET driver are written for the Raspberry Pi but could not be tried. What happens when the board arrives is in section 23 of
-  `../ARM64-PORT.md`. VirtualBox cannot run this on an ARM host; use qemu.
+* **What has run on a real board:** one Raspberry Pi 4B with 1 GByte of RAM (2026-11-08): boot from the SD card, the serial console, the
+  shell and programs of the book (`fork2` with Ctrl-C, `top`), and the network through the Ethernet controller: link detection (also when
+  the cable is plugged in after the boot), receiving and sending frames, DHCP from a home router, answering a ping and a telnet login.
+  Everything else has only been run on qemu (`-M virt`, GICv2 and GICv3, 1 to 4 CPUs, EL1 and EL2, and `-M raspi4b`): the other Raspberry Pi
+  models, more than one CPU on the board (PSCI is missing, see below), the interrupt of the Ethernet controller (the thread polls every 50 ms
+  anyway) and the SD card at speeds above the slow default. VirtualBox cannot run this on an ARM host; use qemu.
 * On the Raspberry Pi only one CPU is used (the firmware parks the other three; no PSCI), the machine cannot be switched off or restarted
   by software yet (no PSCI; the watchdog registers would do), and the 4 and 8 GByte models are not supported (RAM and peripherals share one
   GByte of the boot tables). The SD card driver has no DMA and no 1.8 V mode.
 * The network is small on purpose: no UDP or TCP sockets for user programs (only raw ICMP, which is what `ping` needs), the DHCP lease is not
-  renewed, no name resolution, one interface, no fragmentation, no congestion control in TCP. No telnet server yet (the next step of the plan).
+  renewed, no name resolution, one interface, no fragmentation, no congestion control in TCP. The telnet server serves one session, on one terminal, without encryption, and answers none of the client's option requests.
 * `/dev/fd0` has no drive behind it (a stand-in for the second floppy, `/dev/fd1`, is the only one).
 * Not checked: the x86 build with the compiler that the makefiles name (`gcc-4.4`); all checks used GCC 16 (`i686-elf-gcc`). `ulixlib.c` still
   passes pointers as `uint` to the system call functions; that works because user addresses are below 2 GByte, and changing it would touch the

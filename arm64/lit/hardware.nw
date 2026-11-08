@@ -109,7 +109,8 @@ static u64 address (const struct node *stack, int depth, const u8 *reg) {
 }
 
 static const char *bootargs = 0;                     // the kernel command line from /chosen (it points into the device tree: only used in dt_init)
-static char cmdline[256];                            // ... and a copy of it for later (plat_cmdline ())
+static char cmdline[1024];                           // ... and a copy of it for later (plat_cmdline ()). The firmware of the Pi puts about 250
+                                                     // characters of its own in front of cmdline.txt: with 256 the "ip=dhcp" at the end was cut off
 
 @
 ``maxcpus=N'' on the kernel command line limits the number of CPUs that are started. On the Raspberry Pi the other three cores
@@ -550,6 +551,7 @@ extern int  netd_irq;
 extern void netd_interrupt (void), netd_tick (void);
 extern void sdisk_init (void);
 extern void arch_clock_tick (void);
+extern void stats_tick (void);
 extern int  arch_cow_fault (u64 va);
 extern void smp_before_return (void *frame);
 extern int  blk_irq;
@@ -613,7 +615,7 @@ static void exc_handler_locked (struct frame *f, int kind) {
     u32 irq = GIC_INTID (iar);
     if (irq < 1020) gic_eoi (iar);          // acknowledge first: nested interrupts must be possible
                                             // (the kernel shell waits for keys inside the UART handler)
-    if (irq == IRQ_TIMER) { if (smp_cpu () == 0) { ticks++; arch_clock_tick (); if (book_scheduler_on) netd_tick (); } timer_reload (); }
+    if (irq == IRQ_TIMER) { stats_tick (); if (smp_cpu () == 0) { ticks++; arch_clock_tick (); if (book_scheduler_on) netd_tick (); } timer_reload (); }
     else if (irq == IRQ_UART) { if (book_scheduler_on) uart_rx_irq (); }
     else if (netd_irq && irq == (u32)netd_irq) { if (book_scheduler_on) { netd_interrupt (); disk_woke_someone = 1; } }      // the network card
     else if (plat.uart2 && irq == (u32)plat.uart2_irq) sdisk_irq ();          // the serial disk

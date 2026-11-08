@@ -40,6 +40,8 @@ struct net_driver {
   int  (*recv) (void *out, int max);               // the length of a frame that has arrived (copied to out), or 0
   int  (*start_irq) (void);                        // let the card interrupt when frames arrive: its interrupt number (0: it cannot, keep polling)
   void (*ack) (void);                              // in the interrupt handler: tell the card that we have noticed
+  int  (*link) (void);                             // is there a link (a cable, somebody at the other end)? Called now and then; 0 in the struct: always
+  void (*report) (void);                           // print what the card is doing (statistics, registers), for finding errors; 0 in the struct: nothing
 };
 extern const struct net_driver virtio_net_driver, genet_driver;
 
@@ -49,13 +51,26 @@ int  net_dev_send (const void *frame, int len);
 int  net_dev_recv (void *out, int max);
 int  net_dev_start_irq (void);
 void net_dev_ack (void);
+void net_dev_report (void);                       // let the driver print its statistics
+int  net_dev_link (void);                         // 1 = there is a link (a card without the function counts as always linked)
 
 // ---- the network thread (netd.c): a kernel thread that handles the frames as they arrive, woken by the interrupt of the card ----
 void netd_start (void);                           // start it (after the threads are set up and the card is found)
 extern int netd_irq;                              // the interrupt number of the card (0 until netd_start () has run, or when polling)
 void netd_interrupt (void);                       // in the interrupt handler
 void netd_tick (void);                            // every timer tick: wakes the thread now and then, for the timers of TCP
+extern int net_quiet;                             // the boot is over: no more messages of the network code on the console (ifconfig shows the state)
+extern int net_dhcp_wanted, net_dhcp_done;        // "ip=dhcp" was on the command line / an address from DHCP has been obtained (netd tries again when the cable is plugged in)
 extern int net_echo;                              // the kernel command line said "netecho": answer on port 7 (UDP and TCP) with what comes in
+
+// ---- the configuration file /etc/rc.conf (rcconf.c) and the telnet server (telnet.c) ----
+int  rc_conf_enabled (const char *variable, int fallback);   // is 'variable' set to YES in /etc/rc.conf? 'fallback' if the file or the line is missing
+extern int net_telnet;                            // the telnet server is on (telnetd_enable in /etc/rc.conf)
+int  telnet_start (void);                         // open port 23: 0 = ok
+int  telnet_step (void);                          // serve the session a bit: 1 = something was moved
+extern int telnet_vt;                             // the terminal that the session shows (-1: nobody is connected)
+void telnet_putch (char c);                       // what a process writes to that terminal (arch_vt.c)
+void netd_nudge (void);                           // wake the network thread now (it has something to send)
 
 // ---- the echo service (echo.c) ----
 int  echo_start (void);                           // open port 7 (UDP and TCP): 0 = ok
@@ -149,6 +164,8 @@ const u8 *net_dev_mac (void) { return card->mac (); }
 int net_dev_recv (void *out, int max) { return card ? card->recv (out, max) : 0; }
 int net_dev_start_irq (void) { return card && card->start_irq ? card->start_irq () : 0; }
 void net_dev_ack (void) { if (card && card->ack) card->ack (); }
+int  net_dev_link (void) { return card && card->link ? card->link () : 1; }
+void net_dev_report (void) { if (card && card->report) card->report (); }
 
 int net_dev_send (const void *frame, int len) {
   if (!card) return -1;
@@ -337,6 +354,8 @@ static int init (void) {
 
 static const u8 *mac_address (void) { return mac; }
 
+
+
 @
 Send one frame (Ethernet header and data, without the checksum at the end: the card adds it). Returns 0 if it has been sent.
 
@@ -422,6 +441,8 @@ The complete file is put together from these parts:
 <<genet.c: send_frame>>
 
 <<genet.c: recv_frame>>
+
+<<genet.c: report>>
 
 <<genet.c: start_irq>>
 @
@@ -565,6 +586,7 @@ static u64 base = 0;                       // virtual address of the controller
 static u8 mac[6];
 static u64 rx_pa, tx_pa;                   // the 256 receive buffers (one area), the one buffer for sending
 static u32 rx_cons, tx_prod;               // our side of the indexes
+static u32 tx_count, rx_good, rx_bad, rx_last_status;     // statistics for report (): frames sent, frames received without / with an error
 
 static u32  rd (int off)        { return *(volatile u32 *)(base + off); }
 static void wr (int off, u32 v) { *(volatile u32 *)(base + off) = v; }
@@ -592,23 +614,68 @@ static void phy_write (int reg, int value) {
 }
 
 @
-Let the PHY negotiate with the other end of the cable and wait (at most five seconds) until there is a link.
-Returns the speed in Mbit/s (10, 100, 1000), or 0 if there is no link (no cable, or nobody at the other end).
+What have the PHY and the other end of the cable agreed on? The speed in Mbit/s (10, 100, 1000), or 0 if there is no link (no
+cable, or nobody at the other end, or the negotiation is not finished). This only looks; it does not wait.
+
+<<genet.c: phy_link>>=
+static int link_speed (void) {
+  int status = phy_read (1);                                       // status: bit 2 link is up, bit 5 negotiation is complete
+  if (status > 0 && (status & 0x0004) && (status & 0x0020)) {
+    int partner_gigabit = phy_read (10), partner = phy_read (5), ours = phy_read (9);
+    if (partner_gigabit > 0 && (partner_gigabit & (1 @<< 11)) && ours > 0 && (ours & (1 @<< 9))) return 1000;   // both can do gigabit, full duplex
+    if (partner > 0 && (partner & ((1 @<< 8) | (1 @<< 7)))) return 100;             // 100 Mbit/s, full or half duplex
+    return 10;
+  }
+  return 0;
+}
+
+@
+At the start we let the PHY negotiate and wait (at most five seconds) until there is a link.
 
 <<genet.c: phy_link>>=
 static int phy_link (void) {
   phy_write (0, 0x1200);                                           // control: autonegotiation on (bit 12), start again (bit 9)
   for (int ms = 0; ms < 5000; ms += 10) {
-    int status = phy_read (1);                                     // status: bit 2 link is up, bit 5 negotiation is complete
-    if (status > 0 && (status & 0x0004) && (status & 0x0020)) {
-      int partner_gigabit = phy_read (10), partner = phy_read (5);
-      if (partner_gigabit > 0 && (partner_gigabit & (1 @<< 11))) return 1000;       // the partner can do gigabit, full duplex
-      if (partner > 0 && (partner & ((1 @<< 8) | (1 @<< 7)))) return 100;           // 100 Mbit/s, full or half duplex
-      return 10;
-    }
+    int speed = link_speed ();
+    if (speed != 0) return speed;
     delay_us (10000);
   }
   return 0;
+}
+
+@
+Telling the MAC what the PHY has decided (the ``RGMII'' connection between MAC and PHY, and the speed in the command register).
+The RGMII link needs the clock of the transmitted data to run a little behind the data, and the MAC can add this delay
+([[RGMII_ID_MODE_DISABLE]] switches it off). We do \emph{not} let the MAC add it: the device tree of the Pi 4 says ``rgmii-rxid'' (the
+PHY delays the received clock), and on the real board we found out that with the delay in the MAC every frame that we sent
+was ignored (the frames that arrived were fine, and the PHY showed a healthy link), while without it the DHCP server answered at once.
+(The BSD drivers and the first version of this one added the delay in the MAC; that was wrong for this board.) This has to be done
+every time a link comes up, not only at the start: if the cable is plugged in after the boot, the MAC knows nothing about the link
+until [[link_poll]] (below) has told it.
+
+<<genet.c: phy_link>>=
+static int linked = 0;                                             // did the MAC get the speed of a link?
+
+static void set_speed (int speed) {
+  u32 v = rd (EXT_RGMII_OOB_CTRL);
+  v &= ~RGMII_OOB_DISABLE;
+  v |= RGMII_ID_MODE_DISABLE;                                      // the MAC does not delay its transmit clock (see the text above)
+  wr (EXT_RGMII_OOB_CTRL, v | RGMII_LINK | RGMII_MODE_EN);
+  wr (UMAC_CMD, (rd (UMAC_CMD) & ~CMD_SPEED) | (speed == 1000 ? CMD_SPEED_1000 : speed == 100 ? CMD_SPEED_100 : CMD_SPEED_10));
+  linked = 1;
+}
+
+@
+The network thread asks about once a second whether there is a link ([[link]] of [[struct net_driver]]). A cable that has
+been plugged in gives the MAC its speed and is reported on the console; a cable that has been pulled out is reported, too.
+The answer is 1 if there is a link.
+
+<<genet.c: phy_link>>=
+static int link_poll (void) {
+  int speed = link_speed ();
+  if (speed != 0 && !linked) { set_speed (speed);  if (!net_quiet) printf ("genet: link up, %d Mbit/s\n", speed); }
+  if (speed == 0 && linked)  { linked = 0;  if (!net_quiet) printf ("genet: link down\n"); }
+  return linked;
 }
 
 @
@@ -702,16 +769,12 @@ static int init (void) {
   wr (RBUF_TBUF_SIZE_CTRL, 1);
   wr (UMAC_CMD, rd (UMAC_CMD) | CMD_TXEN | CMD_RXEN);
 
-  // the link: speed from the PHY, then tell the MAC (the "RGMII" connection between MAC and PHY) what the PHY has decided.
-  // The PHY of the Pi 4 adds the clock delay for the received data itself ("rgmii-rxid"), so the MAC does not.
+  // the link: speed from the PHY, then tell the MAC what the PHY has decided (a cable that is plugged in later: see link_poll)
   int speed = phy_link ();
   if (speed == 0) printf ("genet: no link (is the cable connected?)\n");
   else {
     printf ("genet: link up, %d Mbit/s\n", speed);
-    u32 v = rd (EXT_RGMII_OOB_CTRL);
-    v &= ~(RGMII_OOB_DISABLE | RGMII_ID_MODE_DISABLE);
-    wr (EXT_RGMII_OOB_CTRL, v | RGMII_LINK | RGMII_MODE_EN);
-    wr (UMAC_CMD, (rd (UMAC_CMD) & ~CMD_SPEED) | (speed == 1000 ? CMD_SPEED_1000 : speed == 100 ? CMD_SPEED_100 : CMD_SPEED_10));
+    set_speed (speed);
   }
   return 0;
 }
@@ -735,7 +798,7 @@ static int send_frame (const void *frame, int len) {
   tx_prod = (tx_prod + 1) & 0xffff;
   wr (TX_PROD_INDEX (QUEUE), tx_prod);
   for (int us = 0; us < 100000; us += 10) {                                     // the controller is done when its consumer index has caught up
-    if ((rd (TX_CONS_INDEX (QUEUE)) & 0xffff) == tx_prod) return 0;
+    if ((rd (TX_CONS_INDEX (QUEUE)) & 0xffff) == tx_prod) { tx_count++;  return 0; }
     delay_us (10);
   }
   printf ("genet: the frame is not sent\n");
@@ -754,6 +817,8 @@ static int recv_frame (void *out, int max) {
   int len = (status >> DESC_BUFLEN_SHIFT) & 0xfff;
   u8 *buffer = KVA (rx_pa + (u64)i * BUFFER);
   int result = 0;
+  rx_last_status = status;
+  if ((status & (DESC_SOP | DESC_EOP | RX_DESC_ERROR)) != (DESC_SOP | DESC_EOP) || len <= 2) rx_bad++; else rx_good++;
   if ((status & (DESC_SOP | DESC_EOP | RX_DESC_ERROR)) == (DESC_SOP | DESC_EOP) && len > 2) {     // one whole frame, no error
     cache_flush_inval (buffer, BUFFER);
     len -= 2;                                                                   // the two bytes of padding before the frame
@@ -764,6 +829,24 @@ static int recv_frame (void *out, int max) {
   rx_cons = (rx_cons + 1) & 0xffff;
   wr (RX_CONS_INDEX (QUEUE), rx_cons);                                          // the descriptor (and its buffer) goes back to the controller
   return result;
+}
+
+@
+What is the controller doing? This is for the case that no frame arrives (or none gets out): how many frames did we send and
+receive, how are the registers of the MAC set, what does the PHY say, and which of the statistics counters of the MAC (from
+\texttt{0x400}) are not zero. The network thread prints it after a DHCP request that was not answered.
+
+<<genet.c: report>>=
+static void report (void) {
+  printf ("genet: %u frames sent, %u received (%u good, %u rejected; last status 0x%x); rx producer %u, tx consumer %u of %u\n",
+          tx_count, rx_good + rx_bad, rx_good, rx_bad, rx_last_status, rd (RX_PROD_INDEX (QUEUE)) & 0xffff, rd (TX_CONS_INDEX (QUEUE)) & 0xffff, tx_prod);
+  printf ("genet: UMAC_CMD 0x%x, RGMII 0x%x, port 0x%x, DMA rx 0x%x tx 0x%x\n",
+          rd (UMAC_CMD), rd (EXT_RGMII_OOB_CTRL), rd (SYS_PORT_CTRL), rd (DMA_CTRL (RX_BASE)), rd (DMA_CTRL (TX_BASE)));
+  printf ("genet: PHY id 0x%x 0x%x, control 0x%x, status 0x%x, 1000BASE-T status 0x%x, partner 0x%x\n",
+          phy_read (2), phy_read (3), phy_read (0), phy_read (1), phy_read (10), phy_read (5));
+  printf ("genet: counters (offset=value):");
+  for (int off = 0xc00; off < 0xd80; off += 4) { u32 v = rd (off); if (v) printf (" %x=%u", off, v); }       // (the statistics of the MAC)
+  printf ("\n");
 }
 
 @
@@ -779,7 +862,7 @@ static int start_irq (void) {
 
 static void ack (void) { wr (INTRL2_CPU_CLEAR, rd (INTRL2_CPU_STAT) & ~rd (INTRL2_CPU_STAT_MASK)); }
 
-const struct net_driver genet_driver = { "genet0", init, mac_address, send_frame, recv_frame, start_irq, ack };
+const struct net_driver genet_driver = { "genet0", init, mac_address, send_frame, recv_frame, start_irq, ack, link_poll, report };
 
 @
 \section{The network layers below TCP: Ethernet, ARP, IPv4, ICMP and UDP}
@@ -1756,6 +1839,9 @@ The complete file is put together from these parts:
 #include "net.h"
 
 int net_echo = 0;                       // "netecho" on the command line: the echo service is on
+int net_quiet = 0;                      // set when the boot is over: from then on the network thread does not write on the console (it would disturb the user's shell)
+int net_dhcp_wanted = 0;                // "ip=dhcp" on the command line: the address is to come from a DHCP server
+int net_dhcp_done = 0;                  // ... and it has: until then the network thread tries again whenever there is a link
 
 int net_parse_ip (const char *s, u32 *ip, const char **end) {
   u32 value = 0;
@@ -1808,9 +1894,10 @@ void net_configure_from_command_line (void) {
     printf (" router ");  print_ip (net_gateway);  printf (" name server ");  print_ip (net_dns);  printf (" (from the command line)\n");
   }
   if (use_dhcp) {
+    net_dhcp_wanted = 1;
     printf ("net: asking a DHCP server for an address ...\n");
-    if (dhcp_run (8000, 0) == 0) { printf ("net: DHCP: address ");  print_ip (net_my_ip);  printf (", router ");  print_ip (net_gateway);  printf ("\n"); }
-    else printf ("net: no answer from a DHCP server, keeping the address that was set\n");
+    if (dhcp_run (8000, 0) == 0) { net_dhcp_done = 1;  printf ("net: DHCP: address ");  print_ip (net_my_ip);  printf (", router ");  print_ip (net_gateway);  printf ("\n"); }
+    else printf ("net: no answer from a DHCP server, keeping the address that was set (the network thread tries again when there is a link)\n");
   }
 }
 
@@ -1895,6 +1982,10 @@ The complete file is put together from these parts:
 
 <<netd.c>>=
 <<netd.c: includes>>
+
+<<netd.c: link>>
+
+<<netd.c: netd>>
 @
 
 <<netd.c: includes>>=
@@ -1905,18 +1996,29 @@ extern int  net_dev_start_irq (void);
 extern void net_dev_ack (void);
 extern int  echo_start (void);
 extern int  echo_step (void);
-extern int  net_echo;
+extern int  net_echo, net_telnet, net_dhcp_wanted, net_dhcp_done, net_quiet;
+extern int  net_dev_link (void);
+extern void net_dev_report (void);
+extern int  dhcp_run (int timeout_ms, void (*idle) (void));
+extern unsigned long long net_now_ms (void);
+extern unsigned net_my_ip, net_gateway;
+extern int  telnet_start (void);
+extern int  telnet_step (void);
+extern int  rc_conf_enabled (const char *variable, int fallback);
 extern void gic_enable (int irq);
 extern void arch_resign (void);
 extern int  arch_thread_create_high (void (*entry) (void *), void *arg, const char *name);
 
 int netd_irq = 0;
+int net_telnet = 0;                           // the telnet server is on: /etc/rc.conf says telnetd_enable="YES" (or says nothing)
 static int running = 0, ticks_seen = 0;
 
 static void wake (void) {
   thread_id t = front_of_blocked_queue (floppy_queue);
   if (t) deblock (t, &floppy_queue);
 }
+
+void netd_nudge (void) { wake (); }            // a process has written something for the telnet session: send it now, not in 50 ms
 
 void netd_interrupt (void) {                  // the card has something: say so to the card, wake the thread
   net_dev_ack ();
@@ -1927,10 +2029,47 @@ void netd_tick (void) {                       // every 10 ms; the thread gets a 
   if (running && ++ticks_seen >= 5) { ticks_seen = 0; wake (); }
 }
 
+@
+A cable that is plugged in \emph{after} the boot, or an address that the DHCP server did not give at the boot because
+nobody answered: for a computer that is supposed to get its address from DHCP ([[ip=dhcp]]) that must not mean ``no address
+for ever''. Every two seconds the thread asks the card whether there is a link ([[net_dev_link]]; the driver of the Pi then also
+tells the MAC the speed that the PHY has agreed on). As long as there is a link but no address yet, it asks a DHCP server, and
+if nobody answers it tries again after ten seconds. While it waits for the answer it gives the CPU to the other threads
+([[arch_resign]]), the same way the program [[dhclient]] does.
+
+<<netd.c: link>>=
+static void netd_link (void) {
+  static unsigned long long next = 0;
+  static int told = 0;                                           // the user has been told that we are trying (and that nobody has answered yet)
+  unsigned long long now = net_now_ms ();
+  if (now < next) return;
+  next = now + 2000;
+  int up = net_dev_link ();
+  if (!up || !net_dhcp_wanted || net_dhcp_done) return;
+  if (!told && !net_quiet) printf ("net: asking a DHCP server for an address ...\n");
+  if (dhcp_run (5000, arch_resign) == 0) {
+    net_dhcp_done = 1;  told = 0;
+    printf ("net: DHCP: address %d.%d.%d.%d, router %d.%d.%d.%d\n", net_my_ip >> 24, (net_my_ip >> 16) & 255, (net_my_ip >> 8) & 255, net_my_ip & 255,
+           net_gateway >> 24, (net_gateway >> 16) & 255, (net_gateway >> 8) & 255, net_gateway & 255);
+  } else {
+    if (!told) {                                                 // say it once, then go on trying quietly: nobody wants a message every 15 seconds
+      told = 1;
+      if (!net_quiet) {                                          // (not when somebody is working in the shell: ifconfig shows "no carrier" or the missing address)
+        printf ("net: no answer from a DHCP server yet, trying again every 10 seconds\n");
+        net_dev_report ();                                       // (what did the card see? helps to find out why nobody answers)
+      }
+    }
+    next = net_now_ms () + 10000;
+  }
+}
+
+@
+<<netd.c: netd>>=
 static void netd (void *arg) {
   for (;;) {
     int moved;
-    do { moved = net_poll_once (); if (net_echo) moved |= echo_step (); } while (moved);       // everything that is there
+    do { moved = net_poll_once (); if (net_echo) moved |= echo_step (); if (net_telnet) moved |= telnet_step (); } while (moved);       // everything that is there
+    netd_link ();                                                                             // (every two seconds: link? an address yet?)
     block (&floppy_queue, TSTATE_WAITFLP);                                                    // then sleep until we are woken
     arch_resign ();
   }
@@ -1940,9 +2079,285 @@ void netd_start (void) {
   netd_irq = net_dev_start_irq ();
   if (netd_irq) gic_enable (netd_irq);
   if (net_echo && echo_start () != 0) printf ("netd: cannot open port 7\n");
+  net_telnet = rc_conf_enabled ("telnetd_enable", 1);              // on, unless /etc/rc.conf switches it off
+  if (net_telnet && telnet_start () != 0) { printf ("netd: cannot open port 23\n"); net_telnet = 0; }
   arch_thread_create_high (netd, 0, "netd");                       // (a high thread number: see arch_thread_create_high)
   running = 1;
   printf ("netd: network thread started (%s)%s\n", netd_irq ? "woken by the interrupt of the card" : "polling every 50 ms", net_echo ? ", echo service on port 7" : "");
+  if (net_telnet) printf ("netd: telnet server on port 23\n");
+}
+
+@
+\section{The configuration file \texttt{/etc/rc.conf}}
+\label{src:rcconf.c}
+
+Which services a BSD system starts is written down in the file \texttt{/etc/rc.conf}, one setting per line:
+\begin{quote}\begin{verbatim}
+    telnetd_enable="YES"
+\end{verbatim}\end{quote}
+Ulix does the same. A line has the form [[name="YES"]] or [[name="NO"]] (the quotes may be left out; everything behind a
+[[#]] is a comment). The file is read once, when the network thread starts. The kernel asks for one setting at a time
+with [[rc_conf_enabled]], and says what is to be assumed when the file or the line does not exist (the \emph{default}). For the
+telnet server that is ``on'': a system without \texttt{rc.conf} behaves like one that says \texttt{telnetd\_enable="YES"}. To switch the
+server off, write [[telnetd_enable="NO"]] into \texttt{/etc/rc.conf} as root.
+
+The kernel reads the file with the small reader for the Minix file system ([[minixfs.c]]) that the ELF loader uses, because
+no process exists yet. The file may be at most 1 KByte long; what lies behind that is ignored.
+
+<<rcconf.c>>=
+#include "net.h"
+
+extern u32  minix_lookup (const char *path);
+extern long minix_read (u32 ino_nr, u32 offset, void *buf, u32 len);
+
+static char rc_text[1025];
+static int  rc_loaded = 0, rc_size = 0;
+
+static void rc_load (void) {                        // read /etc/rc.conf into rc_text, once
+  rc_loaded = 1;
+  u32 ino = minix_lookup ("/etc/rc.conf");
+  if (ino == 0) return;                             // no such file: every setting has its default
+  long n = minix_read (ino, 0, rc_text, sizeof rc_text - 1);
+  if (n > 0) rc_size = (int)n;
+  rc_text[rc_size] = 0;
+}
+
+@
+A line is searched from its start: blanks first, then the name, then [[=]], then the value. A value that begins with Y, T, 1 or
+\emph{ON} means yes (as in \texttt{rc.conf(5)} of the BSDs: YES, TRUE, ON, 1); one that begins with N, F, 0 or \emph{OFF} means no.
+If the same name appears twice the last line counts, like in a shell script.
+
+<<rcconf.c>>=
+static int rc_is_yes (const char *v) {
+  if (*v == '"') v++;
+  char c = *v | 0x20;                               // (a lower case letter; a digit stays a digit for the test below)
+  if (*v == '1' || c == 'y' || c == 't') return 1;
+  if (*v == '0' || c == 'n' || c == 'f') return 0;
+  if (c == 'o') return ((v[1] | 0x20) == 'n') ? 1 : 0;      // ON or OFF
+  return -1;                                        // we do not understand it
+}
+
+int rc_conf_enabled (const char *variable, int fallback) {
+  if (!rc_loaded) rc_load ();
+  int answer = fallback;
+  int length = 0;
+  while (variable[length]) length++;
+  for (const char *line = rc_text; *line; ) {
+    const char *p = line;
+    while (*p == ' ' || *p == '\t') p++;
+    int i = 0;
+    while (i < length && p[i] == variable[i]) i++;
+    if (i == length && p[i] == '=') {               // the line begins with name=
+      int v = rc_is_yes (p + i + 1);
+      if (v >= 0) answer = v;
+    }
+    while (*line && *line != '\n') line++;          // next line
+    if (*line == '\n') line++;
+  }
+  return answer;
+}
+
+@
+\section{The telnet server}
+\label{src:telnet.c}
+
+\emph{Telnet} sends the keys of a terminal over a TCP connection and shows what the other computer writes: a terminal over the
+network. Ulix already has ten virtual terminals (like the PC version of the book), and on each of the first five a program
+\texttt{login} waits for a user name. The telnet server needs no new kind of terminal: it takes one of these, [[TELNET_VT]],
+and acts as its keyboard and its screen.
+
+\begin{quote}\begin{verbatim}
+    keys:   TCP connection --> telnet_step () --> input buffer of terminal 4 --> login, shell, ...
+    screen: login, shell, ... --> kputch () --> model of terminal 4 --> telnet_putch () --> ring --> TCP connection
+\end{verbatim}\end{quote}
+
+\paragraph{The way in.} What arrives over the connection is put into the keyboard buffer of terminal 4, just like the UART
+does it for the console ([[telnet_input]] in [[arch_console.c]]). The programs on that terminal do not know the difference.
+
+\paragraph{The way out.} [[kputch]] ([[arch_vt.c]]) writes every character that a process prints into the model of its terminal.
+If the terminal is the one of the telnet session, it also calls [[telnet_putch]] here. That function must be quick and must not wait,
+so it only puts the character into a \emph{ring buffer}: an array that is written at [[head]] and read at [[tail]]; both only count up,
+and the place in the array is the count modulo the size. The network thread sends the ring over the connection ([[telnet_step]]). If
+the ring is full, characters are lost; with 8 KByte that happens only when the other side does not read.
+
+\paragraph{The telnet protocol} is almost nothing: bytes are sent as they are, except that the byte 255 ([[IAC]], ``interpret as
+command'') begins a command of two or three bytes, which says that the sender \emph{will} or \emph{won't} do something, or asks the
+other side to \emph{do} or \emph{not do} it (RFC 854). Two things are needed to make an ordinary telnet client behave like a terminal:
+\begin{itemize}
+\item The client must send every key at once and not collect a whole line: we say [[WILL SGA]] (suppress go-ahead).
+\item The client must not show the keys itself: Ulix echoes what is typed (the program that reads the line does this, as on the
+console), so we say [[WILL ECHO]]: ``I do the echo.''
+\end{itemize}
+All answers and all other commands of the client are read and ignored; for these two options that is good enough. A line ends with
+CR LF (or CR NUL), which the server turns into one Enter. Output has to end its lines with CR LF as well, so each \verb|\n| becomes
+two bytes. The byte 255 in the text is sent twice.
+
+\paragraph{One session.} Only one person can use terminal 4 at a time. A second connection gets a message and is closed. When the
+session ends (the client closes the connection), the programs on the terminal are ended, as if the line had been hung up
+([[console_hangup]]); [[login]] then asks for a user name again, ready for the next connection. That the person is the right one
+is checked by [[login]], with the password, as on the console. \emph{Telnet sends the password unencrypted:}
+it is for a private network, a teaching system and trying things out.
+
+@
+
+The complete file is put together from these parts:
+
+<<telnet.c>>=
+<<telnet.c: includes>>
+
+<<telnet.c: the ring>>
+
+<<telnet.c: from the client>>
+
+<<telnet.c: the session>>
+
+<<telnet.c: telnet_step>>
+@
+
+<<telnet.c: includes>>=
+#include "net.h"
+
+#define TELNET_PORT 23
+#define TELNET_VT   4                           // the terminal (Ctrl-T 5) on which the session runs: a login waits there
+
+extern void telnet_input (int vt, unsigned char c);       // arch_console.c: a key from the session
+extern void telnet_attach (int vt);                       // arch_console.c: the session takes over the terminal
+extern void console_hangup (int vt);                      // arch_console.c: end the programs of the terminal
+extern void arch_vt_telnet_attach (void);                 // arch_vt.c: send the screen of the terminal to the session
+
+#define IAC   255                               // the telnet commands that we use
+#define WILL  251
+#define WONT  252
+#define DO    253
+#define DONT  254
+#define SB    250                               // begin of a sub negotiation (ended by IAC SE)
+#define SE    240
+#define IP    244                               // "interrupt process": what some clients send for Ctrl-C
+#define OPT_ECHO 1
+#define OPT_SGA  3
+
+int telnet_vt = -1;                             // the terminal of the session, -1 = no session
+static tcp_conn *conn = 0;                      // the connection of the session
+
+@
+The ring buffer. [[telnet_putch]] is called by the process that prints, in the middle of a system call; it wakes the network thread
+(only when the ring was empty before, to save work).
+
+<<telnet.c: the ring>>=
+static u8 ring[8192];
+static volatile unsigned head = 0, tail = 0;    // written at head, read at tail; the place is the count modulo the size
+
+static void put (u8 c) {
+  if (head - tail >= sizeof ring) return;       // full: this character is lost
+  ring[head % sizeof ring] = c;
+  head++;
+}
+
+void telnet_putch (char c) {
+  if (conn == 0) return;
+  int was_empty = (head == tail);
+  if (c == '\n') put ('\r');                    // a line ends with CR LF
+  put ((u8)c);
+  if ((u8)c == IAC) put (IAC);                  // the byte 255 in the text is sent twice
+  if (was_empty) netd_nudge ();
+}
+
+@
+What the client sends. A small state machine reads the bytes one by one: normally a byte is a key; behind [[IAC]] a command follows
+whose bytes are skipped. [[after_cr]] remembers that the last key was Enter (CR), so that the LF or NUL behind it is not a second Enter.
+
+<<telnet.c: from the client>>=
+static int state = 0;                           // 0 = text, 1 = after IAC, 2 = after WILL/WONT/DO/DONT (one byte to skip), 3 = in SB ... SE, 4 = IAC inside SB
+static int after_cr = 0;
+
+static void from_client (u8 c) {
+  switch (state) {
+    case 1:                                     // the byte behind IAC
+      state = 0;
+      if (c == WILL || c == WONT || c == DO || c == DONT) state = 2;
+      else if (c == SB) state = 3;
+      else if (c == IP) telnet_input (TELNET_VT, 3);          // interrupt process: like Ctrl-C
+      else if (c == IAC) telnet_input (TELNET_VT, IAC);       // the byte 255 as text
+      return;
+    case 2: state = 0; return;                  // the option that WILL/WONT/DO/DONT is about: ignored
+    case 3: if (c == IAC) state = 4; return;
+    case 4: state = (c == SE) ? 0 : 3; return;
+  }
+  if (c == IAC) { state = 1; return; }
+  if (after_cr) {                               // the byte behind Enter: LF or NUL belongs to it
+    after_cr = 0;
+    if (c == '\n' || c == 0) return;
+  }
+  if (c == '\r') after_cr = 1;
+  telnet_input (TELNET_VT, c);                  // (CR becomes Enter there)
+}
+
+@
+Beginning and end of a session. At the beginning the client is told to send single keys and not to echo. The terminal is taken
+over (its keyboard buffer is emptied) and its screen is sent, so that the client sees the prompt of [[login]] at once.
+
+<<telnet.c: the session>>=
+static void session_start (tcp_conn *c) {
+  conn = c;
+  head = tail = 0;
+  state = 0;  after_cr = 0;
+  telnet_vt = TELNET_VT;
+  put (IAC); put (WILL); put (OPT_ECHO);        // "I echo": the client must not show the keys itself
+  put (IAC); put (WILL); put (OPT_SGA);         // "send every key at once"
+  telnet_attach (TELNET_VT);
+  arch_vt_telnet_attach ();                     // paints the terminal into the ring
+}
+
+static void session_end (void) {
+  conn = 0;
+  telnet_vt = -1;
+  console_hangup (TELNET_VT);                   // the programs of the session end, login starts again
+}
+
+int telnet_start (void) {
+  return tcp_listen (TELNET_PORT);
+}
+
+@
+The network thread calls [[telnet_step]] again and again. It accepts a new connection (or sends a busy message to it), reads what the
+client has sent, and sends what is in the ring. The return value 1 tells the thread that something happened, so that it looks
+again before it sleeps.
+
+<<telnet.c: telnet_step>>=
+int telnet_step (void) {
+  static const char busy[] = "Ulix: this terminal is in use.\r\n";
+  int moved = 0;
+
+  tcp_conn *other = tcp_accept (TELNET_PORT);
+  if (other) {
+    if (conn) { tcp_write (other, (const u8 *)busy, sizeof busy - 1); tcp_close (other); }
+    else session_start (other);
+    moved = 1;
+  }
+  if (conn == 0) return moved;
+
+  if (tcp_closed (conn)) { session_end (); return 1; }          // (reset by the other side: the pointer must not be used any more)
+  u8 buf[256];
+  int n = tcp_read (conn, buf, sizeof buf);
+  if (n > 0) {
+    for (int i = 0; i < n; i++) from_client (buf[i]);
+    moved = 1;
+  } else if (n < 0) {                                           // the client has closed the connection: so do we
+    tcp_close (conn);
+    session_end ();
+    return 1;
+  }
+
+  while (tail != head) {                                        // send what the programs have written
+    u8 chunk[256];
+    int len = 0;
+    while (len < (int)sizeof chunk && tail + len != head) { chunk[len] = ring[(tail + len) % sizeof ring]; len++; }
+    int sent = tcp_write (conn, chunk, len);
+    if (sent <= 0) break;                                       // the send buffer is full: the rest stays in the ring
+    tail += sent;
+    moved = 1;
+  }
+  return moved;
 }
 
 @
@@ -2008,6 +2423,7 @@ struct dhcp_result { unsigned server, address, netmask, gateway, dns, lease_seco
 extern unsigned net_my_ip, net_netmask, net_gateway, net_dns;
 extern const char *net_if_name;
 extern const unsigned char *net_dev_mac (void);
+extern int net_dev_link (void);
 extern int dhcp_run (int timeout_ms, void (*idle) (void));
 extern struct dhcp_result dhcp_last;
 
@@ -2081,7 +2497,7 @@ void syscall_net_info (context_t *r) {
   for (int k = 0; k < 16; k++) i->name[k] = net_if_name[k] ? net_if_name[k] : 0;
   const unsigned char *mac = net_dev_mac ();
   for (int k = 0; k < 6; k++) i->mac[k] = mac[k];
-  i->mtu = 1500;  i->flags = 1;
+  i->mtu = 1500;  i->flags = 1 | (net_dev_link () ? 2 : 0);          // bit 1: the interface exists, bit 2: there is a link (a cable)
   i->address = net_my_ip;  i->netmask = net_netmask;  i->gateway = net_gateway;  i->dns = net_dns;
   i->dhcp_server = dhcp_last.server;  i->dhcp_lease = dhcp_last.lease_seconds;
   r->eax = 0;

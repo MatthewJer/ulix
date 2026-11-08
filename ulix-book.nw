@@ -27986,12 +27986,16 @@ case SIGCONT:   if (tcb->state == TSTATE_STOPPED) {
 \end{itemize}
 \begin{itemize}
 
-\item The [[SIGKILL]] signal:
+\item The [[SIGKILL]] signal (as in [[exit]], the children of the killed process are handed to process 1,
+so that the scheduler can remove their zombies):
 
 <<[[u_kill]]: special cases>>=
 case SIGKILL:   <<[[u_kill]]: remove thread from queue>>
                 tcb->used = false;
                 tcb->state = TSTATE_EXIT;
+                for (int c = 0;  c < MAX_THREADS;  c++)    // like [[exit]]: init adopts the children,
+                  if (thread_table[c].ppid == pid)         // the scheduler removes their zombies
+                    thread_table[c].ppid = 1;
                 <<[[u_kill]]: write kill message>>
                 wake_waiting_parent_process (pid);
                 <<enable scheduler>>
@@ -31068,6 +31072,7 @@ The port is described by the files in the directory \path!arm64/! of the sources
 \path!virtio.c!, \path!glue.c!, \path!minixfs.c! & disks (and the serial disk), glue to the book's block layer, ELF loader support \\
 \path!virtionet.c!, \path!netdev.c!, \path!net.c!, \path!tcp.c! & network card, Ethernet, ARP, IP, ICMP, UDP, TCP \\
 \path!dhcp.c!, \path!netconf.c!, \path!netd.c!, \path!net_syscalls.c! & DHCP, network setup, network thread, system calls \\
+\path!rcconf.c!, \path!telnet.c!, \path!stats.c! & the file \path!/etc/rc.conf!, telnet server, load statistics for \verb#top# \\
 \path!sdcard.c!, \path!genet.c! & SD card and Ethernet of the Raspberry Pi 4B \\
 \end{tabular}
 \end{center}
@@ -31141,7 +31146,13 @@ The book's \UlixI{} has no network. The port adds a small TCP/IP stack that is n
 \item \path!netd.c! is a kernel thread that sleeps in a blocked queue, like a process waiting for the disk, and is woken by the interrupt of the card; the timer wakes it every 50 milliseconds for the timers of TCP. It handles each frame when it arrives: ARP, a ping from outside, TCP segments. With the word \verb#netecho# on the command line it also serves the echo service of port 7 (\path!echo.c!), which makes the stack easy to test from the host.
 \end{itemize}
 
+The \emph{telnet server} (\path!telnet.c!) is the first service that uses TCP. Telnet sends the keys of a terminal over a connection and shows what the other computer writes, and Ulix already has ten virtual terminals, on the first five of which a \verb#login# waits. The server therefore needs no new kind of terminal: it takes terminal 5 (\verb#tty4#, Ctrl-T 5 on the console) and acts as its keyboard and screen. Bytes that arrive go into the keyboard buffer of that terminal, exactly like the keys from the UART; what a process prints is written by \verb#kputch# into the model of its terminal and, for this terminal, also into a ring buffer that the network thread sends. The cursor control of programs like \verb#top# and \verb#vi# works over the connection, because the screen is painted with the same functions as on the console (\path!arch_vt.c!); only the place where the characters go differs. Of the telnet protocol only what a terminal needs is implemented: the server says \emph{will echo} and \emph{will suppress go-ahead}, so that a client sends every key at once and does not echo, and it ignores everything else the client says. One session at a time; when the connection ends, all programs on the terminal are ended (as if a modem line had been hung up) and \verb#login# asks again. The password goes over the network unencrypted, so this is for a private network and for learning.
+
+Which services run is written in \path!/etc/rc.conf!, as on the BSDs: one line \verb#telnetd_enable="YES"# or \verb#"NO"# per service. The file is read once when the network thread starts, with the small reader of the Minix file system (no process exists yet); a service whose line is missing has its default, which is \emph{on} for the telnet server.
+
 User programs reach the network through system calls that only exist in this port (numbers 602 to 611, see \path!net_syscalls.c! and \path!userland/arm64-extra.h!). The kernel offers \emph{raw ICMP sockets}, and the program \verb#ping# builds its ICMP messages (type, identifier, sequence number, checksum) itself and measures the round trip time. The programs \verb#ifconfig#, \verb#route# and \verb#dhclient# are modelled on the BSD programs of the same names and print what they print; looking is free for everybody, changing anything needs root (the system calls check that the effective user ID is 0). The programs \verb#shutdown#, \verb#poweroff# and \verb#reboot# are not about the network, but their system calls live in the same file: they write the buffer cache to the disks and then ask the firmware (PSCI) to switch the machine off or to start it again; under the emulator this ends the emulator.
+
+The program \verb#top# shows what the computer is doing: a bar for every CPU, the use of memory, and the processes that use the most CPU time, refreshed every two seconds (\verb#q# or Ctrl-C ends it). The kernel only counts (\path!stats.c!): at every timer interrupt, on every CPU, it adds 10 ms to the counter of the CPU and, if the CPU was not idle, to the counter of the running process. The system call \verb#sysinfo# hands the counters to the program, which subtracts two readings, and \verb#waitkey# lets it wait for a key for at most a given time. The program is written from scratch for Ulix, in the spirit of the BSD \verb#top# and of \verb#htop#; it needs only \verb#clrscr# and \verb#set_xy# of the book and no floating point numbers.
 
 The stack is tested against a real TCP/IP implementation: a Python program on the host talks to the kernel through the user-mode network of the emulator with ordinary sockets (ping of the router, UDP echo, TCP echo of 100 and of 20000 bytes, and the kernel as a TCP client that loses its first SYN and its first data segment on purpose and has to send them again). What is not there: UDP and TCP sockets for user programs, renewal of the DHCP lease, name resolution, more than one interface.
 
@@ -31151,7 +31162,7 @@ The same sources also build a kernel image for the Raspberry Pi 4B (\verb#make k
 
 The disks are partitions of the SD card, whose partition table is the PC's: the partitions of type \hex{81} are \path!/dev/hda!, \path!/dev/hdb! and the stand-in for \path!/dev/fd1!. \path!sdcard.c! is the driver of the SD host controller: first only with polling and one sector per command, then with multi-block commands, the four-bit bus and interrupts, so that a process waiting for the card sleeps in the same queue as for a virtio disk. The Ethernet driver \path!genet.c! is written new for \UlixI{}, but it follows the register layout and the order of the setup steps of the FreeBSD driver; its licence text and copyrights are kept in the file.
 
-The emulator has a model of the board (\verb#qemu-system-aarch64 -M raspi4b#) but no firmware, so the tests give it a device tree that is laid out like the real one (\path!rpi4-qemu.dts!); the kernel tests, the console test and the shell session run on it from an SD card image. The Ethernet controller has no model there: the driver of the board is compiled and linked, but it has never run. Nothing of this has been tried on the real board.
+The emulator has a model of the board (\verb#qemu-system-aarch64 -M raspi4b#) but no firmware, so the tests give it a device tree that is laid out like the real one (\path!rpi4-qemu.dts!); the kernel tests, the console test and the shell session run on it from an SD card image. The Ethernet controller has no model there, so its driver could only be written after the data sheets and the BSD drivers; it ran for the first time on a real Raspberry Pi 4B, where three things had to be corrected (the link is set up whenever a cable is plugged in, the kernel command line is longer than expected, and the MAC must not delay its transmit clock). Since then the board boots from the SD card, gets an address by DHCP and accepts a telnet login.
 
 \section{More Than One CPU}
 
@@ -31171,7 +31182,8 @@ The build needs an AArch64 cross compiler and [[qemu-system-aarch64]]. The comma
 \item an independent check of the Minix file systems on the disk images after the write tests (the checker is written in Python and shares no code with the kernel);
 \item a console test and a session that logs in, runs shell commands, switches terminals, edits a file with \verb#vi# and ends in the kernel shell; a variant of the session with a network card (\verb#ping#, \verb#ifconfig#, \verb#route#, \verb#dhclient#);
 \item the same tests on the emulated Raspberry Pi 4B with its SD card;
-\item the serial disk (\verb#make sdisk-test#) and the network (\verb#make net-test#, \verb#make netd-test#, the network settings of the command line, \verb#poweroff# and \verb#reboot#).
+\item the serial disk (\verb#make sdisk-test#) and the network (\verb#make net-test#, \verb#make netd-test#, the network settings of the command line, \verb#poweroff# and \verb#reboot#);
+\item the telnet server (\verb#make telnet-test#): a Python program connects like a telnet client, logs in, runs \verb#ps# and \verb#top#, tries a second connection, hangs up and connects again; a second boot with \verb#telnetd_enable="NO"# checks that the server can be switched off.
 \end{itemize}
 
 \section{Differences from the x86 Version}
@@ -31179,11 +31191,11 @@ The build needs an AArch64 cross compiler and [[qemu-system-aarch64]]. The comma
 \begin{itemize}
 \item The console must understand ANSI escape sequences (the status line is painted on the 25th line of the terminal).
 \item There is no floppy controller: a virtio disk stands in for the floppy \path!/dev/fd1!, and \path!/dev/fd0! has no drive behind it. The serial disk works over a second UART.
-\item The port has a network stack, the programs \verb#ping#, \verb#ifconfig#, \verb#route#, \verb#dhclient#, \verb#shutdown#, \verb#poweroff# and \verb#reboot#, and system calls (numbers from 600 on) that the book does not have.
+\item The port has a network stack, a telnet server, the file \path!/etc/rc.conf!, the programs \verb#ping#, \verb#ifconfig#, \verb#route#, \verb#dhclient#, \verb#top#, \verb#shutdown#, \verb#poweroff# and \verb#reboot#, and system calls (numbers from 600 on) that the book does not have.
 \item The swap file is not 64 MByte large but grows on demand; the access bit is emulated.
 \item Integer division by zero does not cause an exception on AArch64; the kernel shell command \verb#div0# raises the exception by hand.
 \item The kernel is single-processor code that runs on several CPUs under one lock (see above).
-\item The port has only been run in an emulator (\verb#virt# and \verb#raspi4b#); real boards, including the Raspberry Pi 4B it was prepared for, are untested.
+\item The port has mostly been run in an emulator (\verb#virt# and \verb#raspi4b#). On a real board it has run only on one Raspberry Pi 4B with 1 GByte of RAM (boot, console, shell, Ethernet with DHCP, telnet login); other boards, several CPUs on the board and the interrupt of the Ethernet controller are untested.
 \item Like the x86 version, it has no \verb#pthread_join#.
 \end{itemize}
 

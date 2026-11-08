@@ -15,7 +15,7 @@ CFLAGS = -I$(GENDIR) -mno-outline-atomics -O0 -g -ffreestanding -nostdlib -fno-b
 # "-snapshot" keeps the file unmodified when running.
 DISK ?= disk.img
 
-OBJS = start.o vectors.o irq.o mmu.o virtio.o sdcard.o virtionet.o genet.o netdev.o net.o tcp.o dhcp.o netconf.o echo.o net_test.o net_syscalls.o netd.o minixfs.o elf.o ulix-port.o glue.o arch_thread.o arch_console.o arch_clock.o arch_swap.o arch_vt.o dt.o gic.o smp.o \
+OBJS = start.o vectors.o irq.o mmu.o virtio.o sdcard.o virtionet.o genet.o netdev.o net.o tcp.o dhcp.o netconf.o echo.o net_test.o net_syscalls.o netd.o rcconf.o telnet.o stats.o minixfs.o elf.o ulix-port.o glue.o arch_thread.o arch_console.o arch_clock.o arch_swap.o arch_vt.o dt.o gic.o smp.o \
        bookfs_test.o thread_test.o proc_test.o kmain.o
 
 all: ulix.elf ulix-console.elf ulix-shell.elf ulix.bin ulix-console.bin ulix-shell.bin $(DISK) $(GENDIR)/disk_expected.h
@@ -26,7 +26,7 @@ USERLAND_BIN = userland/build/bin
 userland/build/bin/init.elf: FORCE
 	$(MAKE) -C userland
 
-disk.img: $(wildcard userland/build/bin/*.elf) ../bin-build/minixdata.img user/hello.elf user/cat.elf user/crash.elf user/forktest.elf user/sigtest.elf user/contest.elf user/cowtest.elf user/thtest.elf user/badptr.elf user/swaptest.elf user/screentest.elf user/stacktest.elf user/memtest.elf userland/build/bin/init.elf tools/minix_add.py
+disk.img: $(wildcard userland/build/bin/*.elf) ../bin-build/minixdata.img etc/rc.conf user/hello.elf user/cat.elf user/crash.elf user/forktest.elf user/sigtest.elf user/contest.elf user/cowtest.elf user/thtest.elf user/badptr.elf user/swaptest.elf user/screentest.elf user/stacktest.elf user/memtest.elf userland/build/bin/init.elf tools/minix_add.py
 	cp ../bin-build/minixdata.img $@
 	# two deliberately broken variants of hello.elf for the loader tests:
 	# e_machine = EM_386, and a code segment with flags RWX
@@ -34,7 +34,7 @@ disk.img: $(wildcard userland/build/bin/*.elf) ../bin-build/minixdata.img user/h
 	python3 -c "d=bytearray(open('user/hello.elf','rb').read()); d[68]=7; open('bad-wx.elf','wb').write(d)"
 	python3 tools/minix_add.py $@ --grow=4096 --chmod=/tmp:1777 hello64=user/hello.elf cat64=user/cat.elf crash64=user/crash.elf forktest64=user/forktest.elf sigtest64=user/sigtest.elf contest64=user/contest.elf cowtest64=user/cowtest.elf thtest64=user/thtest.elf badptr64=user/badptr.elf swaptest64=user/swaptest.elf screentest64=user/screentest.elf stacktest64=user/stacktest.elf memtest64=user/memtest.elf \
 		badarch64=bad-arch.elf badwx64=bad-wx.elf \
-		/init=$(USERLAND_BIN)/init.elf \
+		/init=$(USERLAND_BIN)/init.elf /etc/rc.conf=etc/rc.conf \
 		$$(for f in $(USERLAND_BIN)/*.elf; do n=$$(basename $$f .elf); [ $$n != init ] && echo /bin/$$n=$$f; done)
 
 # the user programs are rebuilt by their own Makefile whenever a source changed
@@ -124,6 +124,7 @@ bookfs_test.o: bookfs_test.c $(GENFILES) $(GENDIR)/ulix-api.h
 arch_thread.o: arch_thread.c $(GENFILES) $(GENDIR)/ulix-api.h
 	$(CC) $(BOOKFLAGS) -Dhash=arch_unused_hash -c -o $@ $<
 
+stats.o: stats.c $(GENFILES) $(GENDIR)/ulix-api.h
 netd.o: netd.c $(GENFILES) $(GENDIR)/ulix-api.h
 	$(CC) $(BOOKFLAGS) -Dhash=netd_unused_hash -c -o $@ $<
 
@@ -147,7 +148,7 @@ glue.o: glue.c $(GENFILES) $(GENDIR)/ulix-api.h
 	$(CC) $(BOOKFLAGS) -Dhash=glue_unused_hash -c -o $@ $<
 
 irq.o mmu.o virtio.o sdcard.o dt.o gic.o smp.o kmain.o kmain-console.o kmain-shell.o kmain-net.o: plat.h gic.h smp.h ulix.h arch_pte.h
-virtionet.o genet.o netdev.o net.o tcp.o dhcp.o netconf.o echo.o net_test.o: net.h plat.h ulix.h cache.h delay.h
+virtionet.o genet.o netdev.o net.o tcp.o dhcp.o netconf.o echo.o net_test.o rcconf.o telnet.o: net.h plat.h ulix.h cache.h delay.h
 sdcard.o: delay.h
 
 %.o: %.S
@@ -275,6 +276,14 @@ sdisk-test: ulix.bin $(DISK) $(DISK3)
 # the network thread (netd): the console kernel with "netecho" answers on port 7 while it runs its program
 netd-test: ulix-console.bin $(DISK)
 	python3 tools/netd_test.py ulix-console.bin $(DISK)
+
+# a cable that is plugged in after the boot: the network thread asks DHCP by itself
+dhcp-retry-test: ulix-console.bin $(DISK)
+	python3 tools/dhcp_retry_test.py ulix-console.bin $(DISK)
+
+# the telnet server: a client of the host logs in on terminal 5, runs programs, hangs up; the server can be switched off in /etc/rc.conf
+telnet-test: ulix-shell.bin $(DISK)
+	python3 tools/telnet_test.py ulix-shell.bin $(DISK)
 
 # The network: the net test kernel talks to a Python program on the host through qemu's user-mode network
 net-test: ulix-net.bin

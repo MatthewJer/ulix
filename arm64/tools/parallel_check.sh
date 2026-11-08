@@ -32,7 +32,9 @@ JOBLIST=(
   "net|network: virtio-net, ARP, ICMP, UDP and TCP against real sockets of the host|net|virt||128"
   "poweroff|shutdown and poweroff end qemu by themselves, reboot starts the machine again|poweroff|virt||128"
   "netd|network thread: echo service answers while the kernel runs its program (interrupt of the card)|netd|virt||128"
-  "netconf|network settings from the kernel command line: fixed address and DHCP|netconf|virt||128"
+  "dhcpretry|cable plugged in after the boot: the network thread asks DHCP by itself|dhcpretry|virt||128"
+  "telnet|telnet server: login on terminal 5 over TCP, top, second connection, hang up, switched off in /etc/rc.conf|telnet|virt||128"
+  "netconf|network settings from the kernel command line: fixed address, DHCP, a very long command line|netconf|virt||128"
   "maxcpus|kernel command line maxcpus=2 on a machine with 4 CPUs|maxcpus|virt||128"
   "ram512|RAM 512 MByte, 2 CPUs|kernel|virt|-smp 2|512"
   "ram64|RAM 64 MByte, 2 CPUs|kernel|virt|-smp 2|64"
@@ -89,6 +91,14 @@ if [ "$1" = "--job" ]; then
       python3 tools/poweroff_test.py ulix-shell.bin $DISK > "$log" 2>&1
       rc=$?; sum=$(tail -1 "$log")
       [ $rc -eq 0 ] && grep -q "all passed" <<< "$sum" && st=ok || st=FAILED ;;
+    dhcpretry)
+      python3 tools/dhcp_retry_test.py ulix-console.bin $DISK > "$log" 2>&1
+      rc=$?; sum=$(tail -1 "$log")
+      [ $rc -eq 0 ] && grep -q "all passed" <<< "$sum" && st=ok || st=FAILED ;;
+    telnet)
+      python3 tools/telnet_test.py ulix-shell.bin $DISK > "$log" 2>&1
+      rc=$?; sum=$(tail -1 "$log")
+      [ $rc -eq 0 ] && grep -q "all passed" <<< "$sum" && st=ok || st=FAILED ;;
     netd)
       python3 tools/netd_test.py ulix-console.bin $DISK > "$log" 2>&1
       rc=$?; sum=$(tail -1 "$log")
@@ -103,12 +113,18 @@ if [ "$1" = "--job" ]; then
       $QEMU -M virt -cpu cortex-a72 -m 128 -display none -serial file:"$log.2" -monitor none -kernel ulix-console.bin -snapshot -drive file=$DISK,format=raw,if=none,id=hd0 \
         -device virtio-blk-device,drive=hd0 $NET -append "ip=dhcp" 2>/dev/null &
       P2=$!
-      for i in $(seq 1 60); do sleep 1; grep -q 'console ready' "$log" 2>/dev/null && grep -q 'console ready' "$log.2" 2>/dev/null && break; done
-      kill $P1 $P2 2>/dev/null; wait $P1 $P2 2>/dev/null
-      cat "$log.2" >> "$log"; rm -f "$log.2"
+      # a long command line (the firmware of the Pi puts about 250 characters of its own in front of cmdline.txt): "ip=" at the end must still arrive
+      rm -f "$log.3"
+      $QEMU -M virt -cpu cortex-a72 -m 128 -display none -serial file:"$log.3" -monitor none -kernel ulix-console.bin -snapshot -drive file=$DISK,format=raw,if=none,id=hd0 \
+        -device virtio-blk-device,drive=hd0 $NET -append "$(printf 'filler=%0300d' 0) ip=10.7.7.7/24" 2>/dev/null &
+      P3=$!
+      for i in $(seq 1 60); do sleep 1; grep -q 'console ready' "$log" 2>/dev/null && grep -q 'console ready' "$log.2" 2>/dev/null && grep -q 'console ready' "$log.3" 2>/dev/null && break; done
+      kill $P1 $P2 $P3 2>/dev/null; wait $P1 $P2 $P3 2>/dev/null
+      cat "$log.2" "$log.3" >> "$log"; rm -f "$log.2" "$log.3"
       sum="$(grep -E '^net: (address|DHCP)' "$log" | tr '\n' ';')"
       if grep -q '^net: address 10.9.8.7 netmask 255.255.0.0 router 10.9.0.1 name server 10.9.0.2 (from the command line)' "$log" \
-         && grep -q '^net: DHCP: address 10.0.2.15, router 10.0.2.2' "$log"; then st=ok; else st=FAILED; fi ;;
+         && grep -q '^net: DHCP: address 10.0.2.15, router 10.0.2.2' "$log" \
+         && grep -q '^net: address 10.7.7.7 netmask 255.255.255.0' "$log"; then st=ok; else st=FAILED; fi ;;
     maxcpus)
       # the device tree says 4 CPUs, "maxcpus=2" on the command line (qemu -append) limits it: CPU 1 comes up, CPU 2 and 3 do not
       rm -f "$log"

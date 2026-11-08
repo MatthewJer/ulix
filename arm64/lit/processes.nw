@@ -141,6 +141,8 @@ void syscall_total_frames (context_t *r);
 void syscall_icmp_open (context_t *r), syscall_icmp_send (context_t *r), syscall_icmp_recv (context_t *r), syscall_icmp_close (context_t *r);
 void syscall_clock_us (context_t *r);
 void syscall_poweroff (context_t *r), syscall_reboot (context_t *r);
+void syscall_sysinfo (context_t *r), syscall_waitkey (context_t *r);
+extern unsigned proc_ticks[];                   // stats.c: timer ticks that a process has used
 void syscall_net_info (context_t *r), syscall_net_set (context_t *r), syscall_net_dhcp (context_t *r);
 void arch_clock_init (void);
 void syscall_read_screen (context_t *r);          // the book defines these without prototypes
@@ -360,6 +362,7 @@ static int create_thread (thread_id tid, void (*entry)(void *), void *arg, const
   u64 top = (u64)KVA (kstack_pa[tid]) + KSTACK_PAGES_ARCH * PAGE;
   struct kctx *c = &kctx[tid];
   c->depth = 1;                                // runs with the kernel lock, like the thread that starts it
+  proc_ticks[tid] = 0;                         // a new thread has used no time yet
   for (int i = 0; i < 10; i++) c->x19_x28[i] = 0;
   c->x19_x28[0] = (u64)entry;                  // x19
   c->x19_x28[1] = (u64)arg;                    // x20
@@ -509,6 +512,8 @@ Returns the initial user stack pointer, 0 on error.
 #define ARCH_NR_NET_DHCP     609
 #define ARCH_NR_POWEROFF     610             // AArch64 only: switch the machine off, or start it again (userland/shutdown.c)
 #define ARCH_NR_REBOOT       611
+#define ARCH_NR_SYSINFO      612             // AArch64 only: load of the CPUs, memory, time used by the processes (userland/top.c)
+#define ARCH_NR_WAITKEY      613             // AArch64 only: wait for a key, but not longer than a time limit
 
 static int map_sigpage (u64 l0) {
   u64 pa = alloc_frame_try ();
@@ -595,6 +600,7 @@ static int kstack_for_process (thread_id tid, const context_t *frame, int owns_a
   *f = *frame;
   struct kctx *c = &kctx[tid];
   c->depth = 1;
+  proc_ticks[tid] = 0;                         // a new process has used no time yet
   for (int i = 0; i < 10; i++) c->x19_x28[i] = 0;
   c->x29 = 0;
   c->x30 = (u64)process_first_return;
@@ -1046,6 +1052,8 @@ static void arch_syscalls_init (void) {
   install_syscall_handler (ARCH_NR_NET_DHCP,   syscall_net_dhcp);
   install_syscall_handler (ARCH_NR_POWEROFF,   syscall_poweroff);
   install_syscall_handler (ARCH_NR_REBOOT,     syscall_reboot);
+  install_syscall_handler (ARCH_NR_SYSINFO,    syscall_sysinfo);
+  install_syscall_handler (ARCH_NR_WAITKEY,    syscall_waitkey);
 }
 
 @
@@ -1775,4 +1783,64 @@ u32 minix_lookup (const char *path) {
 int minix_is_file (u32 ino_nr) {
   struct inode ino;
   return get_inode (ino_nr, &ino) == 0 && (ino.mode & 0170000) == 0100000;
+}
+
+@
+\section{Who uses the CPUs? Statistics for the program \texttt{top}}
+\label{src:stats.c}
+
+The program [[top]] shows how busy every CPU is and how much of the time each process uses. The kernel only has to count:
+at every timer interrupt (every 10 ms, on every CPU) it looks at what the CPU was doing when the interrupt came. If it was
+running the idle thread (the CPU waits for an interrupt; in the book that is thread 1 and the process [[[idle]]], which
+is what [[init]] turns into), the CPU was idle for 10 ms; otherwise it was busy, and the
+process that was running is charged for the 10 ms. The numbers are only counters that grow; [[top]] subtracts two readings to
+get the load of the last seconds, as the programs of the BSDs do.
+
+A thread that is created starts with a counter of 0 ([[arch_thread.c]] resets it), because the numbers of the threads are
+used again.
+
+<<stats.c>>=
+#define hash stats_hash                         // (the book defines hash () in its header: keep this copy private)
+#include "ulix-api.h"
+
+extern int smp_cpu (void);
+extern int smp_online_cpus (void);
+extern unsigned long arch_ram_frames (void);
+extern long frames_in_use;                      // mmu.c
+
+unsigned stats_busy[8], stats_idle[8];          // ticks per CPU: busy / idle
+unsigned proc_ticks[MAX_THREADS];               // ticks per thread: the time that it has used
+
+void stats_tick (void) {                        // the timer interrupt of a CPU; the kernel lock is ours, current_task is what ran
+  int cpu = smp_cpu ();
+  if (current_task <= 1 || strncmp (thread_table[current_task].cmdline, "[idle]", 6) == 0) {      // the idle thread
+    stats_idle[cpu]++;
+  } else {
+    stats_busy[cpu]++;
+    proc_ticks[current_task]++;
+  }
+}
+
+@
+The system call gives everything to the program in one structure (the same declaration is in [[userland/arm64-extra.h]]).
+The user program passes the address of the structure; the kernel writes into it like [[syscall_getpsinfo]] does.
+
+<<stats.c>>=
+struct sysinfo {
+  unsigned ticks;                               // timer ticks since the system started (100 per second)
+  int      cpus;                                // CPUs that run Ulix (the others, if the board has more, are parked by the firmware)
+  unsigned busy[8], idle[8];                    // ticks of every CPU in which it ran a process / waited
+  int      total_frames, free_frames;           // RAM in frames of 4 KByte
+  unsigned proc_ticks[MAX_THREADS];             // ticks that every thread has used
+};
+
+void syscall_sysinfo (context_t *r) {
+  struct sysinfo *s = (struct sysinfo *)r->ebx;
+  s->ticks = (unsigned)system_ticks;
+  s->cpus = smp_online_cpus ();
+  for (int c = 0; c < 8; c++) { s->busy[c] = stats_busy[c];  s->idle[c] = stats_idle[c]; }
+  s->total_frames = (int)arch_ram_frames ();
+  s->free_frames = (int)arch_ram_frames () - frames_in_use;     // (as syscall_get_free_frames)
+  for (int t = 0; t < MAX_THREADS; t++) s->proc_ticks[t] = proc_ticks[t];
+  r->eax = 0;
 }

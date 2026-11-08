@@ -639,7 +639,7 @@ static void disk_test (void) {
   CHECK (n == 31, "root directory has 31 entries (16 from x86 Ulix + 15 AArch64 files)");
   n = 0;
   minix_readdir (minix_lookup ("/bin"), count_cb, &n);
-  CHECK (n == 70, "/bin has 70 entries (the programs of lib-build/tools, init, ping, ifconfig, route, dhclient, shutdown, poweroff and reboot)");
+  CHECK (n == 71, "/bin has 71 entries (the programs of lib-build/tools, init, ping, ifconfig, route, dhclient, top, shutdown, poweroff and reboot)");
   CHECK (minix_lookup ("/nonexistent") == 0, "unknown path not found");
 
   // reference values computed on the host from the same image with an independent parser
@@ -680,6 +680,7 @@ static void console_main (void) {
   extern void netd_start (void);
   if (net_ok) netd_start ();                                      // the network thread: frames are handled as they arrive
   printf ("console ready (Ctrl-C: end the running program, Ctrl-]: kernel shell)\n");
+  { extern int net_quiet;  net_quiet = 1; }                       // from now on the network thread keeps quiet: its messages would appear in the middle of what the user types
 #ifndef CONSOLE_PROGRAM
 #define CONSOLE_PROGRAM "/contest64"
 #endif

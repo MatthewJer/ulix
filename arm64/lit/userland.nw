@@ -1027,6 +1027,19 @@ static inline int net_dhcp (struct net_dhcp_args *d)  { return syscall2 (__NR_ne
 #define __NR_reboot   611
 static inline int poweroff (void) { return syscall1 (__NR_poweroff); }
 static inline int reboot (void)   { return syscall1 (__NR_reboot); }
+
+// how busy are the CPUs and the processes, and a wait for a key with a time limit (the program top; stats.c, arch_console.c)
+#define __NR_sysinfo 612
+#define __NR_waitkey 613
+struct sysinfo {
+  unsigned ticks;                                   // timer ticks since the system started (100 per second)
+  int      cpus;                                    // CPUs that run Ulix
+  unsigned busy[8], idle[8];                        // ticks of every CPU in which it ran a process / waited
+  int      total_frames, free_frames;               // RAM in frames of 4 KByte
+  unsigned proc_ticks[1024];                        // ticks that every thread has used (indexed by thread number)
+};
+static inline int sysinfo (struct sysinfo *s)  { return syscall2 (__NR_sysinfo, (int)(long)s); }
+static inline int waitkey (int milliseconds)   { return syscall2 (__NR_waitkey, milliseconds); }       // 1 = a key is waiting, 0 = time over
 #endif
 
 @
@@ -1259,6 +1272,7 @@ static void show (struct net_info *i) {
   if (i->address)
     printf ("\tinet %d.%d.%d.%d netmask 0x%x broadcast %d.%d.%d.%d\n", i->address >> 24, (i->address >> 16) & 255, (i->address >> 8) & 255, i->address & 255,
             i->netmask, broadcast >> 24, (broadcast >> 16) & 255, (broadcast >> 8) & 255, broadcast & 255);
+  printf ("\tstatus: %s\n", (i->flags & 2) ? "active" : "no carrier");        // as on the BSDs: is there a cable?
 }
 
 static void usage (void) {
@@ -1567,4 +1581,171 @@ int main (int argc, char* argv[]) {
       close (fd);
       return;
     }
+}
+
+@
+\section{\texttt{userland/top.c}}
+\label{src:userland:top.c}
+
+\texttt{top} shows what the computer is doing right now: how busy each CPU is, how much of the RAM is used, and which
+processes use the most CPU time. It is a new program for the AArch64 port. The idea is that of \texttt{top} of the BSDs and of
+\texttt{htop}; the program is written from scratch for Ulix (it needs no terminal library: the screen functions of the book,
+[[clrscr]] and [[set_xy]], are enough) and does without floating point numbers.
+
+The kernel only counts (see \texttt{stats.c}); this program reads the counters twice, two seconds apart, and the
+difference tells how much was used in these two seconds. [[sysinfo]] gives the counters of the CPUs, the memory and the
+time of every process; the names, states and parents of the processes come from [[getpsinfo]], as in \texttt{ps}.
+The loop waits with [[waitkey]]: two seconds, or until a key is pressed. The key [[q]] (or Ctrl-C) ends the program.
+
+@
+The complete file is put together from these parts:
+
+<<userland/top.c>>=
+<<userland/top.c: includes>>
+
+<<userland/top.c: screen helpers>>
+
+<<userland/top.c: collect the processes>>
+
+<<userland/top.c: draw the screen>>
+
+<<userland/top.c: main>>
+@
+
+<<userland/top.c: includes>>=
+#include "../ulixlib.h"
+#include "../arm64-extra.h"
+
+#define ROWS    24                      // the screen of Ulix has 24 lines of 80 characters (we use only 79: the 80th would wrap)
+#define COLS    79
+#define MAXPROC 1024
+
+static struct sysinfo now, before;      // the counters now and two seconds ago
+
+@
+A line of the screen is written at a fixed place and filled with blanks up to the end. The screen is therefore never
+cleared while the program runs, and nothing flickers. A bar like \texttt{[|||||     ]} shows a percentage.
+
+<<userland/top.c: screen helpers>>=
+static void show (int row, char *text) {
+  int n = 0;
+  set_xy (0, row);
+  while (text[n] != 0 && n < COLS) { printf ("%c", text[n]); n++; }
+  while (n < COLS) { printf (" "); n++; }
+}
+
+static void bar (char *out, int percent, int width) {       // out: "[|||||     ]"
+  int filled = percent * width / 100, i;
+  out[0] = '[';
+  for (i = 0; i < width; i++) out[1 + i] = (i < filled) ? '|' : ' ';
+  out[1 + width] = ']';
+  out[2 + width] = 0;
+}
+
+static int percent (unsigned part, unsigned whole) {         // part of whole, in percent (no division by 0)
+  if (whole == 0) return 0;
+  return (int)((unsigned long)part * 100 / whole);
+}
+
+static int used_since (unsigned long before_count, unsigned long now_count) {    // a counter of a new process may restart at 0
+  return (now_count >= before_count) ? (int)(now_count - before_count) : (int)now_count;
+}
+
+@
+Which processes are there? We ask for every thread number; [[getpsinfo]] answers for those that exist. The idle thread (number 1)
+and the process [[[idle]]] (what [[init]] turns into) only wait, so they are not shown. The time of every process since the last reading goes into [[delta]];
+the list is sorted by it (an insertion sort: short and easy to read), so that the greediest process comes first.
+
+<<userland/top.c: collect the processes>>=
+static TCB    info[MAXPROC];
+static int    order[MAXPROC];           // thread numbers of the processes, the busiest first
+static int    delta[MAXPROC];           // ticks that the process used in the last two seconds
+static int    nproc, nready;
+
+static void collect (void) {
+  int pid, i, j;
+  nproc = 0;  nready = 0;
+  for (pid = 2; pid < MAXPROC; pid++) {
+    if (getpsinfo (pid, &info[pid]) == 0) continue;
+    if (info[pid].pid != info[pid].tid) continue;              // threads of a process are not listed separately
+    if (strncmp (info[pid].cmdline, "[idle]", 6) == 0) continue;     // the idle process does nothing: it is the free time
+    delta[pid] = used_since (before.proc_ticks[pid], now.proc_ticks[pid]);
+    if (info[pid].state == TSTATE_READY) nready++;
+    for (i = 0; i < nproc; i++)                                // find the place in the sorted list
+      if (delta[pid] > delta[order[i]]) break;
+    for (j = nproc; j > i; j--) order[j] = order[j - 1];      // make room
+    order[i] = pid;
+    nproc++;
+  }
+}
+
+@
+The first lines show the time since the start, the number of processes, the load of every CPU and the memory. The processes
+follow, one per line, as many as fit on the screen. The percentage of a process is the part of the two seconds in which it
+ran on a CPU (with several CPUs the sum can be more than 100).
+
+<<userland/top.c: draw the screen>>=
+static char state_letter (int state) {
+  if (state == TSTATE_READY)   return 'R';                     // running, or ready to run
+  if (state == TSTATE_ZOMBIE)  return 'Z';                     // ended, the parent has not asked for the result yet
+  if (state == TSTATE_STOPPED) return 'T';                     // stopped by a signal
+  return 'S';                                                  // sleeping: waits for a key, a disk, a child, a lock
+}
+
+static void draw (void) {
+  char line[100], graph[48];                         // (a bar of 40 characters needs 2 more and the end mark)
+  int elapsed = used_since (before.ticks, now.ticks);
+  int cpu, i, row, seconds = now.ticks / 100;
+
+  sprintf (line, "top - up %d:%d%d:%d%d   %d processes, %d ready to run",
+           seconds / 3600, (seconds / 600) % 6, (seconds / 60) % 10, (seconds / 10) % 6, seconds % 10, nproc, nready);
+  show (0, line);
+
+  for (cpu = 0; cpu < now.cpus && cpu < 8; cpu++) {            // one bar for every CPU: busy / (busy + idle) of the last two seconds
+    unsigned busy = used_since (before.busy[cpu], now.busy[cpu]);
+    unsigned idle = used_since (before.idle[cpu], now.idle[cpu]);
+    int p = percent (busy, busy + idle);
+    bar (graph, p, 40);
+    sprintf (line, "CPU%d %s %d%%", cpu, graph, p);
+    show (1 + cpu, line);
+  }
+  row = 1 + now.cpus;
+
+  int used = now.total_frames - now.free_frames;               // memory: frames of 4 KByte
+  bar (graph, percent (used, now.total_frames), 40);
+  sprintf (line, "Mem  %s %d%%  %d of %d MByte", graph, percent (used, now.total_frames), used / 256, now.total_frames / 256);
+  show (row++, line);
+
+  show (row++, "");
+  show (row++, "  PID  PPID  UID S   CPU%     TIME  COMMAND");
+  for (i = 0; i < nproc && row < ROWS - 1; i++) {
+    int pid = order[i], t = now.proc_ticks[pid];
+    sprintf (line, "%5d %5d %4d %c %5d %5d:%d%d.%d%d  %s", pid, info[pid].ppid, info[pid].uid, state_letter (info[pid].state),
+             percent (delta[pid], elapsed), t / 6000, (t / 1000) % 6, (t / 100) % 10, (t / 10) % 10, t % 10, info[pid].cmdline);
+    show (row++, line);
+  }
+  while (row < ROWS - 1) show (row++, "");
+  show (ROWS - 1, "q or Ctrl-C: quit");
+}
+
+@
+The main loop: read the counters, collect and draw, then wait. After a key press only [[q]] has a meaning; the other keys just
+make the screen come back at once. When we end, the screen is cleared.
+
+<<userland/top.c: main>>=
+int main () {
+  clrscr ();
+  sysinfo (&before);
+  now = before;
+  for (;;) {
+    sysinfo (&now);
+    collect ();
+    draw ();
+    before = now;
+    if (waitkey (2000)) {                                      // a key was pressed (a time over returns 0: draw again)
+      if (ureadchar () == 'q') break;
+    }
+  }
+  clrscr ();
+  return 0;
 }
