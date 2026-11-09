@@ -105,7 +105,7 @@ $(GENFILES): ../ulix-book.nw ulix-arm64.nw
 	  notangle -L -R$$r ../ulix-book.nw ulix-arm64.nw 2>/dev/null | sed 's/^#line .*//' > $(GENDIR)/$$r; \
 	done
 
-$(GENDIR)/ulix-port.c $(GENDIR)/ulix-api.h: $(GENFILES) port.manifest tools/port.py
+$(GENDIR)/ulix-port.c $(GENDIR)/ulix-api.h: $(GENFILES) port.manifest tools/port.py Makefile
 	python3 tools/port.py $(GENDIR) port.manifest $(GENDIR)/ulix-port.c
 	# several CPUs (smp.c): the book's scheduler () and u_kill () are wrapped; the wrappers have the book's names
 	sed -i.bak -e 's/^void scheduler (context_t \*r, int source) {/void book_scheduler (context_t *r, int source) {/' \
