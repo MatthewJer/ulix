@@ -1022,6 +1022,63 @@ static inline int net_info (struct net_info *i)       { return syscall2 (__NR_ne
 static inline int net_set (struct net_set *s)         { return syscall2 (__NR_net_set, (int)(long)s); }           // -2 = only root may do this
 static inline int net_dhcp (struct net_dhcp_args *d)  { return syscall2 (__NR_net_dhcp, (int)(long)d); }
 
+// IPv6 (ip6.c): the addresses of the interface, and ping (ifconfig, ping6). An address is 16 bytes, most significant first.
+#define __NR_net6_info 620
+#define __NR_ping6     621
+struct net6_info { unsigned char link_local[16], global[16], router[16]; unsigned flags; };       // flags: 1 = there is a global address, 2 = a router
+struct ping6_args { unsigned char address[16]; int size, timeout_ms; };
+static inline int net6_info (struct net6_info *i)  { return syscall2 (__NR_net6_info, (int)(long)i); }
+static inline int ping6 (struct ping6_args *p)     { return syscall2 (__NR_ping6, (int)(long)p); }       // the time in microseconds, or -1
+
+static int ip6_hex (char c) { return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1; }
+
+// "fe80::1" -> 16 bytes; 0 = ok. A part after a '%' (the interface, as in fe80::1%vioif0) is ignored: there is only one.
+static int ip6_parse (const char *s, unsigned char *out) {
+  unsigned short group[8];
+  int n = 0, gap = -1;                                    // 'gap': after how many groups the "::" stands
+  if (s[0] == ':' && s[1] == ':') { gap = 0;  s += 2; }
+  while (*s && *s != '%') {
+    unsigned v = 0;
+    int digits = 0;
+    while (ip6_hex (*s) >= 0) { v = v * 16 + ip6_hex (*s);  s++;  if (++digits > 4) return -1; }
+    if (digits == 0 || n == 8) return -1;
+    group[n++] = v;
+    if (*s == ':') {
+      s++;
+      if (*s == ':') { if (gap >= 0) return -1;  gap = n;  s++; }
+      else if (*s == 0 || *s == '%') return -1;           // a single colon at the end
+    }
+  }
+  if (gap < 0 ? n != 8 : n > 7) return -1;                // without "::" all eight groups, with it at least one is left out
+  for (int i = 0; i < 16; i++) out[i] = 0;
+  for (int i = 0; i < n; i++) {
+    int at = gap >= 0 && i >= gap ? i + 8 - n : i;        // the groups after the "::" go to the end
+    out[2 * at] = group[i] >> 8;  out[2 * at + 1] = group[i] & 255;
+  }
+  return 0;
+}
+
+// 16 bytes -> "fe80::5054:ff:fe12:3456" (the longest run of zero groups, at least two, becomes "::"); 'out' has room for 40 characters
+static void ip6_text (char *out, const unsigned char *a) {
+  int best = -1, best_len = 0;
+  for (int i = 0; i < 8; ) {
+    int j = i;
+    while (j < 8 && a[2 * j] == 0 && a[2 * j + 1] == 0) j++;
+    if (j - i >= 2 && j - i > best_len) { best = i;  best_len = j - i; }
+    i = j > i ? j : i + 1;
+  }
+  int n = 0;
+  for (int i = 0; i < 8; ) {
+    if (i == best) { out[n++] = ':';  out[n++] = ':';  i += best_len;  continue; }
+    if (i > 0 && !(best >= 0 && i == best + best_len)) out[n++] = ':';
+    unsigned g = (a[2 * i] << 8) | a[2 * i + 1];
+    int digits = g > 0xfff ? 4 : g > 0xff ? 3 : g > 0xf ? 2 : 1;
+    for (int k = digits - 1; k >= 0; k--) out[n++] = "0123456789abcdef"[(g >> (4 * k)) & 15];
+    i++;
+  }
+  out[n] = 0;
+}
+
 // switching the machine off, or starting it again (shutdown, poweroff, reboot)
 #define __NR_poweroff 610
 #define __NR_reboot   611
@@ -1211,6 +1268,87 @@ int main (int argc, char *argv[]) {
 }
 
 @
+\section{\texttt{userland/ping6.c}}
+\label{src:userland:ping6.c}
+
+ping6 -- ping over IPv6 (the BSDs have a program of this name)
+
+\begin{quote}\begin{verbatim}
+    ping6 [-c count] [-s size] address       for example  ping6 fe80::2   or   ping6 fec0::2
+\end{verbatim}\end{quote}
+
+The program is shorter than [[ping]]: the kernel builds the ICMPv6 message, chooses the source address and does the checksum, which
+covers the addresses (see [[ip6.c]]), and waits for the answer. The program asks for one echo request per second ([[ping6]]
+returns the round trip time in microseconds, or $-1$) and prints what it gets, in the format of [[ping]]. The address is written
+as usual ([[ip6_parse]] and [[ip6_text]] in [[arm64-extra.h]]); a scope after a percent sign, as in [[fe80::1%vioif0]], is accepted and ignored.
+
+@
+
+The complete file is put together from these parts:
+
+<<userland/ping6.c>>=
+<<userland/ping6.c: includes>>
+
+<<userland/ping6.c: main>>
+@
+
+<<userland/ping6.c: includes>>=
+#include "../ulixlib.h"
+#include "../arm64-extra.h"
+
+static int number (char *s) {
+  int n = 0;
+  while (*s >= '0' && *s <= '9') n = n * 10 + (*s++ - '0');
+  return n;
+}
+
+static void usage (void) { printf ("usage: ping6 [-c count] [-s size] address   (an IPv6 address, for example fe80::2 or fec0::2)\n"); }
+
+static void show_time (unsigned us) { printf ("%d.%d", us / 1000, (us / 100) % 10); }
+
+@
+<<userland/ping6.c: main>>=
+int main (int argc, char *argv[]) {
+  int count = 4, size = 32;
+  struct ping6_args p;
+  char text[48];
+  int have_address = 0;
+  for (int i = 1; i < argc; i++) {
+    if (argv[i][0] == '-' && argv[i][1] == 'c' && i + 1 < argc) count = number (argv[++i]);
+    else if (argv[i][0] == '-' && argv[i][1] == 's' && i + 1 < argc) size = number (argv[++i]);
+    else if (!have_address && ip6_parse (argv[i], p.address) == 0) have_address = 1;
+    else { usage (); return 1; }
+  }
+  if (!have_address || count < 1 || size < 0 || size > 1000) { usage (); return 1; }
+  ip6_text (text, p.address);
+
+  int sent = 0, received = 0;
+  unsigned rtt_min = 0xffffffff, rtt_max = 0, rtt_sum = 0;
+  printf ("PING6 %s: %d data bytes\n", text, size);
+  for (int seq = 1; seq <= count; seq++) {
+    unsigned start = clock_us ();
+    p.size = size;  p.timeout_ms = 1000;
+    int rtt = ping6 (&p);
+    sent++;
+    if (rtt >= 0) {
+      printf ("%d bytes from %s: icmp_seq=%d time=", 8 + size, text, seq);
+      show_time (rtt);  printf (" ms\n");
+      received++;
+      if ((unsigned)rtt < rtt_min) rtt_min = rtt;
+      if ((unsigned)rtt > rtt_max) rtt_max = rtt;
+      rtt_sum += rtt;
+    } else printf ("Request timeout for icmp_seq %d\n", seq);        // (also when there is no router for this address)
+    if (seq < count) while ((clock_us () - start) / 1000 < 1000) syscall1 (__NR_resign);       // one request per second
+  }
+  printf ("--- %s ping6 statistics ---\n", text);
+  printf ("%d packets transmitted, %d received, %d%% packet loss\n", sent, received, (sent - received) * 100 / sent);
+  if (received) {
+    printf ("round-trip min/avg/max = ");  show_time (rtt_min);  printf ("/");  show_time (rtt_sum / received);  printf ("/");  show_time (rtt_max);  printf (" ms\n");
+  }
+  return received ? 0 : 1;
+}
+
+@
 \section{\texttt{userland/ifconfig.c}}
 \label{src:userland:ifconfig.c}
 
@@ -1238,6 +1376,9 @@ ifconfig -- show or set the address of the network interface (modelled on ifconf
     ifconfig interface [inet] A.B.C.D [netmask MASK]         set the address; MASK as 255.255.255.0 or 0xffffff00
     ifconfig interface [inet] A.B.C.D/N                      set the address; N = number of bits of the netmask
 \end{verbatim}\end{quote}
+
+The display also shows the IPv6 addresses ([[inet6]]): the link-local address, which every interface has, and the global
+address that was made from a router advertisement (``autoconf''), and the router. They cannot be set by hand.
 
 Only root may change the address (use su).
 
@@ -1285,6 +1426,14 @@ static void show (struct net_info *i) {
   if (i->address)
     printf ("\tinet %d.%d.%d.%d netmask 0x%x broadcast %d.%d.%d.%d\n", i->address >> 24, (i->address >> 16) & 255, (i->address >> 8) & 255, i->address & 255,
             i->netmask, broadcast >> 24, (broadcast >> 16) & 255, (broadcast >> 8) & 255, broadcast & 255);
+  struct net6_info i6;                                                   // the IPv6 addresses (ip6.c); written like the BSDs do
+  char text[48];
+  if (net6_info (&i6) == 0) {
+    ip6_text (text, i6.link_local);
+    printf ("\tinet6 %s%%%s prefixlen 64 scopeid 0x1\n", text, i->name);
+    if (i6.flags & 1) { ip6_text (text, i6.global);  printf ("\tinet6 %s prefixlen 64 autoconf\n", text); }
+    if (i6.flags & 2) { ip6_text (text, i6.router);  printf ("\trouter6 %s%%%s\n", text, i->name); }
+  }
   printf ("\tstatus: %s\n", (i->flags & 2) ? "active" : "no carrier");        // as on the BSDs: is there a cable?
 }
 

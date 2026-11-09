@@ -14,6 +14,8 @@ log = os.path.join(tmp, "console.log")
 
 host_udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)       # where the kernel's datagram arrives
 host_udp.bind(("127.0.0.1", 5557)); host_udp.settimeout(10)
+host_udp6 = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)    # the same over IPv6: qemu's router fec0::2 passes it to [::1]
+host_udp6.bind(("::1", 5559)); host_udp6.settimeout(10)
 server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)       # where the kernel connects to (port 5558)
 server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 server.bind(("127.0.0.1", 5558)); server.listen(1)
@@ -76,6 +78,13 @@ try:
     except socket.timeout:
         data = b""
     check(data == b"hello from Ulix", "the datagram of the kernel arrived on the host")
+
+    try:
+        data6, peer6 = host_udp6.recvfrom(100)
+        host_udp6.sendto(b"pong6", peer6)                           # the answer goes back through qemu's router to the kernel
+    except socket.timeout:
+        data6 = b""
+    check(data6 == b"hello6 from Ulix", "the IPv6 datagram of the kernel arrived on the host (neighbor discovery, SLAAC address as the source)")
 
     client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); client.settimeout(5)
     for i in range(3):

@@ -145,6 +145,7 @@ void syscall_sysinfo (context_t *r), syscall_waitkey (context_t *r);
 extern unsigned proc_ticks[];                   // stats.c: timer ticks that a process has used
 void syscall_net_info (context_t *r), syscall_net_set (context_t *r), syscall_net_dhcp (context_t *r);
 void syscall_dns_resolve (context_t *r);
+void syscall_net6_info (context_t *r), syscall_ping6 (context_t *r);
 void arch_clock_init (void);
 void syscall_read_screen (context_t *r);          // the book defines these without prototypes
 void syscall_write_screen (context_t *r);
@@ -516,6 +517,8 @@ Returns the initial user stack pointer, 0 on error.
 #define ARCH_NR_SYSINFO      612             // AArch64 only: load of the CPUs, memory, time used by the processes (userland/top.c)
 #define ARCH_NR_WAITKEY      613             // AArch64 only: wait for a key, but not longer than a time limit
 #define ARCH_NR_DNS_RESOLVE  614             // AArch64 only: the IPv4 address of a host name (dns.c, userland/host.c)
+#define ARCH_NR_NET6_INFO    620             // AArch64 only: IPv6 (net_syscalls.c, userland/arm64-extra.h)
+#define ARCH_NR_PING6        621
 
 static int map_sigpage (u64 l0) {
   u64 pa = alloc_frame_try ();
@@ -1057,6 +1060,8 @@ static void arch_syscalls_init (void) {
   install_syscall_handler (ARCH_NR_SYSINFO,    syscall_sysinfo);
   install_syscall_handler (ARCH_NR_WAITKEY,    syscall_waitkey);
   install_syscall_handler (ARCH_NR_DNS_RESOLVE, syscall_dns_resolve);
+  install_syscall_handler (ARCH_NR_NET6_INFO,  syscall_net6_info);
+  install_syscall_handler (ARCH_NR_PING6,      syscall_ping6);
 }
 
 @

@@ -29,7 +29,7 @@ JOBLIST=(
   "rpi4|Raspberry Pi 4B in qemu raspi4b: kernel tests, SD card, device tree with ranges|rpi4|raspi4b||128"
   "rpi4shell|Raspberry Pi 4B in qemu raspi4b: shell session|rpi4shell|raspi4b||128"
   "rpi4console|Raspberry Pi 4B in qemu raspi4b: console test|rpi4console|raspi4b||128"
-  "net|network: virtio-net, ARP, ICMP, UDP and TCP against real sockets of the host|net|virt||128"
+  "net|network: virtio-net, ARP, ICMP, UDP and TCP (IPv4), SLAAC, ICMPv6 and UDP (IPv6) against real sockets of the host|net|virt||128"
   "poweroff|shutdown and poweroff end qemu by themselves, reboot starts the machine again|poweroff|virt||128"
   "netd|network thread: echo service answers while the kernel runs its program (interrupt of the card)|netd|virt||128"
   "dhcpretry|cable plugged in after the boot: the network thread asks DHCP by itself|dhcpretry|virt||128"
@@ -126,9 +126,10 @@ if [ "$1" = "--job" ]; then
       kill $P1 $P2 $P3 2>/dev/null; wait $P1 $P2 $P3 2>/dev/null
       python3 tools/minix_check.py "$log.disk" --cat /var/log/net.log 2>/dev/null | sed 's/^\[[0-9]*s\] //' >> "$log"
       cat "$log.2" "$log.3" >> "$log"; rm -f "$log.2" "$log.3" "$log.disk" "$log.rc"
-      sum="$(grep -E '^net: (address|DHCP)' "$log" | tr '\n' ';')"
+      sum="$(grep -E '^net: (address|DHCP|IPv6 address)' "$log" | tr '\n' ';')"
       if grep -q '^net: address 10.9.8.7 netmask 255.255.0.0 router 10.9.0.1 name server 10.9.0.2 (from the command line)' "$log" \
          && grep -q '^net: DHCP: address 10.0.2.15, router 10.0.2.2' "$log" \
+         && grep -q '^net: IPv6 address fec0::5054:ff:fe12:3456 (from a router advertisement)' "$log" \
          && grep -q '^net: address 10.7.7.7 netmask 255.255.255.0' "$log"; then st=ok; else st=FAILED; fi ;;
     maxcpus)
       # the device tree says 4 CPUs, "maxcpus=2" on the command line (qemu -append) limits it: CPU 1 comes up, CPU 2 and 3 do not

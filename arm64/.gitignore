@@ -61,6 +61,7 @@ netdev.c
 virtionet.c
 genet.c
 net.c
+ip6.c
 tcp.c
 dhcp.c
 netconf.c
@@ -92,6 +93,7 @@ user/stacktest.c
 user/memtest.c
 userland/arm64-extra.h
 userland/ping.c
+userland/ping6.c
 userland/top.c
 userland/ifconfig.c
 userland/route.c

@@ -39,7 +39,7 @@ make kernel8.img     # image for the Raspberry Pi 4B (work in progress, branch r
 make run-rpi4-shell  # ... and the system with login and shell on qemu's raspi4b machine, with an SD card image (sd.img)
 ```
 
-In the shell: `ls`, `cat`, `cd`, `cp`, `rm`, `mkdir`, `rmdir`, `touch`, `wc`, `grep`, `stat`, `ps`, `df`, `free`, `top`, `ping`, `host`, `ifconfig`, `route`, `dhclient`, `shutdown`, `poweroff`, `reboot`, …
+In the shell: `ls`, `cat`, `cd`, `cp`, `rm`, `mkdir`, `rmdir`, `touch`, `wc`, `grep`, `stat`, `ps`, `df`, `free`, `top`, `ping`, `ping6`, `host`, `ifconfig`, `route`, `dhclient`, `shutdown`, `poweroff`, `reboot`, …
 (it is Ulix, so `echo` copies its input until you press Ctrl-C). `>` and `<` redirect. Keys:
 
 | Key | Effect |
@@ -125,6 +125,7 @@ net.c  tcp.c     Ethernet, ARP, IP, ICMP, UDP, TCP  net.h           what the net
   session: boot, auto login, the programs of `lib-build/tools`, Ctrl-C, terminal switching, `exit`, login with password.
 * **`poweroff_test.py`** (job `poweroff`): `shutdown` and `poweroff` end qemu by themselves, `reboot` starts the kernel again.
 * The shell test has a variant with a network card (`make pcheck`, job `shellnet`): the program `ping` in the Ulix shell.
+* IPv6 (`ip6.c`): link-local address, Neighbor Discovery, an address and the router from a router advertisement (SLAAC), ICMPv6 echo and UDP; `ifconfig` shows the `inet6` addresses and `ping6 fec0::2` works under qemu's user network (jobs `net` and `shellnet`). TCP over IPv6 is not done; see section 26 of `ARM64-PORT.md`.
 * The network is configured like on a BSD: the kernel command line (`ip=dhcp`, `ip=10.0.0.5/24 gw=… dns=…`), and as root (`su`) the
   programs `ifconfig`, `route` and `dhclient`; the tests are the `shellnet` and `netconf` jobs of `make pcheck`.
 * Host names: `host example.org` and `ping example.org` ask the name server of `ifconfig` (from DHCP or `dns=`) for an A record (`dns.c`); `make net-test` checks the resolver against a name server on the host and against qemu's forwarder.
@@ -194,6 +195,7 @@ Ulix is a teaching system; what the port and the Raspberry Pi work follow from t
   GByte of the boot tables). The SD card driver has no DMA and no 1.8 V mode.
 * The network is small on purpose: no UDP or TCP sockets for user programs (only raw ICMP, which is what `ping` needs), the DHCP lease is not
   renewed, no name resolution, one interface, no fragmentation, no congestion control in TCP. The telnet server serves one session, on one terminal, without encryption, and answers none of the client's option requests.
+* IPv6 has no TCP, no duplicate address detection, no lifetimes of prefixes and routers, no DHCPv6, and `ifconfig` and `route` cannot set IPv6 addresses or routes (section 26 of `ARM64-PORT.md`). Not yet tried on the board: the home router must send a router advertisement.
 * `/dev/fd0` has no drive behind it (a stand-in for the second floppy, `/dev/fd1`, is the only one).
 * Not checked: the x86 build with the compiler that the makefiles name (`gcc-4.4`); all checks used GCC 16 (`i686-elf-gcc`). `ulixlib.c` still
   passes pointers as `uint` to the system call functions; that works because user addresses are below 2 GByte, and changing it would touch the

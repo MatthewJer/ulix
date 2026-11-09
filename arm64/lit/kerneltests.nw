@@ -115,7 +115,7 @@ int bookfs_test (void) {
   CHECK (mx_stat (DEV, "/bin", &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR, "mx_stat: /bin is a directory");
   CHECK (mx_stat (DEV, "/nonexistent", &st) == -1, "mx_stat: missing file");
   CHECK (count_entries ("/") == 31, "mx_getdent: / has 31 used entries (16 from x86 Ulix + 15 AArch64 files)");
-  CHECK (count_entries ("/bin") == 72, "mx_getdent: /bin has 72 entries");
+  CHECK (count_entries ("/bin") == 73, "mx_getdent: /bin has 73 entries");
   CHECK (mx_file_exists (DEV, "/bin/vi") && mx_file_is_directory (DEV, "/bin") &&
          !mx_file_is_directory (DEV, "/bin/vi"), "mx_file_exists / mx_file_is_directory");
 
@@ -723,6 +723,11 @@ run the network until 'done' is true or 'ms' have passed
 <<net_test.c: WAIT>>=
 #define WAIT(cond, ms) do { u64 t0 = net_now_ms (); while (!(cond) && net_now_ms () - t0 < (u64)(ms)) { net_poll_once (); echo_step (); } } while (0)
 
+static char udp6_answer[32];  static int udp6_answer_len = 0;         // what the host sent back over IPv6
+static void udp6_on_answer (const u8 *src, u16 src_port, const u8 *data, int len) {
+  if (len < (int)sizeof udp6_answer) { for (int i = 0; i < len; i++) udp6_answer[i] = data[i];  udp6_answer[len] = 0;  udp6_answer_len = len; }
+}
+
 int net_test (void) {
   printf ("network test:\n");
   CHECK (net_init () == 0, "virtio network card found and initialised");
@@ -751,13 +756,33 @@ int net_test (void) {
   net_dns = IP (10, 0, 2, 3);  dns_port = 53;
   CHECK (dns_resolve ("localhost", &address, 0) == 0 && address == IP (127, 0, 0, 1), "DNS: localhost = 127.0.0.1 from the name server of qemu (10.0.2.3)");
 
+  // IPv6: the router solicitation is answered by qemu's router with an advertisement (prefix fec0::/64, no DHCP involved)
+  ip6_solicit ();
+  WAIT (ip6_have_global && ip6_have_router, 5000);
+  CHECK (ip6_have_router, "IPv6: router solicitation sent, the router advertisement gave us the router");
+  CHECK (ip6_have_global && ip6_prefix[0] == 0xfe && ip6_prefix[1] == 0xc0, "IPv6: SLAAC made a global address from the prefix fec0::/64");
+  char text[48], text2[48];
+  ip6_format (text, ip6_link_local);  ip6_format (text2, ip6_global);
+  printf ("  info: link-local %s, global %s\n", text, text2);
+  rtt = ip6_ping (ip6_router, 32, 3000, 0);
+  CHECK (rtt >= 0, "IPv6: ping of the router's link-local address (neighbor solicitation and advertisement, ICMPv6 echo)");
+  u8 router_global[16] = { 0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2 };         // qemu's router, fec0::2
+  rtt = ip6_ping (router_global, 32, 3000, 0);
+  CHECK (rtt >= 0, "IPv6: ping of the router's global address fec0::2 (on our network)");
+  printf ("  info: IPv6 round trip %d us\n", rtt);
+
+  // UDP over IPv6: a datagram to the host (qemu's router passes it on: fec0::2 is the host, port 5559); the host answers it
+  CHECK (udp6_bind (4001, udp6_on_answer) == 0, "IPv6: UDP port 4001 bound");
+  CHECK (udp6_send (router_global, 5559, 4001, (const u8 *)"hello6 from Ulix", 16) == 0, "IPv6: UDP datagram sent to the host (fec0::2, port 5559)");
+
   const char *hello = "hello from Ulix";
   CHECK (udp_send (IP (10, 0, 2, 2), 5557, 4000, (const u8 *)hello, 15) == 0, "UDP datagram sent to the host (10.0.2.2 is the host, port 5557)");
 
   CHECK (echo_start () == 0, "the echo service is open on port 7 (UDP and TCP)");
   printf ("net: ready for the host\n");                    // tools/net_test.py waits for this line
-  WAIT (echo_udp_datagrams == 3 && echo_tcp_connections == 2, 60000);
+  WAIT (echo_udp_datagrams == 3 && echo_tcp_connections == 2 && udp6_answer_len, 60000);
   CHECK (echo_udp_datagrams == 3, "three UDP datagrams from the host arrived and were echoed");
+  CHECK (udp6_answer_len == 5 && udp6_answer[0] == 'p' && udp6_answer[4] == '6', "IPv6: the host's answer \"pong6\" arrived over UDP");
   CHECK (echo_tcp_connections == 2, "two TCP connections from the host were served until the host closed them");
   printf ("  info: %ld bytes echoed over TCP\n", echo_tcp_bytes);
 

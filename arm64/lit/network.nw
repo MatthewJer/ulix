@@ -8,6 +8,9 @@ for qemu, GENET for the Raspberry Pi~4, which has not run on real hardware yet),
 thread that an interrupt wakes, and the system calls with which user programs reach all this. The goal is a telnet server;
 until then the echo service shows how a server attaches to the stack.
 
+IPv6 has a section of its own (\texttt{ip6.c}): the same layers with 128 bit addresses, Neighbor Discovery instead of ARP, and an address that the
+router helps to make instead of DHCP. It stops after UDP; the section says why and what is left.
+
 @
 \section{The network: what the layers offer each other and the rest of the kernel (see net.c, tcp.c, virtionet.c)}
 \label{src:net.h}
@@ -132,6 +135,20 @@ int  tcp_closed (tcp_conn *c);                                // 1 = the connect
 int  tcp_read (tcp_conn *c, u8 *buf, int max);                // bytes received (0: nothing now), -1: the other side has closed (and all was read)
 int  tcp_write (tcp_conn *c, const u8 *data, int len);        // bytes accepted into the send buffer (may be fewer than len), -1: cannot send
 void tcp_close (tcp_conn *c);                                 // we have nothing more to send
+
+// ---- IPv6 (ip6.c): link-local address, Neighbor Discovery, router advertisements (SLAAC), ICMPv6 echo, UDP ----
+extern u8 ip6_link_local[16], ip6_global[16], ip6_prefix[8], ip6_router[16];     // addresses are 16 bytes, most significant first
+extern int ip6_have_global, ip6_have_router;      // a router advertisement has given us a global address / a router
+void ip6_format (char *out, const u8 *address);   // the address as text (at most 39 characters and the 0 at the end), for the log
+void ip6_init (void);                             // make the link-local address from the Ethernet address (called by net_init)
+int  ip6_wants_mac (const u8 *mac);               // is this Ethernet multicast address one that we listen to? (frame_input)
+void ip6_input (const u8 *frame, int len);        // an Ethernet frame of type 0x86dd
+void ip6_solicit (void);                          // send a router solicitation: the answer (an advertisement) comes in through ip6_input
+int  ip6_send (const u8 *dst, u8 next_header, u8 *data, int len);      // an IPv6 packet; the checksum field of data is filled in: 0 = sent
+int  ip6_ping (const u8 *dst, int size, int timeout_ms, void (*idle) (void));        // round trip time in microseconds, or -1
+typedef void (*udp6_handler) (const u8 *src_ip, u16 src_port, const u8 *data, int len);
+int  udp6_bind (u16 port, udp6_handler handler);
+int  udp6_send (const u8 *dst_ip, u16 dst_port, u16 src_port, const u8 *data, int len);
 
 // ---- numbers in the headers are big endian ("network byte order") ----
 static inline u16 get16 (const u8 *p) { return (u16)((p[0] @<< 8) | p[1]); }
@@ -1253,10 +1270,11 @@ static void ip_input (const u8 *f, int len) {
 static void frame_input (const u8 *f, int len) {
   if (len < 14) return;
   const u8 *own = net_dev_mac ();
-  if (!same (f, own, 6) && !same (f, broadcast_mac, 6)) return;   // not for this card
+  if (!same (f, own, 6) && !same (f, broadcast_mac, 6) && !ip6_wants_mac (f)) return;   // not for this card
   switch (get16 (f + 12)) {
     case ETH_ARP: arp_input (f, len); break;
     case ETH_IP:  ip_input (f, len); break;
+    case 0x86dd:  ip6_input (f, len); break;                        // IPv6 (ip6.c)
   }
 }
 
@@ -1275,6 +1293,7 @@ void net_run (int ms) {
 
 int net_init (void) {
   if (net_dev_init () != 0) return -1;
+  ip6_init ();                                                   // (the link-local IPv6 address, from the Ethernet address)
   printf ("net: IP address %u.%u.%u.%u, router %u.%u.%u.%u\n", net_my_ip >> 24, (net_my_ip >> 16) & 255, (net_my_ip >> 8) & 255, net_my_ip & 255,
           net_gateway >> 24, (net_gateway >> 16) & 255, (net_gateway >> 8) & 255, net_gateway & 255);
   return 0;
@@ -2068,6 +2087,511 @@ void net_configure_from_command_line (void) {
 }
 
 @
+\section{IPv6: ICMPv6, Neighbor Discovery, autoconfiguration from router advertisements and UDP (see ip6.c)}
+\label{src:ip6.c}
+
+IPv6 is the successor of IPv4. The ideas of the layers stay the same (Ethernet below, ICMP, UDP and TCP above), but three things
+change, and each of them shows in this file:
+
+\begin{itemize}
+\item The addresses have 128 bits (16 bytes), written as eight groups of four hex digits, with the longest run of zero groups
+      replaced by [[::]]: [[fe80::5054:ff:fe12:3456]]. A number of 32 bits does not hold one, so addresses are byte arrays here.
+\item There is no ARP and no DHCP broadcast. \emph{Neighbor Discovery} (RFC 4861) does the work of ARP, with ICMPv6 messages sent
+      to a multicast address, and \emph{stateless address autoconfiguration} (SLAAC, RFC 4862) replaces DHCP: the router tells
+      the computers which prefix the network has, and every computer makes its own address from the prefix and from its Ethernet
+      address.
+\item The header is simpler: fixed 40 bytes, no checksum of its own (the checksum of ICMPv6, UDP and TCP covers the addresses),
+      no fragmentation by routers.
+\end{itemize}
+
+\begin{quote}\begin{verbatim}
+    | version 6, traffic class, flow label (4) | payload length (2) | next header (1) | hop limit (1) |
+    | source address (16) | destination address (16) | data ...
+\end{verbatim}\end{quote}
+
+``Next header'' is the protocol of the data (58 = ICMPv6, 17 = UDP, 6 = TCP). The \emph{link-local address} [[fe80::/64]]
+is made from the Ethernet address (RFC 4291, ``modified EUI-64''): the six bytes are cut in the middle, [[ff:fe]] is put between
+the halves, and one bit of the first byte is turned around (bit 1, ``universal/local''):
+
+\begin{quote}\begin{verbatim}
+    MAC  52:54:00:12:34:56   ->   interface identifier 5054:00ff:fe12:3456   ->   fe80::5054:ff:fe12:3456
+\end{verbatim}\end{quote}
+
+The computer has this address as soon as the card is there; it is only valid on the local network and needs no router. A
+\emph{global address} is the 64 bits of a prefix that the router announces (for example [[fd00:1234:5678:9abc::/64]]) followed by
+the same interface identifier.
+
+The multicast addresses that matter here: [[ff02::1]] (all nodes), [[ff02::2]] (all routers) and the \emph{solicited-node
+address} [[ff02::1:ffXX:XXXX]], where the last three bytes are those of the address that is asked for. A computer that asks
+``who has fe80::...?'' sends to the solicited-node address of that address, so that only the few computers that
+share these last 24 bits have to look at the message. On Ethernet a multicast address becomes the Ethernet address [[33:33]] followed by
+the last four bytes of the IPv6 address. The card must let such frames in (the virtio card of qemu and the GENET of the Pi in
+promiscuous mode do); [[ip6_wants_mac]] is the check that [[frame_input]] in [[net.c]] uses.
+
+What is simplified, and said here once: there is \emph{no duplicate address detection} (a computer should ask for its own new address
+before it uses it), the lifetimes of prefixes and routers are not watched (an address stays), there is one interface, no
+fragmentation and no extension headers (a packet that has one is ignored), and neighbour entries do not age. Everything that is
+there is exercised by the network test (\texttt{make net-test}) against the IPv6 stack of qemu's user-mode network.
+
+\emph{TCP over IPv6 is left out on purpose.} [[tcp.c]] keeps the address of the other side as a 32 bit number in the connection, in the
+lookup of connections, in [[emit]] and in the checksum. To take both kinds of address it would need a 16 byte address and a flag
+in about ten places of a file that is easy to read now, and every one of them would be a small ``if IPv6'' in front of the
+reader. That is where this chapter stops being simple, so the step ends after UDP. The seam is there: [[send6]] already puts a
+checksum where a TCP segment has it (one more case), and [[pseudo_sum6]] is the pseudo header that TCP needs.
+
+@
+
+
+The complete file is put together from these parts:
+
+<<ip6.c>>=
+<<ip6.c: includes>>
+
+<<ip6.c: addresses>>
+
+<<ip6.c: neighbors>>
+
+<<ip6.c: send>>
+
+<<ip6.c: neighbor discovery>>
+
+<<ip6.c: router advertisement>>
+
+<<ip6.c: echo>>
+
+<<ip6.c: udp>>
+
+<<ip6.c: icmp6_input>>
+
+<<ip6.c: ip6_input>>
+@
+
+<<ip6.c: includes>>=
+#include "net.h"
+
+#define ETH_IPV6   0x86dd
+#define IP6_ICMP   58                             // the numbers of the protocols ("next header")
+#define IP6_UDP    17
+
+#define ICMP6_ECHO_REQUEST  128
+#define ICMP6_ECHO_REPLY    129
+#define ICMP6_RS            133                   // router solicitation, router advertisement,
+#define ICMP6_RA            134
+#define ICMP6_NS            135                   // neighbor solicitation, neighbor advertisement
+#define ICMP6_NA            136
+#define ND_SOURCE_LINK_ADDRESS  1                 // the options of Neighbor Discovery: the Ethernet address of the sender, ...
+#define ND_TARGET_LINK_ADDRESS  2                 // ... the Ethernet address that was asked for,
+#define ND_PREFIX_INFORMATION   3                 // ... and a prefix of the network (only in router advertisements)
+
+static void copy (u8 *to, const u8 *from, int n) { for (int i = 0; i < n; i++) to[i] = from[i]; }
+static int  same (const u8 *a, const u8 *b, int n) { for (int i = 0; i < n; i++) if (a[i] != b[i]) return 0; return 1; }
+static void zero (u8 *p, int n) { for (int i = 0; i < n; i++) p[i] = 0; }
+
+@
+\subsection{the addresses of this computer}
+
+The link-local address is made once, when the network starts; the global address and the router appear when a router
+advertisement arrives ([[ip6_have_global]], [[ip6_have_router]]). The prefix is always 64 bits long (that is what SLAAC
+requires); all addresses with this prefix are on our network, all others go to the router.
+
+<<ip6.c: addresses>>=
+u8  ip6_link_local[16];                           // fe80::/64 and the interface identifier
+u8  ip6_global[16];  int ip6_have_global = 0;     // the prefix of the router and our interface identifier
+u8  ip6_prefix[8];                                // the 64 bits of that prefix (valid if ip6_have_global)
+u8  ip6_router[16];  int ip6_have_router = 0;     // the link-local address of the router, where packets for other networks go
+
+static const u8 all_nodes[16]   = { 0xff, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };      // ff02::1
+static const u8 all_routers[16] = { 0xff, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2 };      // ff02::2
+
+void ip6_init (void) {
+  const u8 *mac = net_dev_mac ();
+  zero (ip6_link_local, 16);
+  ip6_link_local[0] = 0xfe;  ip6_link_local[1] = 0x80;
+  ip6_link_local[8] = mac[0] ^ 2;  ip6_link_local[9] = mac[1];  ip6_link_local[10] = mac[2];     // the interface identifier
+  ip6_link_local[11] = 0xff;  ip6_link_local[12] = 0xfe;
+  ip6_link_local[13] = mac[3];  ip6_link_local[14] = mac[4];  ip6_link_local[15] = mac[5];
+  ip6_have_global = 0;  ip6_have_router = 0;
+}
+
+static int is_link_local (const u8 *a) { return a[0] == 0xfe && (a[1] & 0xc0) == 0x80; }
+static int is_multicast (const u8 *a)  { return a[0] == 0xff; }
+static int is_ours (const u8 *a)       { return same (a, ip6_link_local, 16) || (ip6_have_global && same (a, ip6_global, 16)); }
+static int on_link (const u8 *a)       { return is_link_local (a) || (ip6_have_global && same (a, ip6_prefix, 8)); }
+static int unspecified (const u8 *a)   { for (int i = 0; i < 16; i++) if (a[i]) return 0; return 1; }       // "::"
+
+static void solicited_node (u8 *out, const u8 *a) {      // ff02::1:ffXX:XXXX
+  zero (out, 16);
+  out[0] = 0xff;  out[1] = 2;  out[11] = 1;  out[12] = 0xff;
+  out[13] = a[13];  out[14] = a[14];  out[15] = a[15];
+}
+
+static void multicast_mac (u8 *mac, const u8 *a) { mac[0] = 0x33;  mac[1] = 0x33;  copy (mac + 2, a + 12, 4); }
+
+@
+An address as text, as people write it: groups of hex digits without leading zeros, the longest run of zero groups (at least two)
+as [[::]]. Used for the network log and the test; the programs have their own copy ([[userland/arm64-extra.h]]).
+
+<<ip6.c: addresses>>=
+void ip6_format (char *out, const u8 *a) {
+  int best = -1, best_len = 0;                                    // the longest run of zero groups
+  for (int i = 0; i < 8; ) {
+    int j = i;
+    while (j < 8 && get16 (a + 2 * j) == 0) j++;
+    if (j - i >= 2 && j - i > best_len) { best = i;  best_len = j - i; }
+    i = j > i ? j : i + 1;
+  }
+  int n = 0;
+  for (int i = 0; i < 8; ) {
+    if (i == best) { out[n++] = ':';  out[n++] = ':';  i += best_len;  continue; }
+    if (i > 0 && !(best >= 0 && i == best + best_len)) out[n++] = ':';
+    n += sprintf (out + n, "%x", get16 (a + 2 * i));
+    i++;
+  }
+  out[n] = 0;
+}
+
+@
+Which multicast frames does [[frame_input]] let in? Those to all nodes (ff02::1) and to our solicited-node address (it is the
+same for the link-local and the global address, because both end in our interface identifier).
+
+<<ip6.c: addresses>>=
+int ip6_wants_mac (const u8 *mac) {
+  if (mac[0] != 0x33 || mac[1] != 0x33) return 0;
+  const u8 *own = net_dev_mac ();
+  if (mac[2] == 0 && mac[3] == 0 && mac[4] == 0 && mac[5] == 1) return 1;
+  return mac[2] == 0xff && mac[3] == own[3] && mac[4] == own[4] && mac[5] == own[5];
+}
+
+static int wants_address (const u8 *a) {                          // is a packet to this address for us?
+  u8 mine[16];
+  solicited_node (mine, ip6_link_local);
+  return is_ours (a) || same (a, mine, 16) || same (a, all_nodes, 16);
+}
+
+@
+\subsection{neighbours: which Ethernet address belongs to an IPv6 address (the job of ARP in IPv4)}
+
+The table is as small as the ARP table. An entry is made when a neighbour tells us its Ethernet address: in a neighbor
+solicitation or advertisement (the option ``link-layer address''), or in a router advertisement.
+
+<<ip6.c: neighbors>>=
+#define NEIGHBORS 8
+static struct { u8 address[16]; u8 mac[6]; int valid; } neighbors[NEIGHBORS];
+static int neighbor_next = 0;
+
+static void neighbor_remember (const u8 *address, const u8 *mac) {
+  for (int i = 0; i < NEIGHBORS; i++)
+    if (neighbors[i].valid && same (neighbors[i].address, address, 16)) { copy (neighbors[i].mac, mac, 6); return; }
+  copy (neighbors[neighbor_next].address, address, 16);  copy (neighbors[neighbor_next].mac, mac, 6);  neighbors[neighbor_next].valid = 1;
+  neighbor_next = (neighbor_next + 1) % NEIGHBORS;                // the oldest entry goes when the table is full
+}
+
+static int neighbor_lookup (const u8 *address, u8 *mac) {          // 0 = it is in the table
+  for (int i = 0; i < NEIGHBORS; i++)
+    if (neighbors[i].valid && same (neighbors[i].address, address, 16)) { copy (mac, neighbors[i].mac, 6); return 0; }
+  return -1;
+}
+
+@
+\subsection{sending}
+
+[[send_packet]] puts an IPv6 packet into an Ethernet frame; the caller says where it goes on the Ethernet. The checksum of
+ICMPv6, UDP and TCP covers a ``pseudo header'': the two addresses, the length of the data and the protocol, as if they stood in
+front of it (RFC 8200, section 8.1). It is the same idea as for IPv4, only with the longer addresses.
+
+<<ip6.c: send>>=
+static u8 txframe6[1518];
+
+static u32 pseudo_sum6 (const u8 *src, const u8 *dst, u8 next_header, int length) {
+  u32 sum = (u32)length + next_header;                            // (the length has 32 bits, our packets are short)
+  for (int i = 0; i < 16; i += 2) sum += get16 (src + i) + get16 (dst + i);
+  return sum;
+}
+
+static void put_checksum (u8 *msg, int len, int where, const u8 *src, const u8 *dst, u8 next_header) {
+  put16 (msg + where, 0);
+  put16 (msg + where, net_checksum (msg, len, pseudo_sum6 (src, dst, next_header, len)));
+}
+
+static int send_packet (const u8 *src, const u8 *dst, const u8 *mac, u8 next_header, int hop_limit, const u8 *data, int len) {
+  if (len > 1500 - 40) return -1;                                 // no fragmentation
+  u8 *f = txframe6;
+  copy (f, mac, 6);  copy (f + 6, net_dev_mac (), 6);  put16 (f + 12, ETH_IPV6);
+  u8 *ip = f + 14;
+  put32 (ip, 0x60000000);                                         // version 6, traffic class 0, flow label 0
+  put16 (ip + 4, len);  ip[6] = next_header;  ip[7] = hop_limit;
+  copy (ip + 8, src, 16);  copy (ip + 24, dst, 16);
+  copy (ip + 40, data, len);
+  return net_dev_send (f, 14 + 40 + len);
+}
+
+@
+The question ``who has this address?'' is a neighbor solicitation: ICMPv6 type 135, sent to the solicited-node address of
+the one we ask, with our Ethernet address as an option, so that the answer can go directly to us. The answer is a neighbor
+advertisement (type 136) with the Ethernet address of the owner. Neighbor Discovery messages carry the hop limit 255: a router
+decrements it, so a message with a smaller value came from another network and is ignored (a cheap protection against
+messages from far away).
+
+\begin{quote}\begin{verbatim}
+    | type 135 (1) | code 0 (1) | checksum (2) | reserved (4) | target address (16) | option: 1, 1, our MAC (8) |
+    | type 136 (1) | code 0 (1) | checksum (2) | flags R S O (1) and 3 reserved bytes | target address (16) | option: 2, 1, MAC (8) |
+\end{verbatim}\end{quote}
+
+<<ip6.c: neighbor discovery>>=
+static void send_nd (const u8 *src, const u8 *dst, const u8 *mac, u8 *msg, int len) {      // checksum and hop limit 255
+  put_checksum (msg, len, 2, src, dst, IP6_ICMP);
+  send_packet (src, dst, mac, IP6_ICMP, 255, msg, len);
+}
+
+static void send_solicitation (const u8 *target) {
+  u8 dst[16], mac[6], msg[32];
+  solicited_node (dst, target);  multicast_mac (mac, dst);
+  msg[0] = ICMP6_NS;  msg[1] = 0;  put32 (msg + 4, 0);
+  copy (msg + 8, target, 16);
+  msg[24] = ND_SOURCE_LINK_ADDRESS;  msg[25] = 1;  copy (msg + 26, net_dev_mac (), 6);
+  send_nd (ip6_link_local, dst, mac, msg, 32);
+}
+
+static void send_advertisement (const u8 *target, const u8 *dst, const u8 *mac) {
+  u8 msg[32];
+  msg[0] = ICMP6_NA;  msg[1] = 0;  msg[4] = 0x60;  msg[5] = msg[6] = msg[7] = 0;      // flags: Solicited (an answer) and Override
+  copy (msg + 8, target, 16);
+  msg[24] = ND_TARGET_LINK_ADDRESS;  msg[25] = 1;  copy (msg + 26, net_dev_mac (), 6);
+  send_nd (target, dst, mac, msg, 32);
+}
+
+@
+The options of Neighbor Discovery come one after the other, each as ``type, length in units of 8 bytes, data''. [[find_option]]
+returns the first one of a type (or 0).
+
+<<ip6.c: neighbor discovery>>=
+static const u8 *find_option (const u8 *options, int len, int type) {
+  for (int i = 0; i + 2 <= len && options[i + 1] != 0 && i + options[i + 1] * 8 <= len; i += options[i + 1] * 8)
+    if (options[i] == type) return options + i;
+  return 0;
+}
+
+static const u8 *link_address (const u8 *options, int len, int type, const u8 *eth_source) {   // the option's MAC, or the sender of the frame
+  const u8 *o = find_option (options, len, type);
+  return o && o[1] == 1 ? o + 2 : eth_source;
+}
+
+static void solicitation_input (const u8 *eth, const u8 *src, const u8 *icmp, int len) {
+  if (len < 24 || !is_ours (icmp + 8)) return;
+  if (unspecified (src)) return;                                  // "::": a computer checks that its own new address is free (not supported)
+  const u8 *mac = link_address (icmp + 24, len - 24, ND_SOURCE_LINK_ADDRESS, eth + 6);
+  neighbor_remember (src, mac);                                   // whoever asks: we learn how to reach it
+  send_advertisement (icmp + 8, src, mac);
+}
+
+static void advertisement_input (const u8 *eth, const u8 *icmp, int len) {
+  if (len < 24) return;
+  neighbor_remember (icmp + 8, link_address (icmp + 24, len - 24, ND_TARGET_LINK_ADDRESS, eth + 6));
+}
+
+@
+In IPv4 [[ip_send]] asks with ARP and waits a second per attempt; the neighbor solicitation does the same here. A reply to a
+packet that has just arrived does \emph{not} wait (it is sent from inside the receiving code, which must not wait for the next
+frame): if the sender is not in the table, we ask, and its next try is answered. In practice it is in the table: whoever
+wants to ping us has asked for our address first.
+
+<<ip6.c: send>>=
+static void send_solicitation (const u8 *target);                // (defined with the other Neighbor Discovery messages)
+
+static int resolve (const u8 *next_hop, u8 *mac, int wait) {     // the Ethernet address of a computer on our network: 0 = found
+  for (int attempt = 0; attempt < (wait ? 4 : 1); attempt++) {
+    if (neighbor_lookup (next_hop, mac) == 0) return 0;
+    send_solicitation (next_hop);
+    u64 start = net_now_ms ();
+    while (wait && net_now_ms () - start < 1000) {
+      net_poll_once ();
+      if (neighbor_lookup (next_hop, mac) == 0) return 0;
+    }
+  }
+  return -1;
+}
+
+@
+Sending a packet: which address is the sender? A link-local destination gets the link-local source address, anything else
+the global one (if there is none yet, the link-local one). Where does the frame go? A destination on our network gets the frame
+itself, anything else goes to the router. The checksum is put in here, because it needs the source address; it is in a different
+place in each protocol.
+
+<<ip6.c: send>>=
+static int send6 (const u8 *src, const u8 *dst, u8 next_header, u8 *data, int len, int wait) {
+  u8 mac[6];
+  if (is_multicast (dst)) multicast_mac (mac, dst);
+  else {
+    const u8 *next_hop = on_link (dst) ? dst : ip6_have_router ? ip6_router : 0;
+    if (!next_hop) return -1;                                     // another network and no router: "network is unreachable"
+    if (resolve (next_hop, mac, wait) != 0) return -1;
+  }
+  int where = next_header == IP6_UDP ? 6 : 2;                      // (a TCP segment would have its checksum at 16)
+  put_checksum (data, len, where, src, dst, next_header);
+  if (next_header == IP6_UDP && get16 (data + where) == 0) put16 (data + where, 0xffff);       // (0 means ``no checksum'' in UDP)
+  return send_packet (src, dst, mac, next_header, 64, data, len);
+}
+
+int ip6_send (const u8 *dst, u8 next_header, u8 *data, int len) {
+  return send6 (is_link_local (dst) || is_multicast (dst) || !ip6_have_global ? ip6_link_local : ip6_global, dst, next_header, data, len, 1);
+}
+
+@
+\subsection{router advertisements: the address of the router and the prefix of the network}
+
+A router sends from time to time (and when it hears a router solicitation) a router advertisement. In it:
+
+\begin{quote}\begin{verbatim}
+    | type 134 (1) | code (1) | checksum (2) | hop limit (1) | flags (1) | router lifetime in seconds (2) |
+    | reachable time (4) | retransmission timer (4) | options ...
+    option 3, ``prefix information'' (32 bytes): | 3 | 4 | prefix length (1) | flags L, A (1) | valid lifetime (4) |
+    | preferred lifetime (4) | reserved (4) | prefix (16) |
+\end{verbatim}\end{quote}
+
+A router lifetime of 0 says that the sender is no router for the default route. The flag A of a prefix says ``computers may make
+their address from this prefix by themselves''; that is SLAAC. The flag L says ``these addresses are on the same network''; we
+assume that for every prefix that we use. A computer that has just started does not wait for the next advertisement: the network
+thread sends a \emph{router solicitation} ([[ip6_solicit]]) to all routers, and the router answers at once.
+
+<<ip6.c: router advertisement>>=
+void ip6_solicit (void) {                                         // "is there a router?"
+  u8 mac[6], msg[16];
+  multicast_mac (mac, all_routers);
+  msg[0] = ICMP6_RS;  msg[1] = 0;  put32 (msg + 4, 0);
+  msg[8] = ND_SOURCE_LINK_ADDRESS;  msg[9] = 1;  copy (msg + 10, net_dev_mac (), 6);
+  send_nd (ip6_link_local, all_routers, mac, msg, 16);
+}
+
+static void router_advertisement_input (const u8 *eth, const u8 *src, const u8 *icmp, int len) {
+  if (len < 16 || !is_link_local (src)) return;                   // a router's own address is always link-local
+  const u8 *options = icmp + 16;
+  int options_len = len - 16;
+  if (get16 (icmp + 6) != 0) {                                    // the router lifetime: it is a default router
+    copy (ip6_router, src, 16);  ip6_have_router = 1;
+    neighbor_remember (src, link_address (options, options_len, ND_SOURCE_LINK_ADDRESS, eth + 6));
+  } else if (ip6_have_router && same (ip6_router, src, 16)) ip6_have_router = 0;
+  for (int i = 0; i + 2 <= options_len && options[i + 1] != 0 && i + options[i + 1] * 8 <= options_len; i += options[i + 1] * 8) {
+    const u8 *o = options + i;
+    if (o[0] != ND_PREFIX_INFORMATION || o[1] != 4 || o[2] != 64 || !(o[3] & 0x40)) continue;       // we want /64 prefixes with the flag A
+    copy (ip6_prefix, o + 16, 8);                                 // our global address: this prefix and our interface identifier
+    copy (ip6_global, o + 16, 8);  copy (ip6_global + 8, ip6_link_local + 8, 8);
+    ip6_have_global = 1;
+  }
+}
+
+@
+\subsection{ICMPv6 echo: ping}
+
+Echo request (type 128) and reply (129) are the same as in ICMP for IPv4, only the type numbers differ and the checksum has the
+pseudo header. The kernel answers requests by itself. For the program ping6 the kernel also sends requests: [[ip6_ping]] sends one,
+waits for the answer (calling [[idle]] meanwhile, so that a process can give the CPU away) and returns the time in microseconds, or
+-1.
+
+<<ip6.c: echo>>=
+static volatile int echo_seen = -1;                               // the sequence number of the last reply that arrived ...
+static u8 echo_from[16];                                          // ... and who sent it
+
+static u64 now_us (void) {
+  u64 freq, count;
+  __asm__ volatile ("mrs %0, cntfrq_el0" : "=r" (freq));
+  __asm__ volatile ("mrs %0, cntpct_el0" : "=r" (count));
+  return count * 1000 / (freq / 1000);
+}
+
+int ip6_ping (const u8 *dst, int size, int timeout_ms, void (*idle) (void)) {
+  static u16 sequence = 0;
+  static u8 echo[8 + 1024];
+  if (size < 0 || size > 1024) return -1;
+  echo[0] = ICMP6_ECHO_REQUEST;  echo[1] = 0;
+  put16 (echo + 4, 0x756c);  put16 (echo + 6, ++sequence);        // identifier "ul", our sequence number
+  for (int i = 0; i < size; i++) echo[8 + i] = 'a' + i % 26;
+  echo_seen = -1;
+  u64 start = now_us ();
+  if (ip6_send (dst, IP6_ICMP, echo, 8 + size) != 0) return -1;
+  while (now_us () - start < (u64)timeout_ms * 1000) {
+    net_poll_once ();
+    if (echo_seen == sequence && same (echo_from, dst, 16)) return (int)(now_us () - start);
+    if (idle) idle ();
+  }
+  return -1;
+}
+
+@
+\subsection{UDP over IPv6}
+
+The same as in IPv4, with three differences: the pseudo header has the long addresses, the checksum is not optional (a datagram
+without one is dropped), and a computed checksum of 0 is sent as all ones (as in IPv4). A program of the kernel binds a port
+with [[udp6_bind]]; its handler is called with the address of the sender, which it may use as the destination of the answer.
+
+<<ip6.c: udp>>=
+#define UDP6_PORTS 4
+static struct { u16 port; udp6_handler handler; } udp6_ports[UDP6_PORTS];
+
+int udp6_bind (u16 port, udp6_handler handler) {
+  for (int i = 0; i < UDP6_PORTS; i++)
+    if (!udp6_ports[i].handler) { udp6_ports[i].port = port; udp6_ports[i].handler = handler; return 0; }
+  return -1;
+}
+
+int udp6_send (const u8 *dst, u16 dst_port, u16 src_port, const u8 *data, int len) {
+  static u8 datagram[1500 - 40];
+  if (len > (int)sizeof datagram - 8) return -1;
+  put16 (datagram, src_port);  put16 (datagram + 2, dst_port);  put16 (datagram + 4, 8 + len);
+  copy (datagram + 8, data, len);
+  return ip6_send (dst, IP6_UDP, datagram, 8 + len);
+}
+
+static void udp6_input (const u8 *src, const u8 *dst, const u8 *udp, int len) {
+  if (len < 8) return;
+  int length = get16 (udp + 4);
+  if (length < 8 || length > len) return;
+  if (net_checksum (udp, length, pseudo_sum6 (src, dst, IP6_UDP, length)) != 0) return;
+  for (int i = 0; i < UDP6_PORTS; i++)
+    if (udp6_ports[i].handler && udp6_ports[i].port == get16 (udp + 2)) {
+      udp6_ports[i].handler (src, get16 (udp), udp + 8, length - 8);
+      return;
+    }
+}
+
+@
+\subsection{receiving}
+
+[[icmp6_input]] checks the checksum (with the pseudo header) and hands the message to the right function. The hop limit of
+Neighbor Discovery must be 255. An echo request is answered from the address to which it was sent, to the address it came from.
+
+<<ip6.c: icmp6_input>>=
+static void icmp6_input (const u8 *eth, const u8 *src, const u8 *dst, int hop_limit, const u8 *icmp, int len) {
+  if (len < 8 || net_checksum (icmp, len, pseudo_sum6 (src, dst, IP6_ICMP, len)) != 0) return;
+  switch (icmp[0]) {
+    case ICMP6_ECHO_REQUEST:
+      if (!is_multicast (dst) && len <= 1240) {
+        static u8 reply[1240];
+        copy (reply, icmp, len);  reply[0] = ICMP6_ECHO_REPLY;
+        send6 (dst, src, IP6_ICMP, reply, len, 0);
+      }
+      break;
+    case ICMP6_ECHO_REPLY:               echo_seen = get16 (icmp + 6);  copy (echo_from, src, 16); break;
+    case ICMP6_NS:  if (hop_limit == 255) solicitation_input (eth, src, icmp, len); break;
+    case ICMP6_NA:  if (hop_limit == 255) advertisement_input (eth, icmp, len); break;
+    case ICMP6_RA:  if (hop_limit == 255) router_advertisement_input (eth, src, icmp, len); break;
+  }
+}
+
+@
+<<ip6.c: ip6_input>>=
+void ip6_input (const u8 *f, int len) {
+  const u8 *ip = f + 14;
+  if (len < 14 + 40 || (ip[0] >> 4) != 6) return;
+  int payload = get16 (ip + 4);
+  if (14 + 40 + payload > len) return;
+  const u8 *src = ip + 8, *dst = ip + 24, *data = ip + 40;
+  if (!wants_address (dst)) return;                               // not for us
+  switch (ip[6]) {                                                // (a packet with an extension header is not understood: dropped)
+    case IP6_ICMP: icmp6_input (f, src, dst, ip[7], data, payload); break;
+    case IP6_UDP:  udp6_input (src, dst, data, payload); break;
+  }
+}
+@
 \section{The ``echo'' service (port 7): sends back what it gets. The oldest and simplest network service, and so a good test:}
 \label{src:echo.c}
 
@@ -2153,6 +2677,8 @@ The complete file is put together from these parts:
 
 <<netd.c: link>>
 
+<<netd.c: link6>>
+
 <<netd.c: netd>>
 @
 
@@ -2169,6 +2695,10 @@ extern int  net_dev_link (void);
 extern int  dhcp_run (int timeout_ms, void (*idle) (void));
 extern unsigned long long net_now_ms (void);
 extern unsigned net_my_ip, net_gateway;
+extern void ip6_solicit (void);
+extern void ip6_format (char *out, const unsigned char *address);
+extern unsigned char ip6_global[16], ip6_router[16];
+extern int  ip6_have_global, ip6_have_router;
 extern int  telnet_start (void);
 extern int  telnet_step (void);
 extern int  rc_conf_enabled (const char *variable, int fallback);
@@ -2282,11 +2812,37 @@ static void netd_link (void) {
 }
 
 @
+IPv6 needs no asking of a server, only a question to the router: ``is anybody there who can tell me the prefix?'' (a router
+solicitation, sent to all routers). The answer, a router advertisement, comes in like any other frame, through [[net_poll_once]] in the
+loop of the thread, so there is nothing to wait for here, and the boot never waits. As long as there is a link but no router, the
+thread asks again every four seconds, three times at most (RFC 4861 does the same); when the cable is pulled out and plugged in
+again it starts anew. What arrives goes into the network log.
+
+<<netd.c: link6>>=
+static void netd_link6 (void) {
+  static unsigned long long next = 0;
+  static int asked = 0, told_router = 0, told_global = 0;
+  unsigned long long now = net_now_ms ();
+  if (now < next) return;
+  next = now + 2000;
+  if (!net_dev_link ()) { asked = 0;  return; }                  // no link: ask again when it is back
+  char text[48], router[48];
+  if (ip6_have_router && !told_router) { told_router = 1;  ip6_format (router, ip6_router);  NETLOG ("net: IPv6 router %s", router); }
+  if (ip6_have_global && !told_global) { told_global = 1;  ip6_format (text, ip6_global);  NETLOG ("net: IPv6 address %s (from a router advertisement)", text); }
+  if (ip6_have_router || asked >= 3) return;
+  ip6_solicit ();
+  asked++;
+  next = now + 4000;
+  if (asked == 1) NETLOG ("net: IPv6: asking for a router (router solicitation)");
+}
+
+@
 <<netd.c: netd>>=
 static void netd (void *arg) {
   for (;;) {
     int moved;
     do { moved = net_poll_once (); if (net_echo) moved |= echo_step (); if (net_telnet) moved |= telnet_step (); } while (moved);       // everything that is there
+    netd_link6 ();                                                                            // (IPv6: a router solicitation, until a router has answered)
     netd_link ();                                                                             // (every two seconds: link? an address yet?)
     netlog_flush ();                                                                          // (the network log, if there is something for it)
     netd_sleep ();                                                                            // then sleep until we are woken
@@ -2596,6 +3152,8 @@ that ``ping'' needs. TCP and UDP sockets for programs come later (then telnet ca
     net_set (&s)           change address and netmask, or the router (only root; ifconfig, route)
     net_dhcp (&d)          ask a DHCP server and use what it says (only root; dhclient)
     dns_resolve (&q)       q.name: a host name; q.address: its IPv4 address; returns 0, -1 = no answer, -2 = no such name, -3 = failed (ping, host)
+    net6_info (&i)         the IPv6 addresses: link-local, global (from a router advertisement) and the router (ifconfig)
+    ping6 (&p)             p.address, p.size, p.timeout_ms: send one ICMPv6 echo request and wait for the answer; the time in microseconds, -1 = none
 \end{verbatim}\end{quote}
 
 A program that waits for an answer gives the CPU to the others in between ([[arch_resign]]), and looks into the network card each
@@ -2619,6 +3177,7 @@ The complete file is put together from these parts:
 <<net_syscalls.c: syscall_net_info>>
 
 <<net_syscalls.c: syscall_dns_resolve>>
+<<net_syscalls.c: syscall_net6>>
 @
 
 <<net_syscalls.c: includes>>=
@@ -2760,4 +3319,31 @@ void syscall_dns_resolve (context_t *r) {
   while (i < 255 && q->name[i]) { name[i] = q->name[i]; i++; }
   name[i] = 0;
   eax_return (dns_resolve (name, &q->address, arch_resign));
+}
+
+@
+\subsection{IPv6: the addresses, and ``ping'' (the kernel sends the echo request itself and waits for the answer)}
+
+For IPv4 a program builds its ICMP messages itself, on a raw socket. For IPv6 the kernel offers the one thing that
+[[ping6]] needs, a function [[ip6_ping]] that does the whole round trip: the checksum of ICMPv6 needs the source address and the
+pseudo header, and the choice of the source address (link-local or global) is the business of the kernel. While it waits it
+gives the CPU to other processes ([[arch_resign]]).
+
+<<net_syscalls.c: syscall_net6>>=
+struct net6_info { unsigned char link_local[16], global[16], router[16]; unsigned flags; };       // flags: 1 = there is a global address, 2 = a router
+struct ping6_args { unsigned char address[16]; int size, timeout_ms; };
+extern unsigned char ip6_link_local[16], ip6_global[16], ip6_router[16];
+extern int ip6_have_global, ip6_have_router;
+extern int ip6_ping (const unsigned char *dst, int size, int timeout_ms, void (*idle) (void));
+
+void syscall_net6_info (context_t *r) {
+  struct net6_info *i = (struct net6_info *)r->ebx;
+  for (int k = 0; k < 16; k++) { i->link_local[k] = ip6_link_local[k];  i->global[k] = ip6_global[k];  i->router[k] = ip6_router[k]; }
+  i->flags = (ip6_have_global ? 1 : 0) | (ip6_have_router ? 2 : 0);
+  r->eax = 0;
+}
+
+void syscall_ping6 (context_t *r) {
+  struct ping6_args *p = (struct ping6_args *)r->ebx;
+  eax_return (ip6_ping (p->address, p->size, p->timeout_ms, arch_resign));
 }
