@@ -53,7 +53,7 @@ In the shell: `ls`, `cat`, `cd`, `cp`, `rm`, `mkdir`, `rmdir`, `touch`, `wc`, `g
 **Telnet:** the kernel runs a telnet server on port 23. It shows terminal 5 (`tty4`, Ctrl-T 5 on the console): `telnet <address> 23`,
 then log in as on the console. One session at a time; when you hang up, the programs of the session end and `login` asks again.
 (The password goes over the network unencrypted: private networks only.) The server is switched on and off in `/etc/rc.conf`
-(`telnetd_enable="YES"` is the default, `"NO"` switches it off; the file is read at boot; edit it as root with `vi`).
+(`telnetd_enable="YES"` is the default, `"NO"` switches it off; the file is read at boot; edit it as root with `vi`). `netlog_enable="YES"` (default `"NO"`) makes the network code write its messages (link, DHCP) to `/var/log/net.log`; the console stays quiet either way.
 The address is shown by `ifconfig` (with `status: active` or `no carrier`; the network code writes on the console only during the boot and once when DHCP has given an address, so that nothing is printed into the middle of your typing). The cable may be plugged in after the boot: the network
 thread notices the link (every two seconds) and then asks DHCP by itself.
 

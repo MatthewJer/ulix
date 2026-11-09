@@ -680,7 +680,6 @@ static void console_main (void) {
   extern void netd_start (void);
   if (net_ok) netd_start ();                                      // the network thread: frames are handled as they arrive
   printf ("console ready (Ctrl-C: end the running program, Ctrl-]: kernel shell)\n");
-  { extern int net_quiet;  net_quiet = 1; }                       // from now on the network thread keeps quiet: its messages would appear in the middle of what the user types
 #ifndef CONSOLE_PROGRAM
 #define CONSOLE_PROGRAM "/contest64"
 #endif

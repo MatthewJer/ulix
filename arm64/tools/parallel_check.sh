@@ -110,7 +110,10 @@ if [ "$1" = "--job" ]; then
       $QEMU -M virt -cpu cortex-a72 -m 128 -display none -serial file:"$log" -monitor none -kernel ulix-console.bin -snapshot -drive file=$DISK,format=raw,if=none,id=hd0 \
         -device virtio-blk-device,drive=hd0 $NET -append "ip=10.9.8.7/16 gw=10.9.0.1 dns=10.9.0.2" 2>/dev/null &
       P1=$!
-      $QEMU -M virt -cpu cortex-a72 -m 128 -display none -serial file:"$log.2" -monitor none -kernel ulix-console.bin -snapshot -drive file=$DISK,format=raw,if=none,id=hd0 \
+      # (DHCP is asked after the boot and only the network log tells: a copy of the disk with netlog_enable="YES", not -snapshot)
+      cp $DISK "$log.disk"; printf 'netlog_enable="YES"\n' > "$log.rc"
+      python3 tools/minix_add.py "$log.disk" /etc/rc.conf="$log.rc" > /dev/null
+      $QEMU -M virt -cpu cortex-a72 -m 128 -display none -serial file:"$log.2" -monitor none -kernel ulix-console.bin -drive file="$log.disk",format=raw,if=none,id=hd0 \
         -device virtio-blk-device,drive=hd0 $NET -append "ip=dhcp" 2>/dev/null &
       P2=$!
       # a long command line (the firmware of the Pi puts about 250 characters of its own in front of cmdline.txt): "ip=" at the end must still arrive
@@ -119,8 +122,10 @@ if [ "$1" = "--job" ]; then
         -device virtio-blk-device,drive=hd0 $NET -append "$(printf 'filler=%0300d' 0) ip=10.7.7.7/24" 2>/dev/null &
       P3=$!
       for i in $(seq 1 60); do sleep 1; grep -q 'console ready' "$log" 2>/dev/null && grep -q 'console ready' "$log.2" 2>/dev/null && grep -q 'console ready' "$log.3" 2>/dev/null && break; done
+      sleep 6
       kill $P1 $P2 $P3 2>/dev/null; wait $P1 $P2 $P3 2>/dev/null
-      cat "$log.2" "$log.3" >> "$log"; rm -f "$log.2" "$log.3"
+      python3 tools/minix_check.py "$log.disk" --cat /var/log/net.log 2>/dev/null | sed 's/^\[[0-9]*s\] //' >> "$log"
+      cat "$log.2" "$log.3" >> "$log"; rm -f "$log.2" "$log.3" "$log.disk" "$log.rc"
       sum="$(grep -E '^net: (address|DHCP)' "$log" | tr '\n' ';')"
       if grep -q '^net: address 10.9.8.7 netmask 255.255.0.0 router 10.9.0.1 name server 10.9.0.2 (from the command line)' "$log" \
          && grep -q '^net: DHCP: address 10.0.2.15, router 10.0.2.2' "$log" \

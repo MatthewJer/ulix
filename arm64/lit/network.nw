@@ -59,7 +59,8 @@ void netd_start (void);                           // start it (after the threads
 extern int netd_irq;                              // the interrupt number of the card (0 until netd_start () has run, or when polling)
 void netd_interrupt (void);                       // in the interrupt handler
 void netd_tick (void);                            // every timer tick: wakes the thread now and then, for the timers of TCP
-extern int net_quiet;                             // the boot is over: no more messages of the network code on the console (ifconfig shows the state)
+void netlog (const char *line);                   // a line for the network log /var/log/net.log (only when /etc/rc.conf says netlog_enable="YES"; else dropped)
+#define NETLOG(...) do { char netlog_line[160];  sprintf (netlog_line, __VA_ARGS__);  netlog (netlog_line); } while (0)     // netlog with printf's formats
 extern int net_dhcp_wanted, net_dhcp_done;        // "ip=dhcp" was on the command line / an address from DHCP has been obtained (netd tries again when the cable is plugged in)
 extern int net_echo;                              // the kernel command line said "netecho": answer on port 7 (UDP and TCP) with what comes in
 
@@ -667,14 +668,15 @@ static void set_speed (int speed) {
 
 @
 The network thread asks about once a second whether there is a link ([[link]] of [[struct net_driver]]). A cable that has
-been plugged in gives the MAC its speed and is reported on the console; a cable that has been pulled out is reported, too.
+been plugged in gives the MAC its speed; both the new link and a pulled cable are written to the network log (not to the
+console: they would appear in the middle of what the user types).
 The answer is 1 if there is a link.
 
 <<genet.c: phy_link>>=
 static int link_poll (void) {
   int speed = link_speed ();
-  if (speed != 0 && !linked) { set_speed (speed);  if (!net_quiet) printf ("genet: link up, %d Mbit/s\n", speed); }
-  if (speed == 0 && linked)  { linked = 0;  if (!net_quiet) printf ("genet: link down\n"); }
+  if (speed != 0 && !linked) { set_speed (speed);  NETLOG ("genet: link up, %d Mbit/s", speed); }
+  if (speed == 0 && linked)  { linked = 0;  NETLOG ("genet: link down"); }
   return linked;
 }
 
@@ -1839,7 +1841,6 @@ The complete file is put together from these parts:
 #include "net.h"
 
 int net_echo = 0;                       // "netecho" on the command line: the echo service is on
-int net_quiet = 0;                      // set when the boot is over: from then on the network thread does not write on the console (it would disturb the user's shell)
 int net_dhcp_wanted = 0;                // "ip=dhcp" on the command line: the address is to come from a DHCP server
 int net_dhcp_done = 0;                  // ... and it has: until then the network thread tries again whenever there is a link
 
@@ -1893,12 +1894,7 @@ void net_configure_from_command_line (void) {
     printf ("net: address ");  print_ip (net_my_ip);  printf (" netmask ");  print_ip (net_netmask);
     printf (" router ");  print_ip (net_gateway);  printf (" name server ");  print_ip (net_dns);  printf (" (from the command line)\n");
   }
-  if (use_dhcp) {
-    net_dhcp_wanted = 1;
-    printf ("net: asking a DHCP server for an address ...\n");
-    if (dhcp_run (8000, 0) == 0) { net_dhcp_done = 1;  printf ("net: DHCP: address ");  print_ip (net_my_ip);  printf (", router ");  print_ip (net_gateway);  printf ("\n"); }
-    else printf ("net: no answer from a DHCP server, keeping the address that was set (the network thread tries again when there is a link)\n");
-  }
+  if (use_dhcp) net_dhcp_wanted = 1;       // the network thread asks (netd.c): the boot does not wait for the server
 }
 
 @
@@ -1983,6 +1979,8 @@ The complete file is put together from these parts:
 <<netd.c>>=
 <<netd.c: includes>>
 
+<<netd.c: log>>
+
 <<netd.c: link>>
 
 <<netd.c: netd>>
@@ -1996,9 +1994,8 @@ extern int  net_dev_start_irq (void);
 extern void net_dev_ack (void);
 extern int  echo_start (void);
 extern int  echo_step (void);
-extern int  net_echo, net_telnet, net_dhcp_wanted, net_dhcp_done, net_quiet;
+extern int  net_echo, net_telnet, net_dhcp_wanted, net_dhcp_done;
 extern int  net_dev_link (void);
-extern void net_dev_report (void);
 extern int  dhcp_run (int timeout_ms, void (*idle) (void));
 extern unsigned long long net_now_ms (void);
 extern unsigned net_my_ip, net_gateway;
@@ -2008,6 +2005,9 @@ extern int  rc_conf_enabled (const char *variable, int fallback);
 extern void gic_enable (int irq);
 extern void arch_resign (void);
 extern int  arch_thread_create_high (void (*entry) (void *), void *arg, const char *name);
+
+#define NETLOG(...) do { char netlog_line[160];  sprintf (netlog_line, __VA_ARGS__);  netlog (netlog_line); } while (0)
+void netlog (const char *line);
 
 int netd_irq = 0;
 int net_telnet = 0;                           // the telnet server is on: /etc/rc.conf says telnetd_enable="YES" (or says nothing)
@@ -2030,35 +2030,83 @@ void netd_tick (void) {                       // every 10 ms; the thread gets a 
 }
 
 @
+The network code does not write on the console after the boot: its messages would appear in the middle of what the user types,
+and the boot would have to wait for them. A BSD system writes such messages into a log file. Ulix does the same, but only if
+the administrator wants it: with [[netlog_enable="YES"]] in \texttt{/etc/rc.conf} (the default is [[NO]]) every message of
+the network code (the link of the card, the DHCP request and its answer) is appended to \texttt{/var/log/net.log}, one line
+each, with the time since the boot in seconds.
+
+[[netlog]] only puts the line into a small ring buffer; it may be called from anywhere, also from the driver, and is quick.
+The writing into the file is done by the network thread ([[netlog_flush]]), because it can sleep while the disk works. The
+thread opens the file for every portion, appends to it and closes it again, so that the file is complete when the power goes
+off (the disk buffers are written with [[buffer_sync]]). The directories \texttt{/var} and \texttt{/var/log} are made when they are
+missing. If the buffer is full the new line is dropped: a log that blocks the network is worse than a log with a gap.
+
+<<netd.c: log>>=
+static char log_ring[2048];
+static int  log_in = 0, log_out = 0;                             // the buffer is a ring: written at log_in, emptied at log_out
+static int  log_on = -1;                                         // -1: do not know yet, 0: off, 1: netlog_enable="YES"
+
+void netlog (const char *line) {
+  if (log_on < 0) log_on = rc_conf_enabled ("netlog_enable", 0);        // (off, unless /etc/rc.conf says YES)
+  if (!log_on) return;
+  char text[200];
+  int n = sprintf (text, "[%us] %s\n", system_ticks / 100, line);
+  if (n > (int)sizeof text - 1) n = sizeof text - 1;
+  int used = (log_in - log_out + (int)sizeof log_ring) % (int)sizeof log_ring;
+  if (n >= (int)sizeof log_ring - used) return;                          // no room: the line is lost
+  for (int i = 0; i < n; i++) { log_ring[log_in] = text[i];  log_in = (log_in + 1) % sizeof log_ring; }
+}
+
+static void netlog_flush (void) {
+  static int directories = 0;
+  while (log_out != log_in) {
+    char chunk[256];  int n = 0;
+    while (log_out != log_in && n < (int)sizeof chunk) { chunk[n++] = log_ring[log_out];  log_out = (log_out + 1) % sizeof log_ring; }
+    if (!directories) { u_mkdir ("/var", 0755);  u_mkdir ("/var/log", 0755);  directories = 1; }      // (fails if they exist: fine)
+    int fd = u_open ("/var/log/net.log", O_WRONLY | O_CREAT | O_APPEND, FOLLOW_LINK);
+    if (fd < 0) continue;                                                // cannot write the log: the text is lost, the network goes on
+    u_lseek (fd, 0, SEEK_END);
+    u_write (fd, chunk, n);
+    u_close (fd);
+    buffer_sync (1);
+  }
+}
+
+@
 A cable that is plugged in \emph{after} the boot, or an address that the DHCP server did not give at the boot because
 nobody answered: for a computer that is supposed to get its address from DHCP ([[ip=dhcp]]) that must not mean ``no address
-for ever''. Every two seconds the thread asks the card whether there is a link ([[net_dev_link]]; the driver of the Pi then also
-tells the MAC the speed that the PHY has agreed on). As long as there is a link but no address yet, it asks a DHCP server, and
-if nobody answers it tries again after ten seconds. While it waits for the answer it gives the CPU to the other threads
-([[arch_resign]]), the same way the program [[dhclient]] does.
+for ever''. The boot itself does not ask the server (that could take seconds, and the console would show nothing but
+a pause): the kernel only notes that the command line said [[ip=dhcp]], and the network thread does the asking, after the boot
+and while the user already works. Every two seconds the thread asks the card whether there is a link ([[net_dev_link]]; the driver
+of the Pi then also tells the MAC the speed that the PHY has agreed on). As long as there is a link but no address yet, it asks a
+DHCP server, and if nobody answers it tries again after ten seconds. While it waits for the answer it sleeps, so the other threads run. What it does goes into the network log, never on the console.
+
+While the thread waits for the answer it must really \emph{sleep}, as in its main loop ([[netd_sleep]]): it is woken by the interrupt
+of the card or by the timer, and in between the other threads run. (With a plain [[arch_resign]] in a loop the thread stayed
+runnable all the time and the boot, which was starting the first program, got no CPU for the seven seconds that the server may need.)
 
 <<netd.c: link>>=
+static void netd_sleep (void) {
+  block (&floppy_queue, TSTATE_WAITFLP);
+  arch_resign ();
+}
+
 static void netd_link (void) {
   static unsigned long long next = 0;
-  static int told = 0;                                           // the user has been told that we are trying (and that nobody has answered yet)
+  static int told = 0;                                           // the log says that we are trying (and that nobody has answered yet)
   unsigned long long now = net_now_ms ();
   if (now < next) return;
   next = now + 2000;
   int up = net_dev_link ();
   if (!up || !net_dhcp_wanted || net_dhcp_done) return;
-  if (!told && !net_quiet) printf ("net: asking a DHCP server for an address ...\n");
-  if (dhcp_run (5000, arch_resign) == 0) {
+  if (!told) NETLOG ("net: asking a DHCP server for an address");
+  if (dhcp_run (5000, netd_sleep) == 0) {
     net_dhcp_done = 1;  told = 0;
-    printf ("net: DHCP: address %d.%d.%d.%d, router %d.%d.%d.%d\n", net_my_ip >> 24, (net_my_ip >> 16) & 255, (net_my_ip >> 8) & 255, net_my_ip & 255,
-           net_gateway >> 24, (net_gateway >> 16) & 255, (net_gateway >> 8) & 255, net_gateway & 255);
+    NETLOG ("net: DHCP: address %d.%d.%d.%d, router %d.%d.%d.%d", net_my_ip >> 24, (net_my_ip >> 16) & 255, (net_my_ip >> 8) & 255, net_my_ip & 255,
+            net_gateway >> 24, (net_gateway >> 16) & 255, (net_gateway >> 8) & 255, net_gateway & 255);
   } else {
-    if (!told) {                                                 // say it once, then go on trying quietly: nobody wants a message every 15 seconds
-      told = 1;
-      if (!net_quiet) {                                          // (not when somebody is working in the shell: ifconfig shows "no carrier" or the missing address)
-        printf ("net: no answer from a DHCP server yet, trying again every 10 seconds\n");
-        net_dev_report ();                                       // (what did the card see? helps to find out why nobody answers)
-      }
-    }
+    if (!told) { told = 1;  NETLOG ("net: no answer from a DHCP server yet, trying again every 10 seconds"); }     // (once: not every 15 seconds)
     next = net_now_ms () + 10000;
   }
 }
@@ -2070,8 +2118,8 @@ static void netd (void *arg) {
     int moved;
     do { moved = net_poll_once (); if (net_echo) moved |= echo_step (); if (net_telnet) moved |= telnet_step (); } while (moved);       // everything that is there
     netd_link ();                                                                             // (every two seconds: link? an address yet?)
-    block (&floppy_queue, TSTATE_WAITFLP);                                                    // then sleep until we are woken
-    arch_resign ();
+    netlog_flush ();                                                                          // (the network log, if there is something for it)
+    netd_sleep ();                                                                            // then sleep until we are woken
   }
 }
 
@@ -2094,6 +2142,7 @@ void netd_start (void) {
 Which services a BSD system starts is written down in the file \texttt{/etc/rc.conf}, one setting per line:
 \begin{quote}\begin{verbatim}
     telnetd_enable="YES"
+    netlog_enable="NO"
 \end{verbatim}\end{quote}
 Ulix does the same. A line has the form [[name="YES"]] or [[name="NO"]] (the quotes may be left out; everything behind a
 [[#]] is a comment). The file is read once, when the network thread starts. The kernel asks for one setting at a time
