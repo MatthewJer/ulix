@@ -122,7 +122,13 @@ if [ "$1" = "--job" ]; then
         -device virtio-blk-device,drive=hd0 $NET -append "$(printf 'filler=%0300d' 0) ip=10.7.7.7/24" 2>/dev/null &
       P3=$!
       for i in $(seq 1 60); do sleep 1; grep -q 'console ready' "$log" 2>/dev/null && grep -q 'console ready' "$log.2" 2>/dev/null && grep -q 'console ready' "$log.3" 2>/dev/null && break; done
-      sleep 6
+      # (the log of the DHCP run is written by the network thread some time after the boot: read the disk copy every 2 seconds until the DHCP
+      # and the IPv6 line are in it, at most 40 seconds, instead of waiting a fixed time)
+      for i in $(seq 1 20); do
+        sleep 2
+        l=$(python3 tools/minix_check.py "$log.disk" --cat /var/log/net.log 2>/dev/null)
+        grep -aq 'DHCP: address' <<< "$l" && grep -aq 'IPv6 address' <<< "$l" && break
+      done
       kill $P1 $P2 $P3 2>/dev/null; wait $P1 $P2 $P3 2>/dev/null
       python3 tools/minix_check.py "$log.disk" --cat /var/log/net.log 2>/dev/null | sed 's/^\[[0-9]*s\] //' >> "$log"
       cat "$log.2" "$log.3" >> "$log"; rm -f "$log.2" "$log.3" "$log.disk" "$log.rc"
