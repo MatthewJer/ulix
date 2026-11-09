@@ -102,3 +102,5 @@ userland/shutdown.c
 userland/readelf64.c
 lit/build/
 lit/noweb.sty
+dns.c
+userland/host.c
