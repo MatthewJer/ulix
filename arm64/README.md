@@ -39,7 +39,7 @@ make kernel8.img     # image for the Raspberry Pi 4B (work in progress, branch r
 make run-rpi4-shell  # ... and the system with login and shell on qemu's raspi4b machine, with an SD card image (sd.img)
 ```
 
-In the shell: `ls`, `cat`, `cd`, `cp`, `rm`, `mkdir`, `rmdir`, `touch`, `wc`, `grep`, `stat`, `ps`, `df`, `free`, `top`, `ping`, `ifconfig`, `route`, `dhclient`, `shutdown`, `poweroff`, `reboot`, …
+In the shell: `ls`, `cat`, `cd`, `cp`, `rm`, `mkdir`, `rmdir`, `touch`, `wc`, `grep`, `stat`, `ps`, `df`, `free`, `top`, `ping`, `host`, `ifconfig`, `route`, `dhclient`, `shutdown`, `poweroff`, `reboot`, …
 (it is Ulix, so `echo` copies its input until you press Ctrl-C). `>` and `<` redirect. Keys:
 
 | Key | Effect |
@@ -127,6 +127,7 @@ net.c  tcp.c     Ethernet, ARP, IP, ICMP, UDP, TCP  net.h           what the net
 * The shell test has a variant with a network card (`make pcheck`, job `shellnet`): the program `ping` in the Ulix shell.
 * The network is configured like on a BSD: the kernel command line (`ip=dhcp`, `ip=10.0.0.5/24 gw=… dns=…`), and as root (`su`) the
   programs `ifconfig`, `route` and `dhclient`; the tests are the `shellnet` and `netconf` jobs of `make pcheck`.
+* Host names: `host example.org` and `ping example.org` ask the name server of `ifconfig` (from DHCP or `dns=`) for an A record (`dns.c`); `make net-test` checks the resolver against a name server on the host and against qemu's forwarder.
 * **`make netd-test`**: the network thread. The console kernel with the command line `netecho` has nothing but the thread to answer; Python
   sockets of the host get UDP and TCP echo back (up to 20000 bytes) while the kernel runs its program.
 * **`make net-test`**: the network. The kernel (own image `ulix-net.bin`) runs on qemu's user-mode network and a Python program on the

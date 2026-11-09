@@ -6,7 +6,7 @@ the address 10.0.2.15. qemu forwards ports of the host to the kernel, so that or
 of Ulix: UDP 127.0.0.1:5556 and TCP 127.0.0.1:5555 arrive at port 7 of the kernel (the echo service). The kernel, in turn,
 pings the router, sends a datagram to the host (10.0.2.2:5557 is this program, port 5557) and connects to it (TCP port 5558).
 """
-import os, socket, subprocess, sys, tempfile, time
+import os, socket, struct, subprocess, sys, tempfile, threading, time
 
 kernel = sys.argv[1]
 tmp = tempfile.mkdtemp()
@@ -17,6 +17,37 @@ host_udp.bind(("127.0.0.1", 5557)); host_udp.settimeout(10)
 server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)       # where the kernel connects to (port 5558)
 server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 server.bind(("127.0.0.1", 5558)); server.listen(1)
+
+# A name server for the DNS checks of the kernel (the kernel asks 10.0.2.2:5559, which is this socket). It answers like a real one:
+# "alias.test" gets a CNAME and then the A record, both with names as compression pointers (0xC00C = "the name at byte 12");
+# "retry.test" is not answered the first time (the resolver must ask again); "nx.test" does not exist (rcode 3).
+dns_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+dns_sock.bind(("127.0.0.1", 5559))
+def dns_server():
+    seen = {}
+    while True:
+        try:
+            q, peer = dns_sock.recvfrom(512)
+        except OSError:
+            return
+        end = 12
+        while q[end]: end += 1 + q[end]
+        name = q[12:end + 1]                                   # the question name as labels
+        seen[name] = seen.get(name, 0) + 1
+        question = q[12:end + 5]                               # name, type, class
+        head = q[0:2]                                          # the id of the question comes back
+        if name == b"\x05alias\x04test\x00":
+            real = b"\x04real\xc0\x12"                          # "real" + pointer to "test" (byte 18, inside the question)
+            reply = head + b"\x81\x80\x00\x01\x00\x02\x00\x00\x00\x00" + question
+            reply += b"\xc0\x0c\x00\x05\x00\x01\x00\x00\x00\x3c" + struct.pack(">H", len(real)) + real          # alias.test CNAME real.test
+            reply += real + b"\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04\xc0\x00\x02\x07"            # real.test A 192.0.2.7
+        elif name == b"\x05retry\x04test\x00":
+            if seen[name] < 2: continue                        # the first question is not answered
+            reply = head + b"\x81\x80\x00\x01\x00\x01\x00\x00\x00\x00" + question + b"\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04\xc0\x00\x02\x08"
+        else:
+            reply = head + b"\x81\x83\x00\x01\x00\x00\x00\x00\x00\x00" + question      # rcode 3: no such name
+        dns_sock.sendto(reply, peer)
+threading.Thread(target=dns_server, daemon=True).start()
 
 qemu = subprocess.Popen(["qemu-system-aarch64", "-M", os.environ.get("QEMU_M", "virt"), "-cpu", "cortex-a72", "-m", "128", "-display", "none",
     "-monitor", "none", "-serial", "file:" + log, "-kernel", kernel,

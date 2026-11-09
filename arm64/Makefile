@@ -15,7 +15,7 @@ CFLAGS = -I$(GENDIR) -mno-outline-atomics -O0 -g -ffreestanding -nostdlib -fno-b
 # "-snapshot" keeps the file unmodified when running.
 DISK ?= disk.img
 
-OBJS = start.o vectors.o irq.o mmu.o virtio.o sdcard.o virtionet.o genet.o netdev.o net.o tcp.o dhcp.o netconf.o echo.o net_test.o net_syscalls.o netd.o rcconf.o telnet.o stats.o minixfs.o elf.o ulix-port.o glue.o arch_thread.o arch_console.o arch_clock.o arch_swap.o arch_vt.o dt.o gic.o smp.o \
+OBJS = start.o vectors.o irq.o mmu.o virtio.o sdcard.o virtionet.o genet.o netdev.o net.o tcp.o dhcp.o dns.o netconf.o echo.o net_test.o net_syscalls.o netd.o rcconf.o telnet.o stats.o minixfs.o elf.o ulix-port.o glue.o arch_thread.o arch_console.o arch_clock.o arch_swap.o arch_vt.o dt.o gic.o smp.o \
        bookfs_test.o thread_test.o proc_test.o kmain.o
 
 all: ulix.elf ulix-console.elf ulix-shell.elf ulix.bin ulix-console.bin ulix-shell.bin $(DISK) $(GENDIR)/disk_expected.h
@@ -148,7 +148,7 @@ glue.o: glue.c $(GENFILES) $(GENDIR)/ulix-api.h
 	$(CC) $(BOOKFLAGS) -Dhash=glue_unused_hash -c -o $@ $<
 
 irq.o mmu.o virtio.o sdcard.o dt.o gic.o smp.o kmain.o kmain-console.o kmain-shell.o kmain-net.o: plat.h gic.h smp.h ulix.h arch_pte.h
-virtionet.o genet.o netdev.o net.o tcp.o dhcp.o netconf.o echo.o net_test.o rcconf.o telnet.o: net.h plat.h ulix.h cache.h delay.h
+virtionet.o genet.o netdev.o net.o tcp.o dhcp.o dns.o netconf.o echo.o net_test.o rcconf.o telnet.o: net.h plat.h ulix.h cache.h delay.h
 sdcard.o: delay.h
 
 %.o: %.S

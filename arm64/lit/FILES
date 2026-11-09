@@ -30,6 +30,7 @@ genet.c
 net.c
 tcp.c
 dhcp.c
+dns.c
 netconf.c
 echo.c
 netd.c
@@ -63,5 +64,6 @@ userland/top.c
 userland/ifconfig.c
 userland/route.c
 userland/dhclient.c
+userland/host.c
 userland/shutdown.c
 userland/readelf64.c

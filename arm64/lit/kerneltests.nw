@@ -115,7 +115,7 @@ int bookfs_test (void) {
   CHECK (mx_stat (DEV, "/bin", &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR, "mx_stat: /bin is a directory");
   CHECK (mx_stat (DEV, "/nonexistent", &st) == -1, "mx_stat: missing file");
   CHECK (count_entries ("/") == 31, "mx_getdent: / has 31 used entries (16 from x86 Ulix + 15 AArch64 files)");
-  CHECK (count_entries ("/bin") == 71, "mx_getdent: /bin has 71 entries");
+  CHECK (count_entries ("/bin") == 72, "mx_getdent: /bin has 72 entries");
   CHECK (mx_file_exists (DEV, "/bin/vi") && mx_file_is_directory (DEV, "/bin") &&
          !mx_file_is_directory (DEV, "/bin/vi"), "mx_file_exists / mx_file_is_directory");
 
@@ -738,6 +738,18 @@ int net_test (void) {
   int rtt = net_ping (net_gateway, 3000);
   CHECK (rtt >= 0, "ping of the router: ARP request and reply, ICMP echo request and reply");
   printf ("  info: round trip %d ms\n", rtt);
+
+  // DNS. First against a name server on the host (10.0.2.2, port 5559: tools/net_test.py plays it), which answers with a CNAME in front of
+  // the A record and with name compression pointers, loses the first question for "retry.test" and says "no such name" for "nx.test";
+  // then against the real forwarder of qemu (10.0.2.3, port 53), which resolves "localhost" with the resolver of the host.
+  u32 address = 0;
+  net_dns = IP (10, 0, 2, 2);  dns_port = 5559;
+  CHECK (dns_resolve ("alias.test", &address, 0) == 0 && address == IP (192, 0, 2, 7), "DNS: alias.test = 192.0.2.7 (answer with CNAME and compression pointers)");
+  CHECK (dns_resolve ("retry.test.", &address, 0) == 0 && address == IP (192, 0, 2, 8), "DNS: retry.test = 192.0.2.8 (the first question is lost, the second is answered)");
+  CHECK (dns_resolve ("nx.test", &address, 0) == DNS_NOT_FOUND, "DNS: nx.test does not exist (the server says so)");
+  CHECK (dns_resolve ("a..test", &address, 0) == DNS_FAILED, "DNS: a name with an empty label is refused before anything is sent");
+  net_dns = IP (10, 0, 2, 3);  dns_port = 53;
+  CHECK (dns_resolve ("localhost", &address, 0) == 0 && address == IP (127, 0, 0, 1), "DNS: localhost = 127.0.0.1 from the name server of qemu (10.0.2.3)");
 
   const char *hello = "hello from Ulix";
   CHECK (udp_send (IP (10, 0, 2, 2), 5557, 4000, (const u8 *)hello, 15) == 0, "UDP datagram sent to the host (10.0.2.2 is the host, port 5557)");

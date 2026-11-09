@@ -1,10 +1,10 @@
-\chapter{Networking: Ethernet, ARP, IP, ICMP, UDP, TCP and DHCP}
+\chapter{Networking: Ethernet, ARP, IP, ICMP, UDP, TCP, DHCP and DNS}
 \label{ch:network}
 
 The x86 version of Ulix has no network. This chapter is new. It is written from the bottom up, each layer small enough to read
 and to test on its own against the real TCP/IP stack of the host (\texttt{make net-test}): the network card drivers (virtio-net
 for qemu, GENET for the Raspberry Pi~4, which has not run on real hardware yet), Ethernet and ARP, IPv4 without fragments, ICMP echo
-(\texttt{ping}), UDP, a small TCP with retransmission, a DHCP client, the configuration from the kernel command line, a network
+(\texttt{ping}), UDP, a small TCP with retransmission, a DHCP client, a DNS resolver, the configuration from the kernel command line, a network
 thread that an interrupt wakes, and the system calls with which user programs reach all this. The goal is a telnet server;
 until then the echo service shows how a server attaches to the stack.
 
@@ -112,6 +112,12 @@ void net_configure_from_command_line (void);     // called once at boot after ne
 struct dhcp_result { u32 server, address, netmask, gateway, dns, lease_seconds; };
 extern struct dhcp_result dhcp_last;              // what the last successful dhcp_run () got
 int  dhcp_run (int timeout_ms, void (*idle) (void));    // ask a DHCP server for an address and use it: 0 = done; 'idle' is called while waiting
+
+// ---- name resolution (dns.c) ----
+#define DNS_NOT_FOUND (-2)                        // dns_resolve: the name server says that there is no such name
+#define DNS_FAILED    (-3)                        // ... no name server known, bad name, or the server could not answer
+int  dns_resolve (const char *name, u32 *ip, void (*idle) (void));     // the IPv4 address (A record) of a host name: 0 = ok, -1 = no answer; 'idle' as in dhcp_run
+extern u16 dns_port;                              // the port of the name server (53; only the network test changes it)
 
 // ---- TCP (tcp.c) ----
 void tcp_input (u32 src_ip, const u8 *segment, int len);      // called by net.c for every TCP segment that arrives
@@ -1813,6 +1819,170 @@ int dhcp_run (int timeout_ms, void (*idle) (void)) {
 }
 
 @
+\section{A resolver: turns a host name into an IP address (DNS)}
+\label{src:dns.c}
+
+People say \texttt{example.org}, IP wants 93.184.216.34. The \emph{Domain Name System} (RFC 1035) is the phone book: the
+computer sends a question as a UDP datagram to its name server (port 53), the server sends the answer back. The address of the name
+server is [[net_dns]]; DHCP or the command line ([[dns=]]) has put it there. A question and an answer have the same format:
+
+\begin{quote}\begin{verbatim}
+    | id (2) | flags (2) | questions (2) | answers (2) | authority (2) | additional (2) |       the header: 12 bytes
+    | name | type (2) | class (2) |                                                           the question
+    | name | type (2) | class (2) | time to live (4) | length (2) | data |   ...                the answers
+\end{verbatim}\end{quote}
+
+The \emph{id} is a number that we invent and the server copies into its answer, so that we can tell which question an answer
+belongs to (and so that a forged answer has to guess it). In the flags we only set ``recursion desired'' (0x0100): ``please
+ask the other servers for me, if you do not know it yourself.'' The \emph{name} is written as a sequence of labels, each with its
+length in front, and ends with a zero byte: \texttt{example.org} is [[7 example 3 org 0]]. The \emph{type} 1 is ``A'' (the
+IPv4 address), the \emph{class} 1 is ``IN'' (Internet). The data of an A record are the four bytes of the address.
+
+The server does not repeat a name that it has written before: it puts a two byte \emph{pointer} instead. A byte that starts
+with two one bits (0xC0) is the first half of the pointer, and the position (counted from the start of the message) is
+in the 14 remaining bits. A name therefore ends with a zero byte or with a pointer, and that is all we need to know
+to \emph{skip} it. We never have to read the names of the answers: the question was for one name, and if that name is an alias
+(CNAME) the server sends the CNAME record first and then the A record of the real name; the first A record is what we want.
+
+What the resolver does \emph{not} do: AAAA, MX and the other record types, several questions, TCP when the answer does not
+fit into a datagram (a ``truncated'' answer is treated as no answer), a cache, and the search list of domains.
+
+As in [[dhcp_run]], the caller says what is to happen while we wait ([[idle]]): the network thread sleeps, a program that asked
+through the system call gives the CPU to the others. Nobody ever blocks the boot: the kernel itself never resolves a name.
+If no answer comes within a second the question is sent again, then after two seconds, then after four.
+
+@
+The complete file is put together from these parts:
+
+<<dns.c>>=
+<<dns.c: includes>>
+
+<<dns.c: skip_name>>
+
+<<dns.c: build_query>>
+
+<<dns.c: parse_answer>>
+
+<<dns.c: dns_resolve>>
+@
+
+<<dns.c: includes>>=
+#include "net.h"
+
+#define DNS_TYPE_A    1
+#define DNS_CLASS_IN  1
+#define DNS_SOURCE_PORT 5300                              // the port that the answers come back to
+
+u16 dns_port = 53;
+
+static u16 query_id;                                      // the question that we wait for the answer to
+static u8  answer[512];  static int answer_len;           // an answer to it (512 bytes is all that UDP DNS can carry without extensions)
+static volatile int answered;
+static int bound = 0, busy = 0;                           // the port is bound; a question is on its way (there is only one answer buffer)
+
+@
+the position after the name that starts at 'i' (labels, ending with a zero byte or with a pointer), or -1 if it runs out of the message
+
+<<dns.c: skip_name>>=
+static int skip_name (const u8 *msg, int len, int i) {
+  while (i < len) {
+    int c = msg[i];
+    if (c == 0) return i + 1;                             // the end of the name
+    if ((c & 0xC0) == 0xC0) return i + 2 <= len ? i + 2 : -1;     // a pointer: the name goes on elsewhere, but ends here
+    i += 1 + c;                                           // a label: its length byte and the letters
+  }
+  return -1;
+}
+
+@
+the question for the A record of 'name' at 'q': its length, or -1 if the name is not a name (empty label, label over 63 characters, over 253 characters)
+
+<<dns.c: build_query>>=
+static int build_query (u8 *q, const char *name) {
+  put16 (q, query_id);  put16 (q + 2, 0x0100);            // flags: recursion desired
+  put16 (q + 4, 1);  put16 (q + 6, 0);  put16 (q + 8, 0);  put16 (q + 10, 0);
+  u8 *p = q + 12;
+  int total = 0;
+  while (*name) {
+    int n = 0;
+    while (name[n] && name[n] != '.') n++;
+    if (n == 0 || n > 63) return -1;
+    total += n + 1;
+    if (total > 253) return -1;
+    *p++ = n;
+    for (int i = 0; i < n; i++) *p++ = name[i];
+    name += n;
+    if (*name == '.') name++;                             // (a dot at the end, "example.org.", is fine)
+  }
+  if (p == q + 12) return -1;                             // no name at all
+  *p++ = 0;                                               // the end of the name
+  put16 (p, DNS_TYPE_A);  put16 (p + 2, DNS_CLASS_IN);
+  return (int)(p + 4 - q);
+}
+
+@
+the answer in 'answer': 0 and the address, DNS_NOT_FOUND (rcode 3: no such name), or DNS_FAILED (an error, no A record, garbage)
+
+<<dns.c: parse_answer>>=
+static int parse_answer (const u8 *m, int len, u32 *ip) {
+  if (len < 12 || get16 (m) != query_id || !(m[2] & 0x80)) return DNS_FAILED;      // too short, not our id, not an answer (QR bit)
+  int rcode = m[3] & 15;
+  if (rcode == 3) return DNS_NOT_FOUND;
+  if (rcode != 0 || get16 (m + 4) != 1) return DNS_FAILED;
+  int i = skip_name (m, len, 12);                                                  // the question comes back first: skip it
+  if (i < 0) return DNS_FAILED;
+  i += 4;                                                                          // its type and class
+  for (int n = get16 (m + 6); n > 0; n--) {                                        // the answers
+    i = skip_name (m, len, i);
+    if (i < 0 || i + 10 > len) return DNS_FAILED;
+    int type = get16 (m + i), class = get16 (m + i + 2), length = get16 (m + i + 8);
+    i += 10;
+    if (i + length > len) return DNS_FAILED;
+    if (type == DNS_TYPE_A && class == DNS_CLASS_IN && length == 4) { *ip = get32 (m + i); return 0; }
+    i += length;                                                                   // a CNAME or something else: next one
+  }
+  return DNS_FAILED;
+}
+
+@
+The answer is copied by the handler of port 5300, which may run in the network thread or in the program that waits. It is
+accepted only from the name server we asked.
+
+Waiting uses the same loop as DHCP: look at what the card has received, give the CPU away, until the answer is there or the time is
+over. An answer that is garbage or truncated is not an error right away; the next try may be better. But the server saying that
+the name does not exist is final.
+
+<<dns.c: dns_resolve>>=
+static void on_datagram (u32 src, u16 src_port, const u8 *data, int len) {
+  if (src != net_dns || src_port != dns_port || len < 12 || len > (int)sizeof answer || get16 (data) != query_id) return;
+  for (int i = 0; i < len; i++) answer[i] = data[i];
+  answer_len = len;  answered = 1;
+}
+
+int dns_resolve (const char *name, u32 *ip, void (*idle) (void)) {
+  u8 query[12 + 256 + 4];
+  if (!net_dns) return DNS_FAILED;                                                 // nobody to ask
+  while (busy) { net_poll_once ();  if (idle) idle (); }                           // (another program is resolving: wait for our turn)
+  busy = 1;
+  if (!bound) { udp_bind (DNS_SOURCE_PORT, on_datagram);  bound = 1; }
+  query_id = (u16)(net_now_ms () * 2654435761u >> 8);                              // different every time
+  int length = build_query (query, name);
+  int result = length < 0 ? DNS_FAILED : -1;
+  for (int attempt = 0; attempt < 3 && length > 0; attempt++) {                    // three questions: after 1, 2 and 4 seconds we give up
+    answered = 0;
+    udp_send (net_dns, dns_port, DNS_SOURCE_PORT, query, length);
+    u64 start = net_now_ms ();
+    while (!answered && net_now_ms () - start < (u64)(1000 @<< attempt)) { net_poll_once ();  if (!answered && idle) idle (); }
+    if (!answered) continue;
+    result = parse_answer (answer, answer_len, ip);
+    if (result == 0 || result == DNS_NOT_FOUND) break;
+    result = -1;
+  }
+  busy = 0;
+  return result;
+}
+
+@
 \section{The configuration of the network at boot: from the kernel command line}
 \label{src:netconf.c}
 
@@ -2425,6 +2595,7 @@ that ``ping'' needs. TCP and UDP sockets for programs come later (then telnet ca
     net_info (&i)          the interface: name, Ethernet address, IP address, netmask, router, name server (ifconfig, route)
     net_set (&s)           change address and netmask, or the router (only root; ifconfig, route)
     net_dhcp (&d)          ask a DHCP server and use what it says (only root; dhclient)
+    dns_resolve (&q)       q.name: a host name; q.address: its IPv4 address; returns 0, -1 = no answer, -2 = no such name, -3 = failed (ping, host)
 \end{verbatim}\end{quote}
 
 A program that waits for an answer gives the CPU to the others in between ([[arch_resign]]), and looks into the network card each
@@ -2446,6 +2617,8 @@ The complete file is put together from these parts:
 <<net_syscalls.c: syscall_reboot>>
 
 <<net_syscalls.c: syscall_net_info>>
+
+<<net_syscalls.c: syscall_dns_resolve>>
 @
 
 <<net_syscalls.c: includes>>=
@@ -2568,4 +2741,23 @@ void syscall_net_dhcp (context_t *r) {
   d->server = dhcp_last.server;  d->address = dhcp_last.address;  d->netmask = dhcp_last.netmask;
   d->gateway = dhcp_last.gateway;  d->dns = dhcp_last.dns;  d->lease = dhcp_last.lease_seconds;
   eax_return (result);
+}
+
+@
+\subsection{asking the name server (see [[dns.c]])}
+
+The program gives the name; the CPU goes to the other processes while the kernel waits for the answer, as for DHCP. The name
+is copied into the kernel first (and given a zero at the end), because the program may change it, or have none.
+
+<<net_syscalls.c: syscall_dns_resolve>>=
+struct dns_query { char name[256]; unsigned address; };            // the same as in userland/arm64-extra.h
+extern int dns_resolve (const char *name, unsigned *ip, void (*idle) (void));
+
+void syscall_dns_resolve (context_t *r) {
+  struct dns_query *q = (struct dns_query *)r->ebx;
+  char name[256];
+  int i = 0;
+  while (i < 255 && q->name[i]) { name[i] = q->name[i]; i++; }
+  name[i] = 0;
+  eax_return (dns_resolve (name, &q->address, arch_resign));
 }
