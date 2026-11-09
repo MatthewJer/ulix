@@ -2742,6 +2742,12 @@ thread opens the file for every portion, appends to it and closes it again, so t
 off (the disk buffers are written with [[buffer_sync]]). The directories \texttt{/var} and \texttt{/var/log} are made when they are
 missing. If the buffer is full the new line is dropped: a log that blocks the network is worse than a log with a gap.
 
+The thread starts its first flush while the boot is still running, and the boot code (thread 1, the idle thread) is at that moment
+loading the first program from the same disk. That went wrong once in a few boots (a crash in the file system, and no log at all),
+until the cause was found: thread 1 started its disk request without taking the disk lock, because it must not sleep, and so it
+could start while the request of the network thread was on its way. The fix is in the disk driver (\texttt{glue.c}: thread 1 now takes
+the lock by asking again and again), not here; the log may be written at any time.
+
 <<netd.c: log>>=
 static char log_ring[2048];
 static int  log_in = 0, log_out = 0;                             // the buffer is a ring: written at log_in, emptied at log_out

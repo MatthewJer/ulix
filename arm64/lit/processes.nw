@@ -1193,6 +1193,16 @@ Like the IDE driver of the book, a process that reads or writes a block takes [[
 to sleep in [[harddisk_queue]]; the interrupt of the device wakes it up ([[hd_interrupt]]).  Without a running scheduler,
 for the idle thread (the tests, the boot code) and without a known interrupt the driver polls instead.
 
+The idle thread (thread 1) also runs file system code, at the boot: it starts the first program, and it does so while the network
+thread may already be writing its log. Thread 1 must not sleep: if it sat in a blocked queue and the other threads did, too (the
+network thread waiting for the disk), no thread would be ready, and the scheduler has nothing to run. So every lock of the book
+([[mutex_lock]]: the disk, the buffer cache, \ldots) is taken by thread 1 without sleeping: it tries, and gives the CPU away while the
+lock is taken. For this the Makefile renames the book's [[mutex_lock]] to [[book_mutex_lock]] (as it does for [[scheduler]]
+and [[u_kill]]), and the wrapper below has the book's name. Before, thread 1 did not take the disk lock at all, and so it could
+start a disk request while the request of the network thread was on its way: the answer landed in the wrong buffer (wrong blocks, a crash
+in the file system) in about half of the boots with a log, and later, with the lock but without this wrapper, thread 1 slept on the lock of the
+buffer cache and the boot hung.
+
 <<glue.c: blk_disks>>=
 extern int  blk_submit_n (int n, int type, unsigned long sector, void *buf, unsigned nsectors);
 extern int  blk_done_n (int n);
@@ -1206,10 +1216,18 @@ void arch_resign (void);
 
 int hd_sleeps = 0, hd_interrupts = 0;        // statistics, checked by the tests
 
+extern void book_mutex_lock (lock lockvar);       // the book's mutex_lock (the Makefile renames it)
+extern boolean mutex_try_lock (lock lockvar);
+
+void mutex_lock (lock lockvar) {                  // the wrapper has the book's name
+  if (current_task != 1) { book_mutex_lock (lockvar); return; }
+  while (!mutex_try_lock (lockvar)) arch_resign ();        // thread 1 must not sleep: it asks again and again
+}
+
 static int hd_transfer (int hd, int type, int blockno, char *buffer) {
   int sleep_ok = scheduler_is_active && blk_irq && current_task > 1;       // (thread 1 is the idle thread and must not sleep)
   if (hd_lock == NULL) hd_lock = get_new_lock ("hd");
-  if (current_task > 1) mutex_lock (hd_lock);
+  mutex_lock (hd_lock);
     hd_direction = (type == 0) ? HD_OP_READ : HD_OP_WRITE;
     blk_irq_wait = sleep_ok;                                      // (an SD card is told how it is waited for)
     int r = blk_submit_n (hd, type, (unsigned long)blockno * 2, buffer, 2);
@@ -1220,7 +1238,7 @@ static int hd_transfer (int hd, int type, int blockno, char *buffer) {
       r = blk_finish_n (hd);
     }
     hd_direction = HD_OP_NONE;
-  if (current_task > 1) mutex_unlock (hd_lock);
+  mutex_unlock (hd_lock);
   return r;
 }
 
@@ -1322,7 +1340,7 @@ static void sd_transfer (int write, int secno, char *buf) {
   if (!plat_uart2 ()) return;
   int sleep_ok = scheduler_is_active && sd_irq_ready && current_task > 1;
   if (sd_lock == NULL) sd_lock = get_new_lock ("serial disk");
-  if (current_task > 1) mutex_lock (sd_lock);
+  mutex_lock (sd_lock);
     if (write) {
       sd_command (CMD_PUT, secno);
       for (int i = 0; i < BLOCK_SIZE; i++) sd_putc ((unsigned char)buf[i]);
@@ -1343,7 +1361,7 @@ static void sd_transfer (int write, int secno, char *buf) {
       }
       if (sd_pos == BLOCK_SIZE) { memcpy (buf, sd_buf, BLOCK_SIZE); sd_blocks_read++; }
     }
-  if (current_task > 1) mutex_unlock (sd_lock);
+  mutex_unlock (sd_lock);
 }
 
 void readblock_serial  (int secno, char *buf) { sd_transfer (0, secno, buf); }

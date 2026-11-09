@@ -109,8 +109,8 @@ $(GENDIR)/ulix-port.c $(GENDIR)/ulix-api.h: $(GENFILES) port.manifest tools/port
 	python3 tools/port.py $(GENDIR) port.manifest $(GENDIR)/ulix-port.c
 	# several CPUs (smp.c): the book's scheduler () and u_kill () are wrapped; the wrappers have the book's names
 	sed -i.bak -e 's/^void scheduler (context_t \*r, int source) {/void book_scheduler (context_t *r, int source) {/' \
-	           -e 's/^int u_kill (int pid, int signo) {/int book_u_kill (int pid, int signo) {/' $(GENDIR)/ulix-port.c && rm $(GENDIR)/ulix-port.c.bak
-	grep -q 'book_scheduler (context_t' $(GENDIR)/ulix-port.c && grep -q 'book_u_kill (int' $(GENDIR)/ulix-port.c
+	           -e 's/^int u_kill (int pid, int signo) {/int book_u_kill (int pid, int signo) {/' -e 's/^void mutex_lock (lock lockvar) {/void book_mutex_lock (lock lockvar) {/' $(GENDIR)/ulix-port.c && rm $(GENDIR)/ulix-port.c.bak
+	grep -q 'book_scheduler (context_t' $(GENDIR)/ulix-port.c && grep -q 'book_u_kill (int' $(GENDIR)/ulix-port.c && grep -q 'book_mutex_lock (lock' $(GENDIR)/ulix-port.c
 
 BOOKFLAGS = -mno-outline-atomics -std=gnu99 -O0 -g -ffreestanding -nostdlib -nostdinc -fno-builtin -fno-stack-protector \
             -mgeneral-regs-only -Wall -Wno-unused -Wno-pointer-sign -I$(GENDIR)
