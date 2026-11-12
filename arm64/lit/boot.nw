@@ -692,7 +692,7 @@ static void disk_test (void) {
   CHECK (n == 33, "root directory has 33 entries (16 from x86 Ulix + 17 AArch64 files)");
   n = 0;
   minix_readdir (minix_lookup ("/bin"), count_cb, &n);
-  CHECK (n == 76, "/bin has 76 entries (the programs of lib-build/tools, init, ping, ping6, host, ifconfig, route, dhclient, top, shutdown, poweroff, reboot, sntp, rand and https)");
+  CHECK (n == 79, "/bin has 79 entries (the programs of lib-build/tools, init, ping, ping6, host, ifconfig, route, dhclient, top, shutdown, poweroff, reboot, sntp, rand, https, daemon, service and heartbeat)");
   CHECK (minix_lookup ("/nonexistent") == 0, "unknown path not found");
 
   // reference values computed on the host from the same image with an independent parser
@@ -733,6 +733,14 @@ static void console_main (void) {
   extern void netd_start (void);
   if (net_ok) netd_start ();                                      // the network thread: frames are handled as they arrive
   printf ("console ready (Ctrl-C: end the running program, Ctrl-]: kernel shell)\n");
+#ifdef RC_AT_BOOT
+  {                                                                // /etc/rc of Ulix: start the services that rc.conf switches on
+    char *rc_argv[] = { "service", "-a", "start", 0 };             // (chapter "Daemons and services"); the daemons stay, rc ends
+    int rc = arch_start_user ("/bin/service", 3, rc_argv);
+    extern void arch_wait_for_process (int tid, unsigned ticks);
+    arch_wait_for_process (rc, 2000);                              // (at most 20 seconds)
+  }
+#endif
 #ifndef CONSOLE_PROGRAM
 #define CONSOLE_PROGRAM "/contest64"
 #endif

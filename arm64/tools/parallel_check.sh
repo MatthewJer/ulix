@@ -34,6 +34,7 @@ JOBLIST=(
   "netd|network thread: echo service answers while the kernel runs its program (interrupt of the card)|netd|virt||128"
   "dhcpretry|cable plugged in after the boot: the network thread asks DHCP by itself|dhcpretry|virt||128"
   "telnet|telnet server: login on terminal 5 over TCP, top, second connection, hang up, switched off in /etc/rc.conf|telnet|virt||128"
+  "daemon|services: service and daemon, /etc/rc.d, pid file, a daemon on its own terminal, started at boot by rc.conf|daemon|virt||128"
   "https|TLS 1.2: https client against a test CA and a TLS server on the host, random numbers, SNTP, tls_enable switch|https|virt||128"
   "ssh|SSH server: host key, curve25519 key exchange, AES-CTR and HMAC, login on terminal 5 with the ssh client of the host, switched off in /etc/rc.conf|ssh|virt||128"
   "netconf|network settings from the kernel command line: fixed address, DHCP, a very long command line|netconf|virt||128"
@@ -99,6 +100,10 @@ if [ "$1" = "--job" ]; then
       [ $rc -eq 0 ] && grep -q "all passed" <<< "$sum" && st=ok || st=FAILED ;;
     telnet)
       python3 tools/telnet_test.py ulix-shell.bin $DISK > "$log" 2>&1
+      rc=$?; sum=$(tail -1 "$log")
+      [ $rc -eq 0 ] && grep -q "all passed" <<< "$sum" && st=ok || st=FAILED ;;
+    daemon)
+      python3 tools/daemon_test.py ulix-shell.bin $DISK > "$log" 2>&1
       rc=$?; sum=$(tail -1 "$log")
       [ $rc -eq 0 ] && grep -q "all passed" <<< "$sum" && st=ok || st=FAILED ;;
     https)

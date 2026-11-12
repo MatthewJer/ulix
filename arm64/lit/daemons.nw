@@ -1,0 +1,336 @@
+\chapter{Daemons and services}
+\label{ch:daemons}
+
+A \emph{daemon} is a program that runs in the background and does a job for others: it waits for connections, writes a log, or
+sends a heartbeat. Up to now Ulix has two kinds of such jobs, and both are part of the kernel: the network thread
+(\texttt{netd}) and the servers that run in it (\texttt{telnetd}, \texttt{sshd}). That was the shortcut of the first steps. A
+server in the kernel can crash the system, its mistakes cost kernel memory, and the SSH server's cryptography has to fit on the
+16~KByte stack of a kernel thread. A server should be a \emph{program}: it can be written, tested, started, stopped and killed
+like any other, and when it fails, only it fails.
+
+What is missing is not the mechanism --- \texttt{fork}, \texttt{exec} and \texttt{kill} are enough --- but a \emph{convention}: how
+are services described, who starts them when the machine boots, how does the administrator start and stop one, and how does one
+find out whether it is running? The BSDs answer this with \texttt{/etc/rc}, the scripts in \texttt{/etc/rc.d}, the file
+\texttt{/etc/rc.conf} and the command \texttt{service}. Ulix takes the same names and the same ideas, and leaves out what needs a
+shell language: where a BSD service is a script, a Ulix service is a \emph{data file}.
+
+\section{The convention}
+
+\begin{description}
+\item[\texttt{/etc/rc.conf}] says which services are switched on, one line each: \texttt{heartbeat\_enable="YES"}. This is the file the
+  kernel services already use (\texttt{telnetd\_enable}, \texttt{sshd\_enable}, \texttt{tls\_enable}).
+\item[\texttt{/etc/rc.d/NAME}] describes the service \texttt{NAME} in lines of the same form: \texttt{command} (the program;
+  its arguments may follow), \texttt{rcvar} (the name of its switch in \texttt{rc.conf}), \texttt{default} (\texttt{YES} or
+  \texttt{NO}: what to do if \texttt{rc.conf} does not mention the switch) and \texttt{pidfile} (the default is
+  \texttt{/var/run/NAME.pid}). Lines that start with \texttt{\#} are comments.
+\item[\texttt{daemon}] starts a program in the background: it detaches the program from the terminal it was started on and
+  writes its process number into the pid file. (The name and the job are those of \texttt{daemon(8)} of FreeBSD.)
+\item[\texttt{service}] is the administrator's tool: \texttt{service NAME start}, \texttt{stop}, \texttt{restart},
+  \texttt{status}; \texttt{service -e} lists the services that are switched on, \texttt{service -l} all of them, and
+  \texttt{service -a start} starts every service that is switched on.
+\item[boot] The kernel runs \texttt{service -a start} once, after the file system is mounted and before the first \texttt{login}
+  appears. This is the whole job of \texttt{/etc/rc} in this system.
+\end{description}
+
+\section{The pid file}
+
+A service that runs in the background has no terminal that could tell the administrator what it is doing, and the shell does not
+wait for it. The only handle on it is its process number, and it is kept in a file: \texttt{/var/run/NAME.pid} holds the number
+as text. \texttt{service stop} reads it and sends the signal; \texttt{service status} reads it and asks the kernel whether that
+process is alive (\texttt{kill} with signal 0 delivers nothing and only tells whether the process exists; a process of another user, for example a daemon
+that the boot started for root, exists even when the answer is ``not permitted'': only its owner and root may stop it).
+
+The method has a weakness every Unix has: if the machine ended without \texttt{stop}, the file is left behind, and a later
+process may have the old number. \texttt{service} then thinks the service is running. The directories are on the disk, and the disk
+is not emptied at boot; \texttt{service -a start} therefore does not trust a pid file blindly --- a service is only called running
+when the number belongs to a living process --- but it cannot tell \emph{which} program that process is. For a teaching system that
+is acceptable; the book of BSD has the same sentence.
+
+\section{\texttt{daemon}: detach and note the number}
+
+\texttt{daemon [-p pidfile] command [arguments]} does three things. It starts the command in a child process. It moves the child to
+the last virtual terminal (number 9, which nobody logs in on), so the keys and the Ctrl-C of the terminal the administrator uses do
+not reach it: on Ulix the processes of a terminal are its jobs (\texttt{console\_interrupt}), and a daemon is not a job. And it
+writes the process number of the child into the pid file and ends; the child's parent is gone, so the system's first process adopts it,
+and nobody has to wait for it.
+
+What the daemon prints is shown on terminal 9 (Alt-F10 on the console). A daemon with a lot to say should write a log file.
+
+<<userland/daemon.c>>=
+#include "../ulixlib.h"
+#include "../arm64-extra.h"
+
+#define LOG_TERMINAL 9                         // the terminal that no user logs in on: the daemon's output goes there
+
+int main (int argc, char **argv) {
+  char *pidfile = 0;
+  int first = 1;
+  if (argc > 2 && strcmp (argv[1], "-p") == 0) { pidfile = argv[2];  first = 3; }
+  if (first >= argc) { printf ("usage: daemon [-p pidfile] command [arguments]\n");  return 1; }
+
+  mkdir ("/var", 0755);                        // (fails if they exist: fine)
+  mkdir ("/var/run", 0755);
+
+  int pid = fork ();
+  if (pid < 0) { printf ("daemon: cannot fork\n");  return 1; }
+  if (pid == 0) {
+    setterm (LOG_TERMINAL);                    // leave the terminal of the administrator
+    execv (argv[first], &argv[first]);
+    printf ("daemon: cannot start %s\n", argv[first]);
+    exit (1);
+  }
+  if (pidfile) {
+    unlink (pidfile);                          // (a new file: there is no O_TRUNC yet)
+    int fd = open (pidfile, O_WRONLY | O_CREAT, 0644);
+    if (fd < 0) { printf ("daemon: cannot write %s\n", pidfile);  kill (pid, SIGKILL);  return 1; }
+    char text[16];
+    sprintf (text, "%d\n", pid);
+    write (fd, text, strlen (text));
+    close (fd);
+  }
+  return 0;
+}
+@
+
+\section{\texttt{service}}
+
+\texttt{service} has four small jobs, and each is a function of at most a screenful. The first is reading text lines of the form
+\texttt{name="value"} from a file, which serves for \texttt{rc.conf} and for the files in \texttt{rc.d} alike:
+\texttt{get\_setting (text, name, out)} looks for a line that begins with \texttt{name=}, removes the quotes and copies the rest. Both files
+are small, so the whole file is read into a buffer first.
+
+<<userland/service.c: settings>>=
+#define MAXTEXT 2048
+
+// reads a whole (small) file into text; 0 if it cannot be opened
+static int read_file (const char *path, char *text) {
+  int fd = open (path, O_RDONLY, 0), n = 0, k;
+  if (fd < 0) return 0;
+  while (n < MAXTEXT - 1 && (k = read (fd, text + n, MAXTEXT - 1 - n)) > 0) n += k;
+  close (fd);
+  text[n] = 0;
+  return 1;
+}
+
+// finds a line  name="value"  (the quotes are optional) at the start of a line; 1 if found
+static int get_setting (const char *text, const char *name, char *value) {
+  int len = strlen (name);
+  for (const char *p = text; *p; ) {
+    if (strncmp (p, name, len) == 0 && p[len] == '=') {
+      const char *v = p + len + 1;
+      if (*v == '"') v++;
+      int i = 0;
+      while (v[i] && v[i] != '"' && v[i] != '\n' && i < 127) { value[i] = v[i];  i++; }
+      value[i] = 0;
+      return 1;
+    }
+    while (*p && *p != '\n') p++;              // next line
+    if (*p) p++;
+  }
+  return 0;
+}
+@
+
+The second job is to put together what is known about one service: the file in \texttt{rc.d}, the switch in \texttt{rc.conf} and the
+state of the process. A service that has no file in \texttt{rc.d} does not exist.
+
+<<userland/service.c: services>>=
+struct service {
+  char name[32], command[128], pidfile[128], rcvar[64];
+  int  enabled;                                // switched on in rc.conf (or by its default)
+};
+
+static int load_service (const char *name, struct service *s) {
+  char path[64], text[MAXTEXT], value[128];
+  sprintf (path, "/etc/rc.d/%s", name);
+  if (!read_file (path, text)) return 0;
+  strncpy (s->name, name, 31);  s->name[31] = 0;
+  if (!get_setting (text, "command", s->command)) return 0;
+  if (!get_setting (text, "pidfile", s->pidfile)) sprintf (s->pidfile, "/var/run/%s.pid", name);
+  if (!get_setting (text, "rcvar", s->rcvar)) sprintf (s->rcvar, "%s_enable", name);
+  int enabled = 0;                             // the default of the service, unless rc.conf says something
+  if (get_setting (text, "default", value)) enabled = strcmp (value, "YES") == 0;
+  char conf[MAXTEXT];
+  if (read_file ("/etc/rc.conf", conf) && get_setting (conf, s->rcvar, value)) enabled = strcmp (value, "YES") == 0;
+  s->enabled = enabled;
+  return 1;
+}
+
+// does the process exist? Signal 0 is not delivered, kill only tells whether it could be. A process of another user (a daemon that
+// the boot started for root) exists, too, even though we may not signal it: that is the answer "not permitted", not "no such process".
+static int alive (int pid) { return kill (pid, 0) == 0 || errno == EPERM; }
+
+// the process number of the service, or 0 if it does not run (no pid file, or no such process)
+static int running_pid (struct service *s) {
+  char text[32];
+  if (!read_file (s->pidfile, text)) return 0;
+  int pid = atoi (text);
+  return pid > 2 && alive (pid) ? pid : 0;
+}
+@
+
+The third job is to start and to stop. Starting runs \texttt{daemon} and waits for it (it ends at once). Stopping sends \texttt{SIGTERM}, the
+polite request to end, and waits up to three seconds for the process to disappear; a program that does not answer is then
+killed with \texttt{SIGKILL}. A process only reacts to \texttt{SIGTERM} if it has a handler (otherwise the kernel kills it, which
+works but is noisy), so a well-behaved daemon installs one --- see \texttt{heartbeat} below.
+
+<<userland/service.c: start and stop>>=
+static void wait_ms (int ms) {                 // the clock is read in microseconds; other processes run meanwhile
+  unsigned start = clock_us ();
+  while ((clock_us () - start) / 1000 < (unsigned)ms) resign ();
+}
+
+static int service_start (struct service *s) {
+  int pid = running_pid (s);
+  if (pid) { printf ("%s is already running (pid %d).\n", s->name, pid);  return 0; }
+  char *argv[8];
+  int n = 0;
+  argv[n++] = "daemon";  argv[n++] = "-p";  argv[n++] = s->pidfile;
+  char *c = s->command;                        // the command and its arguments, separated by blanks
+  while (*c && n < 7) {
+    argv[n++] = c;
+    while (*c && *c != ' ') c++;
+    if (*c) *c++ = 0;
+  }
+  argv[n] = 0;
+  int child = fork (), status = 0;
+  if (child == 0) { execv ("/bin/daemon", argv);  exit (1); }
+  waitpid (child, &status, 0);
+  if (status != 0 || !(pid = running_pid (s))) { printf ("Starting %s failed.\n", s->name);  return 1; }
+  printf ("Starting %s (pid %d).\n", s->name, pid);
+  return 0;
+}
+
+static int service_stop (struct service *s) {
+  int pid = running_pid (s);
+  if (!pid) { printf ("%s is not running.\n", s->name);  return 0; }
+  if (kill (pid, SIGTERM) != 0) { printf ("service: cannot stop %s (pid %d): permission denied\n", s->name, pid);  return 1; }
+  for (int i = 0; i < 30 && alive (pid); i++) wait_ms (100);
+  if (alive (pid)) { kill (pid, SIGKILL);  wait_ms (300);  printf ("%s did not end and was killed.\n", s->name); }
+  else printf ("Stopped %s.\n", s->name);
+  unlink (s->pidfile);
+  return 0;
+}
+
+static int service_status (struct service *s) {
+  int pid = running_pid (s);
+  if (pid) printf ("%s is running as pid %d.\n", s->name, pid);
+  else     printf ("%s is not running.\n", s->name);
+  return pid ? 0 : 1;                          // like the BSDs: the exit status says it
+}
+@
+
+The fourth job is the loop over all services (\texttt{-a}, \texttt{-e}, \texttt{-l}): the names are the entries of the directory
+\texttt{/etc/rc.d}.
+
+<<userland/service.c: main>>=
+static int for_all (int only_enabled, int (*action) (struct service *), int show_enabled) {
+  struct dir_entry e;
+  int result = 0;
+  for (int index = 0; getdent ("/etc/rc.d", index, &e) != -1; index++) {
+    if (e.filename[0] == '.' || e.inode == 0) continue;
+    struct service s;
+    if (!load_service ((char *)e.filename, &s)) continue;
+    if (only_enabled && !s.enabled) continue;
+    if (action) result |= action (&s);
+    if (show_enabled) printf ("%s%s\n", s.name, s.enabled ? "" : "   (off)");
+  }
+  return result;
+}
+
+int main (int argc, char **argv) {
+  if (argc == 2 && strcmp (argv[1], "-e") == 0) return for_all (1, 0, 1);
+  if (argc == 2 && strcmp (argv[1], "-l") == 0) return for_all (0, 0, 1);
+  if (argc == 3 && strcmp (argv[1], "-a") == 0) {
+    if (strcmp (argv[2], "start") == 0)  return for_all (1, service_start, 0);
+    if (strcmp (argv[2], "stop") == 0)   return for_all (1, service_stop, 0);
+    if (strcmp (argv[2], "status") == 0) return for_all (1, service_status, 0);
+  }
+  if (argc == 3) {
+    struct service s;
+    if (!load_service (argv[1], &s)) { printf ("service: %s: no such service (see /etc/rc.d)\n", argv[1]);  return 1; }
+    if (strcmp (argv[2], "start") == 0)   return service_start (&s);
+    if (strcmp (argv[2], "stop") == 0)    return service_stop (&s);
+    if (strcmp (argv[2], "status") == 0)  return service_status (&s);
+    if (strcmp (argv[2], "restart") == 0) { service_stop (&s);  return service_start (&s); }
+  }
+  printf ("usage: service name start|stop|restart|status\n"
+          "       service -e | -l\n"
+          "       service -a start|stop|status\n");
+  return 2;
+}
+@
+
+<<userland/service.c>>=
+#include "../ulixlib.h"
+#include "../arm64-extra.h"
+
+<<userland/service.c: settings>>
+<<userland/service.c: services>>
+<<userland/service.c: start and stop>>
+<<userland/service.c: main>>
+@
+
+\section{A first service: \texttt{heartbeat}}
+
+A convention needs at least one citizen that follows it, and the tests need one that does something visible. \texttt{heartbeat}
+appends a line to \texttt{/var/log/heartbeat.log} every second. That is all, and it shows what every daemon has to get right:
+it runs forever, it opens its log for each line and closes it again (so the file is complete if the machine stops), and it
+reacts to \texttt{SIGTERM} by ending in an orderly way.
+
+The waiting uses the system call that the program \texttt{top} uses, a wait for a key press with a time limit; on terminal 9, where a daemon
+lives, nobody types, so it is a plain sleep.
+
+<<userland/heartbeat.c>>=
+#include "../ulixlib.h"
+#include "../arm64-extra.h"
+
+static volatile int stop = 0;
+static void on_term (int signo) { stop = 1; }          // SIGTERM: end after the current round
+
+int main (int argc, char **argv) {
+  signal (SIGTERM, on_term);
+  mkdir ("/var", 0755);
+  mkdir ("/var/log", 0755);
+  for (int n = 1; !stop; n++) {
+    int fd = open ("/var/log/heartbeat.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd >= 0) {
+      char line[32];
+      sprintf (line, "heartbeat %d\n", n);
+      write (fd, line, strlen (line));
+      close (fd);
+    }
+    waitkey (1000);                                    // one second
+  }
+  return 0;
+}
+@
+
+Its description is the file \texttt{/etc/rc.d/heartbeat}. It is switched off unless \texttt{rc.conf} says
+\texttt{heartbeat\_enable="YES"}.
+
+<<etc/rc.d/heartbeat>>=
+# heartbeat: writes a line to /var/log/heartbeat.log every second (a test and an example for services)
+command="/bin/heartbeat"
+rcvar="heartbeat_enable"
+default="NO"
+pidfile="/var/run/heartbeat.pid"
+@
+
+\section{Starting the services at boot}
+
+In \texttt{console\_main} (chapter on the boot) the kernel starts \texttt{/bin/service} with the arguments \texttt{-a start} before it starts
+\texttt{/init}, and waits until that process has ended; the daemons it started stay (their parent, \texttt{service}, is gone, and the first process
+adopts them). The kernel only does this in the build with login (the interactive build for the board and the one for the shell test), not
+in the build for the kernel tests, which count processes.
+
+\section{What is not done}
+
+\begin{itemize}
+\item No \texttt{rc.shutdown}: \texttt{shutdown} and \texttt{reboot} do not stop the services first. They end the machine; a daemon that writes to
+  a file only has the disk buffers of the book to lose, and \texttt{sync} runs.
+\item No dependencies between services (BSD's \texttt{REQUIRE} and \texttt{rcorder}): \texttt{-a start} goes through the directory in the order
+  of the entries.
+\item The pid file cannot tell \emph{which} program has the number (see above).
+\item No restart of a daemon that has crashed (that would be a job for a supervisor, as in \texttt{daemontools} or \texttt{runit}).
+\end{itemize}

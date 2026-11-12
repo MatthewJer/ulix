@@ -120,3 +120,7 @@ libc/hello.c
 libc/build/
 pipes.c
 user/pipetest.c
+userland/daemon.c
+userland/service.c
+userland/heartbeat.c
+etc/rc.d/

@@ -1046,6 +1046,15 @@ The real /bin/swapper only runs as process 2 (on the [[x86]] the first process i
 <<arch_thread.c: part 28>>=
 void arch_next_pid_is_2 (void) { next_pid = 2; }
 
+// the boot code (thread 1) waits for a process it has started, at most for the given number of timer ticks
+extern void arch_idle (void);
+void arch_wait_for_process (int tid, unsigned ticks) {
+  unsigned start = (unsigned)system_ticks;
+  while (tid > 0 && thread_table[tid].used && thread_table[tid].state != TSTATE_ZOMBIE && thread_table[tid].state != TSTATE_EXIT &&
+         (unsigned)system_ticks - start < ticks)
+    arch_idle ();
+}
+
 @
 \subsection{system calls: the book's dispatcher, called from the exception handler}
 
