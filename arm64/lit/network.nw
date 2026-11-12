@@ -71,6 +71,9 @@ extern int net_echo;                              // the kernel command line sai
 int  rc_conf_enabled (const char *variable, int fallback);   // is 'variable' set to YES in /etc/rc.conf? 'fallback' if the file or the line is missing
 extern int net_telnet;                            // the telnet server is on (telnetd_enable in /etc/rc.conf)
 int  telnet_start (void);                         // open port 23: 0 = ok
+extern int net_ssh;                               // the SSH server is on (sshd_enable in /etc/rc.conf; only in a system built with TLS=1: sshd.c)
+int  ssh_start (void);                            // open port 22: 0 = ok (needs a host key and random numbers)
+int  ssh_step (void);                             // serve the session a bit: 1 = something was moved
 int  telnet_step (void);                          // serve the session a bit: 1 = something was moved
 extern int telnet_vt;                             // the terminal that the session shows (-1: nobody is connected)
 void telnet_putch (char c);                       // what a process writes to that terminal (arch_vt.c)
@@ -2706,6 +2709,9 @@ extern unsigned char ip6_global[16], ip6_router[16];
 extern int  ip6_have_global, ip6_have_router;
 extern int  telnet_start (void);
 extern int  telnet_step (void);
+extern int  ssh_start (void) __attribute__ ((weak));         // sshd.c (only when the system is built with TLS=1)
+extern int  ssh_step (void) __attribute__ ((weak));
+extern int  rc_conf_enabled (const char *variable, int fallback);
 extern int  rc_conf_enabled (const char *variable, int fallback);
 extern void gic_enable (int irq);
 extern void arch_resign (void);
@@ -2715,6 +2721,7 @@ extern int  arch_thread_create_high (void (*entry) (void *), void *arg, const ch
 void netlog (const char *line);
 
 int netd_irq = 0;
+int net_ssh = 0;                              // the SSH server is on: sshd_enable in /etc/rc.conf (default YES), and the system has one
 int net_telnet = 0;                           // the telnet server is on: /etc/rc.conf says telnetd_enable="YES" (or says nothing)
 static int running = 0, ticks_seen = 0;
 
@@ -2852,7 +2859,7 @@ static void netd_link6 (void) {
 static void netd (void *arg) {
   for (;;) {
     int moved;
-    do { moved = net_poll_once (); if (net_echo) moved |= echo_step (); if (net_telnet) moved |= telnet_step (); } while (moved);       // everything that is there
+    do { moved = net_poll_once (); if (net_echo) moved |= echo_step (); if (net_telnet) moved |= telnet_step (); if (net_ssh) moved |= ssh_step (); } while (moved);       // everything that is there
     netd_link6 ();                                                                            // (IPv6: a router solicitation, until a router has answered)
     netd_link ();                                                                             // (every two seconds: link? an address yet?)
     netlog_flush ();                                                                          // (the network log, if there is something for it)
@@ -2866,10 +2873,13 @@ void netd_start (void) {
   if (net_echo && echo_start () != 0) printf ("netd: cannot open port 7\n");
   net_telnet = rc_conf_enabled ("telnetd_enable", 1);              // on, unless /etc/rc.conf switches it off
   if (net_telnet && telnet_start () != 0) { printf ("netd: cannot open port 23\n"); net_telnet = 0; }
+  net_ssh = ssh_start && rc_conf_enabled ("sshd_enable", 1);        // (a system built with TLS=0 has no SSH server at all)
+  if (net_ssh && ssh_start () != 0) net_ssh = 0;
   arch_thread_create_high (netd, 0, "netd");                       // (a high thread number: see arch_thread_create_high)
   running = 1;
   printf ("netd: network thread started (%s)%s\n", netd_irq ? "woken by the interrupt of the card" : "polling every 50 ms", net_echo ? ", echo service on port 7" : "");
   if (net_telnet) printf ("netd: telnet server on port 23\n");
+  if (net_ssh) printf ("netd: ssh server on port 22\n");
 }
 
 @
@@ -2881,6 +2891,7 @@ Which services a BSD system starts is written down in the file \texttt{/etc/rc.c
     telnetd_enable="YES"
     netlog_enable="NO"
     tls_enable="YES"
+    sshd_enable="YES"
 \end{verbatim}\end{quote}
 Ulix does the same. A line has the form [[name="YES"]] or [[name="NO"]] (the quotes may be left out; everything behind a
 [[#]] is a comment). The file is read once, when the network thread starts. The kernel asks for one setting at a time
@@ -3040,8 +3051,10 @@ static void put (u8 c) {
   head++;
 }
 
+void ssh_putch (char c) __attribute__ ((weak));       // sshd.c: the terminal is used by an SSH session (a system built with TLS=1)
+
 void telnet_putch (char c) {
-  if (conn == 0) return;
+  if (conn == 0) { if (ssh_putch) ssh_putch (c); return; }          // (the SSH server shares this terminal: see sshd.c)
   int was_empty = (head == tail);
   if (c == '\n') put ('\r');                    // a line ends with CR LF
   put ((u8)c);
@@ -3117,7 +3130,7 @@ int telnet_step (void) {
 
   tcp_conn *other = tcp_accept (TELNET_PORT);
   if (other) {
-    if (conn) { tcp_write (other, (const u8 *)busy, sizeof busy - 1); tcp_close (other); }
+    if (conn || telnet_vt >= 0) { tcp_write (other, (const u8 *)busy, sizeof busy - 1); tcp_close (other); }      // (a session of telnet or ssh has the terminal)
     else session_start (other);
     moved = 1;
   }

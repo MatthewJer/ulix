@@ -40,6 +40,8 @@ telnet.c
 net_syscalls.c
 random.c
 sntp.c
+sshcrypto.c
+sshd.c
 stats.c
 bookfs_test.c
 thread_test.c

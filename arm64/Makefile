@@ -15,11 +15,17 @@ CFLAGS = -I$(GENDIR) -mno-outline-atomics -O0 -g -ffreestanding -nostdlib -fno-b
 # "-snapshot" keeps the file unmodified when running.
 DISK ?= disk.img
 
-# make TLS=0 builds a system without TLS: no BearSSL, no CA list on the disk, https only says so (see lit/tls.nw)
+
+# make TLS=0 builds a system without TLS: no BearSSL, no CA list on the disk, https only says so, and no SSH server (see lit/tls.nw, lit/ssh.nw)
 TLS ?= 1
 
 OBJS = start.o vectors.o linux_abi.o irq.o mmu.o virtio.o sdcard.o virtionet.o genet.o netdev.o net.o ip6.o tcp.o dhcp.o dns.o netconf.o echo.o net_test.o net_syscalls.o random.o sntp.o netd.o rcconf.o telnet.o stats.o minixfs.o elf.o ulix-port.o glue.o arch_thread.o arch_console.o arch_clock.o arch_swap.o arch_vt.o dt.o gic.o smp.o \
        bookfs_test.o thread_test.o proc_test.o kmain.o
+
+# the SSH server and the cryptography of BearSSL (the same archive as for the program https) are part of the kernel only with TLS=1
+ifeq ($(TLS),1)
+OBJS += sshd.o sshcrypto.o tlslibc.o userland/build/libbearssl.a
+endif
 
 all: ulix.elf ulix-console.elf ulix-shell.elf ulix.bin ulix-console.bin ulix-shell.bin $(DISK) $(GENDIR)/disk_expected.h
 
@@ -29,7 +35,7 @@ USERLAND_BIN = userland/build/bin
 userland/build/bin/init.elf: FORCE
 	$(MAKE) -C userland
 
-disk.img: $(wildcard userland/build/bin/*.elf) ../bin-build/minixdata.img etc/rc.conf user/hello.elf user/cat.elf user/crash.elf user/forktest.elf user/sigtest.elf user/contest.elf user/cowtest.elf user/thtest.elf user/badptr.elf user/swaptest.elf user/screentest.elf user/stacktest.elf user/memtest.elf libc/build/hello.elf userland/build/bin/init.elf tools/minix_add.py etc/ssl/cacert.pem
+disk.img: $(wildcard userland/build/bin/*.elf) ../bin-build/minixdata.img etc/rc.conf user/hello.elf user/cat.elf user/crash.elf user/forktest.elf user/sigtest.elf user/contest.elf user/cowtest.elf user/thtest.elf user/badptr.elf user/swaptest.elf user/screentest.elf user/stacktest.elf user/memtest.elf libc/build/hello.elf userland/build/bin/init.elf tools/minix_add.py etc/ssl/cacert.pem $(if $(filter 1,$(TLS)),etc/ssh/ssh_host_ecdsa_key)
 	cp ../bin-build/minixdata.img $@
 	# two deliberately broken variants of hello.elf for the loader tests:
 	# e_machine = EM_386, and a code segment with flags RWX
@@ -38,8 +44,14 @@ disk.img: $(wildcard userland/build/bin/*.elf) ../bin-build/minixdata.img etc/rc
 	python3 tools/minix_add.py $@ --grow=4096 --chmod=/tmp:1777 hello64=user/hello.elf cat64=user/cat.elf crash64=user/crash.elf forktest64=user/forktest.elf sigtest64=user/sigtest.elf contest64=user/contest.elf cowtest64=user/cowtest.elf thtest64=user/thtest.elf badptr64=user/badptr.elf swaptest64=user/swaptest.elf screentest64=user/screentest.elf stacktest64=user/stacktest.elf memtest64=user/memtest.elf muslhello64=libc/build/hello.elf \
 		badarch64=bad-arch.elf badwx64=bad-wx.elf \
 		/init=$(USERLAND_BIN)/init.elf /etc/rc.conf=etc/rc.conf \
-		$(if $(filter 1,$(TLS)),--mkdir=/etc/ssl /etc/ssl/cacert.pem=etc/ssl/cacert.pem) \
+		$(if $(filter 1,$(TLS)),--mkdir=/etc/ssl /etc/ssl/cacert.pem=etc/ssl/cacert.pem --mkdir=/etc/ssh /etc/ssh/ssh_host_ecdsa_key=etc/ssh/ssh_host_ecdsa_key --chmod=/etc/ssh/ssh_host_ecdsa_key:600) \
 		$$(for f in $(USERLAND_BIN)/*.elf; do n=$$(basename $$f .elf); [ $$n != init ] && echo /bin/$$n=$$f; done)
+
+# the host key of the SSH server (sshd.c): 32 random bytes as 64 hexadecimal digits, made once per checkout and never part of the repository
+etc/ssh/ssh_host_ecdsa_key:
+	mkdir -p etc/ssh
+	python3 -c "import os; print(os.urandom(32).hex())" > $@
+	chmod 600 $@
 
 # the user programs are rebuilt by their own Makefile whenever a source changed
 # size and checksum of files on the disk, computed by the independent Python parser
@@ -158,6 +170,18 @@ glue.o: glue.c $(GENFILES) $(GENDIR)/ulix-api.h
 irq.o mmu.o virtio.o sdcard.o dt.o gic.o smp.o kmain.o kmain-console.o kmain-shell.o kmain-net.o: plat.h gic.h smp.h ulix.h arch_pte.h
 virtionet.o genet.o netdev.o net.o ip6.o tcp.o dhcp.o dns.o netconf.o echo.o net_test.o rcconf.o telnet.o sntp.o: net.h plat.h ulix.h cache.h delay.h
 random.o: plat.h ulix.h cache.h
+sshd.o: net.h plat.h ulix.h
+
+# sshcrypto.c is the only file of the kernel that sees BearSSL's header files (they define the same types as ulix.h in another way); like the
+# library it is compiled at -O2. tlslibc.o: memmove and memcmp, which BearSSL needs and the kernel does not have.
+BRFLAGS = -mno-outline-atomics -O2 -ffreestanding -nostdlib -fno-stack-protector -fno-pic -mgeneral-regs-only -std=gnu99 -w \
+          -I../third_party/bearssl/inc -I../third_party/bearssl/src -Iuserland/tls -DBR_USE_UNIX_TIME=0 -DBR_USE_WIN32_TIME=0
+sshcrypto.o: sshcrypto.c userland/tls/string.h
+	$(CC) $(BRFLAGS) -c -o $@ $<
+tlslibc.o: userland/tls/libc.c
+	$(CC) $(BRFLAGS) -c -o $@ $<
+userland/build/libbearssl.a: FORCE
+	$(MAKE) -C userland build/libbearssl.a
 sdcard.o: delay.h
 
 %.o: %.S
@@ -289,6 +313,10 @@ netd-test: ulix-console.bin $(DISK)
 # TLS: the https client against a test authority and a TLS 1.2 server of the host, random numbers, SNTP, the tls_enable switch (needs openssl on the host)
 https-test: ulix-shell.bin $(DISK)
 	python3 tools/https_test.py ulix-shell.bin $(DISK)
+
+# the SSH server: the ssh client of the host logs in on terminal 5 (needs ssh, ssh-keyscan and ssh-keygen on the host)
+ssh-test: ulix-shell.bin $(DISK)
+	python3 tools/ssh_test.py ulix-shell.bin $(DISK)
 
 # a cable that is plugged in after the boot: the network thread asks DHCP by itself
 dhcp-retry-test: ulix-console.bin $(DISK)

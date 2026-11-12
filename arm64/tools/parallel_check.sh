@@ -35,6 +35,7 @@ JOBLIST=(
   "dhcpretry|cable plugged in after the boot: the network thread asks DHCP by itself|dhcpretry|virt||128"
   "telnet|telnet server: login on terminal 5 over TCP, top, second connection, hang up, switched off in /etc/rc.conf|telnet|virt||128"
   "https|TLS 1.2: https client against a test CA and a TLS server on the host, random numbers, SNTP, tls_enable switch|https|virt||128"
+  "ssh|SSH server: host key, curve25519 key exchange, AES-CTR and HMAC, login on terminal 5 with the ssh client of the host, switched off in /etc/rc.conf|ssh|virt||128"
   "netconf|network settings from the kernel command line: fixed address, DHCP, a very long command line|netconf|virt||128"
   "maxcpus|kernel command line maxcpus=2 on a machine with 4 CPUs|maxcpus|virt||128"
   "ram512|RAM 512 MByte, 2 CPUs|kernel|virt|-smp 2|512"
@@ -102,6 +103,10 @@ if [ "$1" = "--job" ]; then
       [ $rc -eq 0 ] && grep -q "all passed" <<< "$sum" && st=ok || st=FAILED ;;
     https)
       python3 tools/https_test.py ulix-shell.bin $DISK > "$log" 2>&1
+      rc=$?; sum=$(tail -1 "$log")
+      [ $rc -eq 0 ] && grep -q "all passed" <<< "$sum" && st=ok || st=FAILED ;;
+    ssh)
+      python3 tools/ssh_test.py ulix-shell.bin $DISK > "$log" 2>&1
       rc=$?; sum=$(tail -1 "$log")
       [ $rc -eq 0 ] && grep -q "all passed" <<< "$sum" && st=ok || st=FAILED ;;
     netd)

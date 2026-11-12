@@ -28,6 +28,7 @@ sd.img
 sd-pi.img
 sd-boot/
 firmware/
+etc/ssh/
 ulix-net.elf
 
 # sources written from lit/*.nw by tools/tangle.sh (edit the chapters, not these files)
@@ -73,6 +74,8 @@ stats.c
 net_syscalls.c
 random.c
 sntp.c
+sshcrypto.c
+sshd.c
 bookfs_test.c
 thread_test.c
 proc_test.c

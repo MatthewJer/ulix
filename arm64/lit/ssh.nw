@@ -1,0 +1,835 @@
+\chapter{An SSH server}
+\label{ch:ssh}
+
+Telnet sends every key, and so the password, over the network in clear text. \emph{SSH} (the Secure Shell, RFC 4251 to 4254) is
+the same idea with cryptography: a terminal over a TCP connection, but the server proves who it is, and everything that follows is
+encrypted and protected against changes. The SSH server of Ulix ([[sshd.c]]) is a sibling of the telnet server
+([[telnet.c]]): the same kernel thread serves it, it uses the same terminal (the one on which a [[login]] waits), and it is
+switched on and off with a line in [[/etc/rc.conf]], [[sshd_enable="YES"]] (the default; \emph{not} part of the system when it is
+built with [[make TLS=0]], because it needs the same cryptography library as [[https]]: BearSSL).
+
+\paragraph{What is implemented} is the smallest SSH-2 server that a current OpenSSH client talks to. Each step of the connection
+has exactly one algorithm, so there is nothing to negotiate except to check that the client knows it:
+
+\begin{center}\begin{tabular}{ll}
+  key exchange        & [[curve25519-sha256]] (an elliptic curve Diffie--Hellman exchange, RFC 8731) \\
+  server key          & [[ecdsa-sha2-nistp256]] (a signature with a P-256 key, RFC 5656) \\
+  encryption          & [[aes128-ctr]] (AES in counter mode, RFC 4344) \\
+  integrity           & [[hmac-sha2-256]] (RFC 6668) \\
+  compression         & [[none]] \\
+  user authentication & [[none]], see below \\
+  channels            & one [[session]] with a terminal ([[pty-req]] is accepted and ignored) and a [[shell]]
+\end{tabular}\end{center}
+
+Ed25519 host keys are not possible (BearSSL has no Ed25519), and [[chacha20-poly1305@openssh.com]], the cipher that OpenSSH prefers, needs
+the plain Poly1305 function, which BearSSL only offers inside its TLS construction; AES-CTR with HMAC is the older and simpler
+design and every OpenSSH client still offers it. No [[exec]] requests (running one command: [[ssh host ls]]) and no port forwarding:
+only the interactive shell.
+
+\paragraph{Who is the user?} The \emph{server} is authenticated by the SSH layer: the client compares the host key with the one that
+it knows ([[known_hosts]]). The \emph{user} is authenticated by [[login]], exactly as with telnet: the SSH layer accepts the method
+[[none]], and the session starts at the prompt of [[login]] on the terminal, where the user name and the password are typed
+(through the encrypted connection, which is the point). The password is checked by the existing code and nothing in the SSH
+layer ever sees it in clear text. An SSH client that wants to send a password itself (RFC 4252, method [[password]]) is not
+needed: a client that is refused the method [[password]] falls back on [[none]].
+
+\paragraph{The host key} is a P-256 private key, 32 random bytes written as 64 hexadecimal digits into [[/etc/ssh/ssh_host_ecdsa_key]].
+The kernel can only read files at the time it starts the server, so the key is made when the disk image is built
+([[arm64/etc/ssh/]], by the [[Makefile]], from the random numbers of the host; it is not part of the repository, so every
+image gets its own key). The kernel prints its fingerprint at the start ([[SHA256:]] and 43 characters, the form that
+[[ssh-keygen -l]] prints), so that a person at the console can compare it with what the client shows on the first connection.
+
+\paragraph{One session, one terminal.} Telnet and SSH share one terminal, number 5 ([[TELNET_VT]]). The first one that comes in gets it,
+everybody else is refused until it hangs up. When the SSH client closes the connection, the programs on the terminal are ended
+([[console_hangup]]) and [[login]] asks for a name again. That is what keeps the next person from finding a shell of the
+last one.
+
+\paragraph{Where the code is.} Everything that touches BearSSL is in [[sshcrypto.c]] (the same split as in the TLS chapter: BearSSL and
+the kernel header files use different definitions of the same types). The protocol is [[sshd.c]], a state machine that the
+network thread calls again and again, like [[telnet_step]]: it reads what has arrived, handles every complete packet, and sends
+what the terminal has written. It never waits.
+
+The cryptography runs in the kernel, in the network thread, on a stack of 16 KByte. That is acceptable for a teaching system, and
+BearSSL needs no more than a few KByte of stack for the signature, but a larger system would run the protocol in a process of
+its own ([[telnetd]] and [[sshd]] in kernel space are a shortcut, taken because the system has no pipes or pseudo terminals, which
+such a process would need to talk to the shell).
+
+@
+\section{\texttt{sshcrypto.c}: the cryptography, with plain types}
+\label{src:sshcrypto.c}
+
+The functions below are all that the protocol needs. They are thin wrappers around BearSSL; a call each, no state of the library
+leaks out. The random number generator is BearSSL's HMAC\_DRBG, seeded for every connection with 32 bytes from the hardware generator of
+the kernel ([[random_get]]).
+
+<<sshcrypto.c>>=
+#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+#include "bearssl.h"
+
+<<sshcrypto.c: random>>
+
+<<sshcrypto.c: curve25519>>
+
+<<sshcrypto.c: host key>>
+
+<<sshcrypto.c: hashes>>
+
+<<sshcrypto.c: aes>>
+@
+
+<<sshcrypto.c: random>>=
+static br_hmac_drbg_context drbg;
+
+void sshc_seed (const unsigned char *seed, int len) { br_hmac_drbg_init (&drbg, &br_sha256_vtable, seed, len); }
+void sshc_random (unsigned char *out, int len)      { br_hmac_drbg_generate (&drbg, out, len); }
+
+@
+\emph{Curve25519}: the private key is 32 random bytes, the public key is the point that these bytes (``clamped'': a few bits are fixed) multiply
+the base point to. The shared secret is the peer's public key multiplied by our private key: both sides get the same 32 bytes. BearSSL
+does the clamping itself. If the peer sends a point of small order the result is all zero, and the exchange must be refused.
+
+<<sshcrypto.c: curve25519>>=
+void sshc_x25519_generate (unsigned char *priv, unsigned char *pub) {
+  sshc_random (priv, 32);
+  br_ec_c25519_m31.mulgen (pub, priv, 32, BR_EC_curve25519);
+}
+
+int sshc_x25519_shared (const unsigned char *peer, const unsigned char *priv, unsigned char *out) {
+  unsigned char zero = 0;
+  memcpy (out, peer, 32);
+  if (br_ec_c25519_m31.mul (out, 32, priv, 32, BR_EC_curve25519) != 1) return -1;
+  for (int i = 0; i < 32; i++) zero |= out[i];
+  return zero ? 0 : -1;
+}
+
+@
+The host key: the file holds the private scalar of the curve P-256 (secp256r1). The public key is the point in its uncompressed
+form (65 bytes: 0x04, x, y), which is what goes into the key blob of the protocol. A signature is two numbers $r$ and $s$ of 32 bytes (64
+bytes); BearSSL calculates the nonce of ECDSA from the message and the key (RFC 6979), so no random number is needed for it.
+
+<<sshcrypto.c: host key>>=
+static br_ec_private_key host_sk;
+static unsigned char host_x[32];
+
+int sshc_hostkey (const unsigned char *private_key, unsigned char *public_key) {
+  unsigned char buf[BR_EC_KBUF_PUB_MAX_SIZE];
+  br_ec_public_key pk;
+  memcpy (host_x, private_key, 32);
+  host_sk.curve = BR_EC_secp256r1;  host_sk.x = host_x;  host_sk.xlen = 32;
+  if (br_ec_compute_pub (&br_ec_prime_i31, &pk, buf, &host_sk) != 65) return -1;
+  memcpy (public_key, pk.q, 65);
+  return 0;
+}
+
+int sshc_sign (const unsigned char *hash, unsigned char *r_and_s) {
+  return br_ecdsa_i31_sign_raw (&br_ec_prime_i31, &br_sha256_vtable, hash, &host_sk, r_and_s) == 64 ? 0 : -1;
+}
+
+@
+<<sshcrypto.c: hashes>>=
+void sshc_sha256 (const void *data, int len, unsigned char *out) {
+  br_sha256_context c;
+  br_sha256_init (&c);  br_sha256_update (&c, data, len);  br_sha256_out (&c, out);
+}
+
+// HMAC-SHA-256 with a 32 byte key over two pieces (the sequence number and the packet)
+void sshc_hmac (const unsigned char *key, const void *a, int alen, const void *b, int blen, unsigned char *out) {
+  br_hmac_key_context kc;
+  br_hmac_context hc;
+  br_hmac_key_init (&kc, &br_sha256_vtable, key, 32);
+  br_hmac_init (&hc, &kc, 0);
+  br_hmac_update (&hc, a, alen);  br_hmac_update (&hc, b, blen);
+  br_hmac_out (&hc, out);
+}
+
+// a comparison that takes the same time wherever the first difference is (so that nobody can find a valid MAC byte by byte)
+int sshc_equal (const unsigned char *a, const unsigned char *b, int n) {
+  unsigned char d = 0;
+  for (int i = 0; i < n; i++) d |= a[i] ^ b[i];
+  return d == 0;
+}
+
+@
+\emph{AES in counter mode}: the stream of the connection is made by encrypting a counter, one block of 16 bytes at a time, and
+adding (XOR) it to the data; decrypting is the same operation. The counter is a 128 bit number that starts with the IV
+and counts up for every block, over all packets of the connection. BearSSL's function takes the first 12 bytes as a fixed IV
+and counts a 32 bit number in the last four; [[sshc_aes_crypt]] carries over into the IV if that number wraps around (very rare, but it
+must be right). Two streams: 0 decrypts what the client sends, 1 encrypts what we send.
+
+<<sshcrypto.c: aes>>=
+static struct { br_aes_ct_ctr_keys keys; unsigned char iv[12]; uint32_t counter; } stream[2];
+
+void sshc_aes_start (int which, const unsigned char *key16, const unsigned char *iv16) {
+  br_aes_ct_ctr_init (&stream[which].keys, key16, 16);
+  memcpy (stream[which].iv, iv16, 12);
+  stream[which].counter = ((uint32_t)iv16[12] << 24) | ((uint32_t)iv16[13] << 16) | ((uint32_t)iv16[14] << 8) | iv16[15];
+}
+
+void sshc_aes_crypt (int which, unsigned char *data, int len) {            // len is a multiple of 16
+  while (len > 0) {
+    uint64_t room = (0x100000000ULL - stream[which].counter) * 16;       // bytes until the 32 bit counter wraps
+    int part = (uint64_t)len < room ? len : (int)room;
+    stream[which].counter = stream[which].keys.vtable->run (&stream[which].keys.vtable, stream[which].iv, stream[which].counter, data, part);
+    data += part;  len -= part;
+    if (stream[which].counter == 0)                                       // wrapped: add one to the IV (as a number, most significant byte first)
+      for (int i = 11; i >= 0; i--) if (++stream[which].iv[i] != 0) break;
+  }
+}
+
+@
+\section{\texttt{sshd.c}: the protocol}
+\label{src:sshd.c}
+
+An SSH connection goes through these phases, each of them a state of the server ([[stage]]):
+
+\begin{enumerate}
+\item \textbf{Banner.} Both sides send one line, [[SSH-2.0-]] and the name of the program, ended by CR LF. (They are part of the key exchange hash, without the line end.)
+\item \textbf{Key exchange init} ([[KEXINIT]], message 20). Both sides send the lists of the algorithms they know, in the order of their preference; for each
+      purpose the first algorithm of the \emph{client's} list that the server also knows is used. We know one of each, so we only check that the client lists them.
+\item \textbf{Key exchange} (message 30, 31). The client sends its public key [[Q_C]], we answer with ours ([[Q_S]]), our host key ([[K_S]]) and a signature. Both compute the shared secret $K$. The
+      \emph{exchange hash} $H$ is the SHA-256 of everything that has been said so far (both banners, both KEXINIT messages, the host key, both public
+      keys and $K$); the signature of $H$ with the host key proves to the client that it talks to the owner of the host key and that nobody changed
+      the exchange. $H$ of the first exchange is the \emph{session id}.
+\item \textbf{New keys} (message 21). The six keys (the two IVs, two encryption keys and two MAC keys) are cut from SHA-256 of $K$, $H$, a letter A to F and the session id. After
+      this message each side encrypts what it sends.
+\item \textbf{Services and authentication} (messages 5, 6, 50 to 53): the client asks for the service [[ssh-userauth]] and then tries the method [[none]] (see above).
+\item \textbf{Connection} (messages 90 to 100): the client opens a channel of type [[session]], asks for a terminal and a shell, and then
+      data flows in both directions in [[CHANNEL_DATA]] messages, controlled by windows: a side may send only as many bytes as the other side has said it has room for.
+\end{enumerate}
+
+\paragraph{A packet} (RFC 4253, section 6) is: a length (4 bytes), the length of the padding (1 byte), the \emph{payload} (the message, its first byte is the number),
+the padding (at least 4 bytes, so that the whole packet is a multiple of 16 bytes), and, once the keys are in use, the MAC (32 bytes) behind it. The MAC is the HMAC-SHA-256 of the
+sequence number of the packet (4 bytes, counting every packet since the connection began, never reset) and the whole packet \emph{before} encryption. The whole packet,
+including the length, is encrypted. To know how many bytes belong to the packet the receiver decrypts the first block (16 bytes) first; the counter mode lets
+it decrypt the rest later. The numbers in the packets are big endian ([[get32]], [[put32]] of [[net.h]]); a \emph{string} is a length (4 bytes) and the bytes; an
+\emph{mpint} is a number as a string, most significant byte first, without leading zeros and with a zero byte in front when the highest bit is set (so that it is not negative).
+
+@
+
+The complete file is put together from these parts:
+
+<<sshd.c>>=
+<<sshd.c: includes>>
+
+<<sshd.c: helpers>>
+
+<<sshd.c: sending>>
+
+<<sshd.c: receiving>>
+
+<<sshd.c: key exchange>>
+
+<<sshd.c: messages>>
+
+<<sshd.c: session>>
+
+<<sshd.c: ssh_step>>
+@
+
+<<sshd.c: includes>>=
+#include "net.h"
+
+#define SSH_PORT    22
+#define SSH_VT      4                           // the terminal that telnet uses, too (Ctrl-T 5): a login waits there
+#define CHANNEL_WINDOW  65536                   // how many bytes the client may send before we say that there is more room
+#define MAX_PACKET      4096                    // the biggest packet we accept (the data of one CHANNEL_DATA is at most 2048)
+
+extern void telnet_input (int vt, unsigned char c);       // arch_console.c: a key from the session
+extern void telnet_attach (int vt);                       // arch_console.c: the session takes over the terminal
+extern void console_hangup (int vt);                      // arch_console.c: end the programs of the terminal
+extern void arch_vt_telnet_attach (void);                 // arch_vt.c: send the screen of the terminal to the session
+extern int  telnet_vt;                                    // telnet.c: the terminal of a remote session, -1 = none
+extern int  random_get (void *buf, int n);                // random.c
+extern u32  minix_lookup (const char *path);
+extern long minix_read (u32 ino_nr, u32 offset, void *buf, u32 len);
+
+// sshcrypto.c
+void sshc_seed (const u8 *seed, int len);
+void sshc_random (u8 *out, int len);
+void sshc_x25519_generate (u8 *priv, u8 *pub);
+int  sshc_x25519_shared (const u8 *peer, const u8 *priv, u8 *out);
+int  sshc_hostkey (const u8 *private_key, u8 *public_key);
+int  sshc_sign (const u8 *hash, u8 *r_and_s);
+void sshc_sha256 (const void *data, int len, u8 *out);
+void sshc_hmac (const u8 *key, const void *a, int alen, const void *b, int blen, u8 *out);
+int  sshc_equal (const u8 *a, const u8 *b, int n);
+void sshc_aes_start (int which, const u8 *key16, const u8 *iv16);
+void sshc_aes_crypt (int which, u8 *data, int len);
+
+// the message numbers (RFC 4253, 4252, 4254)
+#define MSG_DISCONNECT 1
+#define MSG_IGNORE 2
+#define MSG_UNIMPLEMENTED 3
+#define MSG_DEBUG 4
+#define MSG_SERVICE_REQUEST 5
+#define MSG_SERVICE_ACCEPT 6
+#define MSG_KEXINIT 20
+#define MSG_NEWKEYS 21
+#define MSG_KEX_ECDH_INIT 30
+#define MSG_KEX_ECDH_REPLY 31
+#define MSG_USERAUTH_REQUEST 50
+#define MSG_USERAUTH_FAILURE 51
+#define MSG_USERAUTH_SUCCESS 52
+#define MSG_GLOBAL_REQUEST 80
+#define MSG_REQUEST_FAILURE 82
+#define MSG_CHANNEL_OPEN 90
+#define MSG_CHANNEL_OPEN_CONFIRMATION 91
+#define MSG_CHANNEL_OPEN_FAILURE 92
+#define MSG_CHANNEL_WINDOW_ADJUST 93
+#define MSG_CHANNEL_DATA 94
+#define MSG_CHANNEL_EOF 96
+#define MSG_CHANNEL_CLOSE 97
+#define MSG_CHANNEL_REQUEST 98
+#define MSG_CHANNEL_SUCCESS 99
+#define MSG_CHANNEL_FAILURE 100
+
+enum { S_BANNER, S_KEXINIT, S_KEX, S_NEWKEYS, S_RUNNING };
+
+static tcp_conn *conn = 0;                      // the connection of the session (0: nobody is connected)
+static u64 started_at;                          // when it began (net_now_ms): a client that has not got through the key exchange in 30 seconds is dropped
+static int stage;
+static u8  hostkey_private[32], hostkey_public[65];
+static int hostkey_ok = 0;
+
+static const char version_line[] = "SSH-2.0-Ulix_1";
+
+@
+\subsection{helpers for strings and numbers}
+
+<<sshd.c: helpers>>=
+static int put_string (u8 *out, const void *s, int len) {          // a string: length and bytes; returns how many bytes it took
+  put32 (out, len);
+  for (int i = 0; i < len; i++) out[4 + i] = ((const u8 *)s)[i];
+  return 4 + len;
+}
+
+static int text_length (const char *s) { int n = 0; while (s[n]) n++; return n; }
+static int put_text (u8 *out, const char *s) { return put_string (out, s, text_length (s)); }
+
+static int put_mpint (u8 *out, const u8 *be, int len) {              // a number given as bytes, most significant first
+  while (len > 0 && be[0] == 0) { be++; len--; }
+  int extra = (len > 0 && (be[0] & 0x80)) ? 1 : 0;                  // a zero byte in front keeps it positive
+  put32 (out, len + extra);
+  if (extra) out[4] = 0;
+  for (int i = 0; i < len; i++) out[4 + extra + i] = be[i];
+  return 4 + extra + len;
+}
+
+// a string in a received message at offset *off: its place and length; 0 = the message is too short
+static int get_string (const u8 *msg, int n, int *off, const u8 **s, int *len) {
+  if (*off + 4 > n) return 0;
+  u32 l = get32 (msg + *off);
+  if (l > (u32)(n - *off - 4)) return 0;
+  *s = msg + *off + 4;  *len = (int)l;  *off += 4 + (int)l;
+  return 1;
+}
+
+static int same_text (const u8 *s, int len, const char *t) {
+  int i = 0;
+  while (i < len && t[i] && s[i] == (u8)t[i]) i++;
+  return i == len && t[i] == 0;
+}
+
+// does the comma separated list contain the name?
+static int list_has (const u8 *list, int len, const char *name) {
+  int n = text_length (name), start = 0;
+  for (int i = 0; i <= len; i++) {
+    if (i == len || list[i] == ',') {
+      if (i - start == n) { int k = 0; while (k < n && list[start + k] == (u8)name[k]) k++; if (k == n) return 1; }
+      start = i + 1;
+    }
+  }
+  return 0;
+}
+
+@
+\subsection{sending}
+
+[[send_packet]] puts the payload into a packet as described above and appends it to the queue [[tx]]; the network thread hands the queue to TCP ([[flush]]).
+The padding is random. The MAC is made over the packet before it is encrypted, with the number of the packet.
+
+<<sshd.c: sending>>=
+static u8 tx[16384];  static int tx_len = 0;           // what has been prepared and not yet been accepted by TCP
+static u32 seq_out = 0, seq_in = 0;                    // numbers of the packets (RFC 4253: they count from the first packet on)
+static int enc_out = 0, enc_in = 0;                    // the keys are in use
+static u8 mac_key_out[32], mac_key_in[32];
+static int broken = 0;                                 // something went wrong that ends the session (the queue is full, a MAC is wrong)
+
+static void send_packet (const u8 *payload, int plen) {
+  static u8 pkt[MAX_PACKET + 64];
+  int pad = 16 - (5 + plen) % 16;
+  if (pad < 4) pad += 16;
+  int total = 4 + 1 + plen + pad;
+  put32 (pkt, 1 + plen + pad);  pkt[4] = pad;
+  for (int i = 0; i < plen; i++) pkt[5 + i] = payload[i];
+  sshc_random (pkt + 5 + plen, pad);
+  u8 seq[4];
+  put32 (seq, seq_out++);
+  int mac = enc_out ? 32 : 0;
+  if (tx_len + total + mac > (int)sizeof tx) { broken = 1; return; }
+  u8 *dest = tx + tx_len;
+  if (enc_out) {
+    u8 tag[32];
+    sshc_hmac (mac_key_out, seq, 4, pkt, total, tag);
+    sshc_aes_crypt (1, pkt, total);
+    for (int i = 0; i < total; i++) dest[i] = pkt[i];
+    for (int i = 0; i < 32; i++) dest[total + i] = tag[i];
+  } else {
+    for (int i = 0; i < total; i++) dest[i] = pkt[i];
+  }
+  tx_len += total + mac;
+}
+
+static void flush (void) {                             // as much of the queue as TCP takes
+  if (!conn || tx_len == 0) return;
+  int n = tcp_write (conn, tx, tx_len);
+  if (n <= 0) return;
+  for (int i = n; i < tx_len; i++) tx[i - n] = tx[i];
+  tx_len -= n;
+}
+
+@
+\subsection{receiving}
+
+Bytes that arrive are collected in [[rx]]. [[get_packet]] says whether a complete packet is there. Before the keys are in use it only needs the length. Afterwards it
+decrypts the first block to learn the length (and remembers that it has done so: the counter has moved on), waits for the whole packet and the MAC, decrypts the rest,
+and compares the MAC with the one it calculates. A packet with a wrong MAC ends the connection; so does a length that makes no sense.
+
+<<sshd.c: receiving>>=
+static u8 rx[2 * MAX_PACKET];  static int rx_len = 0;
+static int first_block_decrypted = 0;
+static const u8 *pkt_payload;  static int pkt_payload_len, pkt_total;          // the packet that get_packet () has found
+
+static int get_packet (void) {                          // 1 = a packet is ready, 0 = more bytes needed, -1 = error
+  if (!enc_in) {
+    if (rx_len < 5) return 0;
+  } else {
+    if (rx_len < 16) return 0;
+    if (!first_block_decrypted) { sshc_aes_crypt (0, rx, 16);  first_block_decrypted = 1; }
+  }
+  u32 length = get32 (rx);
+  if (length < 12 || length > MAX_PACKET) return -1;
+  int total = 4 + (int)length;
+  if (enc_in && total % 16 != 0) return -1;
+  if (rx_len < total + (enc_in ? 32 : 0)) return 0;
+  if (enc_in) {
+    u8 seq[4], tag[32];
+    sshc_aes_crypt (0, rx + 16, total - 16);
+    put32 (seq, seq_in);
+    sshc_hmac (mac_key_in, seq, 4, rx, total, tag);
+    if (!sshc_equal (tag, rx + total, 32)) return -1;
+  }
+  int pad = rx[4];
+  if (pad < 4 || 1 + pad >= (int)length) return -1;
+  pkt_payload = rx + 5;  pkt_payload_len = (int)length - 1 - pad;  pkt_total = total + (enc_in ? 32 : 0);
+  return 1;
+}
+
+static void consume (int n) {                           // the packet has been handled: remove it from rx
+  for (int i = n; i < rx_len; i++) rx[i - n] = rx[i];
+  rx_len -= n;
+  first_block_decrypted = 0;
+  seq_in++;
+}
+
+@
+\subsection{the key exchange}
+
+What has been said is kept for the hash: the banner of the client ([[client_version]]), our banner, the two KEXINIT messages (as payloads: the message number and all) and later the
+rest. The lists in our own KEXINIT are the table at the beginning of the chapter. [[kex_init_ok]] checks that the client's lists contain our algorithms.
+
+<<sshd.c: key exchange>>=
+static u8 client_version[256];  static int client_version_len;
+static u8 kexinit_c[3072];  static int kexinit_c_len;
+static u8 kexinit_s[512];   static int kexinit_s_len;
+static u8 session_id[32];
+
+static void send_kexinit (void) {
+  u8 *p = kexinit_s;
+  *p++ = MSG_KEXINIT;
+  sshc_random (p, 16);  p += 16;                                    // the "cookie"
+  p += put_text (p, "curve25519-sha256,curve25519-sha256@libssh.org");
+  p += put_text (p, "ecdsa-sha2-nistp256");
+  p += put_text (p, "aes128-ctr");  p += put_text (p, "aes128-ctr");
+  p += put_text (p, "hmac-sha2-256");  p += put_text (p, "hmac-sha2-256");
+  p += put_text (p, "none");  p += put_text (p, "none");
+  p += put_text (p, "");  p += put_text (p, "");                    // languages
+  *p++ = 0;                                                         // no guessed key exchange packet follows
+  put32 (p, 0);  p += 4;
+  kexinit_s_len = (int)(p - kexinit_s);
+  send_packet (kexinit_s, kexinit_s_len);
+}
+
+static int kex_init_ok (const u8 *m, int n) {
+  int off = 17;                                                     // message number and cookie
+  const u8 *l[10];  int len[10];
+  for (int i = 0; i < 10; i++) if (!get_string (m, n, &off, &l[i], &len[i])) return 0;
+  return (list_has (l[0], len[0], "curve25519-sha256") || list_has (l[0], len[0], "curve25519-sha256@libssh.org"))
+      && list_has (l[1], len[1], "ecdsa-sha2-nistp256")
+      && list_has (l[2], len[2], "aes128-ctr") && list_has (l[3], len[3], "aes128-ctr")
+      && list_has (l[4], len[4], "hmac-sha2-256") && list_has (l[5], len[5], "hmac-sha2-256")
+      && list_has (l[6], len[6], "none") && list_has (l[7], len[7], "none");
+}
+
+@
+The reply to the client's public key. Every piece is built into one buffer in the order of the hash: $H$ = SHA-256 of the strings
+[[V_C]], [[V_S]], [[I_C]], [[I_S]], [[K_S]], [[Q_C]], [[Q_S]] and the mpint $K$. The signature is ECDSA over the SHA-256 of $H$ (the algorithm
+hashes the data it signs; the data here is $H$) and is sent as a string that contains the name and a string with the mpints $r$ and $s$.
+Then the keys are derived: SHA-256 of $K$ (as mpint), $H$, the letter and the session id.
+
+<<sshd.c: key exchange>>=
+static void derive (u8 letter, const u8 *k_mpint, int k_len, const u8 *h, u8 *out) {
+  u8 buf[4 + 33 + 32 + 1 + 32];
+  int n = 0;
+  for (int i = 0; i < k_len; i++) buf[n++] = k_mpint[i];
+  for (int i = 0; i < 32; i++) buf[n++] = h[i];
+  buf[n++] = letter;
+  for (int i = 0; i < 32; i++) buf[n++] = session_id[i];
+  sshc_sha256 (buf, n, out);
+}
+
+static int kex_reply (const u8 *m, int n) {
+  int off = 1;
+  const u8 *q_c;  int q_c_len;
+  static u8 k_s[160], hbuf[6144], reply[512];
+  u8 priv[32], q_s[32], shared[32], h[32], hh[32], rs[64];
+  if (!get_string (m, n, &off, &q_c, &q_c_len) || q_c_len != 32) return -1;
+  sshc_x25519_generate (priv, q_s);
+  if (sshc_x25519_shared (q_c, priv, shared) != 0) return -1;
+
+  int ks = 0;                                                       // the host key as a blob: "ecdsa-sha2-nistp256", "nistp256", the point
+  ks += put_text (k_s + ks, "ecdsa-sha2-nistp256");  ks += put_text (k_s + ks, "nistp256");  ks += put_string (k_s + ks, hostkey_public, 65);
+  u8 k_mpint[40];
+  int k_len = put_mpint (k_mpint, shared, 32);
+
+  int hn = 0;
+  hn += put_string (hbuf + hn, client_version, client_version_len);
+  hn += put_text (hbuf + hn, version_line);
+  hn += put_string (hbuf + hn, kexinit_c, kexinit_c_len);
+  hn += put_string (hbuf + hn, kexinit_s, kexinit_s_len);
+  hn += put_string (hbuf + hn, k_s, ks);
+  hn += put_string (hbuf + hn, q_c, 32);
+  hn += put_string (hbuf + hn, q_s, 32);
+  for (int i = 0; i < k_len; i++) hbuf[hn++] = k_mpint[i];
+  sshc_sha256 (hbuf, hn, h);
+  for (int i = 0; i < 32; i++) session_id[i] = h[i];                // (the first exchange: H is the session id)
+
+  sshc_sha256 (h, 32, hh);
+  if (sshc_sign (hh, rs) != 0) return -1;
+  u8 sig_inner[80], sig[120];
+  int si = put_mpint (sig_inner, rs, 32);  si += put_mpint (sig_inner + si, rs + 32, 32);
+  int sn = put_text (sig, "ecdsa-sha2-nistp256");  sn += put_string (sig + sn, sig_inner, si);
+
+  int rn = 0;
+  reply[rn++] = MSG_KEX_ECDH_REPLY;
+  rn += put_string (reply + rn, k_s, ks);  rn += put_string (reply + rn, q_s, 32);  rn += put_string (reply + rn, sig, sn);
+  send_packet (reply, rn);
+  u8 newkeys = MSG_NEWKEYS;
+  send_packet (&newkeys, 1);
+
+  u8 iv_c[32], iv_s[32], key_c[32], key_s[32];
+  derive ('A', k_mpint, k_len, h, iv_c);   derive ('B', k_mpint, k_len, h, iv_s);
+  derive ('C', k_mpint, k_len, h, key_c);  derive ('D', k_mpint, k_len, h, key_s);
+  derive ('E', k_mpint, k_len, h, mac_key_in);  derive ('F', k_mpint, k_len, h, mac_key_out);
+  sshc_aes_start (0, key_c, iv_c);  sshc_aes_start (1, key_s, iv_s);
+  enc_out = 1;                                                      // what we send from now on is encrypted
+  for (int i = 0; i < 32; i++) { priv[i] = 0;  shared[i] = 0; }
+  return 0;
+}
+
+@
+\subsection{the messages of the session}
+
+The terminal. What the client types goes into the keyboard buffer of terminal 5 ([[telnet_input]]); Enter arrives as CR (a terminal) or LF
+(a program that pipes lines), and CR LF counts once. What the programs print goes into a ring buffer ([[ssh_putch]], called by [[telnet_putch]] when
+no telnet session is there) and is sent as [[CHANNEL_DATA]] as far as the client's window allows.
+
+<<sshd.c: messages>>=
+static int shell_open = 0;                             // the session has a shell: it owns the terminal
+static u32 channel_remote = 0;  static int channel_is_open = 0;
+static u32 remote_window = 0, remote_max_packet = 0;   // how many bytes we may still send; the biggest data piece the client takes
+static u32 consumed = 0;                               // bytes received since the last WINDOW_ADJUST
+static int after_cr = 0;
+
+static u8 ring[8192];
+static volatile unsigned head = 0, tail = 0;
+
+void ssh_putch (char c) {                               // called by telnet_putch when the session is ours: must be quick and must not wait
+  if (!shell_open) return;
+  int was_empty = (head == tail);
+  if (c == '\n' && head - tail < sizeof ring) ring[head++ % sizeof ring] = '\r';
+  if (head - tail < sizeof ring) ring[head++ % sizeof ring] = (u8)c;
+  if (was_empty) netd_nudge ();
+}
+
+static void send_simple (u8 type) { send_packet (&type, 1); }
+
+static void send_channel_reply (u8 type) {              // CHANNEL_SUCCESS or CHANNEL_FAILURE
+  u8 m[5];  m[0] = type;  put32 (m + 1, channel_remote);
+  send_packet (m, 5);
+}
+
+static void from_client (u8 c) {                        // one byte typed by the person
+  if (after_cr) { after_cr = 0;  if (c == '\n' || c == 0) return; }
+  if (c == '\r') after_cr = 1;
+  telnet_input (SSH_VT, c);
+}
+
+@
+A request on the channel. [[pty-req]] (a terminal of some size and kind) is answered with ``yes'' and otherwise ignored: the terminal is the one of the kernel, 80 times 25
+characters. [[shell]] starts the session on the terminal, if nobody else (telnet) has it: the terminal is taken over and its screen is painted into the ring, so that the
+client sees the prompt of [[login]] at once. Everything else that asks for an answer is refused; [[exec]] belongs there.
+
+<<sshd.c: messages>>=
+static void channel_request (const u8 *m, int n) {
+  int off = 5;
+  const u8 *type;  int type_len;
+  if (!get_string (m, n, &off, &type, &type_len) || off >= n) return;
+  int want_reply = m[off];
+  if (same_text (type, type_len, "pty-req")) { if (want_reply) send_channel_reply (MSG_CHANNEL_SUCCESS); return; }
+  if (same_text (type, type_len, "shell")) {
+    if (telnet_vt != -1 || shell_open) { if (want_reply) send_channel_reply (MSG_CHANNEL_FAILURE); return; }      // the terminal is in use
+    shell_open = 1;  telnet_vt = SSH_VT;
+    head = tail = 0;  after_cr = 0;
+    telnet_attach (SSH_VT);
+    if (want_reply) send_channel_reply (MSG_CHANNEL_SUCCESS);
+    arch_vt_telnet_attach ();                                       // paints the terminal into the ring
+    return;
+  }
+  if (want_reply) send_channel_reply (MSG_CHANNEL_FAILURE);
+}
+
+@
+Now the dispatch on the message number. Messages that the client may send before and during the session and that we do not use (ignore, debug, global requests, window changes)
+are skipped, or answered with ``failure'' if they ask for an answer. A message that we do not know at all is answered with UNIMPLEMENTED, as the RFC says.
+
+<<sshd.c: messages>>=
+static void disconnect (int reason, const char *text) {
+  u8 m[100];  int n = 0;
+  m[n++] = MSG_DISCONNECT;  put32 (m + n, reason);  n += 4;
+  n += put_text (m + n, text);  n += put_text (m + n, "");
+  send_packet (m, n);
+  broken = 2;                                                       // the queue is sent, then the connection is closed
+}
+
+static void handle_packet (const u8 *m, int n) {
+  int off;
+  const u8 *s;  int len;
+  switch (m[0]) {
+    case MSG_IGNORE: case MSG_DEBUG: case MSG_UNIMPLEMENTED: break;
+    case MSG_DISCONNECT: broken = 3; break;
+    case MSG_KEXINIT:
+      if (stage != S_KEXINIT || n > (int)sizeof kexinit_c || !kex_init_ok (m, n)) { disconnect (3, "no common algorithms"); break; }
+      for (int i = 0; i < n; i++) kexinit_c[i] = m[i];
+      kexinit_c_len = n;  stage = S_KEX;
+      break;
+    case MSG_KEX_ECDH_INIT:
+      if (stage != S_KEX || kex_reply (m, n) != 0) { disconnect (3, "key exchange failed"); break; }
+      stage = S_NEWKEYS;
+      break;
+    case MSG_NEWKEYS:
+      if (stage != S_NEWKEYS) { disconnect (2, "unexpected NEWKEYS"); break; }
+      enc_in = 1;  stage = S_RUNNING;
+      break;
+    case MSG_SERVICE_REQUEST: {                                     // "ssh-userauth" (and later "ssh-connection" is implied)
+      u8 reply[40];  int rn = 0;
+      off = 1;
+      if (stage != S_RUNNING || !get_string (m, n, &off, &s, &len) || !same_text (s, len, "ssh-userauth")) { disconnect (7, "service not available"); break; }
+      reply[rn++] = MSG_SERVICE_ACCEPT;  rn += put_string (reply + rn, s, len);
+      send_packet (reply, rn);
+      break; }
+    case MSG_USERAUTH_REQUEST: {                                    // the method "none" is accepted: login asks for the password on the terminal
+      off = 1;
+      const u8 *user, *service, *method;  int ul, sl, ml;
+      if (stage != S_RUNNING || !get_string (m, n, &off, &user, &ul) || !get_string (m, n, &off, &service, &sl) || !get_string (m, n, &off, &method, &ml)) { disconnect (2, "bad request"); break; }
+      if (same_text (method, ml, "none")) send_simple (MSG_USERAUTH_SUCCESS);
+      else { u8 reply[24];  int rn = 0;  reply[rn++] = MSG_USERAUTH_FAILURE;  rn += put_text (reply + rn, "none");  reply[rn++] = 0;  send_packet (reply, rn); }
+      break; }
+    case MSG_GLOBAL_REQUEST:
+      off = 1;
+      if (get_string (m, n, &off, &s, &len) && off < n && m[off]) send_simple (MSG_REQUEST_FAILURE);
+      break;
+    case MSG_CHANNEL_OPEN: {
+      off = 1;
+      u8 reply[32];  int rn = 0;
+      if (!get_string (m, n, &off, &s, &len) || off + 12 > n) { disconnect (2, "bad request"); break; }
+      u32 sender = get32 (m + off);
+      if (!same_text (s, len, "session") || channel_is_open) {      // one session only
+        reply[rn++] = MSG_CHANNEL_OPEN_FAILURE;  put32 (reply + rn, sender);  rn += 4;  put32 (reply + rn, 1);  rn += 4;
+        rn += put_text (reply + rn, "");  rn += put_text (reply + rn, "");
+        send_packet (reply, rn);
+        break;
+      }
+      channel_remote = sender;  channel_is_open = 1;
+      remote_window = get32 (m + off + 4);  remote_max_packet = get32 (m + off + 8);
+      consumed = 0;
+      reply[rn++] = MSG_CHANNEL_OPEN_CONFIRMATION;  put32 (reply + rn, sender);  rn += 4;
+      put32 (reply + rn, 0);  rn += 4;                              // our number of the channel: 0
+      put32 (reply + rn, CHANNEL_WINDOW);  rn += 4;  put32 (reply + rn, 2048);  rn += 4;
+      send_packet (reply, rn);
+      break; }
+    case MSG_CHANNEL_REQUEST: if (channel_is_open) channel_request (m, n); break;
+    case MSG_CHANNEL_WINDOW_ADJUST: if (n >= 9) remote_window += get32 (m + 5); break;
+    case MSG_CHANNEL_DATA:
+      off = 5;
+      if (channel_is_open && get_string (m, n, &off, &s, &len)) {
+        if (shell_open) for (int i = 0; i < len; i++) from_client (s[i]);
+        consumed += len;
+        if (consumed >= CHANNEL_WINDOW / 2) {                       // tell the client that there is room again
+          u8 adjust[9];  adjust[0] = MSG_CHANNEL_WINDOW_ADJUST;  put32 (adjust + 1, channel_remote);  put32 (adjust + 5, consumed);
+          send_packet (adjust, 9);
+          consumed = 0;
+        }
+      }
+      break;
+    case MSG_CHANNEL_EOF: break;
+    case MSG_CHANNEL_CLOSE:
+      if (channel_is_open) { u8 close[5];  close[0] = MSG_CHANNEL_CLOSE;  put32 (close + 1, channel_remote);  send_packet (close, 5);  channel_is_open = 0; }
+      broken = 2;
+      break;
+    default: {
+      u8 reply[5];  reply[0] = MSG_UNIMPLEMENTED;  put32 (reply + 1, seq_in);
+      send_packet (reply, 5); }
+  }
+}
+
+@
+\subsection{beginning and end of a session, the host key}
+
+The host key file holds 64 hexadecimal digits. The fingerprint that is printed when the server starts is the SHA-256 hash of the key blob in base64 without the padding at the end, as
+[[ssh-keygen -l]] shows it.
+
+<<sshd.c: session>>=
+static int hex_digit (char c) { return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1; }
+
+static int load_hostkey (void) {
+  char text[80];
+  u32 ino = minix_lookup ("/etc/ssh/ssh_host_ecdsa_key");
+  if (ino == 0 || minix_read (ino, 0, text, 64) != 64) return -1;
+  for (int i = 0; i < 32; i++) {
+    int hi = hex_digit (text[2 * i]), lo = hex_digit (text[2 * i + 1]);
+    if (hi < 0 || lo < 0) return -1;
+    hostkey_private[i] = hi * 16 + lo;
+  }
+  return sshc_hostkey (hostkey_private, hostkey_public);
+}
+
+static void print_fingerprint (void) {
+  u8 blob[128], hash[32];
+  int n = put_text (blob, "ecdsa-sha2-nistp256");  n += put_text (blob + n, "nistp256");  n += put_string (blob + n, hostkey_public, 65);
+  sshc_sha256 (blob, n, hash);
+  static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  char out[48];  int o = 0;
+  for (int i = 0; i < 32; i += 3) {
+    u32 v = (hash[i] @<< 16) | ((i + 1 < 32 ? hash[i + 1] : 0) @<< 8) | (i + 2 < 32 ? hash[i + 2] : 0);
+    out[o++] = b64[(v >> 18) & 63];  out[o++] = b64[(v >> 12) & 63];
+    if (i + 1 < 32) out[o++] = b64[(v >> 6) & 63];
+    if (i + 2 < 32) out[o++] = b64[v & 63];
+  }
+  out[o] = 0;
+  printf ("netd: ssh host key ecdsa-sha2-nistp256 SHA256:%s\n", out);
+}
+
+int ssh_start (void) {
+  if (load_hostkey () != 0) { printf ("netd: ssh: no usable host key in /etc/ssh/ssh_host_ecdsa_key: the SSH server is off\n");  return -1; }
+  u8 probe[1];
+  if (random_get (probe, 1) < 0) { printf ("netd: ssh: this machine has no random number generator: the SSH server is off\n");  return -1; }
+  hostkey_ok = 1;
+  print_fingerprint ();
+  return tcp_listen (SSH_PORT);
+}
+
+static void session_end (void) {
+  if (shell_open) { shell_open = 0;  telnet_vt = -1;  console_hangup (SSH_VT); }       // the programs of the session end, login starts again
+  conn = 0;
+  for (int i = 0; i < 32; i++) { mac_key_in[i] = 0;  mac_key_out[i] = 0;  session_id[i] = 0; }
+}
+
+static void session_start (tcp_conn *c) {
+  u8 seed[32];
+  if (random_get (seed, 32) < 0) { tcp_close (c);  return; }
+  sshc_seed (seed, 32);
+  conn = c;  started_at = net_now_ms ();
+  stage = S_BANNER;  broken = 0;  tx_len = 0;  rx_len = 0;  seq_in = seq_out = 0;
+  enc_in = enc_out = 0;  first_block_decrypted = 0;
+  channel_is_open = 0;  shell_open = 0;  head = tail = 0;
+  static const char banner[] = "SSH-2.0-Ulix_1\r\n";
+  for (int i = 0; i < (int)sizeof banner - 1; i++) tx[tx_len++] = banner[i];
+}
+
+@
+\subsection{the network thread calls \texttt{ssh\_step}}
+
+As [[telnet_step]]: accept a connection (and refuse it if one is there already or the terminal is in use), read, handle every complete
+packet, send what the terminal has written, send the queue. 1 means that something happened.
+
+<<sshd.c: ssh_step>>=
+static void pump_output (void) {
+  while (shell_open && channel_is_open && tail != head && remote_window > 0 && tx_len < (int)sizeof tx - 2 * MAX_PACKET) {
+    u8 m[9 + 1024];
+    u32 n = head - tail;
+    if (n > 1024) n = 1024;
+    if (n > remote_window) n = remote_window;
+    if (n > remote_max_packet) n = remote_max_packet;
+    if (n == 0) break;
+    m[0] = MSG_CHANNEL_DATA;  put32 (m + 1, channel_remote);  put32 (m + 5, n);
+    for (u32 i = 0; i < n; i++) m[9 + i] = ring[(tail + i) % sizeof ring];
+    send_packet (m, 9 + n);
+    tail += n;  remote_window -= n;
+  }
+}
+
+int ssh_step (void) {
+  int moved = 0;
+  if (!hostkey_ok) return 0;
+  tcp_conn *other = tcp_accept (SSH_PORT);
+  if (other) {
+    if (conn) tcp_close (other); else session_start (other);
+    moved = 1;
+  }
+  if (!conn) return moved;
+  if (tcp_closed (conn)) { session_end ();  return 1; }
+  if (stage != S_RUNNING && net_now_ms () - started_at > 30000) broken = 2;          // (a client that only sends half a packet must not keep the server for ever)
+
+  int n = tcp_read (conn, rx + rx_len, sizeof rx - rx_len);
+  if (n > 0) { rx_len += n;  moved = 1; }
+  else if (n < 0) { tcp_close (conn);  session_end ();  return 1; }
+
+  while (!broken && stage == S_BANNER) {                           // the banner of the client: a line that starts with SSH-
+    int eol = -1;
+    for (int i = 0; i < rx_len; i++) if (rx[i] == '\n') { eol = i;  break; }
+    if (eol < 0) { if (rx_len >= 255) broken = 2;  break; }
+    int len = eol > 0 && rx[eol - 1] == '\r' ? eol - 1 : eol;
+    if (len >= 8 && rx[0] == 'S' && rx[1] == 'S' && rx[2] == 'H' && rx[3] == '-') {
+      if (!(rx[4] == '2' && rx[5] == '.' && rx[6] == '0') && !(len >= 9 && rx[4] == '1' && rx[5] == '.' && rx[6] == '9' && rx[7] == '9')) { broken = 2;  break; }
+      for (int i = 0; i < len; i++) client_version[i] = rx[i];
+      client_version_len = len;
+      stage = S_KEXINIT;
+      send_kexinit ();
+    }
+    for (int i = eol + 1; i < rx_len; i++) rx[i - eol - 1] = rx[i];
+    rx_len -= eol + 1;
+    moved = 1;
+  }
+  while (!broken && stage != S_BANNER) {
+    int r = get_packet ();
+    if (r == 0) break;
+    if (r < 0) { broken = 2;  break; }
+    handle_packet (pkt_payload, pkt_payload_len);
+    consume (pkt_total);
+    moved = 1;
+  }
+  pump_output ();
+  flush ();
+  if (broken) {                                                     // a last try to send what is queued, then hang up
+    flush ();
+    tcp_close (conn);
+    session_end ();
+    return 1;
+  }
+  return moved;
+}
+
+@
