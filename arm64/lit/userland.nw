@@ -1122,6 +1122,8 @@ static inline int resolve_host (char *name, unsigned *address) {
   if (r == 0) *address = q.address;
   return r;
 }
+
+<<userland/arm64-extra.h: tls>>
 #endif
 
 @

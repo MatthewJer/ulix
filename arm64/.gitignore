@@ -101,6 +101,11 @@ userland/ifconfig.c
 userland/route.c
 userland/dhclient.c
 userland/shutdown.c
+userland/sntp.c
+userland/rand.c
+userland/https.c
+userland/https-off.c
+userland/tls/
 userland/readelf64.c
 lit/build/
 lit/noweb.sty

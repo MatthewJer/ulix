@@ -70,6 +70,13 @@ userland/route.c
 userland/dhclient.c
 userland/host.c
 userland/shutdown.c
+userland/sntp.c
+userland/rand.c
+userland/https.c
+userland/https-off.c
+userland/tls/string.h
+userland/tls/libc.c
+userland/tls/tlsglue.c
 userland/readelf64.c
 linux_abi.c
 tools/mark_musl.py

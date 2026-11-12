@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Add files to a Minix v2 image (14- or 30-character names).
 
-usage: minix_add.py IMAGE [--grow=ZONES] [--chmod=PATH:OCTAL ...] PATH=HOSTFILE [PATH=HOSTFILE ...]
+usage: minix_add.py IMAGE [--grow=ZONES] [--mkdir=PATH ...] [--chmod=PATH:OCTAL ...] PATH=HOSTFILE [PATH=HOSTFILE ...]
 
 PATH may name a directory ("/bin/ls"); the directory must exist. If PATH already exists, the old
 file is removed first and its inode and zones are freed. --grow enlarges the file system to ZONES
@@ -147,6 +147,24 @@ class Fs:
         else:   self.add_entry(dirnr, nr, name)
         print('%s %-22s inode %3d, %6d bytes, %3d zones' % ('replaced' if old else 'added   ', path, nr, len(data), nz))
 
+    def mkdir(self, path):
+        """a new empty directory (with . and ..); the directory above it must exist; nothing happens if it exists"""
+        dirpath, _, name = path.rstrip('/').rpartition('/')
+        parent = self.resolve_dir(dirpath or '/')
+        if self.lookup(parent, name)[1] is not None: return
+        nr, z = self.alloc_inode(), self.alloc_zone()
+        blk = bytearray(ZONE)
+        blk[0:self.dsize] = struct.pack('<H', nr) + b'.'.ljust(self.dsize - 2, b'\0')
+        blk[self.dsize:2 * self.dsize] = struct.pack('<H', parent) + b'..'.ljust(self.dsize - 2, b'\0')
+        self.put_zone(z, blk)
+        t = int(time.time())
+        self.put_inode(nr, dict(mode=0o040755, nlinks=2, uid=0, gid=0, size=2 * self.dsize, times=(t, t, t), zones=[z] + [0] * 9))
+        self.add_entry(parent, nr, name)
+        up = self.get_inode(parent)
+        up['nlinks'] += 1                                  # the .. of the new directory
+        self.put_inode(parent, up)
+        print('mkdir    %-22s inode %3d' % (path, nr))
+
     def chmod(self, path, mode):
         dirpath, _, name = path.rstrip('/').rpartition('/')
         off, nr = self.lookup(self.resolve_dir(dirpath or '/'), name)
@@ -163,8 +181,10 @@ def main(image, specs):
     if specs and specs[0].startswith('--grow='):
         grow = int(specs[0][7:]); specs = specs[1:]
     fs = Fs(image, grow)
+    for d in [s for s in specs if s.startswith('--mkdir=')]:
+        fs.mkdir(d[8:])
     chmods = [s for s in specs if s.startswith('--chmod=')]
-    specs = [s for s in specs if not s.startswith('--chmod=')]
+    specs = [s for s in specs if not s.startswith('--chmod=') and not s.startswith('--mkdir=')]
     for spec in specs:
         path, host = spec.split('=', 1)
         if not path.startswith('/'): path = '/' + path

@@ -1,0 +1,597 @@
+% This file continues the chapter on TLS (tls.nw): the part that runs in user space.
+\section{What programs get: the system calls in \texttt{userland/arm64-extra.h}}
+\label{src:tls:extra.h}
+
+The wrappers are added to the header that the network programs already use ([[arm64-extra.h]] includes this chunk). The system call
+numbers are those of the table above; structures are passed by address.
+
+<<userland/arm64-extra.h: tls>>=
+// random numbers, the time of day, TCP sockets and rc.conf (random.c, sntp.c, net_syscalls.c)
+#define __NR_getrandom    615
+#define __NR_time_info    616
+#define __NR_time_set     617
+#define __NR_sntp         618
+#define __NR_tcp_connect  619
+#define __NR_tcp_send     622
+#define __NR_tcp_recv     623
+#define __NR_tcp_close    624
+#define __NR_rc_enabled   625
+struct time_info { unsigned seconds; int source; };                 // source: 0 = a guess (the Pi after the boot), 1 = hardware clock, 2 = set
+struct sntp_args { unsigned server; int port, timeout_ms; unsigned seconds; };
+struct tcp_connect_args { unsigned ip; int port, timeout_ms; };
+struct tcp_msg { int handle; unsigned char *buf; int len; int timeout_ms; };
+struct rc_args { char name[48]; int fallback; };
+static inline int getrandom (void *buf, int n)          { return syscall3 (__NR_getrandom, (int)(long)buf, n); }          // n, or -1: no generator
+static inline int time_info (struct time_info *t)       { return syscall2 (__NR_time_info, (int)(long)t); }
+static inline int time_set (unsigned seconds)           { return syscall2 (__NR_time_set, (int)seconds); }                  // -2: only root
+static inline int sntp (struct sntp_args *a)            { return syscall2 (__NR_sntp, (int)(long)a); }                      // 0 = ok, -1 no answer
+static inline int tcp_connect (struct tcp_connect_args *a) { return syscall2 (__NR_tcp_connect, (int)(long)a); }          // a socket, -1 no room, -2 no connection
+static inline int tcp_send (struct tcp_msg *m)          { return syscall2 (__NR_tcp_send, (int)(long)m); }                  // bytes sent, -1 broken
+static inline int tcp_recv (struct tcp_msg *m)          { return syscall2 (__NR_tcp_recv, (int)(long)m); }                  // bytes, 0 = time over, -1 = closed
+static inline int tcp_close (int handle)                { return syscall2 (__NR_tcp_close, handle); }
+static inline int rc_enabled (char *name, int fallback) {          // is name="YES" in /etc/rc.conf? (fallback: if the line is missing)
+  struct rc_args a;  int i = 0;
+  while (name[i] && i < 47) { a.name[i] = name[i];  i++; }
+  a.name[i] = 0;  a.fallback = fallback;
+  return syscall2 (__NR_rc_enabled, (int)(long)&a);
+}
+
+// "host:port" -> the host and the port (the default if there is no colon); the colon is replaced by a zero
+static inline int split_port (char *s, int port) {
+  for (; *s; s++) if (*s == ':') { *s = 0;  port = 0;  for (s++; *s >= '0' && *s <= '9'; s++) port = port * 10 + (*s - '0');  break; }
+  return port;
+}
+
+// Unix seconds -> date and time (the days are counted from 1 March of the year 0, as civil_from_days of H. Hinnant does it)
+static inline void civil_time (unsigned t, int *year, int *month, int *day, int *hour, int *minute, int *second) {
+  unsigned days = t / 86400, rest = t % 86400;
+  unsigned z = days + 719468, era = z / 146097, doe = z - era * 146097;
+  unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365, doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+  unsigned mp = (5 * doy + 2) / 153;
+  *day = doy - (153 * mp + 2) / 5 + 1;  *month = mp < 10 ? mp + 3 : mp - 9;
+  *year = yoe + era * 400 + (*month <= 2);
+  *hour = rest / 3600;  *minute = rest % 3600 / 60;  *second = rest % 60;
+}
+
+@
+\section{\texttt{userland/sntp.c}}
+\label{src:userland:sntp.c}
+
+The program asks a time server and, if root says so, sets the clock. Without arguments it only shows the time that the system has and
+where it got it from.
+
+\begin{quote}\begin{verbatim}
+    sntp                        the clock of the system and its source
+    sntp pool.ntp.org           ask this server and show its time
+    sntp -s pool.ntp.org        ask it and set the clock (root only)
+    sntp -s 10.0.2.2:12300      a server on another port (the tests use this)
+\end{verbatim}\end{quote}
+
+The program does not choose a server by itself: the Raspberry Pi has no battery clock, so the line
+[[sntp -s pool.ntp.org]] belongs into the start-up of every machine without one. The program [[https]] (below) asks a time server
+on its own when it finds the clock unset, but it only uses the answer for its own checks and does not set the clock.
+
+<<userland/sntp.c>>=
+#include "../ulixlib.h"
+#include "../arm64-extra.h"
+
+static char *source_name (int source) { return source == 1 ? "hardware clock" : source == 2 ? "set by sntp" : "not set (a guess)"; }
+
+static void show (unsigned t) {
+  int y, mo, d, h, mi, s;
+  civil_time (t, &y, &mo, &d, &h, &mi, &s);
+  printf ("%d-%02d-%02d %02d:%02d:%02d UTC", y, mo, d, h, mi, s);
+}
+
+int main (int argc, char *argv[]) {
+  int set = 0, i = 1;
+  if (i < argc && strcmp (argv[i], "-s") == 0) { set = 1;  i++; }
+  struct time_info t;
+  time_info (&t);
+  if (i >= argc) {
+    printf ("clock: ");  show (t.seconds);  printf (" (%s)\n", source_name (t.source));
+    return 0;
+  }
+  struct sntp_args a;
+  a.port = split_port (argv[i], 123);
+  if (resolve_host (argv[i], &a.server) != 0) { printf ("sntp: cannot find %s\n", argv[i]);  return 1; }
+  a.timeout_ms = 7000;
+  if (sntp (&a) != 0) { printf ("sntp: no (usable) answer from %s\n", argv[i]);  return 1; }
+  printf ("%s says ", argv[i]);  show (a.seconds);  printf ("\n");
+  if (set) {
+    if (time_set (a.seconds) != 0) { printf ("sntp: only root can set the clock\n");  return 1; }
+    printf ("clock set\n");
+  }
+  return 0;
+}
+
+@
+\section{\texttt{userland/rand.c}}
+\label{src:userland:rand.c}
+
+A program that shows random bytes as hexadecimal digits: [[rand]] gives 16 bytes, [[rand 4]] four. It is the test of the
+generator ([[random.c]]), and says so if the machine has none.
+
+<<userland/rand.c>>=
+#include "../ulixlib.h"
+#include "../arm64-extra.h"
+
+int main (int argc, char *argv[]) {
+  unsigned char buf[64];
+  int n = argc > 1 ? atoi (argv[1]) : 16;
+  if (n < 1 || n > 64) { printf ("usage: rand [bytes, 1 to 64]\n");  return 1; }
+  if (getrandom (buf, n) != n) { printf ("rand: this machine has no random number generator (qemu: -device virtio-rng-device)\n");  return 1; }
+  for (int i = 0; i < n; i++) printf ("%02x", buf[i]);
+  printf ("\n");
+  return 0;
+}
+
+@
+\section{BearSSL in Ulix: what the library needs from the system}
+\label{src:tls:bearssl}
+
+BearSSL is compiled from [[third_party/bearssl/src]] without changes: all 277 files, at optimisation level 2 (the cryptography is
+slow at level 0), into an archive; the linker takes only the functions that [[https]] uses. The rules are in
+[[userland/Makefile]]. What the library expects of the system is very little:
+
+\begin{itemize}
+\item the header [[string.h]] and the five functions [[memcpy]], [[memmove]], [[memset]], [[memcmp]] and [[strlen]]. The user library
+      of Ulix ([[ulixlib.c]]) has three of them; the file below adds [[memmove]] (copying that is safe when source and target
+      overlap) and [[memcmp]]. The header is our own, three lines, in [[userland/tls/]], and is found before any other because of
+      the order of the [[-I]] options;
+\item [[-DBR_USE_UNIX_TIME=0]]: the library does not call [[time()]]. The program tells it the time (see [[https]]);
+\item nothing else: no [[malloc]], no files, no sockets (the program passes two functions that move bytes), no random numbers (the
+      program hands it a seed).
+\end{itemize}
+
+<<userland/tls/string.h>>=
+#ifndef TLS_STRING_H
+#define TLS_STRING_H
+#include <stddef.h>
+void *memcpy (void *dest, const void *src, size_t n);
+void *memmove (void *dest, const void *src, size_t n);
+void *memset (void *dest, int c, size_t n);
+int   memcmp (const void *a, const void *b, size_t n);
+size_t strlen (const char *s);
+#endif
+
+@
+[[memmove]] copies from the front when the target is below the source, and from the back otherwise. [[memcmp]] stops at the
+first byte that differs. (BearSSL compares secrets with its own constant-time functions; these two are for everything else.)
+
+<<userland/tls/libc.c>>=
+#include <stddef.h>
+
+void *memmove (void *dest, const void *src, size_t n) {
+  unsigned char *d = dest;
+  const unsigned char *s = src;
+  if (d < s) { for (size_t i = 0; i < n; i++) d[i] = s[i]; }
+  else       { for (size_t i = n; i > 0; i--) d[i - 1] = s[i - 1]; }
+  return dest;
+}
+
+int memcmp (const void *a, const void *b, size_t n) {
+  const unsigned char *x = a, *y = b;
+  for (size_t i = 0; i < n; i++) if (x[i] != y[i]) return x[i] < y[i] ? -1 : 1;
+  return 0;
+}
+
+@
+\section{\texttt{userland/https.c}: fetch a page over TLS}
+\label{src:userland:https.c}
+
+\begin{quote}\begin{verbatim}
+    https [-i] [-v] [-c cafile] [-n name] [-t timeserver] https://host[:port]/path
+\end{verbatim}\end{quote}
+
+The program is a small [[curl]]: it writes the body of the answer to the screen ([[-i]]: with the header, [[-v]]: it tells what
+was agreed). What it does, step by step, each one with its own message when it fails:
+
+\begin{enumerate}
+\item \emph{Is TLS switched on?} [[tls_enable]] in [[/etc/rc.conf]] (default YES). If not: ``TLS is disabled'', exit status 1, nothing
+      else happens (no connection, no look at the file system).
+\item \emph{Random numbers.} 32 bytes from [[getrandom]] seed BearSSL's own generator (HMAC\_DRBG). Without a source the program
+      stops.
+\item \emph{The time.} The certificate has dates. If the clock of the system is a guess (the Raspberry Pi after the boot), the
+      program asks a time server ([[-t]], default [[pool.ntp.org]]) and uses that time for the checks. A program of an ordinary
+      user must not set the clock; [[sntp -s]] does that for root.
+\item \emph{The certificate authorities} from [[/etc/ssl/cacert.pem]] (or the file of [[-c]]): the file is read, the PEM text is turned
+      into certificates one at a time, and each one that is a CA is kept as a ``trust anchor'': its name and its public key.
+\item \emph{Name and connection.} The name is resolved ([[resolve_host]]) and the TCP connection is opened ([[tcp_connect]]).
+\item \emph{The handshake.} BearSSL does it while the program sends the request: it checks that the chain of certificates leads to one
+      of the anchors, that every certificate is valid today, that the server's certificate is for the host name (the name
+      in the URL, or the one of [[-n]]), and that the server owns the key. A failure ends the connection before any byte of the
+      request has left.
+\item \emph{HTTP.} A request in version 1.0 ([[GET /path HTTP/1.0]] with a [[Host:]] line): the server answers without chunks and closes the
+      connection at the end, so the end of the data is the end of the page.
+\end{enumerate}
+
+The option [[-n name]] means ``use this name for the Host line and for the certificate check, whatever the URL says''. The
+tests need it: the test server is reached as [[10.0.2.2]] (the host of qemu's network), but its certificate is for a name.
+
+The program is split in two files because the two sides do not understand each other's header files: BearSSL uses the standard
+types of [[<stdint.h>]], the user library of Ulix declares its own ([[uint64_t]] is a different type in each). So everything that
+touches BearSSL is in [[userland/tls/tlsglue.c]], which knows nothing of Ulix and offers eight small functions with plain types;
+[[https.c]] knows Ulix (system calls, [[printf]], arguments) and nothing of BearSSL.
+
+<<userland/https.c>>=
+<<userland/https.c: includes>>
+
+<<userland/https.c: glue>>
+
+<<userland/https.c: main>>
+@
+
+<<userland/https.c: includes>>=
+#include "../ulixlib.h"
+#include "../arm64-extra.h"
+
+#define DEFAULT_CA_FILE   "/etc/ssl/cacert.pem"
+#define DEFAULT_TIME_SERVER "pool.ntp.org"
+
+// the eight functions of tls/tlsglue.c
+int  tls_load_anchors (int (*read_bytes) (void *buf, int n));      // the certificate authorities from PEM text: how many, or -1
+int  tls_start (const char *name, unsigned unix_seconds, const unsigned char *seed, int (*in) (unsigned char *, int), int (*out) (const unsigned char *, int));
+int  tls_write (const void *buf, int len);                         // send, and wait until it has been sent; < 0: error
+int  tls_read (void *buf, int len);                                // > 0: data, <= 0: end or error
+int  tls_error (void);                                             // 0 = no error
+const char *tls_error_text (int error);
+void tls_session (int *version, int *cipher_suite);
+void tls_close (void);
+
+static int sock = -1;                                              // the TCP socket of the connection
+static int ca_fd = -1;                                             // the file of the certificate authorities
+
+@
+BearSSL asks for bytes through two functions, and these call the system calls of the TCP sockets. [[low_read]] waits for the first
+byte (at most 30 seconds); [[tcp_recv]] returns 0 when the time is over and $-1$ when the other side has closed. The library treats
+both as ``the connection is broken'', which is what they are, unless the data was complete (see the end of [[main]]).
+
+<<userland/https.c: glue>>=
+static int low_read (unsigned char *buf, int len) {
+  struct tcp_msg m;
+  m.handle = sock;  m.buf = buf;  m.len = len > 4096 ? 4096 : len;  m.timeout_ms = 30000;
+  int n = tcp_recv (&m);
+  return n > 0 ? n : -1;
+}
+
+static int low_write (const unsigned char *buf, int len) {
+  struct tcp_msg m;
+  m.handle = sock;  m.buf = (unsigned char *)buf;  m.len = len;  m.timeout_ms = 30000;
+  int n = tcp_send (&m);
+  return n > 0 ? n : -1;
+}
+
+static int read_ca_file (void *buf, int n) { return read (ca_fd, buf, n); }
+
+@
+\subsection{\texttt{userland/tls/tlsglue.c}: everything that touches BearSSL}
+\label{src:userland:tlsglue.c}
+
+\paragraph{The trust anchors.}
+A \emph{trust anchor} is a certificate authority that we trust without asking: it is what makes a chain of certificates end somewhere.
+BearSSL wants an array of them, each with the \emph{name} of the authority (the ``distinguished name'' in the DER form of the
+certificate, which is compared byte by byte with the \emph{issuer} of the certificate below it) and its public key.
+
+The file is PEM text: base64 between [[-----BEGIN CERTIFICATE-----]] and [[-----END CERTIFICATE-----]]. [[br_pem_decoder]] cuts it
+into objects and hands the decoded bytes of an object to a function we give it; that function is the push function of
+[[br_x509_decoder]], which parses the certificate on the fly. So no certificate is ever stored as a whole, only the name and
+the key of each one. Their bytes are kept in a memory area of 128 KByte ([[arena]]); the 118 authorities of Mozilla's list need
+about 50 KByte of it.
+
+<<userland/tls/tlsglue.c>>=
+<<tlsglue.c: includes>>
+
+<<tlsglue.c: anchors>>
+
+<<tlsglue.c: engine>>
+
+<<tlsglue.c: errors>>
+@
+
+<<tlsglue.c: includes>>=
+#include <stddef.h>
+#include <string.h>
+#include "bearssl.h"
+
+static int strcmp_certificate (const char *name);
+
+@
+
+<<tlsglue.c: anchors>>=
+#define MAX_ANCHORS 400
+static br_x509_trust_anchor anchors[MAX_ANCHORS];
+static int n_anchors = 0;
+static unsigned char arena[128 * 1024];
+static unsigned arena_used = 0;
+
+static unsigned char *take (unsigned n) {                        // n bytes of the arena (0: it is full)
+  n = (n + 7) & ~7u;
+  if (arena_used + n > sizeof arena) return 0;
+  unsigned char *p = arena + arena_used;
+  arena_used += n;
+  return p;
+}
+
+static br_x509_decoder_context cert;                             // the certificate that is being decoded
+static unsigned char dn[1024];  static size_t dn_len;            // its subject name
+
+static void dn_append (void *ctx, const void *data, size_t len) {
+  if (dn_len + len <= sizeof dn) { memcpy (dn + dn_len, data, len);  dn_len += len; }
+  else dn_len = sizeof dn + 1;                                   // too long: remembered as an error
+}
+
+static void cert_bytes (void *ctx, const void *data, size_t len) { br_x509_decoder_push (&cert, data, len); }
+
+@
+When a certificate is complete we keep it if it decoded without error and is a CA (a server certificate in the file would be an
+error, not an anchor), copying the name and the key out of the decoder's own memory, which the next certificate overwrites.
+
+<<tlsglue.c: anchors>>=
+static int keep_certificate (void) {
+  if (br_x509_decoder_last_error (&cert) != 0 || !br_x509_decoder_isCA (&cert)) return 1;       // not usable: skipped, not an error
+  br_x509_pkey *key = br_x509_decoder_get_pkey (&cert);
+  if (n_anchors == MAX_ANCHORS || dn_len > sizeof dn || !key) return 0;
+  br_x509_trust_anchor *ta = &anchors[n_anchors];
+  ta->dn.data = take (dn_len);
+  if (!ta->dn.data) return 0;
+  memcpy (ta->dn.data, dn, dn_len);  ta->dn.len = dn_len;
+  ta->flags = BR_X509_TA_CA;
+  ta->pkey.key_type = key->key_type;
+  if (key->key_type == BR_KEYTYPE_RSA) {
+    ta->pkey.key.rsa.n = take (key->key.rsa.nlen);  ta->pkey.key.rsa.nlen = key->key.rsa.nlen;
+    ta->pkey.key.rsa.e = take (key->key.rsa.elen);  ta->pkey.key.rsa.elen = key->key.rsa.elen;
+    if (!ta->pkey.key.rsa.n || !ta->pkey.key.rsa.e) return 0;
+    memcpy (ta->pkey.key.rsa.n, key->key.rsa.n, key->key.rsa.nlen);
+    memcpy (ta->pkey.key.rsa.e, key->key.rsa.e, key->key.rsa.elen);
+  } else if (key->key_type == BR_KEYTYPE_EC) {
+    ta->pkey.key.ec.curve = key->key.ec.curve;
+    ta->pkey.key.ec.q = take (key->key.ec.qlen);  ta->pkey.key.ec.qlen = key->key.ec.qlen;
+    if (!ta->pkey.key.ec.q) return 0;
+    memcpy (ta->pkey.key.ec.q, key->key.ec.q, key->key.ec.qlen);
+  } else return 1;                                               // a key type that BearSSL does not know: skipped
+  n_anchors++;
+  return 1;
+}
+
+@
+The PEM text comes through the function [[read_bytes]] of the caller, 1 KByte at a time, and is pushed into the PEM decoder. The
+decoder says what it found through events: an object begins (then we look at its name: only [[CERTIFICATE]] interests us,
+everything else is thrown away by giving the decoder no place to put the data), an object ends (the certificate is complete), or
+an error. Returns the number of anchors, or $-1$.
+
+<<tlsglue.c: anchors>>=
+int tls_load_anchors (int (*read_bytes) (void *buf, int n)) {
+  static br_pem_decoder_context pem;
+  static unsigned char buf[1024];
+  int in_cert = 0, ok = 1, n;
+  br_pem_decoder_init (&pem);
+  while (ok && (n = read_bytes (buf, sizeof buf)) > 0) {
+    int off = 0;
+    while (ok && off < n) {
+      off += br_pem_decoder_push (&pem, buf + off, n - off);
+      switch (br_pem_decoder_event (&pem)) {
+        case BR_PEM_BEGIN_OBJ:
+          in_cert = strcmp_certificate (br_pem_decoder_name (&pem));
+          if (in_cert) { br_x509_decoder_init (&cert, dn_append, 0);  dn_len = 0;  br_pem_decoder_setdest (&pem, cert_bytes, 0); }
+          else br_pem_decoder_setdest (&pem, 0, 0);
+          break;
+        case BR_PEM_END_OBJ:
+          if (in_cert) ok = keep_certificate ();
+          in_cert = 0;
+          break;
+        case BR_PEM_ERROR:
+          ok = 0;
+          break;
+      }
+    }
+  }
+  return ok ? n_anchors : -1;
+}
+
+@
+(A small helper, because the file does not use [[strcmp]]:)
+
+<<tlsglue.c: anchors>>=
+static int strcmp_certificate (const char *name) {
+  const char *want = "CERTIFICATE";
+  while (*want && *name == *want) { name++;  want++; }
+  return *want == 0 && *name == 0;
+}
+
+@
+\paragraph{The TLS engine.} [[tls_start]] sets up a client: everything BearSSL knows ([[br_ssl_client_init_full]]: the key exchanges,
+ciphers and hashes that the Internet uses today), but only version TLS 1.2; its random number generator is seeded with the
+bytes from the kernel, and the certificate checker is told today's date. The date is given to BearSSL in days since 1 January of the
+year 0 (that is the number 719528 for the Unix epoch) and seconds of the day. No byte has been sent yet: the handshake happens in
+the first [[tls_write]].
+
+<<tlsglue.c: engine>>=
+static br_ssl_client_context  client;                   // the state of the TLS connection
+static br_x509_minimal_context chain_checker;           // checks the certificates of the server
+static br_sslio_context        io;                      // the simple read/write interface on top of the engine
+static unsigned char iobuf[BR_SSL_BUFSIZE_MONO];        // BearSSL's buffer for records (half duplex: first we write, then we read)
+static int (*get_bytes) (unsigned char *buf, int len);
+static int (*put_bytes) (const unsigned char *buf, int len);
+
+static int low_read (void *ctx, unsigned char *buf, size_t len)        { return get_bytes (buf, len); }
+static int low_write (void *ctx, const unsigned char *buf, size_t len) { return put_bytes (buf, len); }
+
+int tls_start (const char *name, unsigned unix_seconds, const unsigned char *seed,
+               int (*in) (unsigned char *, int), int (*out) (const unsigned char *, int)) {
+  get_bytes = in;  put_bytes = out;
+  br_ssl_client_init_full (&client, &chain_checker, anchors, n_anchors);
+  br_ssl_engine_set_versions (&client.eng, BR_TLS12, BR_TLS12);
+  br_ssl_engine_set_buffer (&client.eng, iobuf, sizeof iobuf, 0);
+  br_ssl_engine_inject_entropy (&client.eng, seed, 32);
+  br_x509_minimal_set_time (&chain_checker, 719528 + unix_seconds / 86400, unix_seconds % 86400);
+  if (!br_ssl_client_reset (&client, name, 0)) return -1;
+  br_sslio_init (&io, &client.eng, low_read, 0, low_write, 0);
+  return 0;
+}
+
+int tls_write (const void *buf, int len) {
+  if (br_sslio_write_all (&io, buf, len) < 0 || br_sslio_flush (&io) < 0) return -1;
+  return len;
+}
+
+int tls_read (void *buf, int len) { return br_sslio_read (&io, buf, len); }
+int tls_error (void) { return br_ssl_engine_last_error (&client.eng); }
+void tls_close (void) { br_sslio_close (&io); }
+
+void tls_session (int *version, int *cipher_suite) {
+  br_ssl_session_parameters sp;
+  br_ssl_engine_get_session_parameters (&client.eng, &sp);
+  *version = sp.version;  *cipher_suite = sp.cipher_suite;
+}
+
+@
+\paragraph{Error messages.} When the handshake fails, the library says why with a number. A few of them have a human meaning that is
+worth a sentence: those about the certificate. (The others are shown by their number; the header [[bearssl_ssl.h]] lists them.)
+
+<<tlsglue.c: errors>>=
+const char *tls_error_text (int err) {
+  switch (err) {
+    case BR_ERR_X509_NOT_TRUSTED:     return "the certificate does not lead to a trusted certificate authority";
+    case BR_ERR_X509_EXPIRED:         return "the certificate has expired, or is not valid yet (is the clock right? see sntp)";
+    case BR_ERR_X509_BAD_SERVER_NAME: return "the certificate is not for this host name";
+    case BR_ERR_X509_TIME_UNKNOWN:    return "the time is unknown, the certificate cannot be checked";
+    case BR_ERR_X509_BAD_SIGNATURE:   return "a signature in the certificate chain is wrong";
+    case BR_ERR_UNSUPPORTED_VERSION:
+    case BR_ERR_BAD_VERSION:          return "the server does not speak TLS 1.2 (older versions are switched off)";
+    case BR_ERR_IO:                   return "the connection broke during the handshake";
+  }
+  return err >= 256 ? "the server sent an alert (TLS error 256 and above, see bearssl_ssl.h)" : "TLS error (see bearssl_ssl.h)";
+}
+
+@
+\subsection{the program}
+
+Order of the steps as in the list above. [[fail]] says what is wrong and ends the program with status 1.
+
+<<userland/https.c: main>>=
+static int fail (char *message) { printf ("https: %s\n", message);  return 1; }
+
+static int say_error (int err) { printf ("https: %s (error %d)\n", tls_error_text (err), err);  return 1; }
+
+int main (int argc, char *argv[]) {
+  int verbose = 0, headers = 0, i = 1;
+  char *ca_file = DEFAULT_CA_FILE, *name = 0, *time_server = DEFAULT_TIME_SERVER;
+  for (; i < argc && argv[i][0] == '-'; i++) {
+    if (strcmp (argv[i], "-v") == 0) verbose = 1;
+    else if (strcmp (argv[i], "-i") == 0) headers = 1;
+    else if (strcmp (argv[i], "-c") == 0 && i + 1 < argc) ca_file = argv[++i];
+    else if (strcmp (argv[i], "-n") == 0 && i + 1 < argc) name = argv[++i];
+    else if (strcmp (argv[i], "-t") == 0 && i + 1 < argc) time_server = argv[++i];
+    else i = argc;
+  }
+  if (i != argc - 1 || strncmp (argv[i], "https://", 8) != 0) {
+    printf ("usage: https [-i] [-v] [-c cafile] [-n name] [-t timeserver] https://host[:port]/path\n");
+    return 1;
+  }
+
+  // 1. is TLS switched on?
+  if (!rc_enabled ("tls_enable", 1)) return fail ("TLS is disabled (tls_enable=\"NO\" in /etc/rc.conf)");
+
+  // the URL: host, port and path
+  char *host = argv[i] + 8, *slash = host;
+  static char path[512];
+  strcpy (path, "/");
+  while (*slash && *slash != '/') slash++;
+  if (*slash) { strncpy (path, slash, 511);  path[511] = 0;  *slash = 0; }
+  int port = split_port (host, 443);
+  if (!name) name = host;
+
+  // 2. random numbers: the seed of BearSSL's generator
+  unsigned char seed[32];
+  if (getrandom (seed, sizeof seed) != sizeof seed) return fail ("this machine has no source of random numbers (qemu: -device virtio-rng-device)");
+
+  // 3. the time
+  struct time_info now;
+  time_info (&now);
+  if (now.source == 0) {
+    struct sntp_args a;
+    a.port = split_port (time_server, 123);
+    a.timeout_ms = 7000;
+    if (resolve_host (time_server, &a.server) != 0 || sntp (&a) != 0)
+      return fail ("the clock is not set and no time server answers; the validity of certificates cannot be checked (see sntp)");
+    now.seconds = a.seconds;
+    if (verbose) printf ("the clock is not set: using the time of %s\n", time_server);
+  }
+
+  // 4. the certificate authorities
+  ca_fd = open (ca_file, O_RDONLY);
+  int count = ca_fd < 0 ? -1 : tls_load_anchors (read_ca_file);
+  if (ca_fd >= 0) close (ca_fd);
+  if (count < 0) { printf ("https: cannot read the certificate authorities from %s\n", ca_file);  return 1; }
+  if (verbose) printf ("%d certificate authorities from %s\n", count, ca_file);
+
+  // 5. name and connection
+  struct tcp_connect_args c;
+  if (resolve_host (host, &c.ip) != 0) { printf ("https: cannot find %s\n", host);  return 1; }
+  c.port = port;  c.timeout_ms = 10000;
+  sock = tcp_connect (&c);
+  if (sock < 0) { printf ("https: cannot connect to %s port %d\n", host, port);  return 1; }
+
+  // 6. the TLS engine
+  if (tls_start (name, now.seconds, seed, low_read, low_write) != 0) { tcp_close (sock);  return fail ("cannot start TLS"); }
+
+  // 7. the request; the handshake happens inside the first write
+  static char request[1024];
+  sprintf (request, "GET %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: ulix-https\r\nAccept: */*\r\n\r\n", path, name);
+  if (tls_write (request, strlen (request)) < 0) {
+    int r = say_error (tls_error ());
+    tcp_close (sock);
+    return r;
+  }
+  if (verbose) {
+    int version, suite;
+    tls_session (&version, &suite);
+    printf ("TLS %d.%d, cipher suite 0x%04x, certificate for %s checked\n", (version >> 8) - 2, (version & 255) - 1, suite, name);
+  }
+
+  // the answer: the header ends at the first empty line; the status code is in the first line
+  static char head[4096], body[2048];
+  int head_len = 0, in_body = 0, status = 0, n;
+  while ((n = tls_read (body, sizeof body)) > 0) {
+    int off = 0;
+    while (!in_body && off < n) {
+      if (head_len < (int)sizeof head - 1) head[head_len++] = body[off];
+      off++;
+      if (head_len >= 4 && head[head_len - 4] == '\r' && head[head_len - 3] == '\n' && head[head_len - 2] == '\r' && head[head_len - 1] == '\n') {
+        in_body = 1;
+        head[head_len] = 0;
+        if (head_len > 12 && strncmp (head, "HTTP/1.", 7) == 0) status = atoi (head + 9);
+        if (headers) write (1, head, head_len);
+      }
+    }
+    if (in_body && off < n) write (1, body + off, n - off);
+  }
+  // the server closes the connection when it is done; many servers do not send the TLS close_notify first (the library then
+  // reports an I/O error, code 31), so that is no error here
+  int err = tls_error ();
+  tls_close ();
+  tcp_close (sock);
+  if (err != 0 && err != 31) return say_error (err);
+  if (!in_body) return fail ("no (complete) answer from the server");
+  if (status < 200 || status > 299) { printf ("https: the server answered %d\n", status);  return 1; }
+  return 0;
+}
+
+@
+\section{\texttt{userland/https-off.c}: the program when TLS is left out of the build}
+\label{src:userland:https-off.c}
+
+With [[make TLS=0]] this file is built under the name [[https]] instead of the one above. It does not contain BearSSL (the library is not
+even compiled), so there is nothing that could speak TLS; the program makes sure that the system still behaves in an
+orderly way when somebody tries.
+
+<<userland/https-off.c>>=
+#include "../ulixlib.h"
+
+int main (int argc, char *argv[]) {
+  printf ("https: TLS is disabled: this system was built without TLS support (make TLS=0)\n");
+  return 1;
+}
+
+@

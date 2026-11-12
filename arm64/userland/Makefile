@@ -17,7 +17,7 @@ BUILD    = build
 
 SKIP     =
 # new programs of the AArch64 port (the network is not part of the original Ulix; the rule for them is further down)
-NEWTOOLS = ping ping6 host ifconfig route dhclient shutdown poweroff reboot top
+NEWTOOLS = ping ping6 host ifconfig route dhclient shutdown poweroff reboot top sntp rand https
 TOOLS    = $(filter-out $(SKIP),$(patsubst $(TOOLSRC)/%.c,%,$(wildcard $(TOOLSRC)/*.c))) $(NEWTOOLS)
 
 # GCC 4.4 accepted a lot that current compilers reject (return without value, missing types);
@@ -69,7 +69,7 @@ $(BUILD)/tools/free.c: $(TOOLSRC)/free.c $(BUILD)/ulixlib.h $(BUILD)/arm64-extra
 
 # new programs of the AArch64 port (the network is not part of the original Ulix): ping uses raw ICMP sockets, ifconfig, route and dhclient
 # are modelled on the BSD programs of the same names
-$(addprefix $(BUILD)/tools/,$(addsuffix .c,$(filter-out poweroff reboot,$(NEWTOOLS)))): $(BUILD)/tools/%.c: %.c $(BUILD)/ulixlib.h $(BUILD)/arm64-extra.h
+$(addprefix $(BUILD)/tools/,$(addsuffix .c,$(filter-out poweroff reboot https,$(NEWTOOLS)))): $(BUILD)/tools/%.c: %.c $(BUILD)/ulixlib.h $(BUILD)/arm64-extra.h
 	mkdir -p $(BUILD)/tools
 	cp $< $@
 
@@ -77,6 +77,53 @@ $(addprefix $(BUILD)/tools/,$(addsuffix .c,$(filter-out poweroff reboot,$(NEWTOO
 $(BUILD)/tools/poweroff.c $(BUILD)/tools/reboot.c: $(BUILD)/tools/%.c: shutdown.c
 	mkdir -p $(BUILD)/tools
 	cp $< $@
+
+# ---- TLS (chapter "Security: random numbers, the time of day and TLS") ----
+# make TLS=0 leaves BearSSL and everything that speaks TLS out: https is then a small program that says so (https-off.c).
+# BearSSL (third_party/bearssl, unmodified) is compiled at -O2 into an archive; the linker takes what https uses.
+TLS ?= 1
+BEARSSL  = ../../third_party/bearssl
+$(BUILD)/tls-$(TLS).stamp:
+	mkdir -p $(BUILD)
+	rm -f $(BUILD)/tls-*.stamp
+	touch $@
+
+ifeq ($(TLS),1)
+BEARSSL_SRCS = $(shell find $(BEARSSL)/src -name '*.c' 2>/dev/null)
+BEARSSL_OBJS = $(patsubst $(BEARSSL)/src/%.c,$(BUILD)/bearssl/%.o,$(BEARSSL_SRCS))
+BRFLAGS = -mno-outline-atomics -O2 -ffreestanding -nostdlib -fno-stack-protector -fno-pic -mgeneral-regs-only -std=gnu99 -w \
+          -I$(BEARSSL)/inc -I$(BEARSSL)/src -Itls -DBR_USE_UNIX_TIME=0 -DBR_USE_WIN32_TIME=0
+
+$(BUILD)/bearssl/%.o: $(BEARSSL)/src/%.c tls/string.h
+	@mkdir -p $(dir $@)
+	$(CC) $(BRFLAGS) -c -o $@ $<
+
+$(BUILD)/libbearssl.a: $(BEARSSL_OBJS)
+	@test -n "$(BEARSSL_OBJS)" || { echo "third_party/bearssl is empty (the submodule is not checked out)"; exit 1; }
+	rm -f $@
+	$(CROSS)ar rcs $@ $^
+
+$(BUILD)/tools/https.c: https.c $(BUILD)/ulixlib.h $(BUILD)/arm64-extra.h $(BUILD)/tls-1.stamp
+	mkdir -p $(BUILD)/tools
+	cp $< $@
+
+$(BUILD)/tools/https.o: $(BUILD)/tools/https.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+$(BUILD)/tls-glue.o: tls/tlsglue.c
+	$(CC) $(BRFLAGS) -c -o $@ $<
+
+$(BUILD)/tls-libc.o: tls/libc.c
+	$(CC) $(BRFLAGS) -c -o $@ $<
+
+$(BUILD)/bin/https.elf: $(BUILD)/crt0.o $(BUILD)/tools/https.o $(BUILD)/tls-glue.o $(BUILD)/tls-libc.o $(BUILD)/ulixlib.o $(BUILD)/libbearssl.a
+	mkdir -p $(BUILD)/bin
+	$(LD) $(LDFLAGS) -o $@ $(BUILD)/crt0.o $(BUILD)/tools/https.o $(BUILD)/tls-glue.o $(BUILD)/tls-libc.o $(BUILD)/ulixlib.o $(BUILD)/libbearssl.a
+else
+$(BUILD)/tools/https.c: https-off.c $(BUILD)/ulixlib.h $(BUILD)/arm64-extra.h $(BUILD)/tls-0.stamp
+	mkdir -p $(BUILD)/tools
+	cp $< $@
+endif
 
 # readelf.c reads ELF32 headers; the programs here are ELF64 files
 $(BUILD)/tools/readelf.c: readelf64.c $(BUILD)/ulixlib.h
