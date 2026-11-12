@@ -45,6 +45,24 @@ project is GPLv3); reading Linux for facts such as register layouts is fine.
 - Where a BSD driver is much bigger than the job needs, write the small version the way the book would, and use the BSD file as
   the reference for facts.
 
+## Third-party libraries (convention of 2026-11-12, issue #16)
+
+Whole libraries (BearSSL, later musl, LVGL, ...) are not copied into the book and not into `arm64/`. They live **unmodified** as git
+submodules in `third_party/<name>`, pinned to a release tag (`git submodule status` shows the tag). What has to be changed goes into our
+own files next to the library (a configuration header, the glue to the system calls) or into patches in `patches/<name>/`; only *our*
+files become a section of the book. The Makefile compiles a library file straight from `third_party/` (see the rules for BearSSL in
+`userland/Makefile`). A library that is switched off at build time (`make TLS=0`) must not even be fetched or compiled.
+
+Before a library is added, its entry is written to the table in `third_party/README.md`:
+
+| field | content |
+|---|---|
+| name, upstream URL, tag | where it comes from, the tag the submodule is pinned to |
+| licence | the licence text of the upstream `LICENSE` file, checked on the day of the import (BSD, MIT, ISC, Apache-2.0 are fine; never Linux code) |
+| why it is compatible with GPLv3 | one sentence (for MIT/BSD: permissive, only the notice must stay) |
+| what we add | our files, patches, configuration |
+| what it costs | size of the code, RAM use, libc functions it needs |
+
 ## Plan for the Raspberry Pi 4B (branch `rpi4`)
 
 Order decided on 2026-11-04: **first make Ulix run on the board, then networking, then telnet.** Goal at the end: Ulix boots on the

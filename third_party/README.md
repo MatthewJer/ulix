@@ -24,3 +24,22 @@ Foreign code (libc, GUI toolkits, interpreters, ...) is **not** copied into the 
 - Linux code in it? <no / which parts>
 - Patches:      <patches/<name>/..., or none>
 ```
+
+After a fresh clone: `git submodule update --init`. The licence-check template is also repeated in
+[`arm64/PRINCIPLES.md`](../arm64/PRINCIPLES.md), section "Third-party libraries".
+
+## Packages
+
+### musl
+
+See `LICENCE-CHECK-musl.md`.
+
+### bearssl
+
+| field | content |
+|---|---|
+| upstream, tag | <https://bearssl.org/git/BearSSL>, tag `v0.6` (the last release; commit 8ef7680) |
+| licence | MIT (`third_party/bearssl/LICENSE.txt`, Copyright (c) 2016 Thomas Pornin), checked 2026-11-12 |
+| why compatible with GPLv3 | permissive: only the copyright and permission notice must stay with the code |
+| what we add | `userland/https.c` and the glue to the system calls (chapter "TLS", `lit/tls.nw`); a configuration is not needed |
+| what it costs | about 2.3 MByte of source, 60 KByte of code for a client with TLS 1.2, no `malloc`, needs only `memcpy`, `memmove`, `memset`, `memcmp`, `strlen` |
