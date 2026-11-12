@@ -82,7 +82,7 @@ threading.Thread(target=sntp_server, daemon=True).start()
 
 # ---- disks: the test authority is added to a copy; a second copy has tls_enable="NO" ----
 disk_ca = os.path.join(work, "disk-ca.img"); shutil.copy(disk, disk_ca)
-subprocess.run([sys.executable, os.path.join(here, "minix_add.py"), disk_ca, "/etc/ssl/test-ca.pem=" + os.path.join(work, "ca.pem")], check=True, stdout=subprocess.DEVNULL)
+subprocess.run([sys.executable, os.path.join(here, "minix_add.py"), disk_ca, "--mkdir=/etc/ssl", "/etc/ssl/test-ca.pem=" + os.path.join(work, "ca.pem")], check=True, stdout=subprocess.DEVNULL)
 disk_off = os.path.join(work, "disk-off.img"); shutil.copy(disk_ca, disk_off)
 open(os.path.join(work, "rc.off"), "w").write('telnetd_enable="NO"\ntls_enable="NO"\n')
 subprocess.run([sys.executable, os.path.join(here, "minix_add.py"), disk_off, "/etc/rc.conf=" + os.path.join(work, "rc.off")], check=True, stdout=subprocess.DEVNULL)
@@ -127,9 +127,7 @@ class Session:
             self.sock.send(bytes([b])); self.pump(0.04)
     def run(self, cmd, answer, what, timeout=25.0):
         self.send(cmd + "\r")
-        t0 = time.time()
-        out = self.expect(answer, what + " (%.1f s)" % 0, timeout)
-        print("        [%.1f s]" % (time.time() - t0))
+        out = self.expect(answer, what, timeout)
         self.expect(self.PROMPT, "the prompt is back after \"%s\"" % cmd, timeout)
         return out
     def login(self):
@@ -138,6 +136,16 @@ class Session:
     def close(self): self.qemu.kill()
 
 URL = "https://10.0.2.2:%d/" % HTTPS_PORT
+if os.environ.get("TLS0"):                             # the disk was built with "make TLS=0": there is no TLS code at all
+    s = Session(disk, 45142)
+    try:
+        s.login()
+        s.run("https " + URL, r"https: TLS is disabled: this system was built without TLS support \(make TLS=0\)", "make TLS=0: https is the small program that says that TLS is not part of this system")
+        s.run("ls /etc/ssl", r"does not exist", "make TLS=0: there is no /etc/ssl (no list of authorities on the disk)")
+    finally:
+        s.close()
+    print("https test (TLS=0): %s" % ("all passed" if not fails else "%d FAILED" % fails))
+    sys.exit(1 if fails else 0)
 try:
     s = Session(disk_ca, 45140)
     try:

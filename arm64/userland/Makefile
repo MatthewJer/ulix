@@ -83,10 +83,9 @@ $(BUILD)/tools/poweroff.c $(BUILD)/tools/reboot.c: $(BUILD)/tools/%.c: shutdown.
 # BearSSL (third_party/bearssl, unmodified) is compiled at -O2 into an archive; the linker takes what https uses.
 TLS ?= 1
 BEARSSL  = ../../third_party/bearssl
-$(BUILD)/tls-$(TLS).stamp:
-	mkdir -p $(BUILD)
-	rm -f $(BUILD)/tls-*.stamp
-	touch $@
+# a file that records the mode of the last build: when TLS changes, it is made new and everything that depends on it is rebuilt
+# (made while make reads this file, because make does not rebuild a missing file that only sits in the middle of a chain)
+TLS_STAMP := $(shell test -f $(BUILD)/tls-$(TLS).stamp || { mkdir -p $(BUILD); rm -f $(BUILD)/tls-*.stamp; touch $(BUILD)/tls-$(TLS).stamp; })
 
 ifeq ($(TLS),1)
 BEARSSL_SRCS = $(shell find $(BEARSSL)/src -name '*.c' 2>/dev/null)

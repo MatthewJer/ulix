@@ -286,6 +286,10 @@ sdisk-test: ulix.bin $(DISK) $(DISK3)
 netd-test: ulix-console.bin $(DISK)
 	python3 tools/netd_test.py ulix-console.bin $(DISK)
 
+# TLS: the https client against a test authority and a TLS 1.2 server of the host, random numbers, SNTP, the tls_enable switch (needs openssl on the host)
+https-test: ulix-shell.bin $(DISK)
+	python3 tools/https_test.py ulix-shell.bin $(DISK)
+
 # a cable that is plugged in after the boot: the network thread asks DHCP by itself
 dhcp-retry-test: ulix-console.bin $(DISK)
 	python3 tools/dhcp_retry_test.py ulix-console.bin $(DISK)
