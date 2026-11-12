@@ -171,6 +171,8 @@ static void classify (const struct node *stack, int depth) {
   } else if (compat_has (n, "brcm,bcm2711-emmc2", 1) && n->reg) {
     plat.sdhci = address (stack, depth, n->reg);
     plat.sdhci_irq = (n->irq && n->irqlen >= 12) ? irq_number (n->irq) : 0;
+  } else if (compat_has (n, "brcm,bcm2711-rng200", 1) && n->reg) {
+    plat.rng = address (stack, depth, n->reg);
   } else if (compat_has (n, "arm,pl031", 1) && n->reg) {
     plat.rtc = address (stack, depth, n->reg);
   } else if (compat_has (n, "virtio,mmio", 1) && n->reg) {

@@ -131,6 +131,7 @@ int  tcp_listen (u16 port);                                   // accept connecti
 tcp_conn *tcp_accept (u16 port);                              // a new connection to a listening port, or 0 if none is waiting
 tcp_conn *tcp_connect (u32 ip, u16 port);                     // start a connection (tcp_established () tells when it is up), 0 = no room
 int  tcp_established (tcp_conn *c);                           // 1 = data can be sent and received
+u32  tcp_id (tcp_conn *c);                                    // a number for this connection; it changes when the slot is used for another one
 int  tcp_closed (tcp_conn *c);                                // 1 = the connection is gone: do not use the pointer any more
 int  tcp_read (tcp_conn *c, u8 *buf, int max);                // bytes received (0: nothing now), -1: the other side has closed (and all was read)
 int  tcp_write (tcp_conn *c, const u8 *data, int len);        // bytes accepted into the send buffer (may be fewer than len), -1: cannot send
@@ -1360,6 +1361,7 @@ struct tcp_conn {
   int state;
   u32 remote_ip;  u16 local_port, remote_port;
   int from_listener, accepted;            // opened by a listening port; has tcp_accept () returned it yet?
+  u32 id;                                 // a number that is different for every connection that uses this slot (see tcp_id)
 
   u32 snd_una;                            // the oldest sequence number that has been sent but not acknowledged
   u32 snd_nxt;                            // the next sequence number to send
@@ -1378,6 +1380,7 @@ struct tcp_conn {
 static struct tcp_conn conns[CONNS];
 static u16 listeners[LISTENERS];
 static u16 next_port = 49152;             // local ports of connections that we open (the "ephemeral" ports)
+static u32 next_id = 0;
 
 static int seq_lt (u32 a, u32 b) { return (int)(a - b) < 0; }                // sequence numbers wrap around: compare the difference
 static int seq_le (u32 a, u32 b) { return (int)(a - b) <= 0; }
@@ -1459,6 +1462,7 @@ static tcp_conn *allocate (void) {
     if (conns[i].state == CLOSED) {
       u8 *p = (u8 *)&conns[i];
       for (unsigned k = 0; k < sizeof conns[i]; k++) p[k] = 0;
+      conns[i].id = ++next_id;
       return &conns[i];
     }
   return 0;
@@ -1492,6 +1496,7 @@ tcp_conn *tcp_accept (u16 port) {
 }
 
 int tcp_established (tcp_conn *c) { return c->state == ESTABLISHED || c->state == CLOSE_WAIT; }
+u32 tcp_id (tcp_conn *c) { return c->id; }       // a program that keeps the pointer for a while checks that the slot still holds its connection
 int tcp_closed (tcp_conn *c) { return c->state == CLOSED; }
 
 int tcp_read (tcp_conn *c, u8 *buf, int max) {
@@ -2875,6 +2880,7 @@ Which services a BSD system starts is written down in the file \texttt{/etc/rc.c
 \begin{quote}\begin{verbatim}
     telnetd_enable="YES"
     netlog_enable="NO"
+    tls_enable="YES"
 \end{verbatim}\end{quote}
 Ulix does the same. A line has the form [[name="YES"]] or [[name="NO"]] (the quotes may be left out; everything behind a
 [[#]] is a comment). The file is read once, when the network thread starts. The kernel asks for one setting at a time
@@ -3184,6 +3190,8 @@ The complete file is put together from these parts:
 
 <<net_syscalls.c: syscall_dns_resolve>>
 <<net_syscalls.c: syscall_net6>>
+
+<<net_syscalls.c: syscall_tls>>
 @
 
 <<net_syscalls.c: includes>>=

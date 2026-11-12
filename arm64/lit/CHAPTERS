@@ -5,6 +5,7 @@ processes
 console
 disks
 network
+tls
 kerneltests
 userland
 libc

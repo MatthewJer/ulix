@@ -38,6 +38,8 @@ netd.c
 rcconf.c
 telnet.c
 net_syscalls.c
+random.c
+sntp.c
 stats.c
 bookfs_test.c
 thread_test.c

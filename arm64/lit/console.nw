@@ -580,9 +580,11 @@ A board without a real-time clock (the Raspberry Pi 4B has none) starts at this 
 #define NO_CLOCK_START_TIME 1767225600U
 
 unsigned long long clock_start_count;         // the counter of the generic timer when system_start_time was read (clock_gettime, linux_abi.c)
+int clock_source = 0;                         // where the time comes from: 0 = a guess, 1 = a hardware clock, 2 = set by a program (sntp)
 
 void arch_clock_init (void) {
   __asm__ volatile ("mrs %0, cntpct_el0" : "=r" (clock_start_count));
+  clock_source = plat_rtc () ? 1 : 0;
   system_start_time = plat_rtc () ? RTC_DR : NO_CLOCK_START_TIME;
   system_ticks = 0;
   system_time  = system_start_time;

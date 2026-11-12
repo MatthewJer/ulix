@@ -169,6 +169,9 @@ extern unsigned proc_ticks[];                   // stats.c: timer ticks that a p
 void syscall_net_info (context_t *r), syscall_net_set (context_t *r), syscall_net_dhcp (context_t *r);
 void syscall_dns_resolve (context_t *r);
 void syscall_net6_info (context_t *r), syscall_ping6 (context_t *r);
+void syscall_getrandom (context_t *r), syscall_time_info (context_t *r), syscall_time_set (context_t *r), syscall_sntp (context_t *r);
+void syscall_tcp_connect (context_t *r), syscall_tcp_send (context_t *r), syscall_tcp_recv (context_t *r), syscall_tcp_close (context_t *r);
+void syscall_rc_enabled (context_t *r);
 void arch_clock_init (void);
 void syscall_read_screen (context_t *r);          // the book defines these without prototypes
 void syscall_write_screen (context_t *r);
@@ -544,6 +547,15 @@ Returns the initial user stack pointer, 0 on error.
 #define ARCH_NR_DNS_RESOLVE  614             // AArch64 only: the IPv4 address of a host name (dns.c, userland/host.c)
 #define ARCH_NR_NET6_INFO    620             // AArch64 only: IPv6 (net_syscalls.c, userland/arm64-extra.h)
 #define ARCH_NR_PING6        621
+#define ARCH_NR_GETRANDOM    615             // AArch64 only: random numbers, the clock, TCP sockets for programs, rc.conf (chapter on TLS)
+#define ARCH_NR_TIME_INFO    616
+#define ARCH_NR_TIME_SET     617
+#define ARCH_NR_SNTP         618
+#define ARCH_NR_TCP_CONNECT  619
+#define ARCH_NR_TCP_SEND     622
+#define ARCH_NR_TCP_RECV     623
+#define ARCH_NR_TCP_CLOSE    624
+#define ARCH_NR_RC_ENABLED   625
 
 static int map_sigpage (u64 l0) {
   u64 pa = alloc_frame_try ();
@@ -1136,6 +1148,15 @@ static void arch_syscalls_init (void) {
   install_syscall_handler (ARCH_NR_DNS_RESOLVE, syscall_dns_resolve);
   install_syscall_handler (ARCH_NR_NET6_INFO,  syscall_net6_info);
   install_syscall_handler (ARCH_NR_PING6,      syscall_ping6);
+  install_syscall_handler (ARCH_NR_GETRANDOM,  syscall_getrandom);
+  install_syscall_handler (ARCH_NR_TIME_INFO,  syscall_time_info);
+  install_syscall_handler (ARCH_NR_TIME_SET,   syscall_time_set);
+  install_syscall_handler (ARCH_NR_SNTP,       syscall_sntp);
+  install_syscall_handler (ARCH_NR_TCP_CONNECT, syscall_tcp_connect);
+  install_syscall_handler (ARCH_NR_TCP_SEND,   syscall_tcp_send);
+  install_syscall_handler (ARCH_NR_TCP_RECV,   syscall_tcp_recv);
+  install_syscall_handler (ARCH_NR_TCP_CLOSE,  syscall_tcp_close);
+  install_syscall_handler (ARCH_NR_RC_ENABLED, syscall_rc_enabled);
 }
 
 @

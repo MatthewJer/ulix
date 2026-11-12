@@ -463,6 +463,7 @@ struct platform {
   u64 genet;  int genet_irq;     // the Raspberry Pi 4's Ethernet controller (GENET), 0: none, and its interrupt number
   u8  genet_mac[6];  int genet_has_mac;           // its Ethernet address as the firmware wrote it into the device tree
   u64 rtc;                       // PL031
+  u64 rng;                       // the random number generator of the Raspberry Pi 4 (RNG200), 0: none (random.c)
   int timer_irq;                 // INTID of the EL1 physical timer (a PPI)
   int ncpus;  u64 cpu_mpidr[MAX_CPUS];
   int psci_hvc;  u32 psci_cpu_on;  int psci;      // PSCI present, conduit (0 = smc, 1 = hvc), function ID of CPU_ON

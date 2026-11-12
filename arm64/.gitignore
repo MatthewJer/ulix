@@ -71,6 +71,8 @@ rcconf.c
 telnet.c
 stats.c
 net_syscalls.c
+random.c
+sntp.c
 bookfs_test.c
 thread_test.c
 proc_test.c

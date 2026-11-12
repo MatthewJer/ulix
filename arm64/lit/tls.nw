@@ -1,0 +1,522 @@
+\chapter{Security: random numbers, the time of day and TLS (HTTPS)}
+\label{ch:tls}
+
+A telnet session sends the password in clear text. A program that fetches a web page over the Internet has to know that the
+page comes from the server it asked, and that nobody on the way reads or changes it. \emph{TLS} (Transport Layer Security, RFC 5246
+for version 1.2) does that on top of a TCP connection: the two sides agree on keys, the server proves who it is with a
+\emph{certificate}, and everything after that is encrypted and protected against changes. \emph{HTTPS} is the web protocol HTTP spoken
+through TLS.
+
+TLS needs four things that a small system like Ulix did not have yet, and each of them is a section of this chapter:
+
+\begin{enumerate}
+\item \textbf{Random numbers that nobody can guess} (the keys are made from them), from a hardware generator ([[random.c]]).
+\item \textbf{The time of day.} A certificate is valid from one date to another, and the Raspberry Pi has no battery clock, so
+      after the boot it does not know the date. [[sntp.c]] asks a time server.
+\item \textbf{TCP connections for programs.} The kernel has TCP since the chapter on networking, but only for its own services
+      (telnet, echo). A few system calls give programs a socket ([[net_syscalls.c]]).
+\item \textbf{The TLS code itself.} It is not written for this book. Writing a cryptographic library that is correct, and does not
+      leak secrets through timing, is a job for specialists. We use \emph{BearSSL} (Thomas Pornin, MIT licence), which is
+      small, written to be read, needs no [[malloc]] and only five functions of the C library. It is an unmodified git
+      submodule in [[third_party/bearssl]]; what is ours is the glue (a few small files) and the program [[https]].
+\end{enumerate}
+
+\paragraph{What is supported, and what is not.} The client speaks \textbf{TLS 1.2} (BearSSL has no TLS 1.3 yet). TLS 1.0 and 1.1 are
+switched off in the client (they are deprecated since RFC 8996), and \textbf{SSL 2.0 and SSL 3.0 are not implemented, on purpose}: both
+are broken (for example the POODLE attack on SSL 3.0), BearSSL does not contain them, and no web server should accept them today.
+The certificate chain is checked against the certificate authorities in [[/etc/ssl/cacert.pem]], the validity dates against the
+clock, and the host name against the certificate.
+
+\paragraph{The switch.} TLS can be switched off in two places, in the same way as the telnet server. At run time,
+[[/etc/rc.conf]] has the line [[tls_enable="YES"]] (this is also the default when the file or the line is missing); with
+[[tls_enable="NO"]] the program [[https]] says ``TLS is disabled'' and stops. At build time, [[make TLS=0]] leaves the library and the
+glue out completely: [[https]] is then a tiny program that only says that this system was built without TLS, and BearSSL is
+not even compiled.
+
+@
+\section{Random numbers (see \texttt{random.c})}
+\label{src:random.c}
+
+Keys must not be guessable. A program that computes ``random'' numbers from the clock gives an attacker a few thousand possibilities
+to try. The numbers have to come from a physical process, and that is what a \emph{hardware random number generator} measures (noise
+in a circuit). Two are supported:
+
+\begin{itemize}
+\item the generator of the Raspberry Pi 4 (``RNG200'', in the device tree as [[brcm,bcm2711-rng200]]). The kernel starts it and
+      reads 32 bit words from its FIFO. \textbf{This driver is written from the register description and has not run on a board yet}
+      (qemu does not have this device);
+\item the \texttt{virtio-rng} device of qemu's ``virt'' machine (device number 4): the driver gives the device a buffer and the device
+      fills it with bytes from the random number generator of the host. This is how the tests get their numbers. Start qemu with
+      [[-device virtio-rng-device]].
+\end{itemize}
+
+If the machine has neither, [[random_get]] returns $-1$. We do not make up numbers in that case: the programs that need them (the
+TLS client) stop with a message, instead of working with keys that look secure and are not. For the same reason there is no
+``mixing pool'' and no clock-based fallback here. The kernel hands out what the hardware gave, and the program (BearSSL) feeds it
+into its own pseudo random generator (HMAC\_DRBG) as a seed.
+
+The virtio part is the same as in [[virtionet.c]]: one queue, but with a single buffer that the \emph{device} writes
+(flag [[VIRTQ_DESC_F_WRITE]]).
+
+@
+
+The complete file is put together from these parts:
+
+<<random.c>>=
+<<random.c: includes>>
+
+<<random.c: virtio>>
+
+<<random.c: rng200>>
+
+<<random.c: random_get>>
+@
+
+<<random.c: includes>>=
+#include "ulix.h"
+#include "plat.h"
+#include "cache.h"
+
+#define R_MAGIC         0x000
+#define R_VERSION       0x004
+#define R_DEVICE_ID     0x008
+#define R_DEV_FEAT_SEL  0x014
+#define R_DRV_FEATURES  0x020
+#define R_DRV_FEAT_SEL  0x024
+#define R_GUEST_PGSIZE  0x028       // legacy
+#define R_QUEUE_SEL     0x030
+#define R_QUEUE_NUM     0x038
+#define R_QUEUE_ALIGN   0x03c       // legacy
+#define R_QUEUE_PFN     0x040       // legacy
+#define R_QUEUE_READY   0x044       // modern
+#define R_QUEUE_NOTIFY  0x050
+#define R_STATUS        0x070
+#define R_DESC_LO       0x080       // modern
+#define R_DESC_HI       0x084
+#define R_AVAIL_LO      0x090
+#define R_AVAIL_HI      0x094
+#define R_USED_LO       0x0a0
+#define R_USED_HI       0x0a4
+
+#define ST_ACK          1
+#define ST_DRIVER       2
+#define ST_DRIVER_OK    4
+#define ST_FEATURES_OK  8
+#define VIRTQ_DESC_F_WRITE  2       // the device writes into this buffer
+#define VIRTIO_ID_RNG   4
+#define QSIZE           4
+
+struct desc  { u64 addr; u32 len; unsigned short flags, next; };
+struct avail { unsigned short flags, idx, ring[QSIZE]; };
+struct used  { unsigned short flags, idx; struct { u32 id, len; } ring[QSIZE]; };
+
+static volatile u8 *dev = 0;                         // MMIO base of the virtio-rng device (0: there is none)
+static volatile struct desc  *desc;
+static volatile struct avail *avail;
+static volatile struct used  *used;
+static unsigned short used_seen = 0;
+static u64 buffer_pa;                                // one page that the device fills
+static int tried = 0;                                // random_init () has run once
+static volatile u32 *rng200 = 0;                     // the registers of the Raspberry Pi's generator (0: there is none)
+
+static u32  rd (int off)        { return *(volatile u32 *)(dev + off); }
+static void wr (int off, u32 v) { *(volatile u32 *)(dev + off) = v; }
+
+@
+\subsection{the virtio-rng device of qemu}
+
+The start-up is the sequence of the virtio standard, as for the network card: reset, say hello (ACKNOWLEDGE, DRIVER), agree on the
+features (we want none), set up the queue, DRIVER\_OK. The device needs no configuration of its own.
+
+<<random.c: virtio>>=
+static int virtio_rng_init (void) {
+  int slots = plat.nvirtio ? plat.nvirtio : 32;                  // without a device tree: the 32 slots of qemu virt
+  for (int i = slots - 1; i >= 0; i--) {
+    volatile u8 *s = (volatile u8 *)(plat.nvirtio ? KERNEL_VA + plat.virtio[i] : KERNEL_VA + 0x0a000000UL + i * 0x200);
+    if (*(volatile u32 *)(s + R_MAGIC) == 0x74726976 && *(volatile u32 *)(s + R_DEVICE_ID) == VIRTIO_ID_RNG) { dev = s; break; }
+  }
+  if (!dev) return -1;
+  u32 version = rd (R_VERSION);
+  wr (R_STATUS, 0);                                              // reset
+  wr (R_STATUS, ST_ACK);
+  wr (R_STATUS, ST_ACK | ST_DRIVER);
+  wr (R_DEV_FEAT_SEL, 0);
+  wr (R_DRV_FEAT_SEL, 0);  wr (R_DRV_FEATURES, 0);
+  if (version == 2) {                                            // a modern device must be told that we speak VERSION_1 (bit 32)
+    wr (R_DRV_FEAT_SEL, 1);  wr (R_DRV_FEATURES, 1);
+    wr (R_STATUS, ST_ACK | ST_DRIVER | ST_FEATURES_OK);
+    if (!(rd (R_STATUS) & ST_FEATURES_OK)) { dev = 0; return -1; }
+  }
+  wr (R_QUEUE_SEL, 0);
+  wr (R_QUEUE_NUM, QSIZE);
+  u64 pa = alloc_frames_contig (2);                              // descriptors and available ring in page 0, used ring in page 1
+  desc  = KVA (pa);
+  avail = KVA (pa + sizeof (struct desc) * QSIZE);
+  used  = KVA (pa + PAGE_SIZE);
+  if (version == 1) {
+    wr (R_GUEST_PGSIZE, PAGE_SIZE);
+    wr (R_QUEUE_ALIGN, PAGE_SIZE);
+    wr (R_QUEUE_PFN, pa / PAGE_SIZE);
+  } else {
+    u64 a = pa + sizeof (struct desc) * QSIZE, u = pa + PAGE_SIZE;
+    wr (R_DESC_LO, (u32)pa);  wr (R_DESC_HI, pa >> 32);
+    wr (R_AVAIL_LO, (u32)a);  wr (R_AVAIL_HI, a >> 32);
+    wr (R_USED_LO, (u32)u);   wr (R_USED_HI, u >> 32);
+    wr (R_QUEUE_READY, 1);
+  }
+  buffer_pa = alloc_frame ();
+  wr (R_STATUS, rd (R_STATUS) | ST_DRIVER_OK);
+  return 0;
+}
+
+@
+One request: hand the device the buffer, tell it, and poll the used ring until it says ``filled''. The device reports how many bytes
+it wrote (it may give fewer than we asked for). Returns that number, or $-1$ if the device does not answer.
+
+<<random.c: virtio>>=
+static int virtio_rng_read (u8 *out, int max) {
+  if (max > 256) max = 256;
+  desc[0].addr = buffer_pa;  desc[0].len = max;  desc[0].flags = VIRTQ_DESC_F_WRITE;  desc[0].next = 0;
+  cache_clean ((const void *)&desc[0], sizeof (struct desc));
+  avail->ring[avail->idx % QSIZE] = 0;
+  __asm__ volatile ("dmb ish" ::: "memory");
+  avail->idx++;
+  cache_clean ((const void *)avail, sizeof (struct avail));
+  wr (R_QUEUE_NOTIFY, 0);
+  for (long spins = 0; spins < 5000000; spins++) {
+    cache_flush_inval ((const void *)used, sizeof (struct used));
+    if (used->idx != used_seen) {
+      int n = (int)used->ring[used_seen % QSIZE].len;
+      used_seen++;
+      u8 *buf = KVA (buffer_pa);
+      cache_flush_inval (buf, PAGE_SIZE);
+      if (n > max) n = max;
+      for (int i = 0; i < n; i++) out[i] = buf[i];
+      return n;
+    }
+  }
+  return -1;
+}
+
+@
+\subsection{the RNG200 of the Raspberry Pi 4}
+
+The registers (a block of 0x28 bytes): a control register whose bit 0 enables the generator, two soft-reset registers (one for the
+noise source and one for the post-processing, ``RBG''), the interrupt status (the generator reports a failed self test there), a
+FIFO count (the low 8 bits: how many 32 bit words are ready) and the FIFO itself. The start-up is: clear the status, pulse both
+resets, enable. The first words come after the generator has warmed up, so the reader waits for the count to become non-zero (at most
+100 milliseconds) and gives up if it does not.
+
+<<random.c: rng200>>=
+#define RNG_CTRL        0x00
+#define RNG_SOFT_RESET  0x04
+#define RBG_SOFT_RESET  0x08
+#define RNG_INT_STATUS  0x18
+#define RNG_FIFO_DATA   0x20
+#define RNG_FIFO_COUNT  0x24
+
+static void rng200_init (void) {
+  rng200 = (volatile u32 *)(KERNEL_VA + plat.rng);
+  rng200[RNG_INT_STATUS / 4] = 0xffffffffu;                      // clear everything that is reported
+  rng200[RBG_SOFT_RESET / 4] = 1;  rng200[RNG_SOFT_RESET / 4] = 1;
+  rng200[RBG_SOFT_RESET / 4] = 0;  rng200[RNG_SOFT_RESET / 4] = 0;
+  rng200[RNG_CTRL / 4] = rng200[RNG_CTRL / 4] | 1;               // enable
+}
+
+static u64 counter (void) { u64 c; __asm__ volatile ("mrs %0, cntpct_el0" : "=r" (c)); return c; }
+
+static int rng200_read (u8 *out, int max) {
+  u64 freq;  __asm__ volatile ("mrs %0, cntfrq_el0" : "=r" (freq));
+  u64 until = counter () + freq / 10;                            // 100 milliseconds
+  int n = 0;
+  while (n < max) {
+    if ((rng200[RNG_FIFO_COUNT / 4] & 0xff) == 0) {
+      if (counter () > until) break;
+      continue;
+    }
+    u32 word = rng200[RNG_FIFO_DATA / 4];
+    for (int i = 0; i < 4 && n < max; i++) out[n++] = word >> (8 * i);
+  }
+  return n > 0 ? n : -1;
+}
+
+@
+\subsection{what the kernel offers}
+
+The first call looks for a source (and starts it); after that every call fills the buffer, using several requests if the source
+gives fewer bytes at a time. The result is the number of bytes (always [[n]], or $-1$ if the source fails or there is none).
+
+<<random.c: random_get>>=
+const char *random_source (void) { return rng200 ? "RNG200" : dev ? "virtio-rng" : "none"; }
+
+int random_get (void *buf, int n) {
+  if (!tried) {
+    tried = 1;
+    if (plat.rng) rng200_init ();
+    else virtio_rng_init ();
+  }
+  if (!rng200 && !dev) return -1;
+  u8 *p = (u8 *)buf;
+  int done = 0;
+  while (done < n) {
+    int got = rng200 ? rng200_read (p + done, n - done) : virtio_rng_read (p + done, n - done);
+    if (got <= 0) return -1;
+    done += got;
+  }
+  return n;
+}
+
+@
+\section{The time of day: the clock and an SNTP client (see \texttt{sntp.c})}
+\label{src:sntp.c}
+
+Certificates say ``valid from 1 March 2026 to 1 June 2026''. To check that, the client has to know today's date. On qemu the clock of
+the virtual machine (a PL031, [[arch_clock.c]]) gives the date of the host, and the kernel keeps it up to date from the timer interrupt.
+The Raspberry Pi 4 has no battery clock: after the boot the kernel counts from 1 January 2026, which is certainly wrong. The clock
+of the system knows where its value came from ([[clock_source]]): 0 = a guess, 1 = a hardware clock, 2 = set by a program.
+
+A time server tells the right time. \emph{SNTP} (RFC 4330) is the simple version of the Network Time Protocol: a UDP datagram of 48 bytes
+goes to port 123 of the server, the answer has the same format. We use four fields:
+
+\begin{quote}\begin{verbatim}
+    byte 0         leap indicator (2 bits), version (3 bits), mode (3 bits): 0x23 = version 4, mode 3 (client);
+                   the server answers with mode 4
+    byte 1         stratum: 0 in an answer means ``kiss of death'' (the server refuses), 1 to 15 is fine
+    bytes 24 - 31  originate time: the server copies our transmit time here
+    bytes 40 - 47  transmit time: the time the packet left the sender; seconds since 1 January 1900, then a 32 bit fraction
+\end{verbatim}\end{quote}
+
+The client puts a number of its own into the transmit time and checks that the answer repeats it as the originate time. That is
+what keeps a forged answer out (the forger does not know the number), and what tells an answer from an old one. We do \emph{not}
+correct for the time that the packet needed on the way: that is some milliseconds, and certificates are valid for months.
+Seconds from 1900 become Unix seconds by subtracting 2208988800.
+
+@
+
+<<sntp.c>>=
+#include "net.h"
+
+#define SNTP_SOURCE_PORT 12300                         // the port that the answer comes back to
+#define NTP_TO_UNIX      2208988800u                   // seconds from 1 January 1900 to 1 January 1970
+
+static u8  sent_stamp[8];                              // what we put into the transmit time
+static u8  answer[48];  static volatile int answered;  // the answer, once it has been accepted
+static u32 server_ip;  static u16 server_port;
+static int bound = 0, busy = 0;
+
+static void on_datagram (u32 src, u16 src_port, const u8 *data, int len) {
+  if (src != server_ip || src_port != server_port || len < 48) return;
+  if ((data[0] & 7) != 4 || data[1] == 0) return;      // not a server answer, or kiss of death
+  for (int i = 0; i < 8; i++) if (data[24 + i] != sent_stamp[i]) return;      // not the answer to our question
+  for (int i = 0; i < 48; i++) answer[i] = data[i];
+  answered = 1;
+}
+
+@
+Three questions, after one, two and four seconds, as in the resolver ([[dns.c]]); the time is the whole seconds of the
+transmit time of the answer. A time before 2020 (or after 2100) is refused as nonsense.
+
+<<sntp.c>>=
+int sntp_query (u32 server, u16 port, int timeout_ms, u32 *unix_seconds, void (*idle) (void)) {
+  u8 request[48];
+  while (busy) { net_poll_once ();  if (idle) idle (); }                          // (another program asks: wait for our turn)
+  busy = 1;
+  if (!bound) { udp_bind (SNTP_SOURCE_PORT, on_datagram);  bound = 1; }
+  server_ip = server;  server_port = port;
+  int result = -1;
+  u64 begin = net_now_ms ();
+  for (int attempt = 0; attempt < 3 && result != 0; attempt++) {
+    for (int i = 0; i < 48; i++) request[i] = 0;
+    request[0] = 0x23;
+    u64 now = net_now_ms ();
+    put32 (sent_stamp, (u32)(now * 2654435761u >> 3) ^ 0x5a17c0de);  put32 (sent_stamp + 4, (u32)(now * 40503u));     // (different every time)
+    for (int i = 0; i < 8; i++) request[40 + i] = sent_stamp[i];
+    answered = 0;
+    udp_send (server, port, SNTP_SOURCE_PORT, request, 48);
+    u64 start = net_now_ms ();
+    while (!answered && net_now_ms () - start < (u64)(1000 @<< attempt) && net_now_ms () - begin < (u64)timeout_ms) { net_poll_once ();  if (!answered && idle) idle (); }
+    if (!answered) continue;
+    u32 seconds = get32 (answer + 40) - NTP_TO_UNIX;
+    if (seconds > 1577836800u && seconds < 4102444800u) { *unix_seconds = seconds;  result = 0; }       // 2020 ... 2100
+    else result = -3;
+  }
+  busy = 0;
+  return result;
+}
+
+@
+\section{System calls: TCP for programs, random numbers, the clock and rc.conf (in \texttt{net\_syscalls.c})}
+\label{src:tls:syscalls}
+
+These calls are added to the file [[net_syscalls.c]] (they are chunks of it, described here because they belong to TLS). The
+programs use them through [[userland/arm64-extra.h]].
+
+\begin{quote}\begin{verbatim}
+    getrandom (buf, n)         n random bytes from the hardware generator: n, or -1 if the machine has none (615)
+    time_info (&t)             t.seconds: Unix time, t.source: where the clock got it from (0 guess, 1 hardware clock, 2 set) (616)
+    time_set (seconds)         set the clock; only root; the source becomes 2 (617)
+    sntp (&q)                  ask the time server q.server (port q.port): q.seconds; 0 = ok, -1 no answer, -3 nonsense (618)
+    tcp_connect (&c)           connect to c.ip, c.port within c.timeout_ms: a socket number, -1 = no room, -2 = no connection (619)
+    tcp_send (&m)              send m.len bytes: m.len, or -1 if the connection is gone (622)
+    tcp_recv (&m)              wait for data (at most m.timeout_ms): its length, 0 = time over, -1 = the other side has closed (623)
+    tcp_close (socket)         (624)
+    rc_enabled (&r)            r.name: a setting of /etc/rc.conf, r.fallback: the answer if the line is missing; returns 0 or 1 (625)
+\end{verbatim}\end{quote}
+
+A TCP socket of a program is a slot in a small table that points to a connection in [[tcp.c]]. The slot remembers the process
+(as the raw ICMP sockets do): if the process dies without closing, the next [[tcp_connect]] closes the connection. The program
+never sees the pointer, only the slot number. Because [[tcp.c]] re-uses a connection slot as soon as it is closed, the socket
+also keeps the connection's [[id]] (a number that [[tcp.c]] gives every new connection); a socket whose connection was
+closed and re-used answers ``closed'' and does not read somebody else's data.
+
+Waiting works as everywhere else in the network code: while the kernel waits for the network, it looks into the card
+([[net_poll_once]]) and gives the CPU to the others ([[arch_resign]]).
+
+<<net_syscalls.c: syscall_tls>>=
+extern int  random_get (void *buf, int n);
+extern int  clock_source;
+extern int  sntp_query (unsigned server, unsigned short port, int timeout_ms, unsigned *unix_seconds, void (*idle) (void));
+extern int  rc_conf_enabled (const char *variable, int fallback);
+typedef struct tcp_conn tcp_conn;
+extern tcp_conn *tcp_connect (unsigned ip, unsigned short port);
+extern int  tcp_established (tcp_conn *c);
+extern int  tcp_closed (tcp_conn *c);
+extern int  tcp_read (tcp_conn *c, unsigned char *buf, int max);
+extern int  tcp_write (tcp_conn *c, const unsigned char *data, int len);
+extern void tcp_close (tcp_conn *c);
+extern unsigned tcp_id (tcp_conn *c);
+
+@
+The random numbers are copied through a buffer in the kernel, 256 bytes at a time.
+
+<<net_syscalls.c: syscall_tls>>=
+void syscall_getrandom (context_t *r) {
+  unsigned char *out = (unsigned char *)r->ebx;
+  int n = (int)r->ecx, done = 0;
+  unsigned char tmp[256];
+  while (done < n) {
+    int part = n - done > 256 ? 256 : n - done;
+    if (random_get (tmp, part) < 0) eax_return (-1);
+    for (int i = 0; i < part; i++) out[done + i] = tmp[i];
+    done += part;
+  }
+  eax_return (n);
+}
+
+@
+The clock. [[time_set]] moves [[system_start_time]] so that [[system_time]] (which the timer interrupt computes from the
+ticks and the start time) gets the new value.
+
+<<net_syscalls.c: syscall_tls>>=
+struct time_info { unsigned seconds; int source; };         // the same as in userland/arm64-extra.h
+struct sntp_args { unsigned server; int port, timeout_ms; unsigned seconds; };
+struct rc_args   { char name[48]; int fallback; };
+
+void syscall_time_info (context_t *r) {
+  struct time_info *t = (struct time_info *)r->ebx;
+  t->seconds = system_time;  t->source = clock_source;
+  r->eax = 0;
+}
+
+void syscall_time_set (context_t *r) {
+  if (!is_root ()) eax_return (-2);
+  unsigned seconds = r->ebx;
+  system_start_time = seconds - system_ticks / 100;
+  system_time = seconds;
+  clock_source = 2;
+  r->eax = 0;
+}
+
+void syscall_sntp (context_t *r) {
+  struct sntp_args *a = (struct sntp_args *)r->ebx;
+  eax_return (sntp_query (a->server, a->port, a->timeout_ms, &a->seconds, arch_resign));
+}
+
+void syscall_rc_enabled (context_t *r) {
+  struct rc_args *a = (struct rc_args *)r->ebx;
+  char name[48];
+  int i = 0;
+  while (i < 47 && a->name[i]) { name[i] = a->name[i]; i++; }
+  name[i] = 0;
+  eax_return (rc_conf_enabled (name, a->fallback));
+}
+
+@
+The sockets.
+
+<<net_syscalls.c: syscall_tls>>=
+#define SOCKETS 8
+static struct { tcp_conn *c; unsigned id; int owner; } socks[SOCKETS];
+struct tcp_connect_args { unsigned ip; int port, timeout_ms; };         // the same as in userland/arm64-extra.h
+struct tcp_msg { int handle; unsigned char *buf; int len; int timeout_ms; };
+
+static int sock_ok (int h) { return h >= 0 && h < SOCKETS && socks[h].c && socks[h].owner == current_task; }
+
+void syscall_tcp_connect (context_t *r) {
+  struct tcp_connect_args *a = (struct tcp_connect_args *)r->ebx;
+  int h = -1;
+  for (int i = 0; i < SOCKETS; i++) {
+    if (socks[i].c && !alive (socks[i].owner)) { tcp_close (socks[i].c);  socks[i].c = 0; }       // (the owner has died: close it)
+    if (!socks[i].c && h < 0) h = i;
+  }
+  if (h < 0) eax_return (-1);
+  tcp_conn *c = tcp_connect (a->ip, a->port);
+  if (!c) eax_return (-1);
+  socks[h].c = c;  socks[h].id = tcp_id (c);  socks[h].owner = current_task;
+  unsigned long long start = net_now_ms ();
+  while (!tcp_established (c)) {
+    if (tcp_closed (c) || net_now_ms () - start >= (unsigned)a->timeout_ms) { tcp_close (c);  socks[h].c = 0;  eax_return (-2); }
+    net_poll_once ();
+    arch_resign ();
+  }
+  eax_return (h);
+}
+
+@
+[[tcp_write]] takes what fits into the send buffer (4 KByte); the call loops until all of it is accepted, or the connection breaks.
+Nothing is lost when the time is over: it gives up after the same time as the other calls ([[timeout_ms]]) and tells how many
+bytes were taken.
+
+<<net_syscalls.c: syscall_tls>>=
+void syscall_tcp_send (context_t *r) {
+  struct tcp_msg *m = (struct tcp_msg *)r->ebx;
+  if (!sock_ok (m->handle)) eax_return (-1);
+  tcp_conn *c = socks[m->handle].c;
+  int sent = 0;
+  unsigned long long start = net_now_ms ();
+  while (sent < m->len) {
+    if (tcp_id (c) != socks[m->handle].id || tcp_closed (c)) eax_return (-1);
+    int n = tcp_write (c, m->buf + sent, m->len - sent);
+    if (n < 0) eax_return (-1);
+    sent += n;
+    if (n == 0) {
+      if (net_now_ms () - start >= (unsigned)m->timeout_ms) break;
+      net_poll_once ();
+      arch_resign ();
+    }
+  }
+  eax_return (sent);
+}
+
+void syscall_tcp_recv (context_t *r) {
+  struct tcp_msg *m = (struct tcp_msg *)r->ebx;
+  if (!sock_ok (m->handle)) eax_return (-1);
+  tcp_conn *c = socks[m->handle].c;
+  unsigned long long start = net_now_ms ();
+  for (;;) {
+    if (tcp_id (c) != socks[m->handle].id) eax_return (-1);          // the slot belongs to another connection now
+    int n = tcp_read (c, m->buf, m->len);
+    if (n != 0) eax_return (n);                                      // data, or -1: the other side has closed
+    if (net_now_ms () - start >= (unsigned)m->timeout_ms) eax_return (0);
+    net_poll_once ();
+    arch_resign ();
+  }
+}
+
+void syscall_tcp_close (context_t *r) {
+  int h = (int)r->ebx;
+  if (sock_ok (h)) { if (tcp_id (socks[h].c) == socks[h].id) tcp_close (socks[h].c);  socks[h].c = 0; }
+  r->eax = 0;
+}
+
+@
