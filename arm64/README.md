@@ -181,6 +181,10 @@ Ulix is a teaching system; what the port and the Raspberry Pi work follow from t
   of the setup steps are those of the FreeBSD driver `sys/arm64/broadcom/genet/if_genet.c` and `if_genetreg.h` (BSD-2-Clause, Copyright
   (c) 2020 Michael J Karels, (c) 2016, 2020 Jared McNeill; they derive from NetBSD's `bcmgenet.c`). The licence text and the copyrights are in the
   header of `genet.c`. The FreeBSD files themselves are not part of this repository.
+* **musl libc** v1.2.6 (MIT, Copyright (c) 2005-2020 Rich Felker et al.) is the C library of the user space. It is an unmodified submodule in
+  `third_party/musl`, built by `arm64/libc/Makefile`; our part is the system call layer (`linux_abi.c`, chapter 10 of the port's book). The rules for
+  foreign code and the licence check are in `third_party/README.md` and `third_party/LICENCE-CHECK-musl.md`. Programs linked with musl carry its
+  copyright notice with them (`COPYRIGHT` in the submodule).
 
 ## Not done
 
