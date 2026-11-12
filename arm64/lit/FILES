@@ -69,3 +69,6 @@ userland/dhclient.c
 userland/host.c
 userland/shutdown.c
 userland/readelf64.c
+linux_abi.c
+tools/mark_musl.py
+libc/hello.c

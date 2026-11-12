@@ -104,3 +104,7 @@ lit/build/
 lit/noweb.sty
 dns.c
 userland/host.c
+linux_abi.c
+tools/mark_musl.py
+libc/hello.c
+libc/build/

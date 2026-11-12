@@ -55,6 +55,8 @@ The complete file is put together from these parts:
 
 <<arch_thread.c: SIGPAGE_VA>>
 
+<<arch_thread.c: build_linux_stack>>
+
 <<arch_thread.c: part 17>>
 
 <<arch_thread.c: kstack_for_process>>
@@ -99,7 +101,24 @@ The complete file is put together from these parts:
 #define KVA(pa)  ((void *)(0xFFFF000000000000UL + (u64)(pa)))
 #define PA(va)   ((u64)(va) - 0xFFFF000000000000UL)
 
-struct kctx { u64 x19_x28[10]; u64 x29, x30, sp, sp_el0; int depth; };      // layout known to cpu_switch (depth: for C only)
+struct kctx { u64 x19_x28[10]; u64 x29, x30, sp, sp_el0; int depth;
+              u64 tpidr, fpcr, fpsr, v[64]; };           // layout known to cpu_switch (depth: for C only); v = 32 registers of 16 bytes
+typedef char assert_kctx_layout[(__builtin_offsetof (struct kctx, v) == 144) ? 1 : -1];   // the offset used by cpu_switch
+
+// A new thread starts with a clean user state; a forked child starts with a copy of its parent's registers, which are still in
+// the CPU while the parent is in the kernel (the kernel does not use them).
+static void kctx_user_state_clear (struct kctx *c) { c->tpidr = c->fpcr = c->fpsr = 0; for (int i = 0; i < 64; i++) c->v[i] = 0; }
+static void kctx_user_state_copy_live (struct kctx *c) {
+  __asm__ volatile ("mrs %0, tpidr_el0" : "=r" (c->tpidr));
+  __asm__ volatile ("mrs %0, fpcr" : "=r" (c->fpcr));
+  __asm__ volatile ("mrs %0, fpsr" : "=r" (c->fpsr));
+  u64 *v = c->v;
+  __asm__ volatile ("stp q0, q1, [%0, #0]; stp q2, q3, [%0, #32]; stp q4, q5, [%0, #64]; stp q6, q7, [%0, #96]\n"
+                    "stp q8, q9, [%0, #128]; stp q10, q11, [%0, #160]; stp q12, q13, [%0, #192]; stp q14, q15, [%0, #224]\n"
+                    "stp q16, q17, [%0, #256]; stp q18, q19, [%0, #288]; stp q20, q21, [%0, #320]; stp q22, q23, [%0, #352]\n"
+                    "stp q24, q25, [%0, #384]; stp q26, q27, [%0, #416]; stp q28, q29, [%0, #448]; stp q30, q31, [%0, #480]"
+                    :: "r" (v) : "memory");
+}
 
 extern void cpu_switch (struct kctx *old, struct kctx *new);
 extern u64  alloc_frames_contig (int n);
@@ -115,6 +134,10 @@ extern void free_user_space (u64 l0_pa);
 extern int  map_page_in (u64 l0_pa, u64 va, u64 pa, u64 flags);
 extern void sync_icache (void *p, u64 len);
 extern int  elf_load (u64 l0, unsigned ino, u64 *entry, u64 *image_end);
+extern int elf_linux, elf_phnum;                 // set by elf_load (see elf.c)
+extern u64 elf_phdr_va;
+extern void linux_abi_fork (int old_as, int new_as);
+extern unsigned char linux_abi_as[];             // linux_abi.c: 1 = the address space belongs to a program for musl
 extern unsigned minix_lookup (const char *path);
 extern int  minix_is_file (unsigned ino);
 extern u64  empty_l0_pa;
@@ -364,6 +387,7 @@ static int create_thread (thread_id tid, void (*entry)(void *), void *arg, const
   u64 top = (u64)KVA (kstack_pa[tid]) + KSTACK_PAGES_ARCH * PAGE;
   struct kctx *c = &kctx[tid];
   c->depth = 1;                                // runs with the kernel lock, like the thread that starts it
+  kctx_user_state_clear (c);
   proc_ticks[tid] = 0;                         // a new thread has used no time yet
   for (int i = 0; i < 10; i++) c->x19_x28[i] = 0;
   c->x19_x28[0] = (u64)entry;                  // x19
@@ -433,6 +457,7 @@ static int as_alloc (void) {
       address_spaces[id].pid       = -1;
       address_spaces[id].refcount  = 1;
       address_spaces[id].stacksize = USER_STACK_PAGES * PAGE;
+      linux_abi_as[id] = 0;                              // the system call interface of musl is chosen per program (linux_abi.c)
       as_l0[id] = 0;
       return id;
     }
@@ -531,7 +556,8 @@ static int map_sigpage (u64 l0) {
   return map_page_in (l0, SIGPAGE_VA, pa, PAGE_URX);
 }
 
-static u64 build_user_stack (u64 l0, int argc, char **argv) {
+static u64 build_linux_stack (byte *page, u64 base, u64 sp, int argc, u64 *ptrs);
+static u64 build_user_stack (u64 l0, int argc, char **argv, int musl_abi) {
   u64 top_pa = 0;
   if (map_sigpage (l0) != 0) return 0;
   for (int i = 1; i <= USER_STACK_PAGES; i++) {
@@ -552,6 +578,7 @@ static u64 build_user_stack (u64 l0, int argc, char **argv) {
     memcpy (page + (sp - base), argv[i], len);
     ptrs[i] = sp;
   }
+  if (musl_abi) return build_linux_stack (page, base, sp, argc, ptrs);
   sp &= ~15UL;
   sp -= ((argc + 1) * 8 + 15) & ~15UL;
   u64 *av = (u64 *)(page + (sp - base));
@@ -562,6 +589,46 @@ static u64 build_user_stack (u64 l0, int argc, char **argv) {
   u64 *top = (u64 *)(page + (sp - base));
   top[0] = argc;
   top[1] = argv_va;
+  return sp;
+}
+
+@
+\subsection{The stack of a program for musl}
+
+A program that speaks the Linux system call interface finds the same start-up information as on Linux, and musl's [[_start_c]]
+reads it from there: at the stack pointer the number of arguments, then the [[argv]] pointers and a null pointer, the
+[[environ]] pointers and a null pointer, and then the \emph{auxiliary vector}: pairs of (type, value) that end with a pair of type
+zero. musl needs from it the page size, the address of the program headers (to find the thread-local storage segment) and
+sixteen random bytes (for the stack protector canary). The random bytes are made from the cycle counter here, which is
+enough for a canary but not for cryptography. The environment holds one string, [[PATH]].
+
+<<arch_thread.c: build_linux_stack>>=
+#define AT_PHDR    3
+#define AT_PHENT   4
+#define AT_PHNUM   5
+#define AT_PAGESZ  6
+#define AT_RANDOM 25
+
+static u64 build_linux_stack (byte *page, u64 base, u64 sp, int argc, u64 *ptrs) {
+  static const char env0[] = "PATH=/bin";
+  sp -= sizeof env0;
+  memcpy (page + (sp - base), env0, sizeof env0);
+  u64 env0_va = sp;
+  sp -= 16;                                              // sixteen random bytes
+  u64 rnd_va = sp, t;
+  __asm__ volatile ("mrs %0, cntpct_el0" : "=r" (t));
+  for (int i = 0; i < 16; i++) { t = t * 6364136223846793005UL + 1442695040888963407UL; page[sp - base + i] = t >> 56; }
+  u64 auxv[] = { AT_PHDR, elf_phdr_va, AT_PHENT, 56, AT_PHNUM, elf_phnum, AT_PAGESZ, PAGE, AT_RANDOM, rnd_va, 0, 0 };
+  int words = 1 + (argc + 1) + 2 + sizeof auxv / 8;      // argc, argv and its null, environ and its null, auxv
+  sp = (sp - words * 8) & ~15UL;
+  if (sp < base + 64) return 0;
+  u64 *w = (u64 *)(page + (sp - base));
+  *w++ = argc;
+  for (int i = 0; i < argc; i++) *w++ = ptrs[i];
+  *w++ = 0;
+  *w++ = env0_va;
+  *w++ = 0;
+  for (unsigned i = 0; i < sizeof auxv / 8; i++) *w++ = auxv[i];
   return sp;
 }
 
@@ -605,6 +672,7 @@ static int kstack_for_process (thread_id tid, const context_t *frame, int owns_a
   *f = *frame;
   struct kctx *c = &kctx[tid];
   c->depth = 1;
+  kctx_user_state_clear (c);
   proc_ticks[tid] = 0;                         // a new process has used no time yet
   for (int i = 0; i < 10; i++) c->x19_x28[i] = 0;
   c->x29 = 0;
@@ -748,8 +816,10 @@ int u_fork (context_t *r) {
     destroy_address_space (new_as);
     return -1;
   }
+  linux_abi_fork (old_as, new_as);                       // the child speaks the same system call interface
+  kctx_user_state_copy_live (&kctx[new_tid]);            // and starts with the thread pointer and FP registers of the parent
   add_to_ready_queue (new_tid);           // state becomes READY
-  return new_tid;                         // in the parent, fork() returns the child's PID
+  return new_tid;                       // in the parent, fork() returns the child's PID
 }
 
 @
@@ -792,11 +862,12 @@ static int u_execv_loading (char *filename, char *const argv[], memaddress *news
   u64 nl0 = new_user_l0 (), entry, image_end;
   if (!nl0) return -1;
   if (elf_load (nl0, ino, &entry, &image_end) != 0) { free_user_space (nl0); return -1; }
-  u64 sp = build_user_stack (nl0, argc, kargv);
+  u64 sp = build_user_stack (nl0, argc, kargv, elf_linux);
   if (!sp) { free_user_space (nl0); return -1; }
 
   u64 old = as_l0[current_as];                           // from here on there is no way back
   as_l0[current_as] = nl0;
+  linux_abi_as[current_as] = elf_linux;                  // the new program may speak the other system call interface
   address_spaces[current_as].stacksize = USER_STACK_PAGES * PAGE;       // a new program starts with a small stack
   address_spaces[current_as].memstart = 0x400000;
   address_spaces[current_as].memend   = image_end;      // the program break starts behind the image
@@ -830,9 +901,10 @@ static int arch_start_user_loading (const char *path, int argc, char **argv) {
   if (!l0) { destroy_address_space (as); return -1; }
   as_l0[as] = l0;
   u64 sp = 0;
-  if (elf_load (l0, ino, &entry, &image_end) == 0) sp = build_user_stack (l0, argc, argv);
+  if (elf_load (l0, ino, &entry, &image_end) == 0) sp = build_user_stack (l0, argc, argv, elf_linux);
   address_spaces[as].memstart = 0x400000;
   address_spaces[as].memend   = image_end;
+  linux_abi_as[as] = elf_linux;
   if (!sp) { destroy_address_space (as); return -1; }
 
   thread_id tid = register_new_tcb (as);
@@ -964,8 +1036,10 @@ void arch_next_pid_is_2 (void) { next_pid = 2; }
 \subsection{system calls: the book's dispatcher, called from the exception handler}
 
 <<arch_thread.c: book_syscall>>=
+extern void linux_syscall (context_t *r);
 void book_syscall (void *frame) {
-  syscall_handler ((context_t *)frame);
+  if (linux_abi_as[current_as]) linux_syscall ((context_t *)frame);     // a program for musl: x8 = number, see linux_abi.c
+  else syscall_handler ((context_t *)frame);
 }
 
 int book_current_pid (void) { return thread_table[current_task].pid; }
@@ -1075,24 +1149,63 @@ small trampoline page that calls sigreturn, which restores the frame.
 <<arch_thread.c: arch_signal_check>>=
 extern u64 user_to_phys (u64 va, int write);
 
+// What is saved on the user stack for a signal: the interrupted registers, the floating point and SIMD registers (a
+// handler written for musl uses them, e.g. in memcpy and printf) and, for a program of musl, a small siginfo.
+struct sigframe { context_t ctx; u64 fpcr, fpsr, v[64]; u64 siginfo[16]; };
+
+static void fp_save (struct sigframe *sf) {
+  __asm__ volatile ("mrs %0, fpcr" : "=r" (sf->fpcr));
+  __asm__ volatile ("mrs %0, fpsr" : "=r" (sf->fpsr));
+  u64 *v = sf->v;
+  __asm__ volatile ("stp q0, q1, [%0, #0]; stp q2, q3, [%0, #32]; stp q4, q5, [%0, #64]; stp q6, q7, [%0, #96]\n"
+                    "stp q8, q9, [%0, #128]; stp q10, q11, [%0, #160]; stp q12, q13, [%0, #192]; stp q14, q15, [%0, #224]\n"
+                    "stp q16, q17, [%0, #256]; stp q18, q19, [%0, #288]; stp q20, q21, [%0, #320]; stp q22, q23, [%0, #352]\n"
+                    "stp q24, q25, [%0, #384]; stp q26, q27, [%0, #416]; stp q28, q29, [%0, #448]; stp q30, q31, [%0, #480]"
+                    :: "r" (v) : "memory");
+}
+
+static void fp_load (struct sigframe *sf) {
+  u64 *v = sf->v;
+  __asm__ volatile ("ldp q0, q1, [%0, #0]; ldp q2, q3, [%0, #32]; ldp q4, q5, [%0, #64]; ldp q6, q7, [%0, #96]\n"
+                    "ldp q8, q9, [%0, #128]; ldp q10, q11, [%0, #160]; ldp q12, q13, [%0, #192]; ldp q14, q15, [%0, #224]\n"
+                    "ldp q16, q17, [%0, #256]; ldp q18, q19, [%0, #288]; ldp q20, q21, [%0, #320]; ldp q22, q23, [%0, #352]\n"
+                    "ldp q24, q25, [%0, #384]; ldp q26, q27, [%0, #416]; ldp q28, q29, [%0, #448]; ldp q30, q31, [%0, #480]"
+                    :: "r" (v) : "memory");
+  __asm__ volatile ("msr fpcr, %0" :: "r" (sf->fpcr));
+  __asm__ volatile ("msr fpsr, %0" :: "r" (sf->fpsr));
+}
+
+// linux_abi.c: the signal numbers, the mask and the restorer function of a program for musl
+extern int linux_signal_number (int signo);
+extern u64 linux_signal_restorer (void);
+
 void arch_signal_check (context_t *f) {
   TCB *t = &thread_table[current_task];
   if (!t->sig_pending || f->elr >= 0x80000000UL) return;            // nothing pending / not in user mode
   for (int signo = 0; signo < 32; signo++) {
     if (!(t->sig_pending & (1UL @<< signo))) continue;
+    if (t->sig_blocked & (1U @<< signo)) continue;                  // blocked (sigprocmask): stays pending until unblocked
     t->sig_pending &= ~(1UL @<< signo);
     sighandler_t h = t->sighandlers[signo];
     if (h == SIG_DFL || h == SIG_IGN) return;                       // cannot happen (u_kill filters them)
-    u64 sp = (f->sp_el0 - sizeof (context_t)) & ~15UL;
-    if (!user_to_phys (sp, 1) || !user_to_phys (sp + sizeof (context_t) - 1, 1)) {
+    u64 sp = (f->sp_el0 - sizeof (struct sigframe)) & ~15UL;
+    u64 ret = linux_abi_as[current_as] ? linux_signal_restorer () : SIGPAGE_VA;
+    if (!ret || !user_to_phys (sp, 1) || !user_to_phys (sp + sizeof (struct sigframe) - 1, 1)) {
       printf ("[kernel] no room on the stack of process %d for signal %d\n", t->pid, signo);
       f->ebx = (unsigned long)-1;
       syscall_exit (f);                                             // does not return
     }
-    *(context_t *)sp = *f;                                          // save the interrupted state
+    struct sigframe *sf = (struct sigframe *)sp;
+    sf->ctx = *f;                                                   // save the interrupted state
+    fp_save (sf);
+    int no = linux_signal_number (signo);                           // (the number the program knows)
+    for (int i = 0; i < 16; i++) sf->siginfo[i] = 0;
+    sf->siginfo[0] = no;                                            // si_signo; si_code and the rest stay 0
     f->elr    = (u64)h;
-    f->eax    = signo;                                              // x0: argument of the handler
-    f->x30    = SIGPAGE_VA;                                         // the handler returns to the trampoline
+    f->eax    = no;                                                 // x0: argument of the handler
+    f->x1     = (u64)sf->siginfo;                                   // x1, x2: for handlers of musl with SA_SIGINFO
+    f->x2     = 0;
+    f->x30    = ret;                                                // the handler returns to the trampoline
     f->sp_el0 = sp;
     return;                                                         // one signal at a time
   }
@@ -1104,11 +1217,13 @@ sigreturn: the user stack pointer points to the saved frame
 <<arch_thread.c: syscall_sigreturn>>=
 void syscall_sigreturn (context_t *r) {
   u64 sp = r->sp_el0;
-  if ((sp & 15) || !user_to_phys (sp, 0) || !user_to_phys (sp + sizeof (context_t) - 1, 0)) {
+  if ((sp & 15) || !user_to_phys (sp, 0) || !user_to_phys (sp + sizeof (struct sigframe) - 1, 0)) {
     r->ebx = (unsigned long)-1;
     syscall_exit (r);
   }
-  context_t saved = *(context_t *)sp;
+  struct sigframe *sf = (struct sigframe *)sp;
+  context_t saved = sf->ctx;
+  fp_load (sf);
   saved.spsr = r->spsr;                                             // the saved state must stay EL0t
   if (saved.elr >= 0x80000000UL) saved.elr = 0, saved.ebx = (unsigned long)-1;
   *r = saved;
@@ -1543,6 +1658,8 @@ The complete file is put together from these parts:
 <<elf.c>>=
 <<elf.c: includes>>
 
+<<elf.c: what the loader found>>
+
 <<elf.c: elf_load>>
 @
 
@@ -1572,6 +1689,17 @@ struct phdr {
 static int fail (const char *why) { printf ("exec: %s\n", why); return -1; }
 
 @
+What the last [[elf_load]] found out for the process start: a program for musl is marked by [[ELFOSABI_LINUX]] in its header (it
+speaks the Linux system call interface, see [[linux_abi.c]]); the start code of such a program also wants to know where its
+program headers are in memory (the auxiliary vector entry [[AT_PHDR]]).
+
+<<elf.c: what the loader found>>=
+#define ELFOSABI_LINUX 3
+int elf_linux;                                         // 1: the program uses the Linux system call interface
+u64 elf_phdr_va;                                       // address of the program header table in the loaded image (0: unknown)
+int elf_phnum;
+
+@
 returns 0 and the entry point on success; on failure the caller frees the address space
 
 <<elf.c: elf_load>>=
@@ -1591,6 +1719,9 @@ int elf_load (u64 l0, u32 ino, u64 *entry, u64 *image_end) {
 
   int entry_ok = 0;
   u64 end = 0;
+  elf_linux = (eh.ident[7] == ELFOSABI_LINUX);
+  elf_phdr_va = 0;
+  elf_phnum = eh.phnum;
   for (int i = 0; i < eh.phnum; i++) {
     if (minix_read (ino, eh.phoff + i * sizeof ph, &ph, sizeof ph) != sizeof ph)
                                                          return fail ("cannot read program header");
@@ -1602,6 +1733,8 @@ int elf_load (u64 l0, u32 ino, u64 *entry, u64 *image_end) {
                                                          return fail ("segment outside the user address range");
     if ((ph.flags & PF_W) && (ph.flags & PF_X))          return fail ("segment is writable and executable");
 
+    if (eh.phoff >= ph.offset && eh.phoff + eh.phnum * sizeof ph <= ph.offset + ph.filesz)
+      elf_phdr_va = ph.vaddr + (eh.phoff - ph.offset);   // this segment contains the program header table
     u64 flags = (ph.flags & PF_X) ? PAGE_URX : (ph.flags & PF_W) ? PAGE_URW : PAGE_URO;
     u64 seg_end = ph.vaddr + ph.memsz, file_end = ph.vaddr + ph.filesz;
     if (seg_end > end) end = seg_end;

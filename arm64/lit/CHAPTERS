@@ -7,3 +7,4 @@ disks
 network
 kerneltests
 userland
+libc

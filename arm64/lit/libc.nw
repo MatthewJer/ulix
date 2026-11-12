@@ -1,0 +1,877 @@
+\chapter{The C Library: musl on Ulix}
+\label{ch:libc}
+
+Until now the user programs of the port are small and freestanding: the 59 tools of the book use the book's own library
+(\texttt{ulixlib}) and the test programs use a tiny \texttt{ulib}. For real programs, and later for the C++ library, an editor, an
+interpreter or a browser, the system needs the C library every Unix program expects. The choice is \emph{musl} (MIT licence): small
+enough to read, written without the history of glibc, and good for static linking. musl comes as an unmodified submodule
+(\texttt{third\_party/musl}, tag v1.2.6, see \texttt{third\_party/README.md}); everything on this page is our part: the system call
+layer that connects musl to the kernel, the start-up information a program finds on its stack, and the memory, time and signal
+calls that musl needs.
+
+\section{How musl attaches to the kernel}
+
+musl talks to its kernel through one inline function per number of arguments (\texttt{\_\_syscall0} to \texttt{\_\_syscall6},
+\texttt{arch/aarch64/syscall\_arch.h}): the \emph{Linux/AArch64 convention} --- number in \texttt{x8}, arguments in \texttt{x0} to
+\texttt{x5}, \texttt{svc 0}, result in \texttt{x0}, and an error is returned as a negative error number. Ulix has a different
+convention (number in \texttt{x0}, arguments in \texttt{x1} to \texttt{x5}, result \texttt{-1} and the error number kept in the
+process), with the numbers of the book, which are those of Linux/i386. The two conventions cannot be told apart from a single
+\texttt{svc}: \texttt{x0} is the number in one and the first argument in the other.
+
+Three ways were considered (the decision is recorded in issue \#27 and in \texttt{ARM64-PORT.md}):
+
+\begin{enumerate}
+\item \emph{Change musl} (\texttt{syscall\_arch.h}) so that it uses the Ulix convention. This is the translation table ``in
+  \texttt{arch/aarch64}''. It makes the submodule a fork and every musl update a merge, and the translation of structures and
+  64-bit results would still be needed.
+\item \emph{Renumber the kernel} to the Linux/AArch64 numbers. All existing programs, the book's \texttt{ulixlib} and the
+  tests would have to be rebuilt, and the numbers of the book (which the students read) would disappear from the port.
+\item \emph{A second system call interface in the kernel}, chosen per program. The kernel stays as it is for the old programs and
+  speaks Linux/AArch64 to the programs that musl built. musl stays unmodified, and the translation is in one place, in our
+  code, readable next to the kernel functions it calls.
+\end{enumerate}
+
+We take the third way. A program tells which interface it wants in its ELF header: the byte \texttt{EI\_OSABI} is
+\texttt{ELFOSABI\_LINUX} (3). The linker does not write that byte, so the build sets it after linking
+(\texttt{tools/mark\_musl.py}). The loader (\texttt{elf.c}) remembers it, \texttt{linux\_abi\_as[]} keeps it for the address space
+(copied by \texttt{fork}, replaced by \texttt{execve}), and \texttt{book\_syscall} sends the call to \texttt{linux\_syscall} instead of
+the book's dispatcher.
+
+The function \texttt{linux\_syscall} is the translation: it looks at \texttt{x8}, and for most calls it moves the arguments into the
+registers the book's handler (\texttt{syscall\_read}, \texttt{syscall\_write}, \ldots) expects and calls that handler. A few calls
+need real work because the kernel has nothing similar yet: \texttt{mmap}, \texttt{mprotect} and friends (this chapter), the clocks,
+the signal calls. What is missing is answered with \texttt{ENOSYS}, and the kernel prints the number once, so that a program that
+needs more shows exactly what.
+
+The numbers below are the Linux/AArch64 numbers as they are listed in musl's own header (\texttt{bits/syscall.h.in}); they are facts
+about an interface, no Linux code is used.
+
+\section{The system call layer: \texttt{linux\_abi.c}}
+\label{src:linux_abi.c}
+
+@
+
+The complete file is put together from these parts:
+
+<<linux_abi.c>>=
+<<linux_abi.c: includes>>
+
+<<linux_abi.c: numbers>>
+
+<<linux_abi.c: errors, flags and signal numbers>>
+
+<<linux_abi.c: user pointers>>
+
+<<linux_abi.c: memory>>
+
+<<linux_abi.c: time>>
+
+<<linux_abi.c: signals>>
+
+<<linux_abi.c: files and processes>>
+
+<<linux_abi.c: linux_syscall>>
+@
+
+<<linux_abi.c: includes>>=
+#define hash linux_abi_hash                            // (the book's header defines a function of this name: keep it out of the link)
+#include "ulix-api.h"
+#undef hash
+#include "arch_pte.h"
+
+extern void syscall_read (context_t *r), syscall_write (context_t *r), syscall_close (context_t *r), syscall_lseek (context_t *r);
+extern void syscall_open (context_t *r), syscall_mkdir (context_t *r), syscall_rmdir (context_t *r), syscall_unlink (context_t *r);
+extern void syscall_chdir (context_t *r), syscall_execv (context_t *r), syscall_waitpid (context_t *r);
+extern void syscall_resign (context_t *r), syscall_sigreturn (context_t *r);
+extern void arch_resign (void);
+extern int  pfd2gfd (int pfd);
+
+typedef unsigned long u64;
+typedef unsigned char u8;
+
+unsigned char linux_abi_as[MAX_ADDR_SPACES];           // 1: the program of this address space uses the Linux system call interface
+u64 linux_sig_restorer[MAX_ADDR_SPACES];               // the function musl gave to sigaction: a handler returns to it
+
+// fork: the child speaks the same interface and has the same signal restorer
+void linux_abi_fork (int old_as, int new_as) {
+  linux_abi_as[new_as] = linux_abi_as[old_as];
+  linux_sig_restorer[new_as] = linux_sig_restorer[old_as];
+}
+
+@
+\subsection{System call numbers (Linux/AArch64)}
+
+<<linux_abi.c: numbers>>=
+#define L_getcwd         17
+#define L_dup            23
+#define L_fcntl          25
+#define L_ioctl          29
+#define L_mkdirat        34
+#define L_unlinkat       35
+#define L_faccessat      48
+#define L_chdir          49
+#define L_openat         56
+#define L_close          57
+#define L_lseek          62
+#define L_read           63
+#define L_write          64
+#define L_readv          65
+#define L_writev         66
+#define L_exit           93
+#define L_exit_group     94
+#define L_set_tid_address 96
+#define L_nanosleep     101
+#define L_clock_gettime 113
+#define L_clock_nanosleep 115
+#define L_sched_yield   124
+#define L_kill          129
+#define L_tkill         130
+#define L_tgkill        131
+#define L_rt_sigaction  134
+#define L_rt_sigprocmask 135
+#define L_rt_sigreturn  139
+#define L_uname         160
+#define L_gettimeofday  169
+#define L_getpid        172
+#define L_getppid       173
+#define L_getuid        174
+#define L_geteuid       175
+#define L_getgid        176
+#define L_getegid       177
+#define L_gettid        178
+#define L_brk           214
+#define L_munmap        215
+#define L_mremap        216
+#define L_clone         220
+#define L_execve        221
+#define L_mmap          222
+#define L_mprotect      226
+#define L_madvise       233
+#define L_wait4         260
+
+@
+\subsection{Errors, flags and signal numbers}
+
+The kernel reports an error as \texttt{-1} and keeps the number in the process (as the book does); Linux wants the negative number as
+the result. The error numbers the book knows are the same as Linux's, except \texttt{EAGAIN} (35 in the book, 11 on Linux). When
+the kernel gave no number, the call that failed names a default.
+
+<<linux_abi.c: errors, flags and signal numbers>>=
+#define LE_EPERM    1
+#define LE_ENOENT   2
+#define LE_ESRCH    3
+#define LE_EINTR    4
+#define LE_EIO      5
+#define LE_ECHILD  10
+#define LE_EAGAIN  11
+#define LE_ENOMEM  12
+#define LE_EACCES  13
+#define LE_EFAULT  14
+#define LE_EBADF    9
+#define LE_EINVAL  22
+#define LE_ENOTTY  25
+#define LE_ERANGE  34
+#define LE_ENOSYS  38
+
+static long linux_error (int dflt) {
+  int e = get_errno ();
+  if (e == EAGAIN) e = LE_EAGAIN;
+  return -(e ? e : dflt);
+}
+
+#define AT_FDCWD  (-100)
+#define LO_CREAT   0100                  // Linux/AArch64 values of the open flags
+#define LO_APPEND  02000
+
+@
+The book numbers its signals like BSD (\texttt{SIGUSR1} is 30, \texttt{SIGSTOP} 17), musl like Linux. \texttt{to\_ulix[n]} is the
+book's number for Linux signal \texttt{n}, 0 if the book has no such signal; \texttt{to\_linux} is the table the other way round.
+
+<<linux_abi.c: errors, flags and signal numbers>>=
+static const char to_ulix[32] = {
+  0,  1,  2,  3,  4,  5,  6, 10,  8,  9, 30, 11, 31, 13, 14, 15,      //  0..15:  Linux 7 = SIGBUS, 10 = SIGUSR1, 12 = SIGUSR2
+  0, 20, 19, 17, 18, 21, 22, 16, 24, 25, 26, 27,  0, 23,  0, 12 };    // 16..31:  17 = SIGCHLD, 18 = SIGCONT, 19 = SIGSTOP, 20 = SIGTSTP
+static signed char to_linux[32];
+
+static void signal_tables (void) {
+  if (to_linux[1]) return;
+  for (int l = 1; l < 32; l++) if (to_ulix[l]) to_linux[(int) to_ulix[l]] = l;
+}
+
+// the number a program of musl knows for the book's signal number (called when a signal is delivered)
+int linux_signal_number (int signo) {
+  if (!linux_abi_as[current_as]) return signo;
+  signal_tables ();
+  return to_linux[signo] ? to_linux[signo] : signo;
+}
+
+u64 linux_signal_restorer (void) { return linux_sig_restorer[current_as]; }
+
+@
+\subsection{Checking pointers of the program}
+
+A pointer that a program passes to the kernel is checked before the kernel writes through it, page by page, as the other system
+calls do it (\texttt{user\_to\_phys} also copies shared pages and reads back pages that were swapped out).
+
+<<linux_abi.c: user pointers>>=
+extern u64 user_to_phys (u64 va, int write);
+
+static int user_ok (u64 va, u64 len, int write) {
+  if (len == 0) return 1;
+  for (u64 p = va & ~4095UL; p < va + len; p += 4096)
+    if (!user_to_phys (p < va ? va : p, write)) return 0;
+  return 1;
+}
+
+@
+\subsection{Memory: \texttt{brk}, \texttt{mmap}, \texttt{munmap}, \texttt{mprotect}}
+\label{sec:libc:memory}
+
+musl's \texttt{malloc} takes small blocks from the heap that \texttt{brk} moves and big ones from \texttt{mmap}. The kernel already has
+the heap (\texttt{u\_sbrk} takes frames and maps them; the book's \texttt{sbrk} call takes an increment), so Linux's
+\texttt{brk(address)} is a small wrapper that turns the new end into an increment and answers with the current end if that fails.
+The heap cannot shrink yet.
+
+<<linux_abi.c: memory>>=
+extern void *u_sbrk (int incr);
+
+static long linux_brk (u64 want) {
+  u64 cur = (u64) u_sbrk (0);
+  if (want <= cur) return cur;
+  if (u_sbrk (want - cur) == (void *) -1) return cur;     // no memory: Linux answers with the old break
+  return want;
+}
+
+@
+Anonymous memory for \texttt{mmap} comes from a region of the address space between the heap (which grows up from the program)
+and the stack (which grows down): \texttt{MMAP\_LO} to \texttt{MMAP\_HI}. A mapping is placed at the highest free address of that
+region (top-down, like Linux), found by looking at the page table, so there is no separate list of mappings to keep consistent
+with \texttt{fork}, swapping and \texttt{munmap}: the page table is the list. The frames come zeroed, as the standard demands, and are
+taken immediately (there is no demand paging in the kernel yet). Mapping a file is not supported yet (\texttt{ENODEV}).
+
+\paragraph{W\textasciicircum{}X.} A page is writable or executable, never both, as in the program loader. \texttt{mmap} and
+\texttt{mprotect} refuse \texttt{PROT\_WRITE|PROT\_EXEC} with \texttt{EACCES}. A program that generates code (a JIT compiler, issue \#110) maps
+the memory writable, writes the code, and then calls \texttt{mprotect} to make it executable; the kernel cleans the caches for the
+new code at that moment. \texttt{PROT\_NONE} removes the access of the program; the page stays in the table, so the address stays
+reserved. (A system call that reads or writes such a page for the program does not notice the missing permission yet.)
+
+<<linux_abi.c: memory>>=
+extern u64 *pte_of (u64 l0_pa, u64 va);
+extern u64 arch_as_l0 (addr_space_id id);
+extern u64 alloc_frame_try (void);
+extern void free_frame (u64 pa);
+extern int  map_page_in (u64 l0_pa, u64 va, u64 pa, u64 flags);
+extern void release_page (unsigned int pageno);
+extern int  page_in (int as, int pageno);
+extern void sync_icache (void *p, u64 len);
+#define KVA(pa)  ((void *)(0xFFFF000000000000UL + (u64)(pa)))
+
+#define MMAP_LO  0x40000000UL
+#define MMAP_HI  0x7B000000UL
+
+#define PROT_READ   1
+#define PROT_WRITE  2
+#define PROT_EXEC   4
+#define MAP_FIXED   0x10
+#define MAP_ANONYMOUS 0x20
+#define PAGE_UNONE  (PAGE_URW & ~PTE_AP_USER)           // PROT_NONE: no access from user mode
+
+// the page table entry bits for a protection, 0 if the combination is not allowed
+static u64 prot_flags (int prot) {
+  if ((prot & PROT_WRITE) && (prot & PROT_EXEC)) return 0;          // W^X
+  if (prot & PROT_WRITE) return PAGE_URW;
+  if (prot & PROT_EXEC)  return PAGE_URX;
+  if (prot & PROT_READ)  return PAGE_URO;
+  return PAGE_UNONE;
+}
+
+static void flush_tlb_all (void) { __asm__ volatile ("dsb ishst; tlbi vmalle1is; dsb ish; isb" ::: "memory"); }
+
+static int page_is_free (u64 l0, u64 va) {
+  u64 *e = pte_of (l0, va);
+  return !e || !(*e & (PTE_VALID | PTE_SWAPPED));
+}
+
+// the highest address in the region below which n free pages are in a row, 0 if there is none
+static u64 find_free (u64 l0, u64 n) {
+  u64 run = 0;
+  for (u64 va = MMAP_HI - 4096; va >= MMAP_LO; va -= 4096) {
+    run = page_is_free (l0, va) ? run + 1 : 0;
+    if (run == n) return va;
+  }
+  return 0;
+}
+
+static void unmap_range (u64 va, u64 len) {
+  for (u64 p = va; p < va + len; p += 4096) release_page (p >> 12);
+  flush_tlb_all ();
+}
+
+static long linux_mmap (u64 addr, u64 len, int prot, int flags, int fd, long off) {
+  u64 l0 = arch_as_l0 (current_as), flagbits = prot_flags (prot);
+  if (!len || len > MMAP_HI - MMAP_LO) return -LE_EINVAL;
+  len = (len + 4095) & ~4095UL;
+  if (!flagbits) return -LE_EACCES;
+  if (!(flags & MAP_ANONYMOUS)) return -19;                       // ENODEV: no files yet
+  u64 base;
+  if (flags & MAP_FIXED) {
+    if ((addr & 4095) || addr < MMAP_LO || addr + len > MMAP_HI) return -LE_EINVAL;
+    base = addr;
+    unmap_range (base, len);                                      // MAP_FIXED replaces what was there
+  } else {
+    base = find_free (l0, len >> 12);
+    if (!base) return -LE_ENOMEM;
+    base -= len - 4096;                                           // (find_free gave the highest page of the run)
+  }
+  for (u64 va = base; va < base + len; va += 4096) {
+    u64 pa = alloc_frame_try ();                                  // zeroed; swaps a page out if the RAM is full
+    if (!pa || map_page_in (l0, va, pa, flagbits) != 0) {
+      if (pa) free_frame (pa);
+      unmap_range (base, va - base);                              // all or nothing
+      return -LE_ENOMEM;
+    }
+  }
+  return base;
+}
+
+static long linux_munmap (u64 addr, u64 len) {
+  if ((addr & 4095) || !len || addr < MMAP_LO || addr + len > MMAP_HI) return -LE_EINVAL;
+  unmap_range (addr, (len + 4095) & ~4095UL);
+  return 0;
+}
+
+static long linux_mprotect (u64 addr, u64 len, int prot) {
+  u64 l0 = arch_as_l0 (current_as), flagbits = prot_flags (prot);
+  if ((addr & 4095) || !flagbits) return flagbits ? -LE_EINVAL : -LE_EACCES;
+  len = (len + 4095) & ~4095UL;
+  for (u64 va = addr; va < addr + len; va += 4096) {              // first: is everything mapped?
+    u64 *e = pte_of (l0, va);
+    if (!e || !(*e & (PTE_VALID | PTE_SWAPPED))) return -LE_ENOMEM;
+  }
+  for (u64 va = addr; va < addr + len; va += 4096) {
+    u64 *e = pte_of (l0, va);
+    if (!(*e & PTE_VALID) && page_in (current_as, va >> 12) != 0) return -LE_ENOMEM;
+    e = pte_of (l0, va);
+    u64 old = *e, pa = old & PTE_ADDR, ne = pa | flagbits;
+    if ((old & PTE_COW) && (ne & PTE_RO) == 0) ne |= PTE_RO | PTE_COW;   // a shared page stays shared until it is written
+    else if (old & PTE_COW) ne |= PTE_COW;
+    *e = ne;
+    if (prot & PROT_EXEC) sync_icache (KVA (pa), 4096);          // the new code must be seen by the instruction fetch
+  }
+  flush_tlb_all ();
+  return 0;
+}
+
+@
+\subsection{Time: \texttt{clock\_gettime}, \texttt{gettimeofday}, \texttt{nanosleep}}
+
+The monotonic clock is the counter of the generic timer (it counts at \texttt{cntfrq\_el0} Hertz from the start of the machine).
+The real-time clock is the time that \texttt{arch\_clock\_init} read at start-up (from the real-time clock chip, or a fixed date on
+the Raspberry Pi, which has none) plus the time that has passed on the monotonic clock since; setting it from the network is
+a later step (SNTP). \texttt{nanosleep} lets the process give up the CPU until the time has passed (the same polling as the
+book's \texttt{sleep}: simple first), and it ends early when a signal arrives.
+
+<<linux_abi.c: time>>=
+extern unsigned long long clock_start_count;            // arch_clock.c
+
+struct ts { long sec, nsec; };
+
+static unsigned long long counter_ns (void) {           // nanoseconds on the counter, without overflow
+  unsigned long long freq, count;
+  __asm__ volatile ("mrs %0, cntfrq_el0" : "=r" (freq));
+  __asm__ volatile ("mrs %0, cntpct_el0" : "=r" (count));
+  return (count / freq) * 1000000000ULL + (count % freq) * 1000000000ULL / freq;
+}
+
+static unsigned long long mono_ns (void) { return counter_ns (); }
+static unsigned long long real_ns (void) {
+  unsigned long long freq;
+  __asm__ volatile ("mrs %0, cntfrq_el0" : "=r" (freq));
+  unsigned long long start_ns = (clock_start_count / freq) * 1000000000ULL + (clock_start_count % freq) * 1000000000ULL / freq;
+  return system_start_time * 1000000000ULL + (counter_ns () - start_ns);
+}
+
+#define CLOCK_REALTIME  0
+#define CLOCK_MONOTONIC 1
+
+static long linux_clock_gettime (int clk, struct ts *t) {
+  if (!user_ok ((u64) t, sizeof *t, 1)) return -LE_EFAULT;
+  unsigned long long ns;
+  switch (clk) {
+    case CLOCK_REALTIME:  ns = real_ns (); break;
+    case CLOCK_MONOTONIC: case 4: case 7: ns = mono_ns (); break;      // 4 = MONOTONIC_RAW, 7 = BOOTTIME
+    default: return -LE_EINVAL;
+  }
+  t->sec = ns / 1000000000ULL;
+  t->nsec = ns % 1000000000ULL;
+  return 0;
+}
+
+static long linux_gettimeofday (long *tv, void *tz) {
+  if (tv) {
+    if (!user_ok ((u64) tv, 16, 1)) return -LE_EFAULT;
+    unsigned long long ns = real_ns ();
+    tv[0] = ns / 1000000000ULL;
+    tv[1] = ns % 1000000000ULL / 1000;
+  }
+  return 0;
+}
+
+// sleep until the clock has reached the time: 0, or -EINTR when a signal arrived (rem gets the time that is left)
+static long sleep_until (unsigned long long deadline, int absolute_clock, struct ts *rem) {
+  for (;;) {
+    unsigned long long now = absolute_clock == CLOCK_REALTIME ? real_ns () : mono_ns ();
+    if (now >= deadline) return 0;
+    if (thread_table[current_task].sig_pending) {
+      if (rem && user_ok ((u64) rem, sizeof *rem, 1)) { rem->sec = (deadline - now) / 1000000000ULL; rem->nsec = (deadline - now) % 1000000000ULL; }
+      return -LE_EINTR;
+    }
+    arch_resign ();
+  }
+}
+
+static long linux_nanosleep (struct ts *req, struct ts *rem) {
+  if (!user_ok ((u64) req, sizeof *req, 0)) return -LE_EFAULT;
+  if (req->sec < 0 || req->nsec < 0 || req->nsec >= 1000000000L) return -LE_EINVAL;
+  return sleep_until (mono_ns () + req->sec * 1000000000ULL + req->nsec, CLOCK_MONOTONIC, rem);
+}
+
+static long linux_clock_nanosleep (int clk, int flags, struct ts *req, struct ts *rem) {
+  if (clk != CLOCK_REALTIME && clk != CLOCK_MONOTONIC) return -LE_EINVAL;
+  if (!user_ok ((u64) req, sizeof *req, 0)) return -LE_EFAULT;
+  if (req->sec < 0 || req->nsec < 0 || req->nsec >= 1000000000L) return -LE_EINVAL;
+  unsigned long long t = req->sec * 1000000000ULL + req->nsec;
+  if (flags & 1) return sleep_until (t, clk, 0);                  // TIMER_ABSTIME
+  return sleep_until ((clk == CLOCK_REALTIME ? real_ns () : mono_ns ()) + t, clk, rem);
+}
+
+@
+\subsection{Signals: \texttt{sigaction}, \texttt{sigprocmask}, \texttt{kill}}
+
+The book's signals are the base (handlers per process, a pending set, a blocked set, delivery before the return to user mode, see
+\texttt{arch\_signal\_check}). What musl needs on top of that:
+\begin{itemize}
+\item The numbers differ (see above), so every number is translated, in both directions.
+\item \texttt{sigaction} hands over a \emph{restorer}: the function a handler returns to, which calls \texttt{rt\_sigreturn}. On Ulix the
+  trampoline page of the kernel does that for the old programs; for musl's programs the restorer of musl is used instead (its
+  \texttt{svc} has to be a Linux call). The register frame that \texttt{sigreturn} restores is Ulix's own layout, not Linux's
+  \texttt{ucontext}; a handler receives the signal number and, in \texttt{x1}, a \texttt{siginfo} that only has \texttt{si\_signo} filled in.
+  That is enough for \texttt{signal}, \texttt{raise}, \texttt{abort} and handlers that do not inspect the interrupted registers.
+\item \texttt{sigprocmask} changes the set of blocked signals of the process. The book discards a signal that is blocked when it
+  is sent (it does not stay pending); musl's \texttt{raise} blocks all signals around its \texttt{tkill} and needs the signal to be
+  delivered when the mask is restored. So \texttt{linux\_kill} lets a signal that has a handler stay pending when it is blocked,
+  and the delivery code skips blocked signals until they are unblocked. (A blocked signal without a handler is still discarded.)
+\item \texttt{SA\_RESTART}, \texttt{SA\_RESETHAND}, \texttt{SA\_NODEFER} and the signal stack are not supported; the flags are ignored.
+\end{itemize}
+
+<<linux_abi.c: signals>>=
+extern sighandler_t u_signal (int sig, sighandler_t func);
+
+struct k_sigaction { sighandler_t handler; unsigned long flags; void (*restorer) (void); unsigned mask[2]; };   // as musl passes it
+
+static long linux_sigaction (int sig, struct k_sigaction *act, struct k_sigaction *old, u64 size) {
+  signal_tables ();
+  if (sig < 1 || sig > 31 || !to_ulix[sig] || sig == 9 || sig == 19 || sig == 18) return -LE_EINVAL;   // SIGKILL, SIGSTOP, SIGCONT
+  if (size != 8) return -LE_EINVAL;
+  int us = to_ulix[sig];
+  TCB *t = &thread_table[current_task];
+  if (old) {
+    if (!user_ok ((u64) old, sizeof *old, 1)) return -LE_EFAULT;
+    old->handler = t->sighandlers[us];
+    old->flags = 0; old->restorer = (void (*) (void)) linux_sig_restorer[current_as]; old->mask[0] = old->mask[1] = 0;
+  }
+  if (act) {
+    if (!user_ok ((u64) act, sizeof *act, 0)) return -LE_EFAULT;
+    if (act->restorer) linux_sig_restorer[current_as] = (u64) act->restorer;
+    t->sighandlers[us] = act->handler;
+  }
+  return 0;
+}
+
+// the Linux mask (bit n-1 is signal n) from the book's mask (bit n is signal n), and back
+static u64 mask_to_linux (unsigned long um) {
+  signal_tables ();
+  u64 m = 0;
+  for (int u = 1; u < 32; u++) if ((um >> u) & 1 && to_linux[u]) m |= 1UL @<< (to_linux[u] - 1);
+  return m;
+}
+
+static unsigned long mask_to_ulix (u64 lm) {
+  unsigned long m = 0;
+  for (int l = 1; l < 32; l++) if ((lm >> (l - 1)) & 1 && to_ulix[l]) m |= 1UL @<< to_ulix[l];
+  return m & ~((1UL @<< 9) | (1UL @<< 17));                     // SIGKILL and SIGSTOP cannot be blocked
+}
+
+static long linux_sigprocmask (int how, u64 *set, u64 *old, u64 size) {
+  TCB *t = &thread_table[current_task];
+  if (size != 8) return -LE_EINVAL;
+  if (old) { if (!user_ok ((u64) old, 8, 1)) return -LE_EFAULT; *old = mask_to_linux (t->sig_blocked); }
+  if (set) {
+    if (!user_ok ((u64) set, 8, 0)) return -LE_EFAULT;
+    unsigned long m = mask_to_ulix (*set);
+    switch (how) {
+      case 0: t->sig_blocked |= m; break;                     // SIG_BLOCK
+      case 1: t->sig_blocked &= ~m; break;                    // SIG_UNBLOCK
+      case 2: t->sig_blocked = m; break;                      // SIG_SETMASK
+      default: return -LE_EINVAL;
+    }
+  }
+  return 0;
+}
+
+// kill, tkill and tgkill: musl's raise () sends the signal to its own thread
+static long linux_kill (int pid, int sig) {
+  signal_tables ();
+  if (sig < 0 || sig > 31 || (sig && !to_ulix[sig])) return -LE_EINVAL;
+  if (pid < 1 || pid >= MAX_THREADS || !thread_table[pid].used) return -LE_ESRCH;
+  if (sig == 0) return 0;                                     // only asks whether the process exists
+  TCB *t = &thread_table[pid];
+  int us = to_ulix[sig];
+  if (((t->sig_blocked >> us) & 1) && t->sighandlers[us] != SIG_DFL && t->sighandlers[us] != SIG_IGN) {
+    t->sig_pending |= 1UL @<< us;                             // blocked: it stays pending until it is unblocked (musl's raise () relies on it)
+    return 0;
+  }
+  return u_kill (pid, to_ulix[sig]) == 0 ? 0 : linux_error (LE_EPERM);
+}
+
+@
+\subsection{Files and processes}
+
+The simple calls are translations of arguments: Linux's \texttt{openat} has a directory descriptor (only the current directory,
+\texttt{AT\_FDCWD}, is supported) and other flag values; \texttt{readv} and \texttt{writev} are loops over the book's read and write;
+\texttt{clone} with the flags of musl's \texttt{fork} (\texttt{SIGCHLD}, no shared memory) is \texttt{fork}; \texttt{wait4} knows only one
+named child; and the exit status that a Linux parent reads is the value shifted left by eight bits.
+
+<<linux_abi.c: files and processes>>=
+struct iovec { void *base; u64 len; };
+
+// calls a handler of the book: it finds its arguments in x1 to x5 (ebx, ecx, edx, esi, edi) and answers in x0 (a 32-bit value)
+static long ulix_call (context_t *r, void (*handler) (context_t *), long a, long b, long c, long d, long e) {
+  r->ebx = a; r->ecx = b; r->edx = c; r->esi = d; r->edi = e;
+  handler (r);
+  return (int) r->eax;
+}
+
+static long linux_iov (context_t *r, int write, int fd, struct iovec *iov, int n) {
+  if (n < 0 || n > 1024 || !user_ok ((u64) iov, n * sizeof *iov, 0)) return -LE_EFAULT;
+  long total = 0;
+  for (int i = 0; i < n; i++) {
+    if (!iov[i].len) continue;
+    long k = ulix_call (r, write ? syscall_write : syscall_read, fd, (long) iov[i].base, iov[i].len, 0, 0);
+    if (k < 0) return total ? total : linux_error (LE_EBADF);
+    total += k;
+    if ((u64) k < iov[i].len) break;                          // a short transfer ends the call
+  }
+  return total;
+}
+
+static long linux_openat (context_t *r, int dirfd, const char *path, int flags) {
+  if (dirfd != AT_FDCWD && path[0] != '/') return -LE_ENOSYS;
+  int uflags = flags & 3;                                     // O_RDONLY, O_WRONLY, O_RDWR have the same values
+  if (flags & LO_CREAT)  uflags |= O_CREAT;
+  if (flags & LO_APPEND) uflags |= O_APPEND;
+  long fd = ulix_call (r, syscall_open, (long) path, uflags, 0, 0, 0);
+  return fd < 0 ? linux_error (LE_ENOENT) : fd;
+}
+
+#define TIOCGWINSZ 0x5413
+
+static long linux_ioctl (int fd, unsigned long req, unsigned short *ws) {
+  if (req == TIOCGWINSZ && u_isatty (pfd2gfd (fd))) {         // musl asks this to decide whether stdout is line buffered
+    if (!user_ok ((u64) ws, 8, 1)) return -LE_EFAULT;
+    ws[0] = 24; ws[1] = 80; ws[2] = ws[3] = 0;                // the terminals of Ulix have 25 lines of 80 columns
+    return 0;
+  }
+  return -LE_ENOTTY;
+}
+
+static long linux_getcwd (char *buf, u64 size) {
+  if (!user_ok ((u64) buf, size, 1)) return -LE_EFAULT;
+  if (!u_getcwd (buf, size)) return -LE_ERANGE;
+  return strlen (buf) + 1;                                    // Linux returns the length with the terminating zero
+}
+
+static long linux_uname (char *u) {
+  if (!user_ok ((u64) u, 6 * 65, 1)) return -LE_EFAULT;
+  static const char *fields[6] = { "Ulix", "ulix", "1", "AArch64 port", "aarch64", "" };
+  for (int i = 0; i < 6; i++) { strncpy (u + i * 65, fields[i], 64); u[i * 65 + 64] = 0; }
+  return 0;
+}
+
+static long linux_clone (context_t *r, u64 flags) {
+  if ((flags & 0xff) != 17 || (flags & ~0xffUL))              // only fork (SIGCHLD, nothing shared)
+    return -LE_ENOSYS;
+  int pid = u_fork (r);
+  return pid < 0 ? -LE_EAGAIN : pid;
+}
+
+static long linux_wait4 (context_t *r, int pid, int *status, int options) {
+  if (pid < 1) return -LE_ECHILD;                             // "any child" is not supported: name the child
+  if (status && !user_ok ((u64) status, 4, 1)) return -LE_EFAULT;
+  long k = ulix_call (r, syscall_waitpid, pid, 0, options, 0, 0);
+  if (k < 0) return -LE_ECHILD;
+  if (status) *status = (thread_table[pid].exitcode & 0xff) @<< 8;   // (the table entry is free but still holds the value)
+  return k;
+}
+
+@
+\subsection{The translation: \texttt{linux\_syscall}}
+
+Called by \texttt{book\_syscall} instead of the book's dispatcher for a program that has \texttt{ELFOSABI\_LINUX}. A Linux program expects
+that a system call changes nothing but \texttt{x0}, and musl's inline assembler relies on it (it does not declare \texttt{x1} to
+\texttt{x5} as changed), so the registers that the translation used are put back. The exceptions are the calls that change the
+frame on purpose: \texttt{execve} (new program counter and stack) and \texttt{rt\_sigreturn} (the whole frame).
+
+<<linux_abi.c: linux_syscall>>=
+static int unknown_reported[512];
+
+void linux_syscall (context_t *r) {
+  long nr = r->x8, a0 = r->x0, a1 = r->x1, a2 = r->x2, a3 = r->x3, a4 = r->x4, a5 = r->x5;
+  context_t saved = *r;
+  long ret;
+  set_errno (0);
+
+  switch (nr) {
+    case L_rt_sigreturn: syscall_sigreturn (r); return;
+    case L_execve:
+      if (!user_ok (a0, 1, 0) || !a1 || !user_ok (a1, 8, 0)) { r->x0 = -LE_EFAULT; return; }
+      r->ebx = a0; r->ecx = a1;
+      syscall_execv (r);                                      // on success it has set the new program counter and stack
+      if (r->eip != saved.eip) return;                        // the new program starts
+      *r = saved;
+      r->x0 = -LE_ENOENT;
+      return;
+
+    // files
+    case L_read:   ret = ulix_call (r, syscall_read,  a0, a1, a2, 0, 0); if (ret < 0) ret = linux_error (LE_EBADF); break;
+    case L_write:  ret = ulix_call (r, syscall_write, a0, a1, a2, 0, 0); if (ret < 0) ret = linux_error (LE_EBADF); break;
+    case L_readv:  ret = linux_iov (r, 0, a0, (struct iovec *) a1, a2); break;
+    case L_writev: ret = linux_iov (r, 1, a0, (struct iovec *) a1, a2); break;
+    case L_openat: ret = linux_openat (r, a0, (const char *) a1, a2); break;
+    case L_close:  ret = ulix_call (r, syscall_close, a0, 0, 0, 0, 0) < 0 ? -LE_EBADF : 0; break;
+    case L_lseek:  ret = ulix_call (r, syscall_lseek, a0, a1, a2, 0, 0); if (ret < 0) ret = linux_error (LE_EINVAL); break;
+    case L_ioctl:  ret = linux_ioctl (a0, a1, (unsigned short *) a2); break;
+    case L_fcntl:  ret = 0; break;                            // F_GETFD, F_SETFD, F_GETFL, F_SETFL: nothing to remember yet
+    case L_getcwd: ret = linux_getcwd ((char *) a0, a1); break;
+    case L_chdir:  ret = ulix_call (r, syscall_chdir, a0, 0, 0, 0, 0) < 0 ? -LE_ENOENT : 0; break;
+    case L_mkdirat:
+      if (a0 != AT_FDCWD && ((char *) a1)[0] != '/') { ret = -LE_ENOSYS; break; }
+      ret = ulix_call (r, syscall_mkdir, a1, a2, 0, 0, 0) < 0 ? linux_error (LE_EACCES) : 0; break;
+    case L_unlinkat:
+      if (a0 != AT_FDCWD && ((char *) a1)[0] != '/') { ret = -LE_ENOSYS; break; }
+      ret = ulix_call (r, (a2 & 0x200) ? syscall_rmdir : syscall_unlink, a1, 0, 0, 0, 0) < 0 ? linux_error (LE_ENOENT) : 0; break;
+    case L_faccessat: { struct stat st; ret = u_stat ((const char *) a1, &st) == 0 ? 0 : -LE_ENOENT; break; }
+
+    // memory
+    case L_brk:      ret = linux_brk (a0); break;
+    case L_mmap:     ret = linux_mmap (a0, a1, a2, a3, a4, a5); break;
+    case L_munmap:   ret = linux_munmap (a0, a1); break;
+    case L_mprotect: ret = linux_mprotect (a0, a1, a2); break;
+    case L_mremap:   ret = -LE_ENOMEM; break;                 // musl then allocates, copies and frees
+    case L_madvise:  ret = 0; break;                          // advice only
+
+    // time
+    case L_clock_gettime:   ret = linux_clock_gettime (a0, (struct ts *) a1); break;
+    case L_gettimeofday:    ret = linux_gettimeofday ((long *) a0, (void *) a1); break;
+    case L_nanosleep:       ret = linux_nanosleep ((struct ts *) a0, (struct ts *) a1); break;
+    case L_clock_nanosleep: ret = linux_clock_nanosleep (a0, a1, (struct ts *) a2, (struct ts *) a3); break;
+
+    // signals
+    case L_rt_sigaction:   ret = linux_sigaction (a0, (struct k_sigaction *) a1, (struct k_sigaction *) a2, a3); break;
+    case L_rt_sigprocmask: ret = linux_sigprocmask (a0, (u64 *) a1, (u64 *) a2, a3); break;
+    case L_kill:           ret = linux_kill (a0, a1); break;
+    case L_tkill:          ret = linux_kill (a0, a1); break;
+    case L_tgkill:         ret = linux_kill (a1, a2); break;
+
+    // processes
+    case L_exit: case L_exit_group:
+      r->ebx = (int) a0;
+      syscall_exit (r);                                       // does not return
+      return;
+    case L_sched_yield: syscall_resign (r); ret = 0; break;
+    case L_getpid:  ret = thread_table[current_task].pid; break;
+    case L_gettid:  case L_set_tid_address: ret = current_task; break;
+    case L_getppid: ret = thread_table[current_task].ppid; break;
+    case L_getuid: case L_geteuid: case L_getgid: case L_getegid: ret = 0; break;
+    case L_clone: ret = linux_clone (r, a0); break;
+    case L_wait4: ret = linux_wait4 (r, a0, (int *) a1, a2); break;
+    case L_uname: ret = linux_uname ((char *) a0); break;
+
+    default:
+      if (nr >= 0 && nr < 512 && !unknown_reported[nr]) {
+        unknown_reported[nr] = 1;
+        printf ("[kernel] process %d: Linux system call %ld is not implemented\n", thread_table[current_task].pid, nr);
+      }
+      ret = -LE_ENOSYS;
+  }
+  r->x1 = saved.x1; r->x2 = saved.x2; r->x3 = saved.x3; r->x4 = saved.x4; r->x5 = saved.x5;
+  r->x8 = saved.x8;
+  r->x0 = ret;
+}
+
+@
+\section{Marking a program for musl}
+\label{src:tools/mark_musl.py}
+
+The linker writes zero into the \texttt{EI\_OSABI} byte of the ELF header. This small program sets it to \texttt{ELFOSABI\_LINUX}; the
+Makefile of \texttt{libc/} runs it after the link.
+
+<<tools/mark_musl.py>>=
+#!/usr/bin/env python3
+# usage: mark_musl.py FILE...     sets EI_OSABI of an ELF file to ELFOSABI_LINUX (3): the program speaks the Linux system call
+# interface (linux_abi.c); the kernel's ELF loader reads the byte.
+import sys
+for name in sys.argv[1:]:
+    with open(name, 'r+b') as f:
+        if f.read(4) != b'\x7fELF':
+            sys.exit(name + ': not an ELF file')
+        f.seek(7)
+        f.write(bytes([3]))
+@
+\section{Building musl and the first program}
+\label{src:libc/hello.c}
+
+\paragraph{The build} is in \texttt{libc/Makefile} and does nothing clever: it configures the unmodified musl in
+\texttt{libc/build/musl} for the target \texttt{aarch64} (static library only, built with \texttt{aarch64-elf-gcc}; the flags are those of
+the kernel: no position independent code, no outlined atomics), installs the header files, \texttt{libc.a} and the start files into
+\texttt{libc/build/sysroot}, compiles the program against those headers (\texttt{-nostdinc}, so no header of the host is ever
+used), links it with the script \texttt{libc/musl.ld} (the layout of \texttt{user/user.ld}: one segment per permission class, every
+segment on its own page, plus the sections for the start-up code of musl) and finally marks it with \texttt{tools/mark\_musl.py}.
+
+\paragraph{The start code} is musl's own \texttt{crt1.o}: \texttt{\_start} passes the stack pointer to \texttt{\_start\_c}, which reads
+\texttt{argc}, \texttt{argv}, \texttt{environ} and the auxiliary vector from the stack (the kernel built it, see
+\texttt{build\_linux\_stack}), sets up the thread pointer (\texttt{tpidr\_el0}, which the kernel saves for each thread), runs the
+constructors, calls \texttt{main}, and passes its result to \texttt{exit}, which flushes \texttt{stdio}, runs the exit handlers and ends
+with \texttt{exit\_group}.
+
+\paragraph{The test program} uses what a first C program uses: \texttt{stdio}, \texttt{string}, \texttt{stdlib}, \texttt{ctype},
+\texttt{errno}, and then, one by one, the calls this chapter implemented: memory, time, signals, \texttt{fork}. Each line it prints
+says what it proves; the exit status is the number of failed checks, and the kernel test (\texttt{proc\_test.c}) runs it from
+the disk and counts the \texttt{user ok:} lines.
+
+<<libc/hello.c>>=
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include <errno.h>
+#include <unistd.h>
+#include <time.h>
+#include <signal.h>
+#include <sys/mman.h>
+#include <sys/wait.h>
+#include <sys/time.h>
+
+static int fails = 0;
+#define CHECK(c, msg) do { if (c) printf ("  user ok:   %s\n", msg); \
+                           else { printf ("  user FAIL: %s\n", msg); fails++; } } while (0)
+#define MB (1024 * 1024)
+
+static volatile int got_signal;
+static void on_signal (int sig) { got_signal = sig; }
+
+static int cmp_int (const void *a, const void *b) { return *(const int *) a - *(const int *) b; }
+
+int main (int argc, char **argv) {
+  char buf[100];
+
+  // start-up information from the kernel: arguments and environment
+  CHECK (argc == 3 && !strcmp (argv[1], "foo") && !strcmp (argv[2], "bar") && argv[3] == 0, "argc and argv from the stack of the kernel");
+  CHECK (getenv ("PATH") && !strcmp (getenv ("PATH"), "/bin"), "environ: getenv (\"PATH\") is /bin");
+
+  // stdio, including floating point (the kernel keeps the FP registers of each process)
+  snprintf (buf, sizeof buf, "%d %s %c %5.2f %x %ld", 42, "abc", 'Z', 3.14159, 255, 1234567890123L);
+  CHECK (!strcmp (buf, "42 abc Z  3.14 ff 1234567890123"), "snprintf: integers, string, char, double, hex, long");
+
+  // string.h (memcpy and memset are hand-written assembler in musl for AArch64 that uses the SIMD registers)
+  static char a[3000], b[3000];
+  for (int i = 0; i < 3000; i++) a[i] = i * 7;
+  memcpy (b, a, 3000);
+  int same = 1; for (int i = 0; i < 3000; i++) if (a[i] != b[i]) same = 0;
+  memset (b + 100, 'x', 1000);
+  CHECK (same && b[99] == a[99] && b[100] == 'x' && b[1099] == 'x' && b[1100] == a[1100], "memcpy and memset (3000 bytes, SIMD registers)");
+  strcpy (buf, "Ulix"); strcat (buf, " on ARM64");
+  CHECK (strlen (buf) == 13 && !strcmp (buf, "Ulix on ARM64") && strchr (buf, 'o') == buf + 5, "strcpy, strcat, strlen, strcmp, strchr");
+
+  // ctype.h and stdlib.h
+  CHECK (toupper ('a') == 'A' && isdigit ('7') && !isdigit ('x') && isalpha ('q') && isspace (' '), "ctype: toupper, isdigit, isalpha, isspace");
+  int v[8] = { 5, 3, 9, 1, 7, 2, 8, 4 };
+  qsort (v, 8, sizeof v[0], cmp_int);
+  CHECK (v[0] == 1 && v[3] == 4 && v[7] == 9 && atoi ("-123") == -123 && strtol ("0x1f", 0, 16) == 31, "qsort, atoi, strtol");
+
+  // malloc: small blocks come from the heap (brk), big ones from mmap
+  char *p = malloc (100);
+  strcpy (p, "heap");
+  p = realloc (p, 5000);
+  CHECK (p && !strcmp (p, "heap"), "malloc and realloc keep the contents");
+  int *z = calloc (1000, sizeof (int)), zero = 1;
+  for (int i = 0; i < 1000; i++) if (z[i]) zero = 0;
+  CHECK (zero, "calloc returns zeroed memory");
+  char *big = malloc (MB);
+  int ok = big != 0;
+  for (int i = 0; ok && i < MB; i += 4096) { big[i] = i >> 12; }
+  for (int i = 0; ok && i < MB; i += 4096) if (big[i] != (char) (i >> 12)) ok = 0;
+  CHECK (ok, "malloc (1 MByte) (mmap) can be written and read back");
+  free (big); free (z); free (p);
+
+  // errno and files
+  errno = 0;
+  FILE *f = fopen ("/no/such/file", "r");
+  CHECK (f == 0 && errno == ENOENT, "fopen of a missing file fails with errno == ENOENT");
+  f = fopen ("/etc/rc.conf", "r");
+  CHECK (f && fgets (buf, sizeof buf, f) && strlen (buf) > 0, "fopen, fgets: a line of /etc/rc.conf");
+  if (f) fclose (f);
+
+  // time: the clocks and nanosleep
+  struct timespec t1, t2, nap = { 0, 30 * 1000000 };
+  clock_gettime (CLOCK_MONOTONIC, &t1);
+  nanosleep (&nap, 0);
+  clock_gettime (CLOCK_MONOTONIC, &t2);
+  long ms = (t2.tv_sec - t1.tv_sec) * 1000 + (t2.tv_nsec - t1.tv_nsec) / 1000000;
+  CHECK (ms >= 29 && ms < 300, "nanosleep (30 ms) sleeps about that long on CLOCK_MONOTONIC");
+  struct timeval tv;
+  gettimeofday (&tv, 0);
+  CHECK (time (0) > 1700000000L && tv.tv_sec >= time (0) - 1, "time and gettimeofday give a date after 2023");
+
+  // processes
+  CHECK (getpid () > 1 && getppid () >= 1, "getpid, getppid");
+  int pid = fork ();
+  if (pid == 0) _exit (7);
+  int status = 0;
+  int w = waitpid (pid, &status, 0);
+  CHECK (w == pid && WIFEXITED (status) && WEXITSTATUS (status) == 7, "fork, _exit (7), waitpid: WEXITSTATUS is 7");
+
+  // signals
+  signal (SIGUSR1, on_signal);
+  raise (SIGUSR1);
+  CHECK (got_signal == SIGUSR1, "signal and raise: the handler ran with the Linux number SIGUSR1 (10)");
+  struct sigaction sa;
+  memset (&sa, 0, sizeof sa);
+  sa.sa_handler = on_signal;
+  got_signal = 0;
+  CHECK (sigaction (SIGTERM, &sa, 0) == 0 && (raise (SIGTERM), got_signal == SIGTERM), "sigaction (SIGTERM) and raise");
+  sigset_t set, old;
+  sigemptyset (&set); sigaddset (&set, SIGUSR2);
+  CHECK (sigprocmask (SIG_BLOCK, &set, &old) == 0 && sigprocmask (SIG_SETMASK, &old, &set) == 0 && sigismember (&set, SIGUSR2),
+         "sigprocmask: SIGUSR2 is in the mask after SIG_BLOCK");
+
+  // memory protection: W^X
+  unsigned *code = mmap (0, 8192, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  CHECK (code != MAP_FAILED && code[0] == 0 && code[2047] == 0, "mmap: anonymous memory, zero filled");
+  errno = 0;
+  void *wx = mmap (0, 4096, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  CHECK (wx == MAP_FAILED && errno == EACCES, "mmap refuses PROT_WRITE | PROT_EXEC (W^X)");
+  code[0] = 0x52800540;                                  // mov w0, #42
+  code[1] = 0xd65f03c0;                                  // ret
+  errno = 0;
+  CHECK (mprotect (code, 4096, PROT_READ | PROT_WRITE | PROT_EXEC) == -1 && errno == EACCES, "mprotect refuses PROT_WRITE | PROT_EXEC (W^X)");
+  CHECK (mprotect (code, 4096, PROT_READ | PROT_EXEC) == 0 && ((int (*) (void)) code) () == 42, "write the code, mprotect to R+X, run it: returns 42");
+  CHECK (munmap (code, 8192) == 0, "munmap");
+
+  // stdio is flushed by exit: full buffering (no newline), the text appears when main returns
+  static char obuf[256];
+  setvbuf (stdout, obuf, _IOFBF, sizeof obuf);
+  printf ("  user ok:   stdio is flushed by exit (this line stayed in the buffer until main returned)\n");
+  return fails;
+}
+@

@@ -114,7 +114,7 @@ int bookfs_test (void) {
          "mx_stat: regular file, 316 bytes");
   CHECK (mx_stat (DEV, "/bin", &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR, "mx_stat: /bin is a directory");
   CHECK (mx_stat (DEV, "/nonexistent", &st) == -1, "mx_stat: missing file");
-  CHECK (count_entries ("/") == 31, "mx_getdent: / has 31 used entries (16 from x86 Ulix + 15 AArch64 files)");
+  CHECK (count_entries ("/") == 32, "mx_getdent: / has 32 used entries (16 from x86 Ulix + 16 AArch64 files)");
   CHECK (count_entries ("/bin") == 73, "mx_getdent: /bin has 73 entries");
   CHECK (mx_file_exists (DEV, "/bin/vi") && mx_file_is_directory (DEV, "/bin") &&
          !mx_file_is_directory (DEV, "/bin/vi"), "mx_file_exists / mx_file_is_directory");
@@ -687,6 +687,18 @@ int proc_test (void) {
   CHECK (count_in (out, "user FAIL") == 0 && count_in (out, "user ok:") == 8, "all 8 signal checks passed");
   CHECK (count_in (out, "Replacing signal 15") == 1, "the book's kill() turned SIGTERM into SIGKILL (no handler)");
   CHECK (live_threads () == 0, "no process is left, also not the ones killed by signals");
+
+  // a program linked with musl (the C library, third_party/musl) that speaks the Linux system call interface: stdio, string,
+  // stdlib, errno, files, clocks, fork, signals, mmap and W^X (libc/hello.c); its output is a line "user ok:" for each check
+  char *musl_argv[] = { "muslhello64", "foo", "bar", 0 };
+  capture_start ();
+  pid = run ("/muslhello64", 3, musl_argv);
+  capture_stop (&out);
+  arch_threads_reap ();
+  CHECK (pid > 0 && thread_table[pid].exitcode == 0, "/muslhello64 (musl) finished with exit status 0 (no failed checks)");
+  CHECK (count_in (out, "user FAIL") == 0 && count_in (out, "user ok:") == 25, "all 25 checks of the musl program passed");
+  CHECK (count_in (out, "not implemented") == 0, "musl needed no Linux system call that the kernel does not have");
+  CHECK (live_threads () == 0, "no process is left");
 
   arch_threads_reap ();
   CHECK (frames_in_use == frames_before, "no frame leaked: address spaces and kernel stacks freed");

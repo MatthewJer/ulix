@@ -353,6 +353,12 @@ exit_exception:                     // also the first "return" of every new proc
 @
 void [[cpu_switch]] (struct ctx *old, struct ctx *new)  -- kernel context switch.
 Saves callee-saved registers, SP and [[SP_EL0]] of the old context and loads the new ones.
+The user state that the exception entry does not save travels with it: the thread pointer
+[[TPIDR_EL0]] (musl keeps the address of its thread structure there, so [[errno]] depends on it)
+and the floating point and SIMD registers (musl's [[memcpy]] and [[printf]] use them; the kernel
+itself is compiled without them and leaves them alone, so a thread's values are still in the
+registers when the switch happens).  The offsets are those of [[struct kctx]] in [[arch_thread.c]]:
+[[tpidr]] at 120, [[fpcr]] at 128, [[fpsr]] at 136, the 32 registers of 16 bytes at 144.
 
 <<vectors.S: cpu_switch>>=
         .global cpu_switch
@@ -367,6 +373,52 @@ cpu_switch:
         str     x9, [x0, #96]
         mrs     x9, sp_el0
         str     x9, [x0, #104]
+        mrs     x9, tpidr_el0
+        str     x9, [x0, #120]
+        mrs     x9, fpcr
+        str     x9, [x0, #128]
+        mrs     x9, fpsr
+        str     x9, [x0, #136]
+        add     x9, x0, #144
+        stp     q0,  q1,  [x9, #0]
+        stp     q2,  q3,  [x9, #32]
+        stp     q4,  q5,  [x9, #64]
+        stp     q6,  q7,  [x9, #96]
+        stp     q8,  q9,  [x9, #128]
+        stp     q10, q11, [x9, #160]
+        stp     q12, q13, [x9, #192]
+        stp     q14, q15, [x9, #224]
+        stp     q16, q17, [x9, #256]
+        stp     q18, q19, [x9, #288]
+        stp     q20, q21, [x9, #320]
+        stp     q22, q23, [x9, #352]
+        stp     q24, q25, [x9, #384]
+        stp     q26, q27, [x9, #416]
+        stp     q28, q29, [x9, #448]
+        stp     q30, q31, [x9, #480]
+        add     x9, x1, #144
+        ldp     q0,  q1,  [x9, #0]
+        ldp     q2,  q3,  [x9, #32]
+        ldp     q4,  q5,  [x9, #64]
+        ldp     q6,  q7,  [x9, #96]
+        ldp     q8,  q9,  [x9, #128]
+        ldp     q10, q11, [x9, #160]
+        ldp     q12, q13, [x9, #192]
+        ldp     q14, q15, [x9, #224]
+        ldp     q16, q17, [x9, #256]
+        ldp     q18, q19, [x9, #288]
+        ldp     q20, q21, [x9, #320]
+        ldp     q22, q23, [x9, #352]
+        ldp     q24, q25, [x9, #384]
+        ldp     q26, q27, [x9, #416]
+        ldp     q28, q29, [x9, #448]
+        ldp     q30, q31, [x9, #480]
+        ldr     x9, [x1, #128]
+        msr     fpcr, x9
+        ldr     x9, [x1, #136]
+        msr     fpsr, x9
+        ldr     x9, [x1, #120]
+        msr     tpidr_el0, x9
         ldp     x19, x20, [x1, #0]
         ldp     x21, x22, [x1, #16]
         ldp     x23, x24, [x1, #32]
@@ -636,7 +688,7 @@ static void disk_test (void) {
   }
   int n = 0;
   minix_readdir (1, count_cb, &n);
-  CHECK (n == 31, "root directory has 31 entries (16 from x86 Ulix + 15 AArch64 files)");
+  CHECK (n == 32, "root directory has 32 entries (16 from x86 Ulix + 16 AArch64 files)");
   n = 0;
   minix_readdir (minix_lookup ("/bin"), count_cb, &n);
   CHECK (n == 73, "/bin has 73 entries (the programs of lib-build/tools, init, ping, ping6, host, ifconfig, route, dhclient, top, shutdown, poweroff and reboot)");
