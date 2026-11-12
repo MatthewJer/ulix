@@ -41,5 +41,14 @@ See `LICENCE-CHECK-musl.md`.
 | upstream, tag | <https://bearssl.org/git/BearSSL>, tag `v0.6` (the last release; commit 8ef7680) |
 | licence | MIT (`third_party/bearssl/LICENSE.txt`, Copyright (c) 2016 Thomas Pornin), checked 2026-11-12 |
 | why compatible with GPLv3 | permissive: only the copyright and permission notice must stay with the code |
-| what we add | `userland/https.c` and the glue to the system calls (chapter "TLS", `lit/tls.nw`); a configuration is not needed |
-| what it costs | about 2.3 MByte of source, 60 KByte of code for a client with TLS 1.2, no `malloc`, needs only `memcpy`, `memmove`, `memset`, `memcmp`, `strlen` |
+| what we add | `arm64/userland/https.c`, `arm64/userland/tls/` (glue, `string.h`) and `arm64/sshcrypto.c` (chapters `lit/tls.nw`, `lit/tlsuser.nw`, `lit/ssh.nw`); no configuration, no patches |
+| what it costs | 2.3 MByte of source; linked into `https`: 110 KByte of code, 192 KByte of static data (128 KByte of it for the certificate authorities); client context 3.7 KByte, record buffer 16.7 KByte; no `malloc`; needs only `memcpy`, `memmove`, `memset`, `memcmp`, `strlen`; TLS 1.2 at most |
+
+## etc/ssl/cacert.pem (data, not a submodule)
+
+| field | content |
+|---|---|
+| upstream | <https://curl.se/ca/cacert.pem> (the curl project's extract of Mozilla's `certdata.txt`), fetched 2026-11-12 with the date `Thu Nov  5 04:12:01 2026 GMT` in its header; SHA-256 of the file in the repository: `427c064216761a1e72a8b30f0d954d08cb6e4435a82091fb865afd20c8497285` |
+| licence | Mozilla Public License 2.0 (the data of the Mozilla root store) |
+| why compatible with GPLv3 | the MPL 2.0 lists the GNU GPL (version 2.0 and later versions) as a "Secondary License": the data may be combined with GPL code; the file is unmodified and keeps its header |
+| update | `arm64/tools/update_cacert.sh`, then commit; there is no automatic update on the system |

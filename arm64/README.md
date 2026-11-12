@@ -185,6 +185,10 @@ Ulix is a teaching system; what the port and the Raspberry Pi work follow from t
   `third_party/musl`, built by `arm64/libc/Makefile`; our part is the system call layer (`linux_abi.c`, chapter 10 of the port's book). The rules for
   foreign code and the licence check are in `third_party/README.md` and `third_party/LICENCE-CHECK-musl.md`. Programs linked with musl carry its
   copyright notice with them (`COPYRIGHT` in the submodule).
+* **BearSSL v0.6** (MIT, Copyright (c) 2016 Thomas Pornin) is an unmodified git submodule in `../third_party/bearssl` (`git submodule update --init`), compiled by
+  `userland/Makefile` for the program `https` and into the kernel for the SSH server; not with `make TLS=0`. See `../third_party/README.md`.
+* `etc/ssl/cacert.pem`: the list of certificate authorities of Mozilla, as extracted by the curl project (<https://curl.se/ca/cacert.pem>, date in its first lines;
+  updated with `tools/update_cacert.sh`). Mozilla Public License 2.0, which allows the combination with GPLv3.
 
 ## Not done
 
@@ -197,8 +201,8 @@ Ulix is a teaching system; what the port and the Raspberry Pi work follow from t
 * On the Raspberry Pi only one CPU is used (the firmware parks the other three; no PSCI), the machine cannot be switched off or restarted
   by software yet (no PSCI; the watchdog registers would do), and the 4 and 8 GByte models are not supported (RAM and peripherals share one
   GByte of the boot tables). The SD card driver has no DMA and no 1.8 V mode.
-* The network is small on purpose: no UDP or TCP sockets for user programs (only raw ICMP, which is what `ping` needs), the DHCP lease is not
-  renewed, no name resolution, one interface, no fragmentation, no congestion control in TCP. The telnet server serves one session, on one terminal, without encryption, and answers none of the client's option requests.
+* The network is small on purpose: for user programs only raw ICMP and TCP client sockets (no `bind`/`listen`/`accept`, no UDP, no `poll`; section 27 of `ARM64-PORT.md`), the DHCP lease is not
+  renewed, no name resolution, one interface, no fragmentation, no congestion control in TCP. The telnet server serves one session, on one terminal, without encryption, and answers none of the client's option requests; the SSH server (`make TLS=0` leaves it out) shares that terminal and has the limits listed in section 27 (only the interactive shell, user authentication by `login` on the terminal). TLS is version 1.2 only (BearSSL has no 1.3; SSL 2.0/3.0 are not implemented on purpose).
 * IPv6 has no TCP, no duplicate address detection, no lifetimes of prefixes and routers, no DHCPv6, and `ifconfig` and `route` cannot set IPv6 addresses or routes (section 26 of `ARM64-PORT.md`). Not yet tried on the board: the home router must send a router advertisement.
 * `/dev/fd0` has no drive behind it (a stand-in for the second floppy, `/dev/fd1`, is the only one).
 * Not checked: the x86 build with the compiler that the makefiles name (`gcc-4.4`); all checks used GCC 16 (`i686-elf-gcc`). `ulixlib.c` still
