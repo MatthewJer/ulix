@@ -63,6 +63,7 @@ user/swaptest.c
 user/screentest.c
 user/stacktest.c
 user/memtest.c
+user/pipetest.c
 userland/arm64-extra.h
 userland/ping.c
 userland/ping6.c
@@ -83,3 +84,4 @@ userland/readelf64.c
 linux_abi.c
 tools/mark_musl.py
 libc/hello.c
+pipes.c

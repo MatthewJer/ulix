@@ -118,3 +118,5 @@ linux_abi.c
 tools/mark_musl.py
 libc/hello.c
 libc/build/
+pipes.c
+user/pipetest.c

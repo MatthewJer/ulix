@@ -114,7 +114,7 @@ int bookfs_test (void) {
          "mx_stat: regular file, 316 bytes");
   CHECK (mx_stat (DEV, "/bin", &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR, "mx_stat: /bin is a directory");
   CHECK (mx_stat (DEV, "/nonexistent", &st) == -1, "mx_stat: missing file");
-  CHECK (count_entries ("/") == 32, "mx_getdent: / has 32 used entries (16 from x86 Ulix + 16 AArch64 files)");
+  CHECK (count_entries ("/") == 33, "mx_getdent: / has 33 used entries (16 from x86 Ulix + 17 AArch64 files)");
   CHECK (count_entries ("/bin") == 76, "mx_getdent: /bin has 76 entries");
   CHECK (mx_file_exists (DEV, "/bin/vi") && mx_file_is_directory (DEV, "/bin") &&
          !mx_file_is_directory (DEV, "/bin/vi"), "mx_file_exists / mx_file_is_directory");
@@ -670,6 +670,16 @@ int proc_test (void) {
       { mem_mb[round] = 0; for (int k = i + 6; out[k] >= '0' && out[k] <= '9'; k++) mem_mb[round] = mem_mb[round] * 10 + out[k] - '0'; break; }
   }
   CHECK (mem_mb[0] > 20 && mem_mb[1] >= mem_mb[0] - 2, "after the process has ended all memory is available again (second run gets as much)");
+  CHECK (live_threads () == 0, "no process is left");
+
+  // pipes (pipes.c): sleeping readers and writers, end of file, dup2, SIGPIPE, a killed reader
+  char *pipe_argv[] = { "pipetest64", 0 };
+  capture_start ();
+  pid = run ("/pipetest64", 1, pipe_argv);
+  capture_stop (&out);
+  arch_threads_reap ();
+  CHECK (pid > 0 && thread_table[pid].exitcode == 0, "/pipetest64 finished with exit status 0 (no failed checks)");
+  CHECK (count_in (out, "user FAIL") == 0 && count_in (out, "user ok:") == 13, "all 13 pipe checks passed");
   CHECK (live_threads () == 0, "no process is left");
 
   // the disk: processes that read and write sleep until the interrupt of the device wakes them up

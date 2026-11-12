@@ -1,0 +1,398 @@
+\chapter{Pipes}
+\label{ch:pipes}
+
+A pipe connects two processes: what the one writes, the other reads. Nothing else in Unix is as small and as useful. The shell
+uses it to join programs (\texttt{ps | grep ssh}), and a daemon uses it to talk to the program it has started (the SSH server
+later feeds a shell through two pipes). The book mentions pipes only to say that they are not there: the kernel could ``create
+an internal buffer for each pipe and associate two negative file descriptors with it''. This chapter does that, in the way the
+other kinds of files already work.
+
+\section{What a pipe is}
+
+A pipe is a ring buffer in the kernel with two ends. The \emph{write end} puts bytes in, the \emph{read end} takes them out, in
+the same order. Four rules make it behave like a pipe:
+
+\begin{itemize}
+\item \texttt{read} on an empty pipe \emph{sleeps} until somebody writes, but if no process has the write end open any more
+  (every writer closed it or ended), it returns 0: the end of the file.
+\item \texttt{write} on a full pipe sleeps until somebody has read, so a fast writer cannot overtake a slow reader.
+\item \texttt{write} on a pipe without a reader is an error: the writer gets the signal \texttt{SIGPIPE}, which ends it unless
+  it ignores the signal (then \texttt{write} returns $-1$). Nobody would ever read the bytes.
+\item A pipe lives as long as one of its ends is open, in any process. \texttt{fork} gives the child the same two ends, and
+  every process that ends closes its files, so the counts are right without further work.
+\end{itemize}
+
+\section{Where it fits: one more kind of file}
+
+A file descriptor of a process (\texttt{files[pfd]} in the process table) holds a \emph{global} descriptor, and the book builds
+that number as \texttt{(file system * 256) + number inside the file system}: the Minix file system is 1, the devices are 3. A
+pipe becomes file system number 4 (\texttt{FS\_PIPE}), and the number inside it says which pipe and which end:
+\texttt{pipe * 2 + end} (0 = read end, 1 = write end). Nothing else needs to know about it.
+
+The book's \texttt{u\_read}, \texttt{u\_write}, \texttt{u\_close} and \texttt{u\_reopen} look at that number and call the
+right file system. They are compiled unchanged (the book stays the single source, see \texttt{PRINCIPLES.md}), but the build
+renames them to \texttt{book\_u\_read} and so on, as it does for the scheduler and \texttt{u\_kill}. The functions of this chapter
+have the book's names, look whether the descriptor is a pipe, and pass everything else on to the book:
+
+<<pipes.c: wrappers>>=
+int u_read (int fd, void *buf, int nbyte)  { return is_pipe (fd) ? pipe_read (fd, buf, nbyte)  : book_u_read (fd, buf, nbyte); }
+int u_write (int fd, void *buf, int nbyte) { return is_pipe (fd) ? pipe_write (fd, buf, nbyte) : book_u_write (fd, buf, nbyte); }
+int u_close (int fd)                       { if (!is_pipe (fd)) return book_u_close (fd);  pipe_close (fd);  return 0; }
+
+// fork () copies a file descriptor with u_reopen: for a file that is a new position in the file, for a pipe end it is one more
+// user of the same end
+int u_reopen (int fd) {
+  if (!is_pipe (fd)) return book_u_reopen (fd);
+  struct pipe *p = &pipes[(fd & 0xff) / 2];
+  if (fd & 1) p->writers++;  else p->readers++;
+  return fd;
+}
+@
+
+That is the whole connection to the rest of the kernel. \texttt{syscall\_read}, \texttt{syscall\_write}, \texttt{syscall\_close}, \texttt{fork}
+and \texttt{exit} reach the pipe through these four functions and need no change.
+
+\section{The data structures}
+
+There are 16 pipes of 4~KByte. A fixed table is enough for a teaching system, and a full table is an ordinary error
+(\texttt{pipe} returns $-1$) instead of a case that needs memory management. The ring buffer has a read position and a count (the
+write position is the sum of the two, modulo the size). \texttt{readers} and \texttt{writers} count the \emph{descriptors} that
+refer to an end, in all processes.
+
+All processes that wait for any pipe sleep in one queue, \texttt{pipe\_queue}. Whenever something happens on a pipe (data
+arrived, space is free, an end was closed) \emph{all} sleepers wake and look again whether their pipe is ready; a wrong guess
+costs one look and one more sleep. One queue instead of one per pipe keeps the code at a single line per wake-up and cannot lose
+a wake-up; for 16 pipes that is fast enough.
+
+<<pipes.c: pipe table>>=
+#define FS_PIPE      4                        // the file system number of pipes (Minix is 1, devices are 3)
+#define MAX_PIPES    16
+#define PIPE_SIZE    4096
+#define TSTATE_WAITPIPE 13                    // a process sleeps in pipe_queue (12 is the serial disk)
+
+struct pipe {
+  int  used;
+  int  readers, writers;                      // descriptors that refer to the read end / the write end
+  int  start, count;                          // the bytes are buf[start ...], count of them (modulo PIPE_SIZE)
+  char buf[PIPE_SIZE];
+};
+
+static struct pipe pipes[MAX_PIPES];
+static blocked_queue pipe_queue;              // everybody who waits for any pipe
+
+static int is_pipe (int gfd) { return gfd >= 0 && (gfd >> 8) == FS_PIPE; }
+
+static void pipe_wake_all (void) {            // something changed: the sleepers look again
+  while (pipe_queue.next != 0) deblock (pipe_queue.next, &pipe_queue);
+}
+
+// a process may only sleep if it is a real process: the idle thread and the boot code poll (see the book)
+static int can_sleep (void) { return current_task > 1 && scheduler_is_active; }
+@
+
+\section{Reading, writing, closing}
+
+\texttt{pipe\_read} sleeps while the pipe is empty and a writer exists. It takes what is there (at most what was asked for) and
+returns it at once; it does \emph{not} wait for the buffer to fill, which is what a reader on a terminal expects, too. A read
+from the write end is an error.
+
+<<pipes.c: read>>=
+static int pipe_read (int gfd, void *buf, int n) {
+  struct pipe *p = &pipes[(gfd & 0xff) / 2];
+  if (gfd & 1) return -1;                                   // that is the write end
+  while (p->count == 0) {
+    if (p->writers == 0) return 0;                          // nobody can write any more: end of file
+    if (!can_sleep ()) return -1;
+    block (&pipe_queue, TSTATE_WAITPIPE);
+    arch_resign ();                                         // here the process sleeps
+  }
+  if (n > p->count) n = p->count;
+  for (int i = 0; i < n; i++)
+    ((char *)buf)[i] = p->buf[(p->start + i) % PIPE_SIZE];
+  p->start = (p->start + n) % PIPE_SIZE;
+  p->count -= n;
+  pipe_wake_all ();                                         // there is room now
+  return n;
+}
+@
+
+\texttt{pipe\_write} puts all bytes in, in as many rounds as it takes: whenever the buffer is full it sleeps until a reader has made room. If
+the last reader is gone, the writer gets \texttt{SIGPIPE} (the book's \texttt{u\_kill} turns it into a kill for a process that does not
+handle it, and then the call below does not return) and, if it survives, the error $-1$ --- or the number of bytes that were
+written before the readers left.
+
+<<pipes.c: write>>=
+static int pipe_write (int gfd, void *buf, int n) {
+  struct pipe *p = &pipes[(gfd & 0xff) / 2];
+  if (!(gfd & 1)) return -1;                                // that is the read end
+  int done = 0;
+  while (done < n) {
+    if (p->readers == 0) {                                  // nobody will ever read this
+      u_kill (current_task, SIGPIPE);
+      return done > 0 ? done : -1;
+    }
+    if (p->count == PIPE_SIZE) {
+      if (!can_sleep ()) return done > 0 ? done : -1;
+      block (&pipe_queue, TSTATE_WAITPIPE);
+      arch_resign ();
+      continue;                                             // look again
+    }
+    int room = PIPE_SIZE - p->count;
+    int chunk = n - done < room ? n - done : room;
+    for (int i = 0; i < chunk; i++)
+      p->buf[(p->start + p->count + i) % PIPE_SIZE] = ((char *)buf)[done + i];
+    p->count += chunk;
+    done += chunk;
+    pipe_wake_all ();                                       // there is something to read
+  }
+  return done;
+}
+@
+
+Closing an end only counts down. The last close of both ends frees the table entry. In any case the sleepers wake up, because a
+reader may now see the end of the file and a writer the missing reader.
+
+<<pipes.c: close>>=
+static void pipe_close (int gfd) {
+  struct pipe *p = &pipes[(gfd & 0xff) / 2];
+  if (gfd & 1) { if (p->writers > 0) p->writers--; }
+  else         { if (p->readers > 0) p->readers--; }
+  if (p->readers == 0 && p->writers == 0) p->used = 0;      // nothing refers to it: the entry is free
+  pipe_wake_all ();
+}
+@
+
+\section{When a process is killed}
+
+A process that ends with \texttt{exit} closes its files in the book's \texttt{syscall\_exit}, and so its pipe ends are closed by the
+function above. A process that is \emph{killed} (a signal without a handler, a crash, \texttt{kill -9}) does not run
+\texttt{syscall\_exit}: its table entry is simply marked free. Two things must be done for a pipe, and the function
+\texttt{pipes\_before\_kill} does them. The kernel calls it in \texttt{u\_kill} (chapter on the processors, \texttt{smp.c}) just before it
+passes the signal on to the book:
+
+\begin{enumerate}
+\item A process that sleeps in a pipe must leave the queue before it can be killed: the book's \texttt{u\_kill} knows only its own
+  queues. \texttt{deblock} makes it ready, and the book's function then removes it from the ready queue as for any other process.
+\item If the signal ends the process (\texttt{SIGKILL}, or a signal without handler whose default is to end it, as in the book's
+  list), its pipe ends are closed now. Otherwise the reader at the other end would wait for ever for an end of file.
+\end{enumerate}
+
+<<pipes.c: kill>>=
+// does the book's u_kill end the process? (the list of the book: default action of these signals is to terminate)
+static int signal_ends_process (TCB *t, int signo) {
+  if (signo == SIGKILL) return 1;
+  if (t->sighandlers[signo] != SIG_DFL) return 0;
+  return signo == SIGABRT || signo == SIGALRM || signo == SIGBUS || signo == SIGFPE || signo == SIGHUP || signo == SIGILL ||
+         signo == SIGINT  || signo == SIGPIPE || signo == SIGTERM || signo == SIGUSR1 || signo == SIGUSR2 || signo == SIGPROF ||
+         signo == SIGSYS  || signo == SIGTRAP || signo == SIGVTALRM || signo == SIGXCPU || signo == SIGXFSZ;
+}
+
+void pipes_before_kill (int pid, int signo) {
+  if (pid < 3 || pid >= MAX_THREADS || signo < 0 || signo > 31) return;
+  TCB *t = &thread_table[pid];
+  if (!t->used) return;
+  if (t->state == TSTATE_WAITPIPE) deblock (pid, &pipe_queue);          // ready again; the book removes it from the ready queue
+  if (signal_ends_process (t, signo))
+    for (int pfd = 0; pfd < MAX_PFD; pfd++)
+      if (is_pipe (t->files[pfd])) { pipe_close (t->files[pfd]);  t->files[pfd] = -1; }
+}
+@
+
+\section{The system calls \texttt{pipe} and \texttt{dup2}}
+
+\texttt{pipe (fds)} makes a new pipe and returns the read end in \texttt{fds[0]} and the write end in \texttt{fds[1]}, both as
+file descriptors of the calling process (the lowest free ones). It can fail for two reasons that both give $-1$: the table of pipes
+is full, or the process has no two free descriptors.
+
+The two ends are not put in with \texttt{gfd2pfd}: that function first looks whether the global number is already in the table,
+and there it \emph{is} legitimate for the same pipe end to appear twice (after \texttt{dup2}), so the system call looks for free
+entries itself.
+
+<<pipes.c: pipe and dup2>>=
+static int free_pfd (TCB *t, int from) {
+  for (int pfd = from; pfd < MAX_PFD; pfd++) if (t->files[pfd] == -1) return pfd;
+  return -1;
+}
+
+void syscall_pipe (context_t *r) {
+  int *fds = (int *) r->ebx;
+  TCB *t = &thread_table[thread_table[current_task].pid];
+  int n = 0, rfd = free_pfd (t, 0), wfd = rfd < 0 ? -1 : free_pfd (t, rfd + 1);
+  while (n < MAX_PIPES && pipes[n].used) n++;
+  if (n == MAX_PIPES || rfd < 0 || wfd < 0) { eax_return (-1); }
+  pipes[n].used = 1;  pipes[n].readers = pipes[n].writers = 1;  pipes[n].start = pipes[n].count = 0;
+  t->files[rfd] = (FS_PIPE @<< 8) | (n * 2);                // the read end
+  t->files[wfd] = (FS_PIPE @<< 8) | (n * 2 + 1);            // the write end
+  fds[0] = rfd;
+  fds[1] = wfd;
+  eax_return (0);
+}
+@
+
+\texttt{dup2 (old, new)} makes descriptor \texttt{new} another name for what \texttt{old} refers to; if \texttt{new} was open, it is
+closed first. This is how a program that starts another one decides what the new program finds as its standard input and output:
+the child calls \texttt{dup2 (fd, 1)} and then \texttt{exec}, and everything that the new program prints goes into the file or
+the pipe. (A file that is copied this way gets its own read/write position through \texttt{u\_reopen}, the same as after a
+\texttt{fork}. The standard input, output and error are the negative numbers \texttt{DEV\_STDIN} and so on, which need no
+reference count.)
+
+<<pipes.c: pipe and dup2>>=
+void syscall_dup2 (context_t *r) {
+  int old = r->ebx, new = r->ecx;
+  TCB *t = &thread_table[thread_table[current_task].pid];
+  if (old < 0 || old >= MAX_PFD || new < 0 || new >= MAX_PFD || t->files[old] == -1) { eax_return (-1); }
+  if (old == new) { eax_return (new); }
+  int gfd = t->files[old];
+  if (t->files[new] != -1) u_close (t->files[new]);
+  t->files[new] = gfd >= 0 ? u_reopen (gfd) : gfd;
+  eax_return (new);
+}
+@
+
+\section{The whole file}
+
+<<pipes.c>>=
+#define hash pipes_hash                            // (the book's header defines a function of this name: keep it out of the link)
+#include "ulix-api.h"
+#undef hash
+
+extern int  book_u_read (int fd, void *buf, int nbyte);       // the book's functions, renamed by the Makefile
+extern int  book_u_write (int fd, void *buf, int nbyte);
+extern int  book_u_close (int fd);
+extern int  book_u_reopen (int fd);
+extern void arch_resign (void);
+
+<<pipes.c: pipe table>>
+<<pipes.c: read>>
+<<pipes.c: write>>
+<<pipes.c: close>>
+<<pipes.c: wrappers>>
+<<pipes.c: kill>>
+<<pipes.c: pipe and dup2>>
+@
+
+\section{The test program}
+
+The program \texttt{pipetest} (started by the kernel tests as \texttt{/pipetest64}) checks the four rules and the two system calls with real
+processes. It ends with the number of failed checks as its exit status.
+
+<<user/pipetest.c>>=
+#include "ulib.h"
+
+static int fails = 0;
+#define CHECK(c, msg) do { if (c) printf ("  user ok:   %s\n", msg); \
+                           else { printf ("  user FAIL: %s\n", msg); fails++; } } while (0)
+#define SIGPIPE 13
+
+static int same (const char *a, const char *b, int n) { for (int i = 0; i < n; i++) if (a[i] != b[i]) return 0; return 1; }
+static void wait_a_while (void) { for (int i = 0; i < 30; i++) yield (); }
+
+static char big[20000];
+
+int main (int argc, char **argv) {
+  int fds[2], status = -1;
+  char buf[64];
+
+  // 1. one process: what goes in comes out, in the same order
+  CHECK (pipe (fds) == 0 && fds[0] != fds[1], "pipe () gives two descriptors");
+  CHECK (write (fds[1], "hello", 5) == 5, "write 5 bytes");
+  CHECK (read (fds[0], buf, 64) == 5 && same (buf, "hello", 5), "read gives the same 5 bytes");
+  CHECK (read (fds[1], buf, 4) == -1 && write (fds[0], "x", 1) == -1, "reading the write end and writing the read end are errors");
+  close (fds[0]);  close (fds[1]);
+
+  // 2. a reader on an empty pipe sleeps until the writer has something (the child waits, so the parent is the first at the pipe)
+  pipe (fds);
+  int pid = fork ();
+  if (pid == 0) {
+    close (fds[0]);
+    wait_a_while ();
+    write (fds[1], "from the child", 14);
+    exit (0);                                    // ends without closing: the kernel closes the write end
+  }
+  close (fds[1]);
+  int n = read (fds[0], buf, 64);
+  CHECK (n == 14 && same (buf, "from the child", 14), "the reader slept until the child wrote, then got its 14 bytes");
+  CHECK (read (fds[0], buf, 64) == 0, "when the child has ended, read returns 0 (end of file)");
+  waitpid (pid, &status, 0);
+  close (fds[0]);
+
+  // 3. more than fits into the pipe: the writer sleeps while it is full (20000 > 4096 bytes), the order stays
+  for (int i = 0; i < 20000; i++) big[i] = (char)(i * 7 + (i >> 8));
+  pipe (fds);
+  pid = fork ();
+  if (pid == 0) {
+    close (fds[0]);
+    int sent = 0;
+    while (sent < 20000) { int k = write (fds[1], big + sent, 20000 - sent); if (k <= 0) exit (1); sent += k; }
+    exit (0);
+  }
+  close (fds[1]);
+  int total = 0, good = 1, k;
+  while ((k = read (fds[0], buf, 64)) > 0) {
+    for (int i = 0; i < k; i++) if (buf[i] != big[total + i]) good = 0;
+    total += k;
+  }
+  waitpid (pid, &status, 0);
+  CHECK (total == 20000 && good, "20000 bytes pass through a 4096 byte pipe, complete and in order");
+  CHECK (status == 0, "the writer sent everything and ended normally");
+  close (fds[0]);
+
+  // 4. dup2: the child's standard output is the pipe, and so is what printf writes there
+  pipe (fds);
+  pid = fork ();
+  if (pid == 0) {
+    close (fds[0]);
+    if (dup2 (fds[1], 1) != 1) exit (7);
+    close (fds[1]);
+    printf ("via stdout");
+    exit (0);
+  }
+  close (fds[1]);
+  n = read (fds[0], buf, 64);
+  waitpid (pid, &status, 0);
+  CHECK (n == 10 && same (buf, "via stdout", 10) && status == 0, "dup2 (pipe, 1): what the child printed arrived through the pipe");
+  close (fds[0]);
+
+  // 5. a write without a reader: SIGPIPE ends the writer (it never gets to exit (5)); with SIGPIPE ignored it is an error
+  pipe (fds);
+  close (fds[0]);
+  signal (SIGPIPE, SIG_IGN);
+  CHECK (write (fds[1], "x", 1) == -1, "write on a pipe without reader fails when SIGPIPE is ignored");
+  signal (SIGPIPE, SIG_DFL);
+  pid = fork ();
+  if (pid == 0) { write (fds[1], "x", 1); exit (5); }
+  close (fds[1]);
+  waitpid (pid, &status, 0);
+  CHECK (status != 5, "write on a pipe without reader ends a process that does not ignore SIGPIPE");
+
+  // 6. a reader that sleeps in a pipe can be killed, and its end is closed (then the pipe has no reader: write fails)
+  pipe (fds);
+  pid = fork ();
+  if (pid == 0) { close (fds[1]); read (fds[0], buf, 64); exit (0); }
+  close (fds[0]);
+  wait_a_while ();                               // the child sleeps in read
+  kill (pid, SIGKILL);
+  waitpid (pid, &status, 0);
+  signal (SIGPIPE, SIG_IGN);
+  CHECK (write (fds[1], "x", 1) == -1, "after kill -9 of the sleeping reader its end is closed (the write fails)");
+  close (fds[1]);
+
+  // 7. nothing leaked: 40 pipes are made one after another, also with sleepers killed (the table has only 16 entries)
+  int made = 0;
+  for (int i = 0; i < 40; i++) {
+    int f[2];
+    if (pipe (f) != 0) break;
+    if (i % 2) {
+      int p = fork ();
+      if (p == 0) { close (f[1]); read (f[0], buf, 64); exit (0); }
+      wait_a_while ();
+      kill (p, SIGKILL);
+      waitpid (p, &status, 0);
+    }
+    close (f[0]);  close (f[1]);
+    made++;
+  }
+  CHECK (made == 40, "40 pipes in a row (killed sleepers and ended processes leaked nothing)");
+  return fails;
+}
+@

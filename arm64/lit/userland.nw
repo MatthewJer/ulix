@@ -70,6 +70,8 @@ static inline long syscall3 (long nr, long a, long b, long c) {
 #define SYS_mutex_unlock   519
 #define SYS_mutex_destroy  520
 #define SYS_mutex_trylock  526
+#define SYS_dup2      63
+#define SYS_pipe     626
 
 static inline long write (int fd, const void *buf, u64 n)  { return syscall3 (SYS_write, fd, (long)buf, n); }
 static inline int  getpid (void)                           { return syscall3 (SYS_getpid, 0, 0, 0); }
@@ -97,6 +99,8 @@ static inline void *sbrk (int incr)                         { return (void *)(lo
 static inline int  get_free_frames (void)                   { return syscall3 (SYS_free_frames, 0, 0, 0); }
 static inline int  close (int fd)                          { return syscall3 (SYS_close, fd, 0, 0); }
 static inline int  lseek (int fd, int off, int whence)     { return syscall3 (SYS_lseek, fd, off, whence); }
+static inline int  pipe (int fds[2])                       { return syscall3 (SYS_pipe, (long)fds, 0, 0); }       // fds[0]: read end, fds[1]: write end
+static inline int  dup2 (int old, int new)                 { return syscall3 (SYS_dup2, old, new, 0); }
 
 static inline int  gettid (void)                            { return syscall3 (SYS_gettid, 0, 0, 0); }
 static inline int  pthread_create (void (*f) (void))        { return syscall3 (SYS_pthread_create, (long)f, 0, 0); }
