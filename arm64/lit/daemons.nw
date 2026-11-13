@@ -6,7 +6,8 @@ sends a heartbeat. Up to now Ulix has two kinds of such jobs, and both are part 
 (\texttt{netd}) and the servers that run in it (\texttt{telnetd}, \texttt{sshd}). That was the shortcut of the first steps. A
 server in the kernel can crash the system, its mistakes cost kernel memory, and the SSH server's cryptography has to fit on the
 16~KByte stack of a kernel thread. A server should be a \emph{program}: it can be written, tested, started, stopped and killed
-like any other, and when it fails, only it fails.
+like any other, and when it fails, only it fails. (That is what has happened since: \texttt{telnetd} and \texttt{sshd} are services started by the
+boot, see the chapter on servers; the network thread only handles frames now.)
 
 What is missing is not the mechanism --- \texttt{fork}, \texttt{exec} and \texttt{kill} are enough --- but a \emph{convention}: how
 are services described, who starts them when the machine boots, how does the administrator start and stop one, and how does one

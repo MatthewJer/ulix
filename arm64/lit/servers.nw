@@ -11,11 +11,13 @@ Such a program needs three things from the kernel that it did not have:
 
 \begin{enumerate}
 \item \emph{Server sockets}: a way to say ``I accept connections to port 23'' and to wait for the next one. That is the first
-  section of this chapter.
+  section of this chapter (with a small test server, \texttt{echod}).
 \item \emph{A way to attach a session to a terminal}: what the kernel's telnet code did with \texttt{telnet\_input} and
-  \texttt{telnet\_putch}, as system calls. That is the second section (a minimal pseudo terminal).
+  \texttt{telnet\_putch}, as system calls (a minimal pseudo terminal). That is the section after the test of the sockets.
 \item \emph{A convention for starting}: the files in \texttt{/etc/rc.d}, which the chapter on daemons describes.
 \end{enumerate}
+
+With these three, the telnet server becomes a program (the last section but one), and the SSH server follows in its own chapter.
 
 The TCP code of the kernel does not change: it has always been able to accept connections (\texttt{tcp\_listen} and
 \texttt{tcp\_accept} in \texttt{tcp.c}), the kernel servers used it. This chapter only puts system calls on top.
@@ -131,6 +133,69 @@ static inline int tcp_listen (int port)                  { return syscall2 (__NR
 static inline int tcp_accept (int port, int timeout_ms)  { return syscall3 (__NR_tcp_accept, port, timeout_ms); }           // a socket, -1 = no room, -2 = time over; timeout -1: wait for ever
 @
 
+\section{A test server: \texttt{echod}}
+\label{src:userland:echod.c}
+
+The smallest server that is not a toy answers every byte with the same byte (RFC 862, \emph{echo}). \texttt{echod PORT} listens, accepts one client
+at a time, sends back what it receives until the client hangs up, and goes back to \texttt{accept}. It is a service as well, with
+\texttt{/etc/rc.d/echod}: switched off unless \texttt{rc.conf} says \texttt{echod\_enable="YES"}.
+
+Two things show how a server is written. The main loop waits for a client with a time limit of one second, not for ever, and looks at
+a flag after every wait, because \texttt{SIGTERM} (what \texttt{service stop} sends) only makes the handler run when the system call
+returns. And a client that has gone must not leave the server stuck: \texttt{tcp\_recv} says $-1$ and the server closes its end.
+
+<<userland/echod.c>>=
+#include "../ulixlib.h"
+#include "../arm64-extra.h"
+
+static volatile int stop = 0;
+static void on_term (int signo) { stop = 1; }              // SIGTERM: end after the current wait
+
+static void echo (int sock) {                              // everything that arrives goes back, until the client hangs up
+  unsigned char buf[512];
+  struct tcp_msg m;
+  while (!stop) {
+    m.handle = sock;  m.buf = buf;  m.len = sizeof buf;  m.timeout_ms = 1000;
+    int n = tcp_recv (&m);
+    if (n < 0) return;                                     // closed
+    if (n == 0) continue;                                  // nothing for a second: look at the flag
+    m.len = n;  m.timeout_ms = 10000;
+    if (tcp_send (&m) < 0) return;
+  }
+}
+
+int main (int argc, char **argv) {
+  int port = argc > 1 ? atoi (argv[1]) : 7007;
+  signal (SIGTERM, on_term);
+  if (tcp_listen (port) != 0) { printf ("echod: cannot listen on port %d\n", port);  return 1; }
+  while (!stop) {
+    int sock = tcp_accept (port, 1000);                    // sleeps until a client comes (at most a second)
+    if (sock == -1) { waitkey (100);  continue; }          // no room for a socket: try again soon
+    if (sock < 0) continue;                                // time over
+    echo (sock);
+    tcp_close (sock);
+  }
+  return 0;
+}
+@
+
+<<etc/rc.d/echod>>=
+# echod: the echo server (a test and an example of a server written as a program); listens on port 7007
+command="/bin/echod 7007"
+rcvar="echod_enable"
+default="NO"
+pidfile="/var/run/echod.pid"
+@
+
+\section{The test of the server sockets}
+
+\texttt{make listen-test} (\texttt{tools/listen\_test.py}) boots the shell kernel with a network card, on a copy of the disk whose
+\texttt{rc.conf} switches \texttt{echod} on. The boot starts the service before the login appears, and qemu forwards a port of the host
+to port 7007 of the kernel. The test then behaves like clients: one that sends text and gets it back, a second one that comes while the
+first one is still connected (it has to wait: the server serves one client at a time, and the queue of connections is the one of TCP), one
+that connects and leaves without a word, and one that sends 20000 bytes (more than the buffers of TCP hold). A boot with the default
+(\texttt{echod} off) must not answer on the port.
+
 \section{A pseudo terminal: \texttt{pty\_attach}, \texttt{pty\_read}, \texttt{pty\_write}}
 \label{src:pty.c}
 
@@ -183,15 +248,14 @@ for every signal, hangs up when the signal ends the holder. (A holder that has v
 #define PTY_LAST_VT 4                         // a session may take the terminals 0 to 4: the ones on which login waits
 
 int pty_vt = -1;                              // the terminal of the session; -1: nobody holds one (arch_vt.c looks at it)
-static int holder = 0;                        // the process that holds it (0: a server inside the kernel)
+static int holder = 0;                        // the process that holds it (the server)
 static unsigned char ring[8192];
 static volatile unsigned head = 0, tail = 0;  // written at head, read at tail; the place is the count modulo the size
 
 static int is_root (void) { return thread_table[current_task].euid == 0; }
 @
 
-The ring. \texttt{pty\_putch} is the kernel's way in (from \texttt{kputch}), \texttt{pty\_get} the way out. The line \texttt{netd\_nudge} is for the telnet
-server that still lives in the network thread, and goes away with it.
+The ring. \texttt{pty\_putch} is the kernel's way in (from \texttt{kputch}), \texttt{pty\_get} the way out.
 
 <<pty.c: ring>>=
 static void put (unsigned char c) {
@@ -205,7 +269,7 @@ void pty_putch (char c) {                     // called by kputch for the sessio
   int was_empty = (head == tail);
   if (c == '\n') put ('\r');                  // a line ends with CR LF
   put ((unsigned char)c);
-  if (was_empty) { net_wake_all ();  netd_nudge (); }       // the server may sleep: wake it
+  if (was_empty) net_wake_all ();             // the server may sleep: wake it
 }
 
 int pty_ready (void) {                        // has the terminal output for the calling process (its holder)? net_syscalls.c asks
@@ -226,7 +290,7 @@ of the terminal into the ring, so that the client sees the prompt of \texttt{log
 <<pty.c: open and close>>=
 int pty_open (int vt, int who) {
   if (vt < 0 || vt > PTY_LAST_VT) return -3;
-  if (pty_vt >= 0 && holder > 0 && !thread_table[holder].used) pty_close ();      // the holder has died without hanging up
+  if (pty_vt >= 0 && !thread_table[holder].used) pty_close ();      // the holder has died without hanging up
   if (pty_vt >= 0) return -1;
   head = tail = 0;
   holder = who;  pty_vt = vt;
@@ -244,7 +308,7 @@ void pty_close (void) {
 
 // u_kill calls this before it signals a process: if that ends the process that holds the terminal, the session ends with it
 void pty_before_kill (int pid, int signo) {
-  if (pty_vt >= 0 && holder > 0 && pid == holder && signal_ends_process (&thread_table[pid], signo)) pty_close ();
+  if (pty_vt >= 0 && pid == holder && signal_ends_process (&thread_table[pid], signo)) pty_close ();
 }
 @
 
@@ -299,7 +363,6 @@ extern void pty_input (int vt, unsigned char c);       // arch_console.c: a key
 extern void arch_vt_pty_attach (void);          // arch_vt.c: paint the screen of the terminal into the ring
 extern void net_wake_all (void);                // net_syscalls.c: wake the sleepers of the network waiters' queue
 extern void net_wait (void);
-extern void netd_nudge (void);
 extern unsigned long long net_now_ms (void);
 extern int  signal_ends_process (TCB *t, int signo);   // pipes.c
 
@@ -624,65 +687,22 @@ a port that qemu forwards, logs in with a password, runs \texttt{ps} and \texttt
 \texttt{telnetd\_enable="NO"} in \texttt{rc.conf} does not answer. Only the way to learn that the server is up has changed: the kernel used to print a line on the console, now the test
 tries to connect until the server answers with its login prompt (a daemon writes to terminal 9, which the console log does not show).
 
-\section{A test server: \texttt{echod}}
-\label{src:userland:echod.c}
+\section{Where the other server is, and what is not done}
 
-The smallest server that is not a toy answers every byte with the same byte (RFC 862, \emph{echo}). \texttt{echod PORT} listens, accepts one client
-at a time, sends back what it receives until the client hangs up, and goes back to \texttt{accept}. It is a service as well, with
-\texttt{/etc/rc.d/echod}: switched off unless \texttt{rc.conf} says \texttt{echod\_enable="YES"}.
+The SSH server follows the same pattern and has its own chapter (\texttt{userland/sshd.c}): a program, a service, \texttt{tcp\_accept} for the clients, the pseudo terminal for the
+session. It was the reason for the 16~KByte problem that the first section of this chapter names, and it is the program that gains most from a normal stack.
 
-Two things show how a server is written. The main loop waits for a client with a time limit of one second, not for ever, and looks at
-a flag after every wait, because \texttt{SIGTERM} (what \texttt{service stop} sends) only makes the handler run when the system call
-returns. And a client that has gone must not leave the server stuck: \texttt{tcp\_recv} says $-1$ and the server closes its end.
+What the simple versions leave out, on purpose:
 
-<<userland/echod.c>>=
-#include "../ulixlib.h"
-#include "../arm64-extra.h"
-
-static volatile int stop = 0;
-static void on_term (int signo) { stop = 1; }              // SIGTERM: end after the current wait
-
-static void echo (int sock) {                              // everything that arrives goes back, until the client hangs up
-  unsigned char buf[512];
-  struct tcp_msg m;
-  while (!stop) {
-    m.handle = sock;  m.buf = buf;  m.len = sizeof buf;  m.timeout_ms = 1000;
-    int n = tcp_recv (&m);
-    if (n < 0) return;                                     // closed
-    if (n == 0) continue;                                  // nothing for a second: look at the flag
-    m.len = n;  m.timeout_ms = 10000;
-    if (tcp_send (&m) < 0) return;
-  }
-}
-
-int main (int argc, char **argv) {
-  int port = argc > 1 ? atoi (argv[1]) : 7007;
-  signal (SIGTERM, on_term);
-  if (tcp_listen (port) != 0) { printf ("echod: cannot listen on port %d\n", port);  return 1; }
-  while (!stop) {
-    int sock = tcp_accept (port, 1000);                    // sleeps until a client comes (at most a second)
-    if (sock == -1) { waitkey (100);  continue; }          // no room for a socket: try again soon
-    if (sock < 0) continue;                                // time over
-    echo (sock);
-    tcp_close (sock);
-  }
-  return 0;
-}
-@
-
-<<etc/rc.d/echod>>=
-# echod: the echo server (a test and an example of a server written as a program); listens on port 7007
-command="/bin/echod 7007"
-rcvar="echod_enable"
-default="NO"
-pidfile="/var/run/echod.pid"
-@
-
-\section{The test}
-
-\texttt{make listen-test} (\texttt{tools/listen\_test.py}) boots the shell kernel with a network card, on a copy of the disk whose
-\texttt{rc.conf} switches \texttt{echod} on. The boot starts the service before the login appears, and qemu forwards a port of the host
-to port 7007 of the kernel. The test then behaves like clients: one that sends text and gets it back, a second one that comes while the
-first one is still connected (it has to wait: the server serves one client at a time, and the queue of connections is the one of TCP), one
-that connects and leaves without a word, and one that sends 20000 bytes (more than the buffers of TCP hold). A boot with the default
-(\texttt{echod} off) must not answer on the port.
+\begin{itemize}
+\item \emph{No \texttt{select} or \texttt{poll}.} A server that waits for several things (client, terminal, second client) makes rounds with short waits, and
+  \texttt{tcp\_recv} returns early when the terminal has output. A general \texttt{poll} on sockets belongs to the Linux interface that musl needs (\texttt{socket},
+  \texttt{bind}, \texttt{poll}), which is being done separately; the calls of this chapter are not meant to replace it.
+\item \emph{One pseudo terminal, one session at a time}, and the terminal is always the fifth. Several sessions would need numbered pseudo terminals and a place for each
+  ring buffer.
+\item \emph{A signal does not interrupt a system call}, so a server looks at its flag at least once a second (\texttt{service stop} takes up to a second). See the section on
+  \texttt{tcp\_accept}.
+\item \emph{A port stays open when its server has ended.} Connections that arrive meanwhile wait for the next server (and are lost when the table of connections is full).
+\item \emph{Not tested on the Raspberry Pi.} Everything in this chapter was tested under qemu (\texttt{virtio-net}); the GENET driver and the board's timing have not seen it. The
+  board test of issue \#130 (``the telnet session on the Pi'') and \#129 (``SSH from a real client'') cover it and must be repeated with this version.
+\end{itemize}

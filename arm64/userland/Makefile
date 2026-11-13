@@ -17,7 +17,7 @@ BUILD    = build
 
 SKIP     =
 # new programs of the AArch64 port (the network is not part of the original Ulix; the rule for them is further down)
-NEWTOOLS = ping ping6 host ifconfig route dhclient shutdown poweroff reboot top sntp rand https daemon service heartbeat echod ptytest telnetd
+NEWTOOLS = ping ping6 host ifconfig route dhclient shutdown poweroff reboot top sntp rand https daemon service heartbeat echod ptytest telnetd sshd
 TOOLS    = $(filter-out $(SKIP),$(patsubst $(TOOLSRC)/%.c,%,$(wildcard $(TOOLSRC)/*.c))) $(NEWTOOLS)
 
 # GCC 4.4 accepted a lot that current compilers reject (return without value, missing types);
@@ -69,7 +69,7 @@ $(BUILD)/tools/free.c: $(TOOLSRC)/free.c $(BUILD)/ulixlib.h $(BUILD)/arm64-extra
 
 # new programs of the AArch64 port (the network is not part of the original Ulix): ping uses raw ICMP sockets, ifconfig, route and dhclient
 # are modelled on the BSD programs of the same names
-$(addprefix $(BUILD)/tools/,$(addsuffix .c,$(filter-out poweroff reboot https,$(NEWTOOLS)))): $(BUILD)/tools/%.c: %.c $(BUILD)/ulixlib.h $(BUILD)/arm64-extra.h
+$(addprefix $(BUILD)/tools/,$(addsuffix .c,$(filter-out poweroff reboot https sshd,$(NEWTOOLS)))): $(BUILD)/tools/%.c: %.c $(BUILD)/ulixlib.h $(BUILD)/arm64-extra.h
 	mkdir -p $(BUILD)/tools
 	cp $< $@
 
@@ -118,8 +118,28 @@ $(BUILD)/tls-libc.o: tls/libc.c
 $(BUILD)/bin/https.elf: $(BUILD)/crt0.o $(BUILD)/tools/https.o $(BUILD)/tls-glue.o $(BUILD)/tls-libc.o $(BUILD)/ulixlib.o $(BUILD)/libbearssl.a
 	mkdir -p $(BUILD)/bin
 	$(LD) $(LDFLAGS) -o $@ $(BUILD)/crt0.o $(BUILD)/tools/https.o $(BUILD)/tls-glue.o $(BUILD)/tls-libc.o $(BUILD)/ulixlib.o $(BUILD)/libbearssl.a
+
+# the SSH server (chapter "An SSH server"): the protocol is an ordinary program (CFLAGS), the cryptography file sees BearSSL's header files
+# and is compiled like the library (BRFLAGS); both are linked with the same libc functions and the same archive as https
+$(BUILD)/tools/sshd.c: sshd.c $(BUILD)/ulixlib.h $(BUILD)/arm64-extra.h $(BUILD)/tls-1.stamp
+	mkdir -p $(BUILD)/tools
+	cp $< $@
+
+$(BUILD)/tools/sshd.o: $(BUILD)/tools/sshd.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+$(BUILD)/ssh-crypto.o: sshcrypto.c tls/string.h
+	$(CC) $(BRFLAGS) -c -o $@ $<
+
+$(BUILD)/bin/sshd.elf: $(BUILD)/crt0.o $(BUILD)/tools/sshd.o $(BUILD)/ssh-crypto.o $(BUILD)/tls-libc.o $(BUILD)/ulixlib.o $(BUILD)/libbearssl.a
+	mkdir -p $(BUILD)/bin
+	$(LD) $(LDFLAGS) -o $@ $(BUILD)/crt0.o $(BUILD)/tools/sshd.o $(BUILD)/ssh-crypto.o $(BUILD)/tls-libc.o $(BUILD)/ulixlib.o $(BUILD)/libbearssl.a
 else
 $(BUILD)/tools/https.c: https-off.c $(BUILD)/ulixlib.h $(BUILD)/arm64-extra.h $(BUILD)/tls-0.stamp
+	mkdir -p $(BUILD)/tools
+	cp $< $@
+
+$(BUILD)/tools/sshd.c: sshd-off.c $(BUILD)/ulixlib.h $(BUILD)/arm64-extra.h $(BUILD)/tls-0.stamp
 	mkdir -p $(BUILD)/tools
 	cp $< $@
 endif

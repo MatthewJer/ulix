@@ -39,8 +39,6 @@ rcconf.c
 net_syscalls.c
 random.c
 sntp.c
-sshcrypto.c
-sshd.c
 stats.c
 bookfs_test.c
 thread_test.c
@@ -94,3 +92,7 @@ pty.c
 userland/ptytest.c
 userland/telnetd.c
 etc/rc.d/telnetd
+userland/sshd.c
+userland/sshcrypto.c
+userland/sshd-off.c
+etc/rc.d/sshd

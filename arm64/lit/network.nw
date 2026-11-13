@@ -69,17 +69,6 @@ extern int net_echo;                              // the kernel command line sai
 
 // ---- the configuration file /etc/rc.conf (rcconf.c) ----
 int  rc_conf_enabled (const char *variable, int fallback);   // is 'variable' set to YES in /etc/rc.conf? 'fallback' if the file or the line is missing
-extern int net_ssh;                               // the SSH server is on (sshd_enable in /etc/rc.conf; only in a system built with TLS=1: sshd.c)
-int  ssh_start (void);                            // open port 22: 0 = ok (needs a host key and random numbers)
-int  ssh_step (void);                             // serve the session a bit: 1 = something was moved
-void netd_nudge (void);                           // wake the network thread now (it has something to send)
-
-// ---- the pseudo terminal that a server (here: telnet.c and sshd.c; later programs) uses to hold a terminal (pty.c) ----
-extern int pty_vt;                                // the terminal that the session shows (-1: nobody holds one)
-int  pty_open (int vt, int who);                  // take the terminal vt: 0 = ok, -1 = in use, -3 = no such terminal (who: the process, 0 for the kernel)
-int  pty_get (u8 *buf, int max);                  // what the programs have written to the terminal since the last call (0: nothing)
-void pty_close (void);                            // hang up: the programs of the terminal end, the terminal is free again
-void pty_input (int vt, unsigned char c);         // a key typed in the session (arch_console.c)
 
 // ---- the echo service (echo.c) ----
 int  echo_start (void);                           // open port 7 (UDP and TCP): 0 = ok
@@ -2710,8 +2699,6 @@ extern void ip6_solicit (void);
 extern void ip6_format (char *out, const unsigned char *address);
 extern unsigned char ip6_global[16], ip6_router[16];
 extern int  ip6_have_global, ip6_have_router;
-extern int  ssh_start (void) __attribute__ ((weak));         // sshd.c (only when the system is built with TLS=1)
-extern int  ssh_step (void) __attribute__ ((weak));
 extern int  rc_conf_enabled (const char *variable, int fallback);
 extern void net_wake_all (void);                            // net_syscalls.c: wake the programs that wait for the network
 extern void gic_enable (int irq);
@@ -2722,15 +2709,12 @@ extern int  arch_thread_create_high (void (*entry) (void *), void *arg, const ch
 void netlog (const char *line);
 
 int netd_irq = 0;
-int net_ssh = 0;                              // the SSH server is on: sshd_enable in /etc/rc.conf (default YES), and the system has one
 static int running = 0, ticks_seen = 0;
 
 static void wake (void) {
   thread_id t = front_of_blocked_queue (floppy_queue);
   if (t) deblock (t, &floppy_queue);
 }
-
-void netd_nudge (void) { wake (); }            // a process has written something for the SSH session: send it now, not in 50 ms
 
 void netd_interrupt (void) {                  // the card has something: say so to the card, wake the thread
   net_dev_ack ();
@@ -2859,7 +2843,7 @@ static void netd_link6 (void) {
 static void netd (void *arg) {
   for (;;) {
     int moved;
-    do { moved = net_poll_once (); if (net_echo) moved |= echo_step (); if (net_ssh) moved |= ssh_step (); } while (moved);       // everything that is there
+    do { moved = net_poll_once (); if (net_echo) moved |= echo_step (); } while (moved);       // everything that is there
     netd_link6 ();                                                                            // (IPv6: a router solicitation, until a router has answered)
     netd_link ();                                                                             // (every two seconds: link? an address yet?)
     netlog_flush ();                                                                          // (the network log, if there is something for it)
@@ -2872,12 +2856,9 @@ void netd_start (void) {
   netd_irq = net_dev_start_irq ();
   if (netd_irq) gic_enable (netd_irq);
   if (net_echo && echo_start () != 0) printf ("netd: cannot open port 7\n");
-  net_ssh = ssh_start && rc_conf_enabled ("sshd_enable", 1);        // (a system built with TLS=0 has no SSH server at all)
-  if (net_ssh && ssh_start () != 0) net_ssh = 0;
   arch_thread_create_high (netd, 0, "netd");                       // (a high thread number: see arch_thread_create_high)
   running = 1;
   printf ("netd: network thread started (%s)%s\n", netd_irq ? "woken by the interrupt of the card" : "polling every 50 ms", net_echo ? ", echo service on port 7" : "");
-  if (net_ssh) printf ("netd: ssh server on port 22\n");
 }
 
 @
@@ -2959,7 +2940,7 @@ int rc_conf_enabled (const char *variable, int fallback) {
 \label{src:net_syscalls.c}
 
 Programs get raw ICMP sockets: they build ICMP messages themselves, the kernel puts them into IP packets ([[net.c]]). That is all
-that ``ping'' needs. TCP and UDP sockets for programs come later (then telnet can be a program, too).
+that ``ping'' needs. TCP sockets for programs were added with the TLS chapter ([[tcp_connect]] and friends) and the chapter on servers ([[tcp_listen]], [[tcp_accept]]); with them the telnet and SSH servers are programs.
 
 \begin{quote}\begin{verbatim}
     icmp_open ()           a socket number, or -1

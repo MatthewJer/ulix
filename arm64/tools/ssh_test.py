@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Test of the SSH server of Ulix: usage: ssh_test.py ulix-shell.bin DISK.img
 
-Boots the shell kernel with a network card and a random number generator. qemu forwards TCP port 5522 of the host to port 22 of the
+Boots the shell kernel with a network card and a random number generator; the boot starts the program /bin/sshd as the service sshd. qemu forwards TCP port 5522 of the host to port 22 of the
 kernel (10.0.2.15). The host's own ssh client (OpenSSH) is the other side: it checks the host key, makes the key exchange
 (curve25519-sha256), talks AES-128-CTR with HMAC-SHA-256, opens a session with a terminal and a shell, and a person (this
 program) logs in on the terminal with the password, runs programs, hangs up and connects again. A second boot with
@@ -54,7 +54,7 @@ class Ssh:
         while time.time() < end:
             with self.lock:
                 m = re.search(pattern, self.text, re.S)
-                if m: self.text = self.text[m.end():]; return True
+                if m: self.last = m; self.text = self.text[m.end():]; return True
             time.sleep(0.1)
         return False
     def send(self, s):
@@ -64,19 +64,25 @@ class Ssh:
 
 qemu, log = boot(disk)
 try:
-    check(wait_log(log, "netd: ssh server on port 22", 120), "the kernel started the SSH server (host key found, random numbers present, /etc/rc.conf says YES)")
-    m = re.search(r"netd: ssh host key ecdsa-sha2-nistp256 (SHA256:\S+)", console(log))
-    check(m is not None, "the kernel printed the fingerprint of its host key")
-    fingerprint = m.group(1) if m else ""
-    check(wait_log(log, "ulix login: esser", 60), "the system is up (the console logged in)")
+    check(wait_log(log, "ulix login: esser", 120), "the system is up (the boot started the services, among them the program sshd, before the login appeared)")
+    up = False
+    for _ in range(60):                                        # the server is a program: it answers when it has read the host key and called tcp_listen
+        try:
+            s = socket.create_connection(("127.0.0.1", PORT), timeout=5); s.settimeout(5)
+            up = s.recv(100).startswith(b"SSH-2.0-Ulix_1"); s.close()
+        except OSError:
+            up = False
+        if up: break
+        time.sleep(1)
+    check(up, "sshd is up (host key found, random numbers present, /etc/rc.conf says YES): a connection gets its banner")
     time.sleep(2)
 
-    # --- the host key: what the server sends in the key exchange is the key whose fingerprint the kernel printed
+    # --- the host key: what the server sends in the key exchange (compared later with the fingerprint that sshd -k prints in the session)
     scan = subprocess.run(["ssh-keyscan", "-p", str(PORT), "-t", "ecdsa", "127.0.0.1"], capture_output=True, text=True, timeout=60).stdout
     known = os.path.join(work, "known_hosts"); open(known, "w").write(scan)
     check("ecdsa-sha2-nistp256" in scan, "ssh-keyscan: the server answers the banner and the key exchange and offers an ECDSA P-256 host key")
     fp = subprocess.run(["ssh-keygen", "-lf", known], capture_output=True, text=True).stdout
-    check(fingerprint != "" and fingerprint in fp, "the key that the server sent has the fingerprint that the kernel printed (%s)" % fingerprint)
+    check("SHA256:" in fp, "ssh-keygen can read the key that the server sent (%s)" % fp.strip())
 
     # --- a client that does not know the key refuses the server (the host key is what proves who the server is)
     other = os.path.join(work, "other_key")
@@ -97,6 +103,8 @@ try:
             if not d: break
             got += d
         closed = True
+    except ConnectionResetError:                               # the server closed with our bytes still unread: TCP says reset, which is "closed" too
+        closed = True
     except socket.timeout:
         closed = False
     s.close()
@@ -113,6 +121,8 @@ try:
             if not d: break
             got += d
         closed = True
+    except ConnectionResetError:                               # the server closed with our bytes still unread: TCP says reset, which is "closed" too
+        closed = True
     except socket.timeout:
         closed = False
     s.close()
@@ -127,6 +137,9 @@ try:
     check(c.expect(r"root@ulix\[\d+\]:/root# ", 30), "the password is accepted by login: a root shell runs in the SSH session")
     c.send("ps\n")
     check(c.expect(r"(?s)PID\s+PPID.*tty4.*/bin/sh.*root@ulix\[\d+\]:/root# ", 30), "ps shows the shell on tty4, the terminal of the session")
+    c.send("sshd -k\n")
+    ok = c.expect(r"sshd: ssh host key ecdsa-sha2-nistp256 (SHA256:\S+)\s.*root@ulix\[\d+\]:/root# ", 30)
+    check(ok and c.last.group(1) in fp, "sshd -k (run in the session) prints the fingerprint of the host key, and it is the one that ssh-keyscan found")
     c.send("cat /etc/rc.conf\n")
     check(c.expect(r"(?s)sshd_enable=\"YES\".*root@ulix\[\d+\]:/root# ", 30), "cat /etc/rc.conf: output of a program comes back (several packets, both directions)")
 
@@ -157,7 +170,6 @@ try:
     check(wait_log(log, "netd: network thread started", 120), "second boot: the network thread started")
     check(wait_log(log, "ulix login: esser", 60), "second boot: the system is up")
     time.sleep(2)
-    check("ssh server" not in console(log), 'with sshd_enable="NO" the SSH server is not started')
     answered = False
     try:
         s = socket.create_connection(("127.0.0.1", PORT), timeout=5); s.settimeout(5)
