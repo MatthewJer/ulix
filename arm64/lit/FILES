@@ -82,6 +82,7 @@ linux_abi.c
 tools/mark_musl.py
 libc/hello.c
 pipes.c
+fastfs.c
 userland/daemon.c
 userland/service.c
 userland/heartbeat.c

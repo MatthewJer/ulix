@@ -776,6 +776,7 @@ int proc_test (void) {
   char expect[64];
   sprintf (expect, "%u bytes sum %u chunk", bigsize, kernel_sum);
   CHECK (pid > 0 && thread_table[pid].exitcode == 0 && bigsize > 65536 && count_in (out, expect) == 1, "readtest reads /muslhello64: size and sum of the bytes are the ones the kernel finds");
+  CHECK (requests < 100 && sectors < 2 * (int) (2 * bigsize / 1024 + 100), "starting readtest (114 KByte) and reading 154 KByte took fewer than 100 disk requests (361 before the multi-block read), and moved no more than the two files");
   CHECK (live_threads () == 0, "no process is left");
 
   arch_threads_reap ();

@@ -35,7 +35,9 @@ renames them to \texttt{book\_u\_read} and so on, as it does for the scheduler a
 have the book's names, look whether the descriptor is a pipe, and pass everything else on to the book:
 
 <<pipes.c: wrappers>>=
-int u_read (int fd, void *buf, int nbyte)  { return is_pipe (fd) ? pipe_read (fd, buf, nbyte)  : is_vdev (fd) ? vdev_read (fd, buf, nbyte)  : is_sock (fd) ? sock_read (fd, buf, nbyte) : book_u_read (fd, buf, nbyte); }
+extern int minix_read_fast (int gfd, void *buf, int nbyte);       // fastfs.c: -2 means that the call is not for the fast path
+static int file_read (int fd, void *buf, int nbyte) { int k = minix_read_fast (fd, buf, nbyte);  return k == -2 ? book_u_read (fd, buf, nbyte) : k; }
+int u_read (int fd, void *buf, int nbyte)  { return is_pipe (fd) ? pipe_read (fd, buf, nbyte)  : is_vdev (fd) ? vdev_read (fd, buf, nbyte)  : is_sock (fd) ? sock_read (fd, buf, nbyte) : file_read (fd, buf, nbyte); }
 int u_write (int fd, void *buf, int nbyte) {
   if (is_pipe (fd)) return pipe_write (fd, buf, nbyte);
   if (is_vdev (fd)) return vdev_write (fd, buf, nbyte);

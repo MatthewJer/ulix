@@ -1450,6 +1450,8 @@ The complete file is put together from these parts:
 
 <<glue.c: blk_disks>>
 
+<<glue.c: readblocks>>
+
 <<glue.c: hd_interrupt>>
 
 <<glue.c: part 4>>
@@ -1546,6 +1548,50 @@ void writeblock_hd (int hd, int blockno, char *buffer) {
   if (hd < 0 || hd >= blk_disks) return;
   hd_transfer (hd, 1, blockno, buffer, 1);
 }
+
+@
+---- many blocks with one request (section ``Reading many blocks with one request'' of the chapter on disks) ----
+[[readblocks]] reads [[count]] consecutive blocks of a disk into [[dest]]. The device is asked once ([[hd_transfer]] with
+[[count]] blocks: one request, one interrupt, one wake-up of the sleeping process), and the copy goes to a buffer of the
+kernel, [[run_buffer]], first: the destination may be a buffer of a user program (its addresses are not the physical
+ones the device needs) or a stack, and the device moves its data to {\em physically contiguous} memory only. One buffer
+for everybody means that a lock must protect it ([[run_lock]]): the reader sleeps on the disk interrupt, and another
+thread that starts a program must not fill the buffer meanwhile (the same bug that once hit the static buffers of the
+Minix reader, see section 30 of ARM64-PORT.md).
+
+The buffer cache of the book is bypassed on the way in (a 7 MByte program would push everything else out of its 512 blocks),
+but not on the way out: a block that the cache holds may be newer than the disk (a file that was written but not
+synced), so every block that [[buffer_contains]] finds is taken from the cache after the transfer.
+
+If the big request fails (the device refuses it), the blocks are read one at a time with [[readblock]], the way
+they always were: slower, and correct.
+
+<<glue.c: readblocks>>=
+#define RUN_BLOCKS 64                              // at most 64 KByte per request
+static char run_buffer[RUN_BLOCKS * BLOCK_SIZE] __attribute__ ((aligned (64)));
+static lock run_lock;
+
+int readblocks (int device, int first, int count, char *dest) {
+  int r = -1;
+  if (count < 1 || count > RUN_BLOCKS) return -1;
+  if (devmajor (device) == MAJOR_HD && devminor (device) / 64 < blk_disks) {
+    if (run_lock == NULL) run_lock = get_new_lock ("run buffer");
+    mutex_lock (run_lock);
+      r = hd_transfer (devminor (device) / 64, 0, first, run_buffer, count);
+      if (r == 0) {
+        memcpy (dest, run_buffer, count * BLOCK_SIZE);
+        for (int i = 0; i < count; i++)            // newer than the disk: blocks that the cache holds
+          if (buffer_contains (device, first + i)) buffer_read (device, first + i, dest + i * BLOCK_SIZE);
+      }
+    mutex_unlock (run_lock);
+  }
+  if (r != 0) {                                    // not a disk, or the request failed: block by block
+    for (int i = 0; i < count; i++) readblock (device, first + i, dest + i * BLOCK_SIZE);
+    r = 0;
+  }
+  return r;
+}
+
 
 @
 the interrupt handler of the disk: acknowledge, wake up the process that waits for the transfer
@@ -1842,6 +1888,8 @@ The complete file is put together from these parts:
 
 <<elf.c: what the loader found>>
 
+<<elf.c: window>>
+
 <<elf.c: elf_load>>
 @
 
@@ -1882,6 +1930,31 @@ u64 elf_phdr_va;                                       // address of the program
 int elf_phnum;
 
 @
+The loader copies a segment page by page into frames that are far apart in memory, so a request of the device cannot go
+straight into them. A window of 64 KByte does the job: [[window_read]] hands out the bytes of the page that is wanted, and
+when the page is not in the window (the first page, and then every sixteenth) it fills the window from the file with one
+call of [[minix_read]] --- which asks the disk for the whole 64 KByte at once, see [[minix_read]]. Loading the 7 MByte
+interpreter takes a bit more than a hundred requests instead of about fourteen thousand. The window is a static
+buffer; that is safe because only one program is loaded at a time ([[exec_lock]] in [[arch_thread.c]]; the boot code
+starts its programs one after the other), like the static [[eh]] and [[ph]] below. Every [[elf_load]] starts with an
+empty window.
+
+<<elf.c: window>>=
+#define WINDOW_SIZE 65536
+static u8 window[WINDOW_SIZE] __attribute__ ((aligned (64)));
+static u32 window_ino, window_start, window_len;
+
+static long window_read (u32 ino, u32 offset, void *dst, u32 n) {
+  if (!window_len || window_ino != ino || offset < window_start || offset + n > window_start + window_len) {
+    long got = minix_read (ino, offset, window, WINDOW_SIZE);
+    if (got < (long)n) { window_len = 0; return -1; }
+    window_ino = ino;  window_start = offset;  window_len = got;
+  }
+  for (u32 i = 0; i < n; i++) ((u8 *)dst)[i] = window[offset - window_start + i];
+  return n;
+}
+
+@
 returns 0 and the entry point on success; on failure the caller frees the address space
 
 <<elf.c: elf_load>>=
@@ -1889,6 +1962,7 @@ int elf_load (u64 l0, u32 ino, u64 *entry, u64 *image_end) {
   static struct ehdr eh __attribute__ ((aligned (16)));
   static struct phdr ph __attribute__ ((aligned (16)));
   u32 fsize = minix_size (ino);
+  window_len = 0;
 
   if (minix_read (ino, 0, &eh, sizeof eh) != sizeof eh)  return fail ("file too short");
   if (eh.ident[0] != 0x7f || eh.ident[1] != 'E' || eh.ident[2] != 'L' || eh.ident[3] != 'F')
@@ -1925,7 +1999,7 @@ int elf_load (u64 l0, u32 ino, u64 *entry, u64 *image_end) {
       if (!pa) return fail ("out of memory");
       u64 a = p > ph.vaddr ? p : ph.vaddr;               // file bytes that land in this page
       u64 b = p + PAGE_SIZE < file_end ? p + PAGE_SIZE : file_end;
-      if (a < b && minix_read (ino, ph.offset + (a - ph.vaddr), (u8 *)KVA (pa) + (a - p), b - a) != (long)(b - a)) {
+      if (a < b && window_read (ino, ph.offset + (a - ph.vaddr), (u8 *)KVA (pa) + (a - p), b - a) != (long)(b - a)) {
         free_frame (pa);
         return fail ("read error while loading a segment");
       }
@@ -2027,38 +2101,85 @@ static int get_inode (u32 n, struct inode *out) {
 }
 
 @
-zone number of the n-th zone of a file (0 = hole)
+A file is read in many steps (one per zone, or per run of zones), and every step needs the same things again: the inode and
+the zone numbers that are stored in the indirect zones. The first version looked them up from the disk each time: for a
+file in the double indirect range (more than 263 KByte: the Python interpreter) that is the inode, the double indirect
+zone, the indirect zone and the data zone for every single KByte, four requests where one would do. A [[struct reader]]
+keeps what the call has read so far: the inode and the last single, double and second level indirect zone, each with
+its own zone number (0: nothing read yet). It is a local variable of [[minix_read]], like all buffers of this file (see
+above): one call, one reader, nothing shared between threads, nothing to invalidate when the file changes.
 
 <<minixfs.c: file_zone>>=
-static u32 file_zone (struct inode *ino, u32 n) {
-  u32 ind[ZONE_SIZE / 4] __attribute__ ((aligned (16)));
-  if (n < 7) return ino->zone[n];
-  n -= 7;
-  if (n < 256) {
-    if (!ino->zone[7] || read_zone (ino->zone[7], ind)) return 0;
-    return ind[n];
-  }
-  n -= 256;
-  if (!ino->zone[8] || read_zone (ino->zone[8], ind)) return 0;
-  u32 l1 = ind[n / 256];
-  if (!l1 || read_zone (l1, ind)) return 0;
-  return ind[n % 256];
+struct reader {
+  struct inode ino;
+  u32 ind1[ZONE_SIZE / 4], ind1_zone;      // the indirect zone ino.zone[7] (after the first use)
+  u32 dind[ZONE_SIZE / 4], dind_zone;      // the double indirect zone ino.zone[8]
+  u32 ind2[ZONE_SIZE / 4], ind2_zone;      // the indirect zone that dind points to (the one that was needed last)
+};
+
+static void load_indirect (u32 zone, u32 *buf, u32 *have) {      // read an indirect zone unless it is the one that we have
+  if (*have == zone) return;
+  read_zone (zone, buf);
+  *have = zone;
 }
 
 @
-read up to len bytes at offset; returns number of bytes read
+zone number of the n-th zone of a file (0 = hole)
+
+<<minixfs.c: file_zone>>=
+static u32 file_zone (struct reader *rd, u32 n) {
+  struct inode *ino = &rd->ino;
+  if (n < 7) return ino->zone[n];
+  n -= 7;
+  if (n < 256) {
+    if (!ino->zone[7]) return 0;
+    load_indirect (ino->zone[7], rd->ind1, &rd->ind1_zone);
+    return rd->ind1[n];
+  }
+  n -= 256;
+  if (!ino->zone[8]) return 0;
+  load_indirect (ino->zone[8], rd->dind, &rd->dind_zone);
+  u32 l1 = rd->dind[n / 256];
+  if (!l1) return 0;
+  load_indirect (l1, rd->ind2, &rd->ind2_zone);
+  return rd->ind2[n % 256];
+}
+
+@
+The second change: zones that follow each other on the disk are read with one request. An allocator that fills a file from the
+start of a disk (and the program that builds the image does) gives it consecutive zone numbers, so a run of 64 zones
+(RUN\_ZONES, 64 KByte) is the normal case. Where the next position is the start of a zone and at least two whole zones are still
+wanted, the loop looks at the following zone numbers as far as they continue the run, and asks [[readblocks]] (in
+[[glue.c]]) for the whole run. Everything else (the first and last, partial zone, a hole, a run of one) takes the old way:
+one zone into a local buffer and a copy. [[readblocks]] falls back to single blocks itself if the device refuses the big
+request, so the answer is the same in every case, only the number of requests differs.
 
 <<minixfs.c: minix_read>>=
+extern int readblocks (int device, int first, int count, char *dest);
+#define RUN_ZONES 64
+
 long minix_read (u32 ino_nr, u32 offset, void *buf, u32 len) {
   u8 z[ZONE_SIZE] __attribute__ ((aligned (16)));
-  struct inode ino;
-  if (get_inode (ino_nr, &ino)) return -1;
-  if (offset >= ino.size) return 0;
-  if (len > ino.size - offset) len = ino.size - offset;
+  struct reader rd;
+  rd.ind1_zone = rd.dind_zone = rd.ind2_zone = 0;
+  if (get_inode (ino_nr, &rd.ino)) return -1;
+  if (offset >= rd.ino.size) return 0;
+  if (len > rd.ino.size - offset) len = rd.ino.size - offset;
   u32 done = 0;
   while (done < len) {
-    u32 pos = offset + done, zn = file_zone (&ino, pos / ZONE_SIZE);
-    u32 in = pos % ZONE_SIZE, n = ZONE_SIZE - in;
+    u32 pos = offset + done, first = pos / ZONE_SIZE, in = pos % ZONE_SIZE;
+    u32 zn = file_zone (&rd, first);
+    if (zn && in == 0 && len - done >= 2 * ZONE_SIZE) {          // whole zones: how many follow each other on the disk?
+      u32 most = (len - done) / ZONE_SIZE, run = 1;
+      if (most > RUN_ZONES) most = RUN_ZONES;
+      while (run < most && file_zone (&rd, first + run) == zn + run) run++;
+      if (run >= 2) {
+        if (readblocks (0x300, zn, run, (char *)buf + done)) return -1;      // DEV_HDA: one request for all of them
+        done += run * ZONE_SIZE;
+        continue;
+      }
+    }
+    u32 n = ZONE_SIZE - in;
     if (n > len - done) n = len - done;
     if (zn) { if (read_zone (zn, z)) return -1; }
     else    { for (int i = 0; i < ZONE_SIZE; i++) z[i] = 0; }

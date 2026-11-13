@@ -36,7 +36,7 @@ ROOT_ZONES ?= 16384
 # make TLS=0 builds a system without TLS: no BearSSL, no CA list on the disk, https only says so, and no SSH server (see lit/tls.nw, lit/ssh.nw)
 TLS ?= 1
 
-OBJS = start.o vectors.o linux_abi.o pipes.o sockets.o pty.o irq.o mmu.o virtio.o sdcard.o virtionet.o genet.o netdev.o net.o ip6.o tcp.o dhcp.o dns.o netconf.o echo.o net_test.o net_syscalls.o random.o sntp.o netd.o rcconf.o stats.o minixfs.o elf.o ulix-port.o glue.o arch_thread.o arch_console.o arch_clock.o arch_swap.o arch_vt.o dt.o gic.o smp.o \
+OBJS = start.o vectors.o linux_abi.o pipes.o fastfs.o sockets.o pty.o irq.o mmu.o virtio.o sdcard.o virtionet.o genet.o netdev.o net.o ip6.o tcp.o dhcp.o dns.o netconf.o echo.o net_test.o net_syscalls.o random.o sntp.o netd.o rcconf.o stats.o minixfs.o elf.o ulix-port.o glue.o arch_thread.o arch_console.o arch_clock.o arch_swap.o arch_vt.o dt.o gic.o smp.o \
        bookfs_test.o thread_test.o proc_test.o kmain.o
 
 all: ulix.elf ulix-console.elf ulix-shell.elf ulix.bin ulix-console.bin ulix-shell.bin $(DISK) $(GENDIR)/disk_expected.h
@@ -82,7 +82,7 @@ $(DISK3): tools/minix_mkfs.py tools/minix_add.py README.md
 
 $(GENDIR)/disk_expected.h: $(DISK) tools/disk_expected.py tools/minix_check.py
 	mkdir -p $(GENDIR)
-	python3 tools/disk_expected.py $(DISK) /init /bin/vi /hello.c /test.txt > $@
+	python3 tools/disk_expected.py $(DISK) /init /bin/vi /hello.c /test.txt /muslhello64 $(if $(filter 1,$(PYTHON)),/musl/python) > $@
 
 user/%.elf: FORCE
 	$(MAKE) -C user
@@ -165,6 +165,9 @@ netd.o: netd.c $(GENFILES) $(GENDIR)/ulix-api.h
 	$(CC) $(BOOKFLAGS) -Dhash=netd_unused_hash -c -o $@ $<
 
 linux_abi.o: linux_abi.c $(GENFILES) $(GENDIR)/ulix-api.h
+fastfs.o: fastfs.c $(GENFILES) $(GENDIR)/ulix-api.h
+	$(CC) $(BOOKFLAGS) -c -o $@ $<
+
 pipes.o: pipes.c $(GENFILES) $(GENDIR)/ulix-api.h
 	$(CC) $(BOOKFLAGS) -c -o $@ $<
 

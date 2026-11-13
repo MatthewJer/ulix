@@ -126,6 +126,7 @@ userland/heartbeat.c
 etc/rc.d/
 userland/echod.c
 pty.c
+fastfs.c
 userland/ptytest.c
 userland/telnetd.c
 userland/sshd.c

@@ -628,3 +628,31 @@ Interpreter 7.4 MByte stripped (4.4 MByte code, 1.4 MByte data); a start uses ab
 - Threads: see above; polling futex. Sockets: see above.
 - The 16-entry descriptor table (`MAX_PFD`) is a real limit for programs that open many files.
 - **Conflicts to expect when merging with `userspace-servers` (#124):** the wrappers in `pipes.c` (`u_read`, `u_write`, `u_close`, `u_reopen`), the table of `linux_abi.c` and the list in `lit/FILES`, `lit/CHAPTERS` and the Makefile object list; the number of entries in `/` (34 now) and the file system numbers 4 (pipes), 5 (made-up files) and 6 (sockets) are used here.
+
+## 32. Reading files fast (2026-11-13, branch `fast-read-stdlib`, issue #140)
+
+Why: `python -c print(6*7)` took one to three minutes under qemu (section 31 blamed the 7 MByte program being read in blocks of 1 KByte, one device interrupt each, and the test waited up to 400 s). The step was done **measurement first**; the book text is the section "Reading many blocks with one request" of the chapter on disks (`lit/disks.nw`).
+
+**Measurement (a).** `glue.c` counts requests and sectors (`hd_requests`, `hd_sectors`); `/musl/readtest FILE [CHUNK]` (new, `libc/readtest.c`) reads a file with `read ()` calls and prints size, byte sum and milliseconds; the kernel test starts it on `/muslhello64` and counts the requests; `disk_test` in `kmain.c` reads a file in one call and in small pieces and counts requests. Numbers (qemu `virt`, 2 CPUs, Apple silicon host; "before" is the commit before this section, `0c8cda2`):
+
+| what | before | after |
+|---|---|---|
+| exec of `/musl/python` (7.4 MByte): disk requests | 13 881 (about 2 per KByte) | 146 (one per 64 KByte, plus the indirect zones) |
+| exec of `/musl/python`: time in the loader | 5946 to 12 993 ticks (60 to 130 s) | 128 ticks (1.3 s) |
+| `/musl/readtest /musl/python 65536` (the book's `read ()` path) | 3491 ms (7200 requests) | 91 ms |
+| `python -c pass` in a login session | 199 s (first start), 93 s (second) | 6.6 s, 5.3 s (of which about 1.7 s are the typing and the prompt of the test script) |
+| kernel test: `readtest /musl/hello` (starting a 114 KByte program and reading 154 KByte) | 361 requests, 722 sectors | 7 requests, 434 sectors |
+| `/muslhello64` (151 zones) read by `minix_read` in one call (`disk_test`) | 151 or more requests | 6 requests |
+| `make pcheck` (36 jobs, 6 in parallel) | 506 s | 358 s (all green); the `python` test waits up to 120 s per start instead of 400 s |
+
+**What the measurement showed (the first guess was only half right).** The book's own `read ()` path moves a block in half a millisecond; it was the *kernel's* Minix reader (`minixfs.c`, used by `exec`) that made up to four requests per KByte: it re-read the inode and, above 263 KByte, the double indirect zone and the indirect zone below it for every single KByte, and the buffer cache of the book (512 blocks) cannot help while a 7 MByte file streams through it. Each request is a full trip through the interrupt path (sleep, interrupt, wake, scheduling), several timer ticks under load, hence 60 to 130 s.
+
+**What was done.**
+- *(b) `struct reader`* in `minixfs.c`: the inode and the last single/double/second-level indirect zone stay in memory for the length of one call of `minix_read`; a local variable, so no sharing between threads (the earlier bug with static buffers, section 30).
+- *(c) `readblocks (device, first, count, dest)`* in `glue.c`: one request for `count` blocks (at most 64). The drivers already took `n` sectors per request (virtio-blk: header, one data buffer of any length, status; the SD driver: `READ_MULTIPLE_BLOCK` with automatic stop, one interrupt per sector as before), so no descriptor chain was needed, only a caller. A kernel buffer (`run_buffer`, 64 KByte, protected by `run_lock`) takes the data and the caller gets a copy: the device needs physically contiguous memory, which user buffers, stacks and the scattered frames of the program loader are not. The buffer cache is bypassed on the way in (it would be flushed by one big file) and consulted on the way out (blocks that it holds are newer than the disk). If the big request fails the blocks are read one by one with `readblock`, as before. `minix_read` looks for runs of consecutive zone numbers and uses it for whole zones (two or more); partial first/last zones and holes take the old path. `elf_load` reads through a 64 KByte window (`window_read`) because the loader copies page by page into frames that are far apart.
+- *The user path.* The book's `mx_read` looks up the zone of every block again. `u_read` (the wrapper chain of `pipes.c`) now sends reads of two or more blocks from a regular file of the root disk, opened read-only, whose inode is clean, to `minix_read_fast` (new file `fastfs.c`), which uses `minix_read`; every other case goes to the book as before.
+- *(d) a block cache:* nothing new. The book has one (`buffer_cache`, 512 blocks, linear search). The measurement did not call for a second one: after (b) and (c) the loader needs 146 requests.
+
+**Tests.** `disk_test`: whole `/muslhello64` in one call = the sum computed by the host (`tools/disk_expected.py`), at most 8 requests, pieces of 1000 bytes give the same bytes; an unaligned range of 70001 bytes (one call vs pieces of 4096); with Python on the disk: a range across the border between single and double indirect zones (one call vs pieces of 1024), at most 10 requests. `proc_test`: `readtest /muslhello64` prints the sum that the kernel finds and needs fewer than 100 requests (it was 361). The test fails if the mechanism stops working, since the request count is part of it.
+
+**Not tested / open.** The SD path (`sd_submit` with up to 128 sectors, per-sector interrupts, the polled variant) is correct by construction and runs in qemu's `raspi4b` (job `rpi4` of `pcheck`), but **not on a real card**; a card or a controller may refuse 128 blocks in one command, in which case `readblocks` falls back to single blocks only if the request *fails* (a hang is not recovered). A scatter/gather chain (descriptor per page) would avoid the copy and the bounce buffer; it was not needed. The path of `open`/`stat` (`mx_pathname_to_ino` with up to 224 entries, each through several `readblock` calls) is slow as well: it was not touched, see the next section for how much it costs Python.

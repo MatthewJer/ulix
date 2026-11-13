@@ -662,6 +662,23 @@ static u32 file_sum (const char *path, u32 *size_out) {
 
 static void count_cb (u32 ino, const char *name, void *arg) { (*(int *)arg)++; }
 
+// the bytes offset ... offset+len-1 of a file, read with calls of PIECE bytes (piece = len: one call); the sum of the bytes,
+// and how many requests went to the disk meanwhile (glue.c counts them)
+extern int hd_requests;
+static u32 range_sum (u32 ino, u32 offset, u32 len, u32 piece, int *requests) {
+  static u8 buf[160000] __attribute__ ((aligned (16)));
+  int before = hd_requests;
+  u32 sum = 0;
+  for (u32 done = 0; done < len; ) {
+    u32 n = len - done < piece ? len - done : piece;
+    if (minix_read (ino, offset + done, buf, n) != (long)n) return 0xffffffffu;
+    for (u32 i = 0; i < n; i++) sum += buf[i];
+    done += n;
+  }
+  *requests = hd_requests - before;
+  return sum;
+}
+
 static void disk_test (void) {
   static u8 a[1024] __attribute__ ((aligned (16))), b[1024] __attribute__ ((aligned (16)));
   CHECK (blk_init () == 0, "virtio-blk device found and initialised");
@@ -705,6 +722,25 @@ static void disk_test (void) {
   CHECK (size == EXPECT_INIT_SIZE && sum == EXPECT_INIT_SUM && size > 7 * 1024, "/init: more than 7 KByte (indirect zone), checksum matches");
   sum = file_sum ("/bin/vi", &size);
   CHECK (size == EXPECT_BIN_VI_SIZE && sum == EXPECT_BIN_VI_SUM && size > 7 * 1024, "/bin/vi: through a subdirectory, checksum matches");
+
+  // reading many blocks with one request (issue #140, chapter "Disks"): the same bytes by one call and by many small ones, and
+  // the number of disk requests that the one call needed
+  u32 mh = minix_lookup ("/muslhello64");
+  int one = 0, many = 0;
+  u32 whole = range_sum (mh, 0, EXPECT_MUSLHELLO64_SIZE, EXPECT_MUSLHELLO64_SIZE, &one);
+  CHECK (whole == EXPECT_MUSLHELLO64_SUM, "/muslhello64 (150 zones) in one call: sum matches the one of the host");
+  CHECK (one <= 8, "that call needed at most 8 disk requests (inode, indirect zone, three runs of up to 64 zones), not one per zone");
+  u32 piecewise = range_sum (mh, 0, EXPECT_MUSLHELLO64_SIZE, 1000, &many);
+  CHECK (piecewise == EXPECT_MUSLHELLO64_SUM && many > 100, "the same file in pieces of 1000 bytes: same sum, but a request for (nearly) every zone");
+  printf ("  info: /muslhello64, %u bytes: %d requests in one call, %d in pieces of 1000 bytes\n", (unsigned)EXPECT_MUSLHELLO64_SIZE, one, many);
+  CHECK (range_sum (mh, 5, 70001, 70001, &one) == range_sum (mh, 5, 70001, 4096, &many) && one <= 7, "an unaligned range of 70001 bytes: one call and pieces of 4096 give the same bytes, at most 7 requests");
+#ifdef EXPECT_MUSL_PYTHON_SIZE
+  u32 py = minix_lookup ("/musl/python");
+  u32 around = 7 * 1024 + 256 * 1024 - 20000;                  // 20000 bytes before the end of the single indirect zone
+  CHECK (range_sum (py, around, 100000, 100000, &one) == range_sum (py, around, 100000, 1024, &many) && one <= 10,
+         "the Python interpreter across the border of single and double indirect zones: one call and pieces give the same bytes, at most 10 requests");
+  printf ("  info: /musl/python at %u: %d requests in one call of 100000 bytes, %d in pieces of 1024\n", around, one, many);
+#endif
 
   u8 text[64];
   long got = minix_read (minix_lookup ("/hello.c"), 0, text, 40);

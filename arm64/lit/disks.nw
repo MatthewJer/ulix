@@ -644,3 +644,91 @@ int sd_partitions (u64 *first, u64 *sectors, int max) {
   }
   return n;
 }
+@
+\section{Reading many blocks with one request (issue \#140)}
+\label{src:fastfs.c}
+
+\subsection*{What was slow, and why}
+
+Starting the Python interpreter took one to three minutes under qemu. The first guess, ``the disk is slow'', was wrong in an
+interesting way: the file is only 7.4~MByte, and the book's \texttt{read ()} path moves a block in half a millisecond. What
+the measurement of the first step showed was this. The kernel loads a program with its own small Minix reader
+(\texttt{minixfs.c}), one KByte at a time, and for every KByte it
+
+\begin{itemize}
+\item read the inode again (a block of the inode table),
+\item and, for a file in the double indirect range (everything above 263 KByte), read the double indirect zone, the indirect
+      zone below it and then the data zone,
+\end{itemize}
+
+all through the buffer cache of the book, which has 512 blocks and cannot hold what a 7~MByte program pushes through it. That
+is up to four disk requests for each KByte: 13\,881 requests for the interpreter, about two per KByte on the average.
+Every request means a trip through the whole interrupt path: the process goes to sleep in \texttt{harddisk\_queue}, the
+device interrupt wakes it, the scheduler runs it again --- in a loaded system several timer ticks after the data had arrived.
+That adds up to 60 to 130 seconds of the start. The fix has two halves that are independent of each other, and the second
+one only works because of the first.
+
+\subsection*{Half one: remember what was read}
+
+\texttt{minix\_read} keeps a small \texttt{struct reader} for the length of one call: the inode and the last indirect zones
+it has read, each with its zone number. The first KByte of a file costs an inode and perhaps two indirect zones; each of the next 255
+KByte costs nothing for the lookup. (The structure is a local variable of the function: the earlier bug with static buffers
+that a sleeping reader and a second thread overwrote, section 30 of \texttt{ARM64-PORT.md}, is the reason why nothing here is
+shared or kept between two calls.)
+
+\subsection*{Half two: one request for a run of zones}
+
+A file that was written to an empty disk by one process has consecutive zone numbers: zone $n$, $n+1$, $n+2$ and so on. With
+the zone numbers at hand, \texttt{minix\_read} looks at how far this holds and asks for the whole run at once, at most 64
+zones (64 KByte). The driver below already took more than one sector per request --- virtio-blk's request is a header, one
+data buffer of any length and a status byte, and the SD controller has the multi-block commands 18 and 25 --- so no new
+descriptor chain was needed; the only thing missing was a caller that asked for more than a block. That is \texttt{readblocks}
+(in \texttt{glue.c}), next to \texttt{readblock}, which the book's buffer cache and all its callers keep using:
+
+\begin{itemize}
+\item the data lands in a buffer of the kernel, \texttt{run\_buffer}, and is copied from there: a device moves its data to
+      \emph{physically contiguous} memory, which a user buffer or a stack is not, and the frames into which the program loader
+      copies are scattered all over RAM;
+\item the single buffer is protected by a lock, because the reader sleeps on the interrupt, and the thread that is scheduled
+      meanwhile may want to read, too;
+\item the buffer cache is not filled (7 MByte would push everything else out of it) but it is looked at: a block that the cache
+      holds may be newer than the disk, so it is taken from the cache after the transfer;
+\item if the request fails, the blocks are read one at a time with \texttt{readblock}, as before. Slower, and correct.
+\end{itemize}
+
+The program loader asks for one page at a time, for frames that are not next to each other, so \texttt{elf.c} keeps a window of 64
+KByte on the file: one call for the window, and the next 15 pages are copies from it.
+
+\subsection*{The path of a user program}
+
+The book's \texttt{read ()} goes through \texttt{mx\_read}, which does the same one block at a time (it keeps its inode in memory, but
+looks up the zone of every block again). A Python import reads a source file with one \texttt{read} of the file's size; that
+call should not become a hundred requests either. So the wrapper chain that \texttt{pipes.c} puts around the book's \texttt{u\_read}
+sends a read of two or more blocks on a regular file of the root disk, opened for reading, to \texttt{minix\_read\_fast}. The
+conditions are those under which the in-memory inode and the disk agree: the file is open read-only, the book's inode is
+\emph{clean} (it has not been changed since it was read), and the disk is the root disk, which \texttt{minixfs.c} serves. In
+every other case the function says ``not for me'' and the book does what it always did.
+
+<<fastfs.c>>=
+#define hash fastfs_hash                           // (the book's header defines a function of this name: keep it out of the link)
+#include "ulix-api.h"
+#undef hash
+
+extern long minix_read (unsigned ino_nr, unsigned offset, void *buf, unsigned len);       // minixfs.c
+
+// a read () of a regular file of the root disk that is longer than a block, by minix_read (one request for a run of zones);
+// -2: this call is not for the fast path, the book's mx_read does it
+int minix_read_fast (int gfd, void *buf, int nbyte) {
+  if (gfd < 0 || (gfd >> 8) != FS_MINIX || nbyte < 2 * BLOCK_SIZE) return -2;
+  struct mx_filestat *st = &mx_status[gfd & 0xff];
+  struct int_minix2_inode *in = st->int_inode;
+  if (in == NULL || st->mode != O_RDONLY) return -2;                      // (a file that is written is the book's business)
+  if (!in->clean || in->device != DEV_HDA || (in->i_mode & S_IFMT) != S_IFREG) return -2;
+  if (st->pos < 0 || st->pos >= (int) in->i_size) return 0;               // end of file
+  if (nbyte > (int) in->i_size - st->pos) nbyte = in->i_size - st->pos;
+  long got = minix_read (in->ino, st->pos, buf, nbyte);
+  if (got < 0) return -2;                                                 // let the book try and report the error
+  st->pos += got;
+  return got;
+}
+@
