@@ -266,6 +266,9 @@ int random_get (void *buf, int n) {
   return n;
 }
 
+
+// called once at boot: the virtio device needs two contiguous frames, which only exist while the boot-time allocator has some
+void random_init (void) { random_get (0, 0); }
 @
 \section{The time of day: the clock and an SNTP client (see \texttt{sntp.c})}
 \label{src:sntp.c}

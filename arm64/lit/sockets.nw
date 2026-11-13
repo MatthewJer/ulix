@@ -1,0 +1,366 @@
+\chapter{Sockets for Programs}
+\label{ch:sockets}
+
+Until now a program could use the network only through private system calls (\texttt{tcp\_connect}, \texttt{dns\_resolve}, \ldots, chapter
+\ref{ch:tls}). Programs that were written for Unix, such as the Python interpreter, call \texttt{socket}, \texttt{connect}, \texttt{sendto},
+\texttt{recvfrom}, \texttt{poll} and \texttt{getaddrinfo} of the C library, and musl turns these into the Linux system calls 198 to 210 and 73 (\texttt{ppoll}).
+This chapter is the kernel side (issue \#37): a socket is one more kind of file, next to files, devices, pipes and the files that the kernel makes up. It
+reuses the kernel's own network stack of chapter \ref{ch:network} (\texttt{tcp\_connect}, \texttt{tcp\_read}, \texttt{udp\_send}, \ldots), which was written for
+the kernel's own use and is polled: a program that waits for the network calls \texttt{net\_poll\_once} itself, as the private calls do.
+
+\paragraph{What is there.} IPv4 only. A \emph{stream socket} (\texttt{SOCK\_STREAM}) is a TCP connection that the program opens with
+\texttt{connect}; a \emph{datagram socket} (\texttt{SOCK\_DGRAM}) is a UDP port, \texttt{bind} chooses it (or the first \texttt{sendto} gets
+one) and it keeps the last four datagrams that arrive. \texttt{read} and \texttt{write} work on both (a stream, or a connected datagram socket), \texttt{send},
+\texttt{recv}, \texttt{sendto}, \texttt{recvfrom} too, \texttt{poll} and \texttt{select} ask which sockets (and pipes) can be read or written
+without waiting, a socket can be non-blocking (\texttt{SOCK\_NONBLOCK}, \texttt{O\_NONBLOCK}), \texttt{shutdown}, \texttt{getsockname}, \texttt{getpeername},
+\texttt{setsockopt} and \texttt{getsockopt} exist (the options are accepted and ignored, \texttt{SO\_ERROR} and \texttt{SO\_TYPE} are answered).
+
+\paragraph{What is not there.} \texttt{listen} and \texttt{accept} (a server in a program, issue \#124, is another piece of work and has its own calls), the
+other families (\texttt{AF\_INET6}, \texttt{AF\_UNIX}: \texttt{EAFNOSUPPORT}, which is what a resolver and \texttt{socketpair} users expect to handle), raw sockets,
+out-of-band data, \texttt{MSG\_PEEK}, ancillary data, \texttt{sendmsg}/\texttt{recvmsg}. A \texttt{bind} of a stream socket is remembered (the local port of the
+later connection) and nothing else.
+
+\section{Where it fits: one more kind of file}
+
+A socket is file system number 6, and the number inside it is the index in a table of 16 sockets, like a pipe (chapter \ref{ch:pipes}). The same four
+wrappers of the book's \texttt{u\_read}, \texttt{u\_write}, \texttt{u\_close} and \texttt{u\_reopen} (in \texttt{pipes.c}) pass the calls on to this file.
+\texttt{fork} copies a descriptor with \texttt{u\_reopen}: the child gets one more user of the same socket (\texttt{refs}), as with a pipe end, and the socket goes away when
+the last user has closed it.
+
+\section{The code}
+
+<<sockets.c>>=
+#define hash sockets_hash                          // (the book's header defines a function of this name: keep it out of the link)
+#include "ulix-api.h"
+#undef hash
+
+typedef unsigned char  u8;
+typedef unsigned short u16;
+typedef unsigned int   u32;
+typedef unsigned long  u64;
+typedef struct tcp_conn tcp_conn;
+extern tcp_conn *tcp_connect (u32 ip, u16 port);       // the kernel's network stack (net.c, tcp.c)
+extern int  tcp_established (tcp_conn *c), tcp_closed (tcp_conn *c), tcp_readable (tcp_conn *c), tcp_writable (tcp_conn *c);
+extern int  tcp_read (tcp_conn *c, u8 *buf, int max), tcp_write (tcp_conn *c, const u8 *data, int len);
+extern void tcp_close (tcp_conn *c);
+extern u32  tcp_id (tcp_conn *c);
+typedef void (*udp_handler) (u32 src_ip, u16 src_port, const u8 *data, int len);
+extern int  udp_bind (u16 port, udp_handler handler);
+extern void udp_unbind (u16 port);
+extern int  udp_send (u32 dst_ip, u16 dst_port, u16 src_port, const u8 *data, int len);
+extern int  net_poll_once (void);
+extern unsigned long long net_now_ms (void);
+extern u32  net_my_ip;
+extern void arch_resign (void), arch_poll_pause (void);
+
+#define FS_SOCK   6                                // the file system number of sockets (Minix 1, devices 3, pipes 4, made-up files 5)
+#define MAX_SOCKS 16
+#define SOCK_STREAM_ 1
+#define SOCK_DGRAM_  2
+
+// errors: the numbers of Linux (the functions that linux_abi.c calls directly return them as minus numbers; sock_read and sock_write turn
+// EAGAIN into the book's 35, because they are called by the book's descriptor functions and linux_error () of linux_abi.c turns 35 back into 11)
+#define E_INTR 4
+#define E_AGAIN 11
+#define E_INVAL 22
+#define E_PIPE 32
+#define E_NOTSOCK 88
+#define E_DESTADDRREQ 89
+#define E_PROTONOSUPPORT 93
+#define E_OPNOTSUPP 95
+#define E_AFNOSUPPORT 97
+#define E_ADDRINUSE 98
+#define E_NOBUFS 105
+#define E_ISCONN 106
+#define E_NOTCONN 107
+#define E_TIMEDOUT 110
+#define E_CONNREFUSED 111
+#define E_INPROGRESS 115
+#define E_MFILE 24
+
+struct dgram { u32 ip; u16 port; int len; u8 data[1472]; };
+
+struct sock {
+  int used, refs, type;
+  int nonblock;
+  tcp_conn *c;  u32 id;                              // stream: the connection (and its number, see tcp_id: the slot may be used again)
+  int connecting;                                    // stream: connect () has started and the handshake is not finished
+  int shut_write;                                    // shutdown (SHUT_WR) was called
+  u32 peer_ip;  u16 peer_port, local_port;           // (host byte order)
+  int connected;                                     // datagram: connect () has set the peer
+  struct dgram q[4];  int qhead, qcount;             // datagram: what has arrived and not been read
+};
+
+static struct sock socks[MAX_SOCKS];
+static u16 next_port = 50000;                        // local ports of datagram sockets that did not bind
+
+static struct sock *sock_of (int gfd) { return (gfd >= 0 && (gfd >> 8) == FS_SOCK && (gfd & 0xff) < MAX_SOCKS && socks[gfd & 0xff].used) ? &socks[gfd & 0xff] : 0; }
+int is_sock (int gfd) { return gfd >= 0 && (gfd >> 8) == FS_SOCK; }
+
+@
+\subsection{Receiving datagrams}
+
+The network stack calls a \emph{handler function} for a UDP port, and the function does not get an argument that says which socket the port belongs to.
+So there is one small function per socket (generated by a macro: \texttt{udp\_in0} to \texttt{udp\_in15}), each of them puts the datagram into the queue of its own socket.
+A datagram that arrives when the queue is full is dropped, as UDP is allowed to do.
+
+<<sockets.c>>=
+static void udp_in (int i, u32 src, u16 sport, const u8 *data, int len) {
+  struct sock *s = &socks[i];
+  if (!s->used || s->qcount == 4 || len > 1472) return;
+  struct dgram *d = &s->q[(s->qhead + s->qcount++) % 4];
+  d->ip = src;  d->port = sport;  d->len = len;
+  for (int k = 0; k < len; k++) d->data[k] = data[k];
+}
+#define UDP_IN(n) static void udp_in##n (u32 src, u16 sport, const u8 *data, int len) { udp_in (n, src, sport, data, len); }
+UDP_IN(0)  UDP_IN(1)  UDP_IN(2)  UDP_IN(3)  UDP_IN(4)  UDP_IN(5)  UDP_IN(6)  UDP_IN(7)
+UDP_IN(8)  UDP_IN(9)  UDP_IN(10) UDP_IN(11) UDP_IN(12) UDP_IN(13) UDP_IN(14) UDP_IN(15)
+static udp_handler udp_handlers[MAX_SOCKS] = { udp_in0, udp_in1, udp_in2, udp_in3, udp_in4, udp_in5, udp_in6, udp_in7,
+                                               udp_in8, udp_in9, udp_in10, udp_in11, udp_in12, udp_in13, udp_in14, udp_in15 };
+
+@
+\subsection{Making, copying and closing a socket}
+
+<<sockets.c>>=
+// a new socket: the global descriptor, or -1 (errno says why)
+int sock_new (int type, int nonblock) {
+  if (type != SOCK_STREAM_ && type != SOCK_DGRAM_) { set_errno (E_PROTONOSUPPORT);  return -1; }
+  for (int i = 0; i < MAX_SOCKS; i++)
+    if (!socks[i].used) {
+      u8 *p = (u8 *) &socks[i];
+      for (unsigned k = 0; k < sizeof socks[i]; k++) p[k] = 0;
+      socks[i].used = 1;  socks[i].refs = 1;  socks[i].type = type;  socks[i].nonblock = nonblock;
+      return (FS_SOCK << 8) | i;
+    }
+  set_errno (E_MFILE);
+  return -1;
+}
+
+static void sock_release (struct sock *s) {
+  if (s->type == SOCK_STREAM_ && s->c) { if (tcp_id (s->c) == s->id) tcp_close (s->c);  s->c = 0; }
+  if (s->type == SOCK_DGRAM_ && s->local_port) udp_unbind (s->local_port);
+  s->used = 0;
+}
+
+int sock_close (int gfd) {
+  struct sock *s = sock_of (gfd);
+  if (!s) return -1;
+  if (--s->refs <= 0) sock_release (s);
+  return 0;
+}
+
+int sock_reopen (int gfd) {
+  struct sock *s = sock_of (gfd);
+  if (s) s->refs++;
+  return gfd;
+}
+
+void sock_set_nonblock (int gfd, int on) { struct sock *s = sock_of (gfd); if (s) s->nonblock = on; }
+int  sock_is_nonblock (int gfd) { struct sock *s = sock_of (gfd); return s && s->nonblock; }
+int  sock_type (int gfd) { struct sock *s = sock_of (gfd); return s ? s->type : 0; }
+
+@
+\subsection{Waiting}
+
+Everything that waits does it in a loop: look at the network (\texttt{net\_poll\_once}), then give the CPU to the others. The loop also ends when a signal
+is pending (the call fails with \texttt{EINTR}) or when the time is up. \texttt{arch\_poll\_pause} lets the other CPUs into the kernel (chapter \ref{ch:processes}).
+
+<<sockets.c>>=
+// 0: the time has not come, E_INTR: a signal is pending, E_TIMEDOUT: the time is up (timeout_ms < 0: for ever)
+static int wait_a_little (unsigned long long start, long timeout_ms) {
+  if (thread_table[current_task].sig_pending) return E_INTR;
+  if (timeout_ms >= 0 && net_now_ms () - start >= (unsigned long long) timeout_ms) return E_TIMEDOUT;
+  net_poll_once ();
+  arch_resign ();
+  arch_poll_pause ();
+  return 0;
+}
+
+@
+\subsection{Connecting, binding}
+
+A stream socket connects to a TCP server and waits for the handshake (at most 30 seconds); a non-blocking socket starts it and answers \texttt{EINPROGRESS}, and the
+program finds out later with \texttt{poll} that the socket can be written (or has an error). A datagram socket does not talk to anybody: \texttt{connect} only
+remembers where the datagrams go, and \texttt{bind} or the first \texttt{sendto} takes a local port.
+
+<<sockets.c>>=
+static int bind_udp (struct sock *s, u16 port) {
+  if (s->local_port) return -E_INVAL;
+  if (!port) port = next_port++;
+  int i = s - socks;
+  if (udp_bind (port, udp_handlers[i]) != 0) return -E_NOBUFS;
+  s->local_port = port;
+  return 0;
+}
+
+int sock_bind (int gfd, u32 ip, u16 port) {
+  struct sock *s = sock_of (gfd);
+  if (!s) return -E_NOTSOCK;
+  if (s->type == SOCK_STREAM_) { s->local_port = port;  return 0; }     // remembered; listen () is not part of this chapter
+  return bind_udp (s, port);
+}
+
+// 0 when the connection is made, or minus an error number; a socket that was started earlier is waited for here
+static int stream_connect_wait (struct sock *s) {
+  unsigned long long start = net_now_ms ();
+  while (!tcp_established (s->c)) {
+    if (tcp_closed (s->c) || tcp_id (s->c) != s->id) { s->connecting = 0;  s->c = 0;  return -E_CONNREFUSED; }
+    int e = wait_a_little (start, 30000);
+    if (e) { if (e == E_TIMEDOUT) { tcp_close (s->c);  s->c = 0;  s->connecting = 0; }  return -e; }
+  }
+  s->connecting = 0;
+  return 0;
+}
+
+int sock_connect (int gfd, u32 ip, u16 port) {
+  struct sock *s = sock_of (gfd);
+  if (!s) return -E_NOTSOCK;
+  if (s->type == SOCK_DGRAM_) {
+    if (!s->local_port) { int e = bind_udp (s, 0);  if (e) return e; }
+    s->peer_ip = ip;  s->peer_port = port;  s->connected = 1;
+    return 0;
+  }
+  if (s->c) return s->connecting ? -E_INPROGRESS : -E_ISCONN;
+  s->c = tcp_connect (ip, port);
+  if (!s->c) return -E_NOBUFS;
+  s->id = tcp_id (s->c);  s->peer_ip = ip;  s->peer_port = port;  s->connecting = 1;
+  if (s->nonblock) return -E_INPROGRESS;
+  return stream_connect_wait (s);
+}
+
+@
+\subsection{Sending and receiving}
+
+A stream write goes into the send buffer of the connection (\texttt{tcp\_write} takes what fits); a blocking socket waits until everything is in, a non-blocking
+one returns what went in (or \texttt{EAGAIN} when nothing did). A write to a connection that is closed is \texttt{EPIPE} (musl's \texttt{send} adds \texttt{MSG\_NOSIGNAL}
+where it can; for \texttt{write} the signal \texttt{SIGPIPE} is not sent here). A stream read gives what has arrived; at the end of the stream it returns 0.
+
+<<sockets.c>>=
+static int stream_check (struct sock *s) {                          // the connection exists and is not a stale slot
+  if (!s->c) return -E_NOTCONN;
+  if (s->connecting) { if (s->nonblock && !tcp_established (s->c)) return -E_AGAIN;  int e = stream_connect_wait (s);  if (e) return e; }
+  if (tcp_id (s->c) != s->id) { s->c = 0;  return -E_NOTCONN; }
+  return 0;
+}
+
+static long stream_send (struct sock *s, const u8 *buf, u64 n) {
+  int e = stream_check (s);
+  if (e) return e;
+  if (s->shut_write) return -E_PIPE;
+  u64 sent = 0;
+  unsigned long long start = net_now_ms ();
+  while (sent < n) {
+    if (tcp_closed (s->c) || tcp_id (s->c) != s->id) return sent ? (long) sent : -E_PIPE;
+    int k = tcp_write (s->c, buf + sent, n - sent > 1400 ? 1400 : n - sent);
+    if (k < 0) return sent ? (long) sent : -E_PIPE;
+    sent += k;
+    if (k == 0) {
+      if (s->nonblock) return sent ? (long) sent : -E_AGAIN;
+      if (wait_a_little (start, -1)) return sent ? (long) sent : -E_INTR;
+    }
+  }
+  return sent;
+}
+
+static long stream_recv (struct sock *s, u8 *buf, u64 n) {
+  int e = stream_check (s);
+  if (e) return e;
+  unsigned long long start = net_now_ms ();
+  for (;;) {
+    int k = tcp_read (s->c, buf, n > 4096 ? 4096 : n);
+    if (k > 0) return k;
+    if (k < 0) return 0;                                              // the other side has closed: end of the stream
+    if (s->nonblock) return -E_AGAIN;
+    if (wait_a_little (start, -1)) return -E_INTR;
+  }
+}
+
+@
+A datagram is sent to the address in the call, or to the one that \texttt{connect} remembered. The first \texttt{sendto} of a socket that is not bound takes a local port.
+A datagram that is received is cut to the size of the buffer (the rest is lost, as with UDP), and the sender's address is given to the caller.
+
+<<sockets.c>>=
+static long dgram_send (struct sock *s, const u8 *buf, u64 n, u32 ip, u16 port, int has_addr) {
+  if (!has_addr) { if (!s->connected) return -E_DESTADDRREQ;  ip = s->peer_ip;  port = s->peer_port; }   // (an address in the call wins, as on Linux)
+  if (n > 1472) return -E_INVAL;
+  if (!s->local_port) { int e = bind_udp (s, 0);  if (e) return e; }
+  return udp_send (ip, port, s->local_port, buf, n) == 0 ? (long) n : -E_NOBUFS;
+}
+
+static long dgram_recv (struct sock *s, u8 *buf, u64 n, u32 *ip, u16 *port) {
+  unsigned long long start = net_now_ms ();
+  while (s->qcount == 0) {
+    if (s->nonblock) return -E_AGAIN;
+    if (wait_a_little (start, -1)) return -E_INTR;
+  }
+  struct dgram *d = &s->q[s->qhead];
+  u64 k = (u64) d->len < n ? (u64) d->len : n;
+  for (u64 i = 0; i < k; i++) buf[i] = d->data[i];
+  if (ip) *ip = d->ip;
+  if (port) *port = d->port;
+  s->qhead = (s->qhead + 1) % 4;  s->qcount--;
+  return k;
+}
+
+// the calls of linux_abi.c: the result is a count, or minus an error number
+long sock_send (int gfd, const void *buf, u64 n, u32 ip, u16 port, int has_addr) {
+  struct sock *s = sock_of (gfd);
+  if (!s) return -E_NOTSOCK;
+  return s->type == SOCK_STREAM_ ? stream_send (s, buf, n) : dgram_send (s, buf, n, ip, port, has_addr);
+}
+
+long sock_recv (int gfd, void *buf, u64 n, u32 *ip, u16 *port) {
+  struct sock *s = sock_of (gfd);
+  if (!s) return -E_NOTSOCK;
+  if (s->type == SOCK_DGRAM_) return dgram_recv (s, buf, n, ip, port);
+  if (ip) *ip = s->peer_ip;
+  if (port) *port = s->peer_port;
+  return stream_recv (s, buf, n);
+}
+
+// read and write of the book's descriptor functions: the book's convention (-1 and the error number in the process)
+static int as_book (long k) { if (k >= 0) return k;  set_errno (k == -E_AGAIN ? 35 : -k);  return -1; }
+int sock_read (int gfd, void *buf, int n)  { return as_book (sock_recv (gfd, buf, n, 0, 0)); }
+int sock_write (int gfd, void *buf, int n) { return as_book (sock_send (gfd, buf, n, 0, 0, 0)); }
+
+int sock_shutdown (int gfd, int how) {
+  struct sock *s = sock_of (gfd);
+  if (!s) return -E_NOTSOCK;
+  if (s->type == SOCK_STREAM_) {
+    if (!s->c) return -E_NOTCONN;
+    if (how == 1 || how == 2) { s->shut_write = 1;  tcp_close (s->c); }       // (the connection says goodbye; reading the rest still works)
+  }
+  return 0;
+}
+
+// the addresses of a socket (host byte order); 0, or minus an error number
+int sock_name (int gfd, int peer, u32 *ip, u16 *port) {
+  struct sock *s = sock_of (gfd);
+  if (!s) return -E_NOTSOCK;
+  if (peer) {
+    if (s->type == SOCK_STREAM_ ? !s->c : !s->connected) return -E_NOTCONN;
+    *ip = s->peer_ip;  *port = s->peer_port;
+  } else {
+    *ip = net_my_ip;  *port = s->local_port;
+  }
+  return 0;
+}
+
+@
+\subsection{Is it ready? (for \texttt{poll} and \texttt{select})}
+
+The bits are the ones of \texttt{poll}: \texttt{POLLIN} 1, \texttt{POLLOUT} 4, \texttt{POLLERR} 8, \texttt{POLLHUP} 16. A stream socket can be read when data
+has arrived or the other side has closed, and written when the connection is up and the send buffer has room; a connection that has failed has \texttt{POLLERR} and \texttt{POLLHUP}.
+A datagram socket can be read when a datagram is queued and can always be written.
+
+<<sockets.c>>=
+int sock_ready (int gfd) {
+  struct sock *s = sock_of (gfd);
+  if (!s) return 32;                                                   // POLLNVAL
+  if (s->type == SOCK_DGRAM_) return (s->qcount ? 1 : 0) | 4;
+  if (!s->c) return 4 | 16;                                            // not connected (any more): POLLOUT | POLLHUP, like Linux
+  if (tcp_id (s->c) != s->id) return 8 | 16;
+  if (s->connecting) { if (tcp_established (s->c)) { s->connecting = 0; return 4; }  return tcp_closed (s->c) ? 8 | 16 : 0; }
+  return (tcp_readable (s->c) ? 1 : 0) | (tcp_writable (s->c) ? 4 : 0) | (tcp_closed (s->c) ? 16 : 0);
+}
+@

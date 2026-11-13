@@ -6,7 +6,7 @@ usage: minix_add.py IMAGE [--grow=ZONES] [--mkdir=PATH ...] [--chmod=PATH:OCTAL 
 PATH may name a directory ("/bin/ls"); the directory must exist. If PATH already exists, the old
 file is removed first and its inode and zones are freed. --grow enlarges the file system to ZONES
 zones first (more room for write tests). Needed because mkfs.minix and mounting a Minix image are
-not available on macOS. Files up to 7 direct + 256 indirect zones (263 KByte) are supported.
+not available on macOS. Files up to 7 direct + 256 indirect + 256 * 256 double indirect zones (64 MByte) are supported.
 """
 import struct, sys, time
 
@@ -20,6 +20,7 @@ class Fs:
         if magic not in (0x2468, 0x2478) or logz != 0:
             sys.exit('not a Minix v2 image with 1 KByte zones (magic 0x%x)' % magic)
         self.dsize, self.nlen = (32, 30) if magic == 0x2478 else (16, 14)
+        self.zhint = 1
         self.imap_off, self.zmap_off = 2 * ZONE, (2 + self.imap_b) * ZONE
         self.ino_off = (2 + self.imap_b + self.zmap_b) * ZONE
         if grow: self.grow(grow)
@@ -44,12 +45,14 @@ class Fs:
         sys.exit('no free inode')
 
     def alloc_zone(self):
-        for n in range(1, self.nzones - self.first + 1):
+        for n in range(self.zhint, self.nzones - self.first + 1):   # (zones below zhint are known to be in use)
             if not self.bit(self.zmap_off, n):
-                self.setbit(self.zmap_off, n); return self.first + n - 1
+                self.setbit(self.zmap_off, n); self.zhint = n + 1; return self.first + n - 1
         sys.exit('no free zone')
 
-    def free_zone(self, z): self.clearbit(self.zmap_off, z - self.first + 1)
+    def free_zone(self, z):
+        self.clearbit(self.zmap_off, z - self.first + 1)
+        self.zhint = min(self.zhint, z - self.first + 1)
 
     def inode_at(self, n): return self.ino_off + (n - 1) * 64
     def get_inode(self, n):
@@ -123,12 +126,12 @@ class Fs:
         self.set_entry(dirnr, off, nr, name)
 
     # ---- files ----
-    def add_file(self, path, data):
+    def add_file(self, path, data, mode=0o100755, uid=0, gid=0, times=None):
         dirpath, _, name = path.rpartition('/')
         if len(name) > self.nlen: sys.exit('name too long: ' + name)
         dirnr = self.resolve_dir(dirpath or '/')
         nz = (len(data) + ZONE - 1) // ZONE
-        if nz > 7 + 256: sys.exit('file too large: ' + path)
+        if nz > 7 + 256 + 256 * 256: sys.exit('file too large: ' + path)
         off, old = self.lookup(dirnr, name)
         if old: self.free_file(old)                        # replace: free inode and zones of the old file
         nr = self.alloc_inode()
@@ -137,17 +140,27 @@ class Fs:
             self.put_zone(z, data[i * ZONE:(i + 1) * ZONE].ljust(ZONE, b'\0'))
         zones = zl[:7] + [0] * (7 - len(zl[:7]))
         zones += [0, 0, 0]
-        if nz > 7:
+        if nz > 7:                                         # one indirect block: 256 more zones
+            part = zl[7:7 + 256]
             ind = self.alloc_zone()
-            self.put_zone(ind, struct.pack('<256I', *(zl[7:] + [0] * (256 - (nz - 7)))))
+            self.put_zone(ind, struct.pack('<256I', *(part + [0] * (256 - len(part)))))
             zones[7] = ind
+        if nz > 7 + 256:                                   # a double indirect block: up to 256 blocks of 256 zones
+            dbl, blocks = self.alloc_zone(), []
+            for i in range(7 + 256, nz, 256):
+                part = zl[i:i + 256]
+                b = self.alloc_zone()
+                self.put_zone(b, struct.pack('<256I', *(part + [0] * (256 - len(part)))))
+                blocks.append(b)
+            self.put_zone(dbl, struct.pack('<256I', *(blocks + [0] * (256 - len(blocks)))))
+            zones[8] = dbl
         t = int(time.time())
-        self.put_inode(nr, dict(mode=0o100755, nlinks=1, uid=0, gid=0, size=len(data), times=(t, t, t), zones=zones))
+        self.put_inode(nr, dict(mode=mode, nlinks=1, uid=uid, gid=gid, size=len(data), times=times or (t, t, t), zones=zones))
         if old: self.set_entry(dirnr, off, nr, name)
         else:   self.add_entry(dirnr, nr, name)
         print('%s %-22s inode %3d, %6d bytes, %3d zones' % ('replaced' if old else 'added   ', path, nr, len(data), nz))
 
-    def mkdir(self, path):
+    def mkdir(self, path, mode=0o040755, uid=0, gid=0, times=None):
         """a new empty directory (with . and ..); the directory above it must exist; nothing happens if it exists"""
         dirpath, _, name = path.rstrip('/').rpartition('/')
         parent = self.resolve_dir(dirpath or '/')
@@ -158,7 +171,7 @@ class Fs:
         blk[self.dsize:2 * self.dsize] = struct.pack('<H', parent) + b'..'.ljust(self.dsize - 2, b'\0')
         self.put_zone(z, blk)
         t = int(time.time())
-        self.put_inode(nr, dict(mode=0o040755, nlinks=2, uid=0, gid=0, size=2 * self.dsize, times=(t, t, t), zones=[z] + [0] * 9))
+        self.put_inode(nr, dict(mode=mode, nlinks=2, uid=uid, gid=gid, size=2 * self.dsize, times=times or (t, t, t), zones=[z] + [0] * 9))
         self.add_entry(parent, nr, name)
         up = self.get_inode(parent)
         up['nlinks'] += 1                                  # the .. of the new directory
@@ -194,5 +207,6 @@ def main(image, specs):
         fs.chmod(path, int(mode, 8))
     fs.save(image)
 
-if len(sys.argv) < 3: sys.exit(__doc__)
-main(sys.argv[1], sys.argv[2:])
+if __name__ == '__main__':
+    if len(sys.argv) < 3: sys.exit(__doc__)
+    main(sys.argv[1], sys.argv[2:])

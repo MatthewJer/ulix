@@ -15,9 +15,9 @@ the same order. Four rules make it behave like a pipe:
 \begin{itemize}
 \item \texttt{read} on an empty pipe \emph{sleeps} until somebody writes, but if no process has the write end open any more
   (every writer closed it or ended), it returns 0: the end of the file.
-\item \texttt{write} on a full pipe sleeps until somebody has read, so a fast writer cannot overtake a slow reader.
-\item \texttt{write} on a pipe without a reader is an error: the writer gets the signal \texttt{SIGPIPE}, which ends it unless
-  it ignores the signal (then \texttt{write} returns $-1$). Nobody would ever read the bytes.
+\item write on a full pipe sleeps until somebody has read, so a fast writer cannot overtake a slow reader.
+\item write on a pipe without a reader is an error: the writer gets the signal \texttt{SIGPIPE}, which ends it unless
+  it ignores the signal (then write returns $-1$). Nobody would ever read the bytes.
 \item A pipe lives as long as one of its ends is open, in any process. \texttt{fork} gives the child the same two ends, and
   every process that ends closes its files, so the counts are right without further work.
 \end{itemize}
@@ -35,13 +35,30 @@ renames them to \texttt{book\_u\_read} and so on, as it does for the scheduler a
 have the book's names, look whether the descriptor is a pipe, and pass everything else on to the book:
 
 <<pipes.c: wrappers>>=
-int u_read (int fd, void *buf, int nbyte)  { return is_pipe (fd) ? pipe_read (fd, buf, nbyte)  : book_u_read (fd, buf, nbyte); }
-int u_write (int fd, void *buf, int nbyte) { return is_pipe (fd) ? pipe_write (fd, buf, nbyte) : book_u_write (fd, buf, nbyte); }
-int u_close (int fd)                       { if (!is_pipe (fd)) return book_u_close (fd);  pipe_close (fd);  return 0; }
+int u_read (int fd, void *buf, int nbyte)  { return is_pipe (fd) ? pipe_read (fd, buf, nbyte)  : is_vdev (fd) ? vdev_read (fd, buf, nbyte)  : is_sock (fd) ? sock_read (fd, buf, nbyte) : book_u_read (fd, buf, nbyte); }
+int u_write (int fd, void *buf, int nbyte) {
+  if (is_pipe (fd)) return pipe_write (fd, buf, nbyte);
+  if (is_vdev (fd)) return vdev_write (fd, buf, nbyte);
+  if (is_sock (fd)) return sock_write (fd, buf, nbyte);
+  int k = book_u_write (fd, buf, nbyte);
+  // the book prints the text on the terminal and then, because a return is missing, falls into the error case: a program that
+  // looks at the result of write (musl stdio and every cat) must see the number of bytes
+  if (k == -1 && (fd == DEV_STDOUT || fd == DEV_STDERR)) return nbyte;
+  return k;
+}
+int u_close (int fd) {
+  if (is_vdev (fd)) return 0;                       // nothing to give back
+  if (is_sock (fd)) return sock_close (fd);         // (sockets.c: the socket goes away with its last user)
+  if (!is_pipe (fd)) return book_u_close (fd);
+  pipe_close (fd);
+  return 0;
+}
 
 // fork () copies a file descriptor with u_reopen: for a file that is a new position in the file, for a pipe end it is one more
 // user of the same end
 int u_reopen (int fd) {
+  if (is_vdev (fd)) return fd;
+  if (is_sock (fd)) return sock_reopen (fd);
   if (!is_pipe (fd)) return book_u_reopen (fd);
   struct pipe *p = &pipes[(fd & 0xff) / 2];
   if (fd & 1) p->writers++;  else p->readers++;
@@ -49,8 +66,59 @@ int u_reopen (int fd) {
 }
 @
 
+Two more kinds of files use the same four wrappers: the files that the kernel makes up (below) and the sockets of chapter~\ref{ch:sockets}. And the wrapper of \texttt{u\_write} repairs one thing in the book: the book's code for the console prints the text and then, because a \texttt{return} is missing, falls into the error case, so \texttt{write (1, \ldots)} answers $-1$ although the text appeared; a program that looks at the result (every \texttt{cat}, and musl's \texttt{stdio} when it can) must get the number of bytes.
+
 That is the whole connection to the rest of the kernel. \texttt{syscall\_read}, \texttt{syscall\_write}, \texttt{syscall\_close}, \texttt{fork}
 and \texttt{exit} reach the pipe through these four functions and need no change.
+
+\section{Files that the kernel makes up: \texttt{/dev/null}, \texttt{/dev/zero}, \texttt{/dev/random}}
+\label{sec:pipes:vdev}
+
+A program written for Unix expects four more files that are not on the disk (issue \#45 for the random ones): \texttt{/dev/null}
+(reads end at once, writes vanish), \texttt{/dev/zero} (reads give zero bytes), \texttt{/dev/random} and \texttt{/dev/urandom} (read
+the random number generator). The device directory of the book has seven fixed entries and is shared with the x86 version, so it
+stays as it is. Instead the file system number 5 (\texttt{FS\_VDEV}) is one more kind of file next to pipes, and
+\texttt{u\_open} is wrapped in the same way as \texttt{u\_read} above (the book's function is renamed \texttt{book\_u\_open}): a name
+from the short list gives the descriptor \texttt{(5 * 256) + kind}, any other name goes to the book. Such a file has no state,
+so there is no table, nothing to close and nothing to copy for \texttt{fork}.
+
+The kernel hands out what the hardware generator gave, and nothing else (chapter~\ref{ch:tls}): without a generator
+\texttt{read} fails. \texttt{/dev/random} and \texttt{/dev/urandom} are the same file; Linux used to make \texttt{/dev/random} block
+until its pool is filled, and there is no pool here. They do not show up in a listing of \texttt{/dev} (the book's \texttt{readdir}
+does not know them), but \texttt{open} finds them.
+
+<<pipes.c: virtual devices>>=
+#define FS_VDEV   5                           // /dev/null, /dev/zero, /dev/random and /dev/urandom
+static const char *vdev_names[] = { "/dev/null", "/dev/zero", "/dev/random", "/dev/urandom" };
+enum { VDEV_NULL, VDEV_ZERO, VDEV_RANDOM, VDEV_URANDOM, VDEVS };
+
+static int is_vdev (int gfd) { return gfd >= 0 && (gfd >> 8) == FS_VDEV; }
+
+static int vdev_read (int gfd, void *buf, int n) {
+  switch (gfd & 0xff) {
+    case VDEV_NULL: return 0;                                            // end of file
+    case VDEV_ZERO: memset (buf, 0, n);  return n;
+    default: {
+      char tmp[256];                                                     // the generator is asked for a few bytes at a time
+      for (int done = 0; done < n; ) {
+        int part = n - done < 256 ? n - done : 256;
+        if (random_get (tmp, part) < 0) { set_errno (5);  return done ? done : -1; }       // EIO
+        memcpy ((char *) buf + done, tmp, part);
+        done += part;
+      }
+      return n;
+    }
+  }
+}
+
+static int vdev_write (int gfd, void *buf, int n) { return n; }          // everything is accepted (a write to /dev/random adds nothing)
+
+int u_open (char *path, int oflag, int open_link) {
+  for (int k = 0; k < VDEVS; k++)
+    if (strequal (path, (char *) vdev_names[k])) return (FS_VDEV << 8) | k;
+  return book_u_open (path, oflag, open_link);
+}
+@
 
 \section{The data structures}
 
@@ -160,6 +228,13 @@ static void pipe_close (int gfd) {
   if (p->readers == 0 && p->writers == 0) p->used = 0;      // nothing refers to it: the entry is free
   pipe_wake_all ();
 }
+
+// poll () and select () ask: can this end be read or written without waiting? (the bits of poll: POLLIN 1, POLLOUT 4, POLLERR 8, POLLHUP 16)
+int pipe_ready (int gfd) {
+  struct pipe *p = &pipes[(gfd & 0xff) / 2];
+  if (gfd & 1) return p->readers == 0 ? 8 : (p->count < PIPE_SIZE ? 4 : 0);                  // the write end: room, or nobody will ever read
+  return (p->count > 0 ? 1 : 0) | (p->writers == 0 ? 16 : 0);                                 // the read end: data, or nobody will ever write
+}
 @
 
 \section{When a process is killed}
@@ -195,6 +270,7 @@ void pipes_before_kill (int pid, int signo) {
   if (signal_ends_process (t, signo))
     for (int pfd = 0; pfd < MAX_PFD; pfd++)
       if (is_pipe (t->files[pfd])) { pipe_close (t->files[pfd]);  t->files[pfd] = -1; }
+      else if (is_sock (t->files[pfd])) { sock_close (t->files[pfd]);  t->files[pfd] = -1; }
 }
 @
 
@@ -260,12 +336,16 @@ extern int  book_u_read (int fd, void *buf, int nbyte);       // the book's func
 extern int  book_u_write (int fd, void *buf, int nbyte);
 extern int  book_u_close (int fd);
 extern int  book_u_reopen (int fd);
+extern int  book_u_open (char *path, int oflag, int open_link);
+extern int  random_get (void *buf, int n);                    // random.c
+extern int  is_sock (int gfd), sock_read (int gfd, void *buf, int n), sock_write (int gfd, void *buf, int n), sock_close (int gfd), sock_reopen (int gfd);   // sockets.c
 extern void arch_resign (void);
 
 <<pipes.c: pipe table>>
 <<pipes.c: read>>
 <<pipes.c: write>>
 <<pipes.c: close>>
+<<pipes.c: virtual devices>>
 <<pipes.c: wrappers>>
 <<pipes.c: kill>>
 <<pipes.c: pipe and dup2>>

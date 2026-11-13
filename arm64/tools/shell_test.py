@@ -166,7 +166,7 @@ try:
     for what in [b'login', b'/bin/sh', b'swapper', b'tty9', b'idle']:
         if what in seen: print('  ok:   ps lists %s' % what.decode())
         else: print('  FAIL: ps does not list %s' % what.decode()); fails += 1
-    run('df', r'/dev/hda\s+4096 K', 'df shows the disk')
+    run('df', r'/dev/hda\s+16384 K', 'df shows the disk')
     run('free', r'.', 'free runs')
 
     # a program that reads the terminal, ended with Ctrl-C

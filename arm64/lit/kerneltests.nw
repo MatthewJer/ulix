@@ -114,7 +114,7 @@ int bookfs_test (void) {
          "mx_stat: regular file, 316 bytes");
   CHECK (mx_stat (DEV, "/bin", &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR, "mx_stat: /bin is a directory");
   CHECK (mx_stat (DEV, "/nonexistent", &st) == -1, "mx_stat: missing file");
-  CHECK (count_entries ("/") == 33, "mx_getdent: / has 33 used entries (16 from x86 Ulix + 17 AArch64 files)");
+  CHECK (count_entries ("/") == 34, "mx_getdent: / has 34 used entries (16 from x86 Ulix + 18 AArch64 files and directories)");
   CHECK (count_entries ("/bin") == 83, "mx_getdent: /bin has 83 entries");
   CHECK (mx_file_exists (DEV, "/bin/vi") && mx_file_is_directory (DEV, "/bin") &&
          !mx_file_is_directory (DEV, "/bin/vi"), "mx_file_exists / mx_file_is_directory");
@@ -708,6 +708,46 @@ int proc_test (void) {
   CHECK (pid > 0 && thread_table[pid].exitcode == 0, "/muslhello64 (musl) finished with exit status 0 (no failed checks)");
   CHECK (count_in (out, "user FAIL") == 0 && count_in (out, "user ok:") == 25, "all 25 checks of the musl program passed");
   CHECK (count_in (out, "not implemented") == 0, "musl needed no Linux system call that the kernel does not have");
+  CHECK (live_threads () == 0, "no process is left");
+
+  // more programs on musl: the file calls (fstat, getdents64, dup3, pipe2, fcntl, O_TRUNC), and cat and ls in /musl
+  extern const char *random_source (void);
+  int has_rng = random_source ()[0] != 'n';                 // "none": qemu raspi4b has neither a virtio-rng nor an RNG200
+  char *ft_argv[] = { "filetest", "-n", 0 };
+  capture_start ();
+  pid = run ("/musl/filetest", has_rng ? 1 : 2, ft_argv);
+  capture_stop (&out);
+  arch_threads_reap ();
+  CHECK (pid > 0 && thread_table[pid].exitcode == 0, "/musl/filetest finished with exit status 0 (no failed checks)");
+  CHECK (count_in (out, "user FAIL") == 0 && count_in (out, "user ok:") == 29 - !has_rng, "all file checks of the musl program passed (29, or 28 on a machine without random number generator)");
+  CHECK (count_in (out, "not implemented") == 0, "the file test needed no Linux system call that the kernel does not have");
+  char *mthr_argv[] = { "threadtest", 0 };                    // threads: clone, futex, thread-local variables, exit with threads (musl's pthreads)
+  capture_start ();
+  pid = run ("/musl/threadtest", 1, mthr_argv);
+  capture_stop (&out);
+  arch_threads_reap ();
+  CHECK (pid > 0 && thread_table[pid].exitcode == 0, "/musl/threadtest finished with exit status 0 (no failed checks)");
+  CHECK (count_in (out, "user FAIL") == 0 && count_in (out, "user ok:") == 9, "all 9 thread checks of the musl program passed");
+  CHECK (count_in (out, "not implemented") == 0, "the thread test needed no Linux system call that the kernel does not have");
+  char *loc_argv[] = { "localetest", 0 };                   // locale C.UTF-8, wide characters, regular expressions (all of it is musl's own code)
+  capture_start ();
+  pid = run ("/musl/localetest", 1, loc_argv);
+  capture_stop (&out);
+  arch_threads_reap ();
+  CHECK (pid > 0 && thread_table[pid].exitcode == 0, "/musl/localetest finished with exit status 0 (no failed checks)");
+  CHECK (count_in (out, "user FAIL") == 0 && count_in (out, "user ok:") == 15, "all 15 locale, wide character and regular expression checks passed");
+  char *mcat_argv[] = { "cat", "/etc/rc.conf", 0 };
+  capture_start ();
+  pid = run ("/musl/cat", 2, mcat_argv);
+  capture_stop (&out);
+  arch_threads_reap ();
+  CHECK (pid > 0 && thread_table[pid].exitcode == 0 && count_in (out, "telnetd_enable") == 1, "/musl/cat prints /etc/rc.conf");
+  char *ls_argv[] = { "ls", "-l", "/musl", 0 };
+  capture_start ();
+  pid = run ("/musl/ls", 3, ls_argv);
+  capture_stop (&out);
+  arch_threads_reap ();
+  CHECK (pid > 0 && thread_table[pid].exitcode == 0 && count_in (out, "filetest") == 1 && count_in (out, " cat") == 1 && count_in (out, " ls") == 1, "/musl/ls -l /musl lists cat, ls and filetest");
   CHECK (live_threads () == 0, "no process is left");
 
   arch_threads_reap ();

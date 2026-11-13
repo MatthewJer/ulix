@@ -34,6 +34,16 @@ After a fresh clone: `git submodule update --init`. The licence-check template i
 
 See `LICENCE-CHECK-musl.md`.
 
+### cpython
+
+| field | content |
+|---|---|
+| upstream, tag | <https://github.com/python/cpython>, tag `v3.12.7`; the submodule is shallow (`git submodule update --init third_party/cpython`: about 100 MByte instead of 700) |
+| licence | PSF License Version 2 (`third_party/cpython/LICENSE`, "2.2 and above: GPL-compatible"), checked 2026-11-13; see `LICENCE-CHECK-cpython.md` |
+| why compatible with GPLv3 | the FSF lists the PSF licence as GPL-compatible; the notice and the licence text must stay with the code |
+| what we add | `arm64/libc/musl-cc` (compiler wrapper for configure), `arm64/libc/python-setup.local` (the modules that are built in), rules in `arm64/libc/Makefile`, `arm64/tools/python_test.py`, `arm64/libc/hello.py`; the chapter "Python" in `lit/libc.nw`; no patches |
+| what it costs | the stripped interpreter is 7.4 MByte (static, with the modules of `python-setup.local`); a start needs about 7 MByte of RAM for the image plus 3 to 4 MByte of heap; the build needs a Python 3.12 on the host (`BUILD_PYTHON`); it is switched off with `make PYTHON=0` and then not even compiled |
+
 ### bearssl
 
 | field | content |

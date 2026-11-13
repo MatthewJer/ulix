@@ -661,23 +661,31 @@ int page_in (int as, int pageno) {
 @
 Fault handler part of the book: ``check if page was paged out''.  Also resolves the access flag faults.
 Returns 1 if the instruction can be repeated.
-The user mode stack grows by a page when the program touches the page just below it (``page fault handler:
-enlarge user mode stack'' of the book; the stack is limited to 64 MByte and must not run into the heap).
+The user mode stack grows when the program touches a page below it (``page fault handler:
+enlarge user mode stack'' of the book; the stack is limited to 64 MByte and must not run into the heap). The book grows it by the one page
+just below the end; a function with a big local array (CPython's tokenizer and the parser have frames of 64 KByte and more) moves the stack
+pointer by much more than a page and touches an address that is several pages away. So every page between the old end and the touched
+address is added, if the address is at most 1 MByte below the old end (an access further away is still a wild pointer).
 
 <<arch_swap.c: USER_STACK_TOP>>=
 #define USER_STACK_TOP   0x80000000UL
 #define MAX_STACK        (64UL @<< 20)
 extern int map_page_in (u64 l0_pa, u64 va, u64 pa, u64 flags);
 
+#define STACK_JUMP       (1UL @<< 20)     // a function may reserve this much stack at once (a big local array) and touch it below the old end
+
 static int grow_stack (u64 l0, u64 va) {
   address_space *as = &address_spaces[current_as];
-  u64 bottom = USER_STACK_TOP - as->stacksize;
-  if (va > USER_STACK_TOP || va + PAGE < bottom) return 0;                  // not just below the stack
-  if (as->stacksize >= MAX_STACK || bottom - PAGE < as->memend + PAGE) return 0;
-  u64 pa = alloc_frame_try ();
-  if (!pa) return 0;
-  if (map_page_in (l0, bottom - PAGE, pa, PAGE_URW) != 0) { free_frame (pa); return 0; }
-  as->stacksize += PAGE;
+  u64 bottom = USER_STACK_TOP - as->stacksize, target = va & ~(PAGE - 1);
+  if (va > USER_STACK_TOP || va + STACK_JUMP < bottom) return 0;            // not near the stack
+  while (bottom > target) {                                                  // one page at a time, down to the page that was touched
+    if (as->stacksize >= MAX_STACK || bottom - PAGE < as->memend + PAGE) return 0;
+    u64 pa = alloc_frame_try ();
+    if (!pa) return 0;
+    if (map_page_in (l0, bottom - PAGE, pa, PAGE_URW) != 0) { free_frame (pa); return 0; }
+    as->stacksize += PAGE;
+    bottom -= PAGE;
+  }
   return 1;
 }
 

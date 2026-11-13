@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 """Make an empty Minix v2 file system (1 KByte zones, 30 character names) in a new image file.
 
-usage: minix_mkfs.py IMAGE ZONES
+usage: minix_mkfs.py IMAGE ZONES [--inodes=N]
 
 Like mkfs.minix -2 -n 30, which is not available on macOS. The image gets an empty root directory.
-Used for the second disk of the ARM64 port (/dev/hdb, mounted on /tmp like on the x86).
+--inodes sets the number of inodes (default: a quarter of the zones). The book's mx_unlink and mx_rmdir free a zone with the
+constant 33 (the floppy's first data zone is 34), so a root disk that is used with them must also start its data at zone 34:
+464 inodes and 16384 zones do that (see the Makefile). Used for the second disk of the ARM64 port (/dev/hdb, mounted on /tmp like on the x86).
 """
 import struct, sys, time
 
 ZONE = 1024
-if len(sys.argv) != 3: sys.exit(__doc__)
+opts = [a for a in sys.argv[3:] if a.startswith('--inodes=')]
+if len(sys.argv) < 3 or len(sys.argv) - 3 != len(opts): sys.exit(__doc__)
 image, nzones = sys.argv[1], int(sys.argv[2])
 
-ninodes = nzones // 4
+ninodes = int(opts[0][9:]) if opts else nzones // 4
 imap_b = (ninodes + 1 + 8 * ZONE - 1) // (8 * ZONE)
 inode_blocks = (ninodes * 64 + ZONE - 1) // ZONE
 # the zone map needs one bit per data zone (bit 0 of the map is unused); first is the number of the first data zone

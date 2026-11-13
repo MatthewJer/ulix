@@ -9,6 +9,7 @@ tls
 tlsuser
 ssh
 pipes
+sockets
 daemons
 kerneltests
 userland

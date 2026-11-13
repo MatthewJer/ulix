@@ -77,6 +77,8 @@ The complete file is put together from these parts:
 
 <<arch_thread.c: arch_syscall_pthread_exit>>
 
+<<arch_thread.c: linux threads>>
+
 <<arch_thread.c: mutex_of>>
 
 <<arch_thread.c: part 28>>
@@ -153,6 +155,7 @@ extern void smp_boot_init (void), smp_start (void), smp_unmark (void), smp_stop_
 extern int  smp_running_elsewhere (thread_id t);
 extern int  bkl_depth (void);
 extern void bkl_set_depth (int d);
+extern void bkl_lock (void);
 extern void bkl_unlock (void);
 extern void arch_idle (void);
 static struct kctx *ctx_of (thread_id t) { return t == 1 ? &idle_kctx[smp_cpu ()] : &kctx[t]; }
@@ -578,6 +581,7 @@ static int map_sigpage (u64 l0) {
   return map_page_in (l0, SIGPAGE_VA, pa, PAGE_URX);
 }
 
+extern int random_get (void *buf, int n);             // random.c
 static u64 build_linux_stack (byte *page, u64 base, u64 sp, int argc, u64 *ptrs);
 static u64 build_user_stack (u64 l0, int argc, char **argv, int musl_abi) {
   u64 top_pa = 0;
@@ -621,8 +625,8 @@ A program that speaks the Linux system call interface finds the same start-up in
 reads it from there: at the stack pointer the number of arguments, then the [[argv]] pointers and a null pointer, the
 [[environ]] pointers and a null pointer, and then the \emph{auxiliary vector}: pairs of (type, value) that end with a pair of type
 zero. musl needs from it the page size, the address of the program headers (to find the thread-local storage segment) and
-sixteen random bytes (for the stack protector canary). The random bytes are made from the cycle counter here, which is
-enough for a canary but not for cryptography. The environment holds one string, [[PATH]].
+sixteen random bytes (for the stack protector canary). The random bytes come from the hardware generator (\texttt{random\_get}, issue \#45);
+on a machine without one the cycle counter is used, which is enough for a canary but not for cryptography. The environment holds one string, [[PATH]].
 
 <<arch_thread.c: build_linux_stack>>=
 #define AT_PHDR    3
@@ -638,8 +642,10 @@ static u64 build_linux_stack (byte *page, u64 base, u64 sp, int argc, u64 *ptrs)
   u64 env0_va = sp;
   sp -= 16;                                              // sixteen random bytes
   u64 rnd_va = sp, t;
-  __asm__ volatile ("mrs %0, cntpct_el0" : "=r" (t));
-  for (int i = 0; i < 16; i++) { t = t * 6364136223846793005UL + 1442695040888963407UL; page[sp - base + i] = t >> 56; }
+  if (random_get (page + (sp - base), 16) < 0) {         // no generator on this machine: the cycle counter is enough for a canary
+    __asm__ volatile ("mrs %0, cntpct_el0" : "=r" (t));
+    for (int i = 0; i < 16; i++) { t = t * 6364136223846793005UL + 1442695040888963407UL; page[sp - base + i] = t >> 56; }
+  }
   u64 auxv[] = { AT_PHDR, elf_phdr_va, AT_PHENT, 56, AT_PHNUM, elf_phnum, AT_PAGESZ, PAGE, AT_RANDOM, rnd_va, 0, 0 };
   int words = 1 + (argc + 1) + 2 + sizeof auxv / 8;      // argc, argv and its null, environ and its null, auxv
   sp = (sp - words * 8) & ~15UL;
@@ -1007,6 +1013,123 @@ void arch_syscall_pthread_exit (context_t *r) {
 }
 
 @
+\subsection{Threads for programs that use musl: \texttt{clone}, thread exit, \texttt{exit\_group}}
+\label{sec:linux-threads}
+
+musl's \texttt{pthread\_create} makes a thread with \texttt{clone (CLONE\_VM | CLONE\_FS | CLONE\_FILES | CLONE\_SIGHAND | CLONE\_THREAD | CLONE\_SETTLS |
+CLONE\_PARENT\_SETTID | CLONE\_CHILD\_CLEARTID, stack, \&tid, tls, \&lock)}. For the kernel that is the same thing as the book's
+\texttt{pthread\_create} above (a thread control block of its own, a kernel stack of its own, the address space and the descriptors of
+the process), with three differences: the new thread starts \emph{in the middle of the system call}, with the registers of its creator
+(musl's \texttt{\_\_clone} continues there with a function and an argument that it put on the new stack), only \texttt{x0} is $0$ and the
+stack pointer is the one that was given; its thread pointer (\texttt{tpidr\_el0}, where musl keeps \texttt{errno} and the other
+thread-local data) is the \texttt{tls} argument; and the kernel has to remember an address, \texttt{clear\_tid}: when the thread ends, the
+kernel writes $0$ there and wakes everybody who waits on it (a \texttt{futex}, see \texttt{linux\_abi.c}). \texttt{pthread\_join} and the lock of
+the list of threads work through that word. \texttt{set\_tid\_address} sets the same word for the thread that calls it.
+
+<<arch_thread.c: linux threads>>=
+extern void futex_wake_address (u64 addr, int n);                  // linux_abi.c
+extern void bkl_set_depth (int d);
+extern void bkl_lock (void);
+
+// A thread that waits in a loop (nanosleep, futex) calls arch_resign () to let the others run. With several CPUs that is not enough:
+// when no other thread is ready on this CPU, the loop would keep the big kernel lock for ever and a thread on the other CPU could
+// never enter the kernel to wake it. So the lock is given up for a moment, as the idle loop does.
+void arch_poll_pause (void) {
+  int d = bkl_depth ();
+  bkl_set_depth (1);
+  bkl_unlock ();
+  for (int i = 0; i < 200; i++) __asm__ volatile ("yield");
+  bkl_lock ();
+  bkl_set_depth (d);
+}
+static u64 clear_tid[MAX_THREADS];                                 // the word that the kernel clears when the thread ends (0: none)
+static int as_dying[MAX_ADDR_SPACES], as_exit_code[MAX_ADDR_SPACES];     // exit_group is under way in this address space
+
+void arch_set_clear_tid (thread_id t, u64 addr) { clear_tid[t] = addr; }
+
+int arch_clone_thread (context_t *r, u64 stack, u64 tls, int set_tls) {
+  arch_threads_reap ();
+  TCB *to = &thread_table[current_task];
+  addr_space_id as = current_as;
+  thread_id nt = register_new_tcb (as);
+  if (nt == -1) return -1;
+  TCB *tn = &thread_table[nt];
+  *tn = *to;                                   // like the book: copy the TCB, then fix it up
+  tn->used = true;
+  tn->state = TSTATE_FORK;
+  tn->tid = nt;
+  tn->addr_space = as;
+  tn->pid = to->pid;                           // same process: it shares the descriptors
+  tn->ppid = to->ppid;
+  tn->sig_pending = 0;
+  context_t f = *r;                            // the new thread continues exactly where its creator is ...
+  f.eax = 0;                                   // ... and clone () returns 0 there
+  f.sp_el0 = stack;
+  if (kstack_for_process (nt, &f, 0) != 0) { tn->used = false; return -1; }
+  kctx_user_state_copy_live (&kctx[nt]);       // the FP registers of the creator; the thread pointer is the one that was asked for
+  if (set_tls) kctx[nt].tpidr = tls;
+  clear_tid[nt] = 0;
+  address_spaces[as].refcount++;
+  add_to_ready_queue (nt);
+  return nt;
+}
+
+@
+\paragraph{Ending.} \texttt{exit} of a thread (not the last one) writes $0$ to its \texttt{clear\_tid} word, wakes the futex and goes away
+like \texttt{pthread\_exit} of the book. \texttt{exit\_group} ends the whole process: the caller marks the address space as dying and
+leaves; every other thread notices the mark when it returns to user mode (the same place where signals are delivered) and ends itself.
+The main thread is the last one to go: it waits until it is alone (at most two seconds; a thread that sleeps in a pipe or a file never
+returns to user mode, so after that it is killed like a process), then it ends the process with the exit status, so that the parent's
+\texttt{waitpid} finds it where it expects it. \texttt{exit} of the main thread, while other threads run, is treated like
+\texttt{exit\_group} (POSIX lets the others go on; no program of this system needs that).
+
+<<arch_thread.c: linux threads>>=
+extern u64 user_to_phys (u64 va, int write);
+
+static void thread_clear_tid (void) {
+  u64 a = clear_tid[current_task];
+  clear_tid[current_task] = 0;
+  if (a && user_to_phys (a, 1)) { *(int *) a = 0; futex_wake_address (a, 0x7fffffff); }
+}
+
+static unsigned long long counter_now (void) { unsigned long long c; __asm__ volatile ("mrs %0, cntpct_el0" : "=r" (c)); return c; }
+
+// the main thread ends the process once the other threads are gone
+static void main_thread_ends_process (context_t *r, int code) {
+  unsigned long long freq, start = counter_now ();
+  __asm__ volatile ("mrs %0, cntfrq_el0" : "=r" (freq));
+  while (address_spaces[current_as].refcount > 1 && counter_now () - start < 2 * freq) { arch_resign ();  arch_poll_pause (); }
+  if (address_spaces[current_as].refcount > 1)                       // some thread sleeps in the kernel: it has to be killed
+    for (thread_id t = 2; t < MAX_THREADS; t++)
+      if (t != current_task && thread_table[t].used && thread_table[t].addr_space == current_as) u_kill (t, SIGKILL);
+  as_dying[current_as] = 0;
+  r->ebx = code;
+  syscall_exit (r);                                                  // does not return
+}
+
+void arch_linux_exit (context_t *r, int code, int group) {
+  TCB *t = &thread_table[current_task];
+  if (address_spaces[current_as].refcount <= 1) { r->ebx = code; syscall_exit (r); return; }
+  if (group || t->pid == current_task) { as_dying[current_as] = 1; as_exit_code[current_as] = code; }
+  if (t->pid == current_task) { main_thread_ends_process (r, code); return; }
+  thread_clear_tid ();
+  r->ebx = 0;
+  arch_syscall_pthread_exit (r);                                     // does not return
+}
+
+// called when a thread returns to user mode (arch_signal_check): if another thread called exit_group, this one ends too
+void arch_check_dying (context_t *f) {
+  if (!as_dying[current_as] || f->elr >= 0x80000000UL) return;
+  TCB *t = &thread_table[current_task];
+  if (t->pid == current_task) main_thread_ends_process (f, as_exit_code[current_as]);
+  thread_clear_tid ();
+  f->ebx = 0;
+  arch_syscall_pthread_exit (f);
+}
+
+int arch_as_dying (void) { return as_dying[current_as]; }        // a thread that waits in the kernel gives up when it is true
+
+@
 \subsection{pthread mutexes: the user mutex is the index of a kernel lock (the book stores the pointer in an int)}
 
 <<arch_thread.c: mutex_of>>=
@@ -1227,7 +1350,9 @@ static void fp_load (struct sigframe *sf) {
 extern int linux_signal_number (int signo);
 extern u64 linux_signal_restorer (void);
 
+void arch_check_dying (context_t *f);
 void arch_signal_check (context_t *f) {
+  arch_check_dying (f);                                             // exit_group of another thread
   TCB *t = &thread_table[current_task];
   if (!t->sig_pending || f->elr >= 0x80000000UL) return;            // nothing pending / not in user mode
   for (int signo = 0; signo < 32; signo++) {
@@ -1626,6 +1751,8 @@ typedef unsigned char u8;
 #define KVA(pa)     ((void *)(KERNEL_VA + (u64)(pa)))
 #define PA(va)      ((u64)(va) - KERNEL_VA)
 #define PAGE_SIZE   4096UL
+
+void random_init (void);                       // random.c: called once at boot (the virtio device needs contiguous frames)
 
 // user address space layout (TTBR0)
 #define USER_CODE       0x00400000UL

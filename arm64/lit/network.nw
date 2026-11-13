@@ -97,6 +97,7 @@ int  icmp_get (int socket, u8 *buf, int max, u32 *from);      // the oldest mess
 
 typedef void (*udp_handler) (u32 src_ip, u16 src_port, const u8 *data, int len);
 int  udp_bind (u16 port, udp_handler handler);
+void udp_unbind (u16 port);                                     // the port is free again (sockets.c closes its UDP sockets with it)
 int  udp_send (u32 dst_ip, u16 dst_port, u16 src_port, const u8 *data, int len);
 
 // ---- configuration (netconf.c, dhcp.c) ----
@@ -125,6 +126,8 @@ int  tcp_listen (u16 port);                                   // accept connecti
 tcp_conn *tcp_accept (u16 port);                              // a new connection to a listening port, or 0 if none is waiting
 tcp_conn *tcp_connect (u32 ip, u16 port);                     // start a connection (tcp_established () tells when it is up), 0 = no room
 int  tcp_established (tcp_conn *c);                           // 1 = data can be sent and received
+int  tcp_readable (tcp_conn *c);                              // 1 = tcp_read () returns at once (data, or the end of the stream)
+int  tcp_writable (tcp_conn *c);                              // 1 = tcp_write () takes at least one byte
 u32  tcp_id (tcp_conn *c);                                    // a number for this connection; it changes when the slot is used for another one
 int  tcp_closed (tcp_conn *c);                                // 1 = the connection is gone: do not use the pointer any more
 int  tcp_read (tcp_conn *c, u8 *buf, int max);                // bytes received (0: nothing now), -1: the other side has closed (and all was read)
@@ -1197,13 +1200,18 @@ The checksum also covers a ``pseudo header'' with the IP addresses and the proto
 the wrong address is noticed.
 
 <<net.c: UDP_PORTS>>=
-#define UDP_PORTS 8
+#define UDP_PORTS 16
 static struct { u16 port; udp_handler handler; } udp_ports[UDP_PORTS];
 
 int udp_bind (u16 port, udp_handler handler) {
   for (int i = 0; i < UDP_PORTS; i++)
     if (!udp_ports[i].handler) { udp_ports[i].port = port; udp_ports[i].handler = handler; return 0; }
   return -1;
+}
+
+void udp_unbind (u16 port) {
+  for (int i = 0; i < UDP_PORTS; i++)
+    if (udp_ports[i].handler && udp_ports[i].port == port) udp_ports[i].handler = 0;
 }
 
 @
@@ -1493,6 +1501,8 @@ tcp_conn *tcp_accept (u16 port) {
 int tcp_established (tcp_conn *c) { return c->state == ESTABLISHED || c->state == CLOSE_WAIT; }
 u32 tcp_id (tcp_conn *c) { return c->id; }       // a program that keeps the pointer for a while checks that the slot still holds its connection
 int tcp_closed (tcp_conn *c) { return c->state == CLOSED; }
+int tcp_readable (tcp_conn *c) { return c->rx_len > 0 || c->fin_received || c->state == CLOSED; }      // tcp_read () would not have to wait
+int tcp_writable (tcp_conn *c) { return (c->state == ESTABLISHED || c->state == CLOSE_WAIT) && c->tx_len < BUFFER; }
 
 int tcp_read (tcp_conn *c, u8 *buf, int max) {
   u32 before = free_window (c);

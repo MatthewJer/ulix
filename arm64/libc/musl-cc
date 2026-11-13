@@ -1,0 +1,16 @@
+#!/bin/sh
+# musl-cc: the C compiler for programs that are linked with musl (see lit/libc.nw). It is aarch64-elf-gcc, told to use the
+# headers, start files and libc.a that libc/Makefile installed in libc/build/sysroot, and nothing of the host or of the
+# bare-metal toolchain's own library. Used by the configure scripts of foreign programs (CPython, third_party/cpython).
+HERE=$(cd "$(dirname "$0")" && pwd)
+SYSROOT=$HERE/build/sysroot
+CC=${CROSS:-aarch64-elf-}gcc
+GCCINC=$($CC -print-file-name=include)
+FLAGS="-fno-pic -mno-outline-atomics"
+for a in "$@"; do
+  case "$a" in -c|-E|-S) exec $CC $FLAGS -nostdinc -isystem "$SYSROOT/include" -isystem "$GCCINC" "$@" ;; esac
+done
+# linking: start files first, libc.a and libgcc after the objects
+exec $CC $FLAGS -static -nostdlib -nostartfiles -z max-page-size=4096 -z noexecstack ${MUSL_LDSCRIPT:+-T "$MUSL_LDSCRIPT"} \
+  -nostdinc -isystem "$SYSROOT/include" -isystem "$GCCINC" -L"$SYSROOT/lib" \
+  "$SYSROOT/lib/crt1.o" "$SYSROOT/lib/crti.o" "$@" "$SYSROOT/lib/libc.a" -lgcc "$SYSROOT/lib/crtn.o"

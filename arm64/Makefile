@@ -11,15 +11,32 @@ LD    = $(CROSS)ld
 OBJCOPY = $(CROSS)objcopy
 CFLAGS = -I$(GENDIR) -mno-outline-atomics -O0 -g -ffreestanding -nostdlib -fno-builtin -fno-stack-protector -mgeneral-regs-only -std=c99 -Wall
 
+# the programs linked with musl besides /muslhello64: they live in the directory /musl of the disk (see lit/libc.nw)
+MUSL_NAMES = cat ls filetest threadtest sockettest localetest
+
+# the Python interpreter (third_party/cpython, chapter "Python" of lit/libc.nw, issue #59): make PYTHON=0 leaves it out. It is part of the
+# system when the submodule is checked out (git submodule update --init third_party/cpython) and a Python 3.12 is on the host.
+PYTHON ?= $(if $(and $(wildcard ../third_party/cpython/configure),$(shell command -v python3.12)),1,0)
+PYLIB = /usr/local/lib/python3.12
+# the part of the standard library that is on the disk (the interpreter needs the encodings at start-up; os, site, io, ... are frozen into it)
+PYTHON_LIB_FILES = $(addprefix encodings/,__init__.py aliases.py utf_8.py latin_1.py ascii.py)
+ifeq ($(PYTHON),1)
+MUSL_NAMES += python
+PYTHON_DISK_FILES = /musl/hello.py=libc/hello.py --mkdir=/usr/local --mkdir=/usr/local/lib --mkdir=$(PYLIB) --mkdir=$(PYLIB)/encodings \
+                    $(foreach f,$(PYTHON_LIB_FILES),$(PYLIB)/$(f)=../third_party/cpython/Lib/$(f))
+endif
+MUSL_PROGS = $(foreach p,$(MUSL_NAMES),libc/build/$(p).elf)
+
 # Disk image: the Minix image of the x86 version plus the AArch64 user programs.
 # "-snapshot" keeps the file unmodified when running.
 DISK ?= disk.img
+ROOT_ZONES ?= 16384
 
 
 # make TLS=0 builds a system without TLS: no BearSSL, no CA list on the disk, https only says so, and no SSH server (see lit/tls.nw, lit/ssh.nw)
 TLS ?= 1
 
-OBJS = start.o vectors.o linux_abi.o pipes.o pty.o irq.o mmu.o virtio.o sdcard.o virtionet.o genet.o netdev.o net.o ip6.o tcp.o dhcp.o dns.o netconf.o echo.o net_test.o net_syscalls.o random.o sntp.o netd.o rcconf.o stats.o minixfs.o elf.o ulix-port.o glue.o arch_thread.o arch_console.o arch_clock.o arch_swap.o arch_vt.o dt.o gic.o smp.o \
+OBJS = start.o vectors.o linux_abi.o pipes.o sockets.o pty.o irq.o mmu.o virtio.o sdcard.o virtionet.o genet.o netdev.o net.o ip6.o tcp.o dhcp.o dns.o netconf.o echo.o net_test.o net_syscalls.o random.o sntp.o netd.o rcconf.o stats.o minixfs.o elf.o ulix-port.o glue.o arch_thread.o arch_console.o arch_clock.o arch_swap.o arch_vt.o dt.o gic.o smp.o \
        bookfs_test.o thread_test.o proc_test.o kmain.o
 
 all: ulix.elf ulix-console.elf ulix-shell.elf ulix.bin ulix-console.bin ulix-shell.bin $(DISK) $(GENDIR)/disk_expected.h
@@ -30,15 +47,17 @@ USERLAND_BIN = userland/build/bin
 userland/build/bin/init.elf: FORCE
 	$(MAKE) -C userland
 
-disk.img: $(wildcard userland/build/bin/*.elf) ../bin-build/minixdata.img etc/rc.conf user/hello.elf user/cat.elf user/crash.elf user/forktest.elf user/sigtest.elf user/contest.elf user/cowtest.elf user/thtest.elf user/badptr.elf user/swaptest.elf user/screentest.elf user/stacktest.elf user/memtest.elf user/pipetest.elf libc/build/hello.elf userland/build/bin/init.elf tools/minix_add.py etc/ssl/cacert.pem etc/rc.d/heartbeat etc/rc.d/echod etc/rc.d/telnetd $(if $(filter 1,$(TLS)),etc/ssh/ssh_host_ecdsa_key etc/rc.d/sshd)
-	cp ../bin-build/minixdata.img $@
+disk.img: $(wildcard userland/build/bin/*.elf) ../bin-build/minixdata.img etc/rc.conf etc/hosts etc/resolv.conf etc/services user/hello.elf user/cat.elf user/crash.elf user/forktest.elf user/sigtest.elf user/contest.elf user/cowtest.elf user/thtest.elf user/badptr.elf user/swaptest.elf user/screentest.elf user/stacktest.elf user/memtest.elf user/pipetest.elf libc/build/hello.elf $(MUSL_PROGS) userland/build/bin/init.elf tools/minix_add.py tools/minix_copy.py tools/minix_mkfs.py etc/ssl/cacert.pem etc/rc.d/heartbeat etc/rc.d/echod etc/rc.d/telnetd $(if $(filter 1,$(TLS)),etc/ssh/ssh_host_ecdsa_key etc/rc.d/sshd)
+	# a root file system of ROOT_ZONES KByte: the image of the book is too small for big programs (tools/minix_copy.py)
+	python3 tools/minix_mkfs.py $@ $(ROOT_ZONES) --inodes=464 > /dev/null
+	python3 tools/minix_copy.py ../bin-build/minixdata.img $@ > /dev/null
 	# two deliberately broken variants of hello.elf for the loader tests:
 	# e_machine = EM_386, and a code segment with flags RWX
 	python3 -c "d=bytearray(open('user/hello.elf','rb').read()); d[18]=3; d[19]=0; open('bad-arch.elf','wb').write(d)"
 	python3 -c "d=bytearray(open('user/hello.elf','rb').read()); d[68]=7; open('bad-wx.elf','wb').write(d)"
-	python3 tools/minix_add.py $@ --grow=4096 --chmod=/tmp:1777 hello64=user/hello.elf cat64=user/cat.elf crash64=user/crash.elf forktest64=user/forktest.elf sigtest64=user/sigtest.elf contest64=user/contest.elf cowtest64=user/cowtest.elf thtest64=user/thtest.elf badptr64=user/badptr.elf swaptest64=user/swaptest.elf screentest64=user/screentest.elf stacktest64=user/stacktest.elf memtest64=user/memtest.elf pipetest64=user/pipetest.elf muslhello64=libc/build/hello.elf \
+	python3 tools/minix_add.py $@ --chmod=/tmp:1777 hello64=user/hello.elf cat64=user/cat.elf crash64=user/crash.elf forktest64=user/forktest.elf sigtest64=user/sigtest.elf contest64=user/contest.elf cowtest64=user/cowtest.elf thtest64=user/thtest.elf badptr64=user/badptr.elf swaptest64=user/swaptest.elf screentest64=user/screentest.elf stacktest64=user/stacktest.elf memtest64=user/memtest.elf pipetest64=user/pipetest.elf muslhello64=libc/build/hello.elf \
 		badarch64=bad-arch.elf badwx64=bad-wx.elf \
-		/init=$(USERLAND_BIN)/init.elf /etc/rc.conf=etc/rc.conf --mkdir=/etc/rc.d /etc/rc.d/heartbeat=etc/rc.d/heartbeat /etc/rc.d/echod=etc/rc.d/echod /etc/rc.d/telnetd=etc/rc.d/telnetd \
+		--mkdir=/musl $(foreach p,$(MUSL_NAMES),/musl/$(p)=libc/build/$(p).elf) $(PYTHON_DISK_FILES) /init=$(USERLAND_BIN)/init.elf /etc/rc.conf=etc/rc.conf /etc/hosts=etc/hosts /etc/resolv.conf=etc/resolv.conf /etc/services=etc/services --mkdir=/etc/rc.d /etc/rc.d/heartbeat=etc/rc.d/heartbeat /etc/rc.d/echod=etc/rc.d/echod /etc/rc.d/telnetd=etc/rc.d/telnetd \
 		$(if $(filter 1,$(TLS)),--mkdir=/etc/ssl /etc/ssl/cacert.pem=etc/ssl/cacert.pem --mkdir=/etc/ssh /etc/ssh/ssh_host_ecdsa_key=etc/ssh/ssh_host_ecdsa_key --chmod=/etc/ssh/ssh_host_ecdsa_key:600 /etc/rc.d/sshd=etc/rc.d/sshd) \
 		$$(for f in $(USERLAND_BIN)/*.elf; do n=$$(basename $$f .elf); [ $$n != init ] && echo /bin/$$n=$$f; done)
 
@@ -70,7 +89,7 @@ user/%.elf: FORCE
 
 # the programs linked with musl (libc/Makefile builds musl first, from the unmodified submodule third_party/musl)
 libc/build/%.elf: FORCE
-	$(MAKE) -C libc
+	$(MAKE) -C libc PYTHON=$(PYTHON)
 
 # the book of the ARM64 part (lit/build/ulix-arm64.pdf)
 book:
@@ -126,8 +145,8 @@ $(GENDIR)/ulix-port.c $(GENDIR)/ulix-api.h: $(GENFILES) port.manifest tools/port
 	sed -i.bak -e 's/^void scheduler (context_t \*r, int source) {/void book_scheduler (context_t *r, int source) {/' \
 	           -e 's/^int u_kill (int pid, int signo) {/int book_u_kill (int pid, int signo) {/' -e 's/^void mutex_lock (lock lockvar) {/void book_mutex_lock (lock lockvar) {/' \
 	           -e 's/^int u_read (int fd, void \*buf, int nbyte) {/int book_u_read (int fd, void *buf, int nbyte) {/' -e 's/^int u_write (int fd, void \*buf, int nbyte) {/int book_u_write (int fd, void *buf, int nbyte) {/' \
-	           -e 's/^int u_close (int fd) {/int book_u_close (int fd) {/' -e 's/^int u_reopen (int fd) {/int book_u_reopen (int fd) {/' $(GENDIR)/ulix-port.c && rm $(GENDIR)/ulix-port.c.bak
-	grep -q 'book_scheduler (context_t' $(GENDIR)/ulix-port.c && grep -q 'book_u_kill (int' $(GENDIR)/ulix-port.c && grep -q 'book_mutex_lock (lock' $(GENDIR)/ulix-port.c && grep -q 'book_u_read (int' $(GENDIR)/ulix-port.c && grep -q 'book_u_write (int' $(GENDIR)/ulix-port.c && grep -q 'book_u_close (int' $(GENDIR)/ulix-port.c && grep -q 'book_u_reopen (int' $(GENDIR)/ulix-port.c
+	           -e 's/^int u_close (int fd) {/int book_u_close (int fd) {/' -e 's/^int u_reopen (int fd) {/int book_u_reopen (int fd) {/' -e 's/^int u_open (char \*path, int oflag, int open_link) {/int book_u_open (char *path, int oflag, int open_link) {/' $(GENDIR)/ulix-port.c && rm $(GENDIR)/ulix-port.c.bak
+	grep -q 'book_scheduler (context_t' $(GENDIR)/ulix-port.c && grep -q 'book_u_kill (int' $(GENDIR)/ulix-port.c && grep -q 'book_mutex_lock (lock' $(GENDIR)/ulix-port.c && grep -q 'book_u_read (int' $(GENDIR)/ulix-port.c && grep -q 'book_u_write (int' $(GENDIR)/ulix-port.c && grep -q 'book_u_close (int' $(GENDIR)/ulix-port.c && grep -q 'book_u_reopen (int' $(GENDIR)/ulix-port.c && grep -q 'book_u_open (char' $(GENDIR)/ulix-port.c
 
 BOOKFLAGS = -mno-outline-atomics -std=gnu99 -O0 -g -ffreestanding -nostdlib -nostdinc -fno-builtin -fno-stack-protector \
             -mgeneral-regs-only -Wall -Wno-unused -Wno-pointer-sign -I$(GENDIR)
@@ -145,10 +164,14 @@ stats.o: stats.c $(GENFILES) $(GENDIR)/ulix-api.h
 netd.o: netd.c $(GENFILES) $(GENDIR)/ulix-api.h
 	$(CC) $(BOOKFLAGS) -Dhash=netd_unused_hash -c -o $@ $<
 
+linux_abi.o: linux_abi.c $(GENFILES) $(GENDIR)/ulix-api.h
 pipes.o: pipes.c $(GENFILES) $(GENDIR)/ulix-api.h
 	$(CC) $(BOOKFLAGS) -c -o $@ $<
 
 pty.o: pty.c $(GENFILES) $(GENDIR)/ulix-api.h
+	$(CC) $(BOOKFLAGS) -c -o $@ $<
+
+sockets.o: sockets.c $(GENFILES) $(GENDIR)/ulix-api.h
 	$(CC) $(BOOKFLAGS) -c -o $@ $<
 
 net_syscalls.o: net_syscalls.c $(GENFILES) $(GENDIR)/ulix-api.h
@@ -324,6 +347,14 @@ listen-test: ulix-shell.bin $(DISK)
 # user-space services: service, daemon, /etc/rc.d, pid file, start at boot (chapter "Daemons and services")
 daemon-test: ulix-shell.bin $(DISK)
 	python3 tools/daemon_test.py ulix-shell.bin $(DISK)
+
+# CPython: the interpreter runs scripts in a login session (chapter "Python"; needs libc/build/python.elf, see PYTHON in this Makefile)
+python-test: ulix-shell.bin $(DISK)
+	python3 tools/python_test.py ulix-shell.bin $(DISK)
+
+# sockets for programs: a program of /musl talks to TCP and UDP servers of the host (chapter "Sockets for Programs")
+socket-test: ulix-shell.bin $(DISK)
+	python3 tools/socket_test.py ulix-shell.bin $(DISK)
 
 # The network: the net test kernel talks to a Python program on the host through qemu's user-mode network
 net-test: ulix-net.bin

@@ -35,6 +35,8 @@ JOBLIST=(
   "dhcpretry|cable plugged in after the boot: the network thread asks DHCP by itself|dhcpretry|virt||128"
   "telnet|telnet server: login on terminal 5 over TCP, top, second connection, hang up, switched off in /etc/rc.conf|telnet|virt||128"
   "listen|server sockets: the program echod (tcp_listen, tcp_accept sleeps), clients one after the other and queued, 20000 bytes|listen|virt||128"
+  "python|CPython: the interpreter (static, linked with musl) runs a script|python|virt||256"
+  "socket|sockets for programs: socket, connect, sendto, recvfrom, poll, select, non-blocking, getaddrinfo against servers of the host|socket|virt||128"
   "daemon|services: service and daemon, /etc/rc.d, pid file, a daemon on its own terminal, started at boot by rc.conf|daemon|virt||128"
   "https|TLS 1.2: https client against a test CA and a TLS server on the host, random numbers, SNTP, tls_enable switch|https|virt||128"
   "ssh|SSH server: host key, curve25519 key exchange, AES-CTR and HMAC, login on terminal 5 with the ssh client of the host, switched off in /etc/rc.conf|ssh|virt||128"
@@ -42,7 +44,7 @@ JOBLIST=(
   "maxcpus|kernel command line maxcpus=2 on a machine with 4 CPUs|maxcpus|virt||128"
   "ram512|RAM 512 MByte, 2 CPUs|kernel|virt|-smp 2|512"
   "ram64|RAM 64 MByte, 2 CPUs|kernel|virt|-smp 2|64"
-  "el1|EL1, virtio legacy transport|kernel|virt||128"
+  "el1|EL1, virtio legacy transport, with a random number generator (virtio-rng)|kernel|virt|-device virtio-rng-device|128"
   "el2|EL2, virtio modern transport|kernel|virt,virtualization=on|-global virtio-mmio.force-legacy=false|128"
   "m-v2-1|GICv2, 1 CPU|kernel|virt,gic-version=2|-smp 1|128"
   "m-v3-1|GICv3, 1 CPU|kernel|virt,gic-version=3|-smp 1|128"
@@ -105,6 +107,15 @@ if [ "$1" = "--job" ]; then
       [ $rc -eq 0 ] && grep -q "all passed" <<< "$sum" && st=ok || st=FAILED ;;
     listen)
       python3 tools/listen_test.py ulix-shell.bin $DISK > "$log" 2>&1
+      rc=$?; sum=$(tail -1 "$log")
+      [ $rc -eq 0 ] && grep -q "all passed" <<< "$sum" && st=ok || st=FAILED ;;
+    python)
+      if [ -f libc/build/python.elf ]; then python3 tools/python_test.py ulix-shell.bin $DISK > "$log" 2>&1
+      else echo "python test: all passed (the interpreter is not part of this build: PYTHON=0)" > "$log"; fi
+      rc=$?; sum=$(tail -1 "$log")
+      [ $rc -eq 0 ] && grep -q "all passed" <<< "$sum" && st=ok || st=FAILED ;;
+    socket)
+      python3 tools/socket_test.py ulix-shell.bin $DISK > "$log" 2>&1
       rc=$?; sum=$(tail -1 "$log")
       [ $rc -eq 0 ] && grep -q "all passed" <<< "$sum" && st=ok || st=FAILED ;;
     daemon)

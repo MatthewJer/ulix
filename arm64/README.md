@@ -188,6 +188,7 @@ Ulix is a teaching system; what the port and the Raspberry Pi work follow from t
   `third_party/musl`, built by `arm64/libc/Makefile`; our part is the system call layer (`linux_abi.c`, chapter 10 of the port's book). The rules for
   foreign code and the licence check are in `third_party/README.md` and `third_party/LICENCE-CHECK-musl.md`. Programs linked with musl carry its
   copyright notice with them (`COPYRIGHT` in the submodule).
+* **CPython v3.12.7** (PSF License 2.0, which is GPL-compatible) is an unmodified, shallow git submodule in `../third_party/cpython`, configured and built by `libc/Makefile` (`make PYTHON=1`, the default when the submodule is there and a `python3.12` is on the host) as a static program linked with musl; not with `make PYTHON=0`. See `../third_party/LICENCE-CHECK-cpython.md`, the chapter "Python" of the port's book and section 30 of `../ARM64-PORT.md`.
 * **BearSSL v0.6** (MIT, Copyright (c) 2016 Thomas Pornin) is an unmodified git submodule in `../third_party/bearssl` (`git submodule update --init`), compiled by
   `userland/Makefile` for the program `https` and into the kernel for the SSH server; not with `make TLS=0`. See `../third_party/README.md`.
 * `etc/ssl/cacert.pem`: the list of certificate authorities of Mozilla, as extracted by the curl project (<https://curl.se/ca/cacert.pem>, date in its first lines;

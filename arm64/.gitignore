@@ -131,3 +131,10 @@ userland/telnetd.c
 userland/sshd.c
 userland/sshcrypto.c
 userland/sshd-off.c
+libc/cat.c
+libc/ls.c
+libc/filetest.c
+libc/threadtest.c
+sockets.c
+libc/sockettest.c
+libc/localetest.c

@@ -1,0 +1,19 @@
+# Modules/Setup.local for CPython on Ulix (see the chapter "Python" in arm64/lit/libc.nw, issue #59).
+# There is no dlopen (issue #40: static linking only), so every extension module that the interpreter should have is listed here and linked
+# into the executable. Modules/Setup.bootstrap already has the ones the interpreter needs to start (posix, errno, _io, _sre, time, ...).
+*static*
+math mathmodule.c
+cmath cmathmodule.c
+_random _randommodule.c
+_bisect _bisectmodule.c
+_heapq _heapqmodule.c
+_struct _struct.c
+array arraymodule.c
+binascii binascii.c
+_datetime _datetimemodule.c
+_json _json.c
+_contextvars _contextvarsmodule.c
+_opcode _opcode.c
+_pickle _pickle.c
+unicodedata unicodedata.c
+select selectmodule.c

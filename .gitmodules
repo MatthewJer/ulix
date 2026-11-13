@@ -4,3 +4,7 @@
 [submodule "third_party/bearssl"]
 	path = third_party/bearssl
 	url = https://bearssl.org/git/BearSSL
+[submodule "third_party/cpython"]
+	path = third_party/cpython
+	url = https://github.com/python/cpython.git
+	shallow = true

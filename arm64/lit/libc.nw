@@ -66,9 +66,15 @@ The complete file is put together from these parts:
 
 <<linux_abi.c: time>>
 
+<<linux_abi.c: futex>>
+
 <<linux_abi.c: signals>>
 
 <<linux_abi.c: files and processes>>
+
+<<linux_abi.c: file status, directories and descriptors>>
+
+<<linux_abi.c: sockets and poll>>
 
 <<linux_abi.c: linux_syscall>>
 @
@@ -83,8 +89,10 @@ extern void syscall_read (context_t *r), syscall_write (context_t *r), syscall_c
 extern void syscall_open (context_t *r), syscall_mkdir (context_t *r), syscall_rmdir (context_t *r), syscall_unlink (context_t *r);
 extern void syscall_chdir (context_t *r), syscall_execv (context_t *r), syscall_waitpid (context_t *r);
 extern void syscall_resign (context_t *r), syscall_sigreturn (context_t *r);
-extern void arch_resign (void);
+extern void arch_resign (void), arch_poll_pause (void);
 extern int  pfd2gfd (int pfd);
+extern int  is_sock (int gfd), sock_is_nonblock (int gfd);                // sockets.c (used by fcntl and ioctl)
+extern void sock_set_nonblock (int gfd, int on);
 
 typedef unsigned long u64;
 typedef unsigned char u8;
@@ -105,21 +113,35 @@ void linux_abi_fork (int old_as, int new_as) {
 #define L_getcwd         17
 #define L_dup            23
 #define L_fcntl          25
+#define L_pselect6       72
+#define L_ppoll          73
+#define L_dup3           24
 #define L_ioctl          29
 #define L_mkdirat        34
 #define L_unlinkat       35
+#define L_ftruncate      46
 #define L_faccessat      48
 #define L_chdir          49
+#define L_renameat       38
 #define L_openat         56
+#define L_pipe2          59
 #define L_close          57
+#define L_getdents64     61
 #define L_lseek          62
 #define L_read           63
 #define L_write          64
 #define L_readv          65
 #define L_writev         66
+#define L_readlinkat     78
+#define L_newfstatat     79
+#define L_fstat          80
+#define L_fsync          82
+#define L_fdatasync      83
 #define L_exit           93
 #define L_exit_group     94
 #define L_set_tid_address 96
+#define L_set_robust_list 99
+#define L_futex          98
 #define L_nanosleep     101
 #define L_clock_gettime 113
 #define L_clock_nanosleep 115
@@ -130,7 +152,9 @@ void linux_abi_fork (int old_as, int new_as) {
 #define L_rt_sigaction  134
 #define L_rt_sigprocmask 135
 #define L_rt_sigreturn  139
+#define L_getrandom     278
 #define L_uname         160
+#define L_umask         166
 #define L_gettimeofday  169
 #define L_getpid        172
 #define L_getppid       173
@@ -148,6 +172,17 @@ void linux_abi_fork (int old_as, int new_as) {
 #define L_mprotect      226
 #define L_madvise       233
 #define L_wait4         260
+#define L_renameat2     276
+#define L_socket        198
+#define L_bind          200
+#define L_connect       203
+#define L_getsockname   204
+#define L_getpeername   205
+#define L_sendto        206
+#define L_recvfrom      207
+#define L_setsockopt    208
+#define L_getsockopt    209
+#define L_shutdown      210
 
 @
 \subsection{Errors, flags and signal numbers}
@@ -166,6 +201,11 @@ the kernel gave no number, the call that failed names a default.
 #define LE_EAGAIN  11
 #define LE_ENOMEM  12
 #define LE_EACCES  13
+#define LE_EEXIST  17
+#define LE_ENODEV  19
+#define LE_ENOTDIR 20
+#define LE_EISDIR  21
+#define LE_EMFILE  24
 #define LE_EFAULT  14
 #define LE_EBADF    9
 #define LE_EINVAL  22
@@ -181,7 +221,11 @@ static long linux_error (int dflt) {
 
 #define AT_FDCWD  (-100)
 #define LO_CREAT   0100                  // Linux/AArch64 values of the open flags
+#define LO_EXCL    0200
+#define LO_TRUNC   01000
 #define LO_APPEND  02000
+#define LO_DIRECTORY 040000
+#define LO_NONBLOCK  04000
 
 @
 The book numbers its signals like BSD (\texttt{SIGUSR1} is 30, \texttt{SIGSTOP} 17), musl like Linux. \texttt{to\_ulix[n]} is the
@@ -221,6 +265,19 @@ static int user_ok (u64 va, u64 len, int write) {
   for (u64 p = va & ~4095UL; p < va + len; p += 4096)
     if (!user_to_phys (p < va ? va : p, write)) return 0;
   return 1;
+}
+
+@
+A string (a file name) has no length that the kernel knows in advance, so it is checked as it is read: every page it touches
+must be readable, up to the largest name the book's file functions accept (255 bytes).
+
+<<linux_abi.c: user pointers>>=
+static int user_string_ok (u64 va) {
+  for (int i = 0; i < 256; i++, va++) {
+    if ((i == 0 || (va & 4095) == 0) && !user_to_phys (va, 0)) return 0;
+    if (*(char *) va == 0) return 1;
+  }
+  return 0;                                                   // too long
 }
 
 @
@@ -264,6 +321,7 @@ extern int  map_page_in (u64 l0_pa, u64 va, u64 pa, u64 flags);
 extern void release_page (unsigned int pageno);
 extern int  page_in (int as, int pageno);
 extern void sync_icache (void *p, u64 len);
+extern long frames_in_use;
 #define KVA(pa)  ((void *)(0xFFFF000000000000UL + (u64)(pa)))
 
 #define MMAP_LO  0x40000000UL
@@ -292,7 +350,7 @@ static int page_is_free (u64 l0, u64 va) {
   return !e || !(*e & (PTE_VALID | PTE_SWAPPED));
 }
 
-// the highest address in the region below which n free pages are in a row, 0 if there is none
+// the lowest address of the highest run of n free pages in a row (the search goes downwards), 0 if there is none
 static u64 find_free (u64 l0, u64 n) {
   u64 run = 0;
   for (u64 va = MMAP_HI - 4096; va >= MMAP_LO; va -= 4096) {
@@ -320,12 +378,12 @@ static long linux_mmap (u64 addr, u64 len, int prot, int flags, int fd, long off
     unmap_range (base, len);                                      // MAP_FIXED replaces what was there
   } else {
     base = find_free (l0, len >> 12);
-    if (!base) return -LE_ENOMEM;
-    base -= len - 4096;                                           // (find_free gave the highest page of the run)
+    if (!base) { printf ("[kernel] mmap: no free address range of %lu pages\n", len >> 12); return -LE_ENOMEM; }
   }
   for (u64 va = base; va < base + len; va += 4096) {
     u64 pa = alloc_frame_try ();                                  // zeroed; swaps a page out if the RAM is full
     if (!pa || map_page_in (l0, va, pa, flagbits) != 0) {
+      printf ("[kernel] mmap: %s at page %lu of %lu (frames in use: %ld)\n", pa ? "cannot map" : "no free frame", (va - base) >> 12, len >> 12, frames_in_use);
       if (pa) free_frame (pa);
       unmap_range (base, va - base);                              // all or nothing
       return -LE_ENOMEM;
@@ -427,6 +485,7 @@ static long sleep_until (unsigned long long deadline, int absolute_clock, struct
       return -LE_EINTR;
     }
     arch_resign ();
+    arch_poll_pause ();                                           // (let the other CPUs into the kernel, see arch_thread.c)
   }
 }
 
@@ -443,6 +502,84 @@ static long linux_clock_nanosleep (int clk, int flags, struct ts *req, struct ts
   unsigned long long t = req->sec * 1000000000ULL + req->nsec;
   if (flags & 1) return sleep_until (t, clk, 0);                  // TIMER_ABSTIME
   return sleep_until ((clk == CLOCK_REALTIME ? real_ns () : mono_ns ()) + t, clk, rem);
+}
+
+@
+\subsection{Threads: \texttt{futex}}
+\label{sec:libc:futex}
+
+A \emph{futex} is how a library puts a thread to sleep without the kernel knowing what a lock is: \texttt{FUTEX\_WAIT (address, value)} sleeps
+if the word at \texttt{address} still has the \texttt{value} (so a wake-up that came between the program's look and the call is not lost) and
+\texttt{FUTEX\_WAKE (address, n)} wakes up to $n$ sleepers on that address. musl's mutexes, condition variables, \texttt{pthread\_join}
+and the lock around its own thread list are built from these two calls; the kernel never sees a mutex.
+
+\paragraph{Simple version first.} The table of sleepers has 64 entries (address space, address, a flag \texttt{woken}). A sleeper does not leave the
+ready queue: it checks the flag and calls \texttt{arch\_resign} in a loop, like \texttt{nanosleep} does with the clock. It costs CPU time
+while it waits, and it needs no new thread state and no change of the scheduler. (The better version, a blocked queue per address like the one
+for pipes, is a replacement for the loop and for the flag; the table stays.) Wake-ups cannot get lost because all of this runs under the
+kernel lock: the value is compared and the entry made without a thread switch in between. A signal or the end of the process
+(\texttt{exit\_group} in another thread) ends the wait with \texttt{EINTR}; the timeout of a timed wait is relative (\texttt{FUTEX\_WAIT}) or
+absolute on the real-time clock (\texttt{FUTEX\_WAIT\_BITSET} with \texttt{FUTEX\_CLOCK\_REALTIME}, which is what \texttt{pthread\_cond\_timedwait} uses). The calls
+that move waiters from one address to another (\texttt{FUTEX\_REQUEUE}) and the priority-inheritance locks are not implemented: musl does not need them.
+
+<<linux_abi.c: futex>>=
+#define FUTEX_WAIT          0
+#define FUTEX_WAKE          1
+#define FUTEX_WAIT_BITSET   9
+#define FUTEX_WAKE_BITSET  10
+#define FUTEX_CLOCK_REALTIME 256
+#define LE_ETIMEDOUT 110
+
+struct futex_waiter { int used, as, woken; u64 addr; };
+static struct futex_waiter futex_waiters[64];
+
+// wake up to n sleepers on this address of the current address space; returns how many
+static int futex_wake (u64 addr, int n) {
+  int woken = 0;
+  for (int i = 0; i < 64 && woken < n; i++)
+    if (futex_waiters[i].used && futex_waiters[i].as == current_as && futex_waiters[i].addr == addr && !futex_waiters[i].woken) {
+      futex_waiters[i].woken = 1;
+      woken++;
+    }
+  return woken;
+}
+
+void futex_wake_address (u64 addr, int n) { futex_wake (addr, n); }       // (the end of a thread: arch_thread.c)
+
+extern int arch_as_dying (void);
+
+static long futex_wait (int *addr, int val, struct ts *timeout, int absolute, int realtime) {
+  if (!user_ok ((u64) addr, 4, 0) || ((u64) addr & 3)) return -LE_EFAULT;
+  if (*addr != val) return -LE_EAGAIN;                           // the value changed: do not sleep
+  unsigned long long deadline = 0;
+  if (timeout) {
+    if (!user_ok ((u64) timeout, sizeof *timeout, 0)) return -LE_EFAULT;
+    unsigned long long t = timeout->sec * 1000000000ULL + timeout->nsec;
+    deadline = absolute ? t : (realtime ? real_ns () : mono_ns ()) + t;
+  }
+  int slot = 0;
+  while (slot < 64 && futex_waiters[slot].used) slot++;
+  if (slot == 64) return -LE_ENOMEM;
+  futex_waiters[slot].used = 1;  futex_waiters[slot].as = current_as;  futex_waiters[slot].addr = (u64) addr;  futex_waiters[slot].woken = 0;
+  long result = 0;
+  for (;;) {
+    if (futex_waiters[slot].woken) break;
+    if (thread_table[current_task].sig_pending || arch_as_dying ()) { result = -LE_EINTR; break; }
+    if (deadline && (realtime || absolute ? real_ns () : mono_ns ()) >= deadline) { result = -LE_ETIMEDOUT; break; }
+    arch_resign ();
+    arch_poll_pause ();
+  }
+  futex_waiters[slot].used = 0;
+  return result;
+}
+
+static long linux_futex (int *addr, int op, int val, struct ts *timeout, int val3) {
+  switch (op & 127) {                                            // (bit 7 is FUTEX_PRIVATE_FLAG: every futex is private to its address space here)
+    case FUTEX_WAIT:        return futex_wait (addr, val, timeout, 0, 0);
+    case FUTEX_WAIT_BITSET: return futex_wait (addr, val, timeout, 1, (op & FUTEX_CLOCK_REALTIME) != 0);
+    case FUTEX_WAKE: case FUTEX_WAKE_BITSET: return futex_wake ((u64) addr, val < 0 ? 0 : val);
+  }
+  return -LE_ENOSYS;
 }
 
 @
@@ -565,18 +702,38 @@ static long linux_iov (context_t *r, int write, int fd, struct iovec *iov, int n
   return total;
 }
 
+static long linux_ftruncate (int fd, long length);
+
 static long linux_openat (context_t *r, int dirfd, const char *path, int flags) {
+  if (!user_string_ok ((u64) path)) return -LE_EFAULT;
   if (dirfd != AT_FDCWD && path[0] != '/') return -LE_ENOSYS;
   int uflags = flags & 3;                                     // O_RDONLY, O_WRONLY, O_RDWR have the same values
+  struct stat st = { 0 };
+  int exists = strncmp (path, "/dev/", 5) != 0 && u_stat (path, &st) == 0;   // (a device is no file and no directory: the file system calls do not apply)
   if (flags & LO_CREAT)  uflags |= O_CREAT;
   if (flags & LO_APPEND) uflags |= O_APPEND;
+  if ((flags & LO_CREAT) && (flags & LO_EXCL) && exists) return -LE_EEXIST;
+  if ((flags & LO_DIRECTORY) && exists && (st.st_mode & S_IFMT) != S_IFDIR) return -LE_ENOTDIR;
+  if ((flags & 3) != 0 && exists && (st.st_mode & S_IFMT) == S_IFDIR) return -LE_EISDIR;
   long fd = ulix_call (r, syscall_open, (long) path, uflags, 0, 0, 0);
-  return fd < 0 ? linux_error (LE_ENOENT) : fd;
+  if (fd < 0) return linux_error (LE_ENOENT);
+  if ((flags & LO_TRUNC) && (flags & 3) != 0 && linux_ftruncate (fd, 0) < 0) {   // the book has no O_TRUNC: shorten the file now
+    ulix_call (r, syscall_close, fd, 0, 0, 0, 0);
+    return -LE_EACCES;
+  }
+  return fd;
 }
 
 #define TIOCGWINSZ 0x5413
 
+#define FIONBIO 0x5421
+
 static long linux_ioctl (int fd, unsigned long req, unsigned short *ws) {
+  if (req == FIONBIO && is_sock (pfd2gfd (fd))) {              // non-blocking mode of a socket: *(int *) arg
+    if (!user_ok ((u64) ws, 4, 0)) return -LE_EFAULT;
+    sock_set_nonblock (pfd2gfd (fd), *(int *) ws != 0);
+    return 0;
+  }
   if (req == TIOCGWINSZ && u_isatty (pfd2gfd (fd))) {         // musl asks this to decide whether stdout is line buffered
     if (!user_ok ((u64) ws, 8, 1)) return -LE_EFAULT;
     ws[0] = 24; ws[1] = 80; ws[2] = ws[3] = 0;                // the terminals of Ulix have 25 lines of 80 columns
@@ -598,11 +755,37 @@ static long linux_uname (char *u) {
   return 0;
 }
 
-static long linux_clone (context_t *r, u64 flags) {
-  if ((flags & 0xff) != 17 || (flags & ~0xffUL))              // only fork (SIGCHLD, nothing shared)
-    return -LE_ENOSYS;
-  int pid = u_fork (r);
-  return pid < 0 ? -LE_EAGAIN : pid;
+#define CLONE_VM             0x00000100
+#define CLONE_FS             0x00000200
+#define CLONE_FILES          0x00000400
+#define CLONE_SIGHAND        0x00000800
+#define CLONE_THREAD         0x00010000
+#define CLONE_SETTLS         0x00080000
+#define CLONE_PARENT_SETTID  0x00100000
+#define CLONE_CHILD_CLEARTID 0x00200000
+#define CLONE_CHILD_SETTID   0x01000000
+
+extern int  arch_clone_thread (context_t *r, u64 stack, u64 tls, int set_tls);
+extern void arch_set_clear_tid (thread_id t, u64 addr);
+extern void arch_linux_exit (context_t *r, int code, int group);
+
+// clone: either what musl's fork () asks for (only SIGCHLD in the flags: a copy of the process), or a thread (the flags of pthread_create)
+static long linux_clone (context_t *r, u64 flags, u64 stack, int *ptid, u64 tls, int *ctid) {
+  if ((flags & 0xff) == 17 && !(flags & ~0xffUL)) {
+    int pid = u_fork (r);
+    return pid < 0 ? -LE_EAGAIN : pid;
+  }
+  u64 thread_flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
+  if ((flags & thread_flags) != thread_flags) return -LE_ENOSYS;
+  if (!stack) return -LE_EINVAL;
+  if (((flags & CLONE_PARENT_SETTID) && !user_ok ((u64) ptid, 4, 1)) || ((flags & (CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID)) && !user_ok ((u64) ctid, 4, 1)))
+    return -LE_EFAULT;
+  int tid = arch_clone_thread (r, stack & ~15UL, tls, (flags & CLONE_SETTLS) != 0);
+  if (tid < 0) return -LE_EAGAIN;
+  if (flags & CLONE_PARENT_SETTID) *ptid = tid;
+  if (flags & CLONE_CHILD_SETTID)  *ctid = tid;
+  if (flags & CLONE_CHILD_CLEARTID) arch_set_clear_tid (tid, (u64) ctid);
+  return tid;
 }
 
 static long linux_wait4 (context_t *r, int pid, int *status, int options) {
@@ -615,6 +798,437 @@ static long linux_wait4 (context_t *r, int pid, int *status, int options) {
 }
 
 @
+\subsection{File status, directories and descriptors}
+\label{sec:libc:files}
+
+\paragraph{\texttt{stat}.} The book's \texttt{struct stat} is a small, 32-bit version of the one in the Linux manual. musl wants the
+128-byte Linux/AArch64 layout (64-bit sizes and inode numbers, nanoseconds, \texttt{st\_blksize}), so every status is copied field by
+field. \texttt{fstat} looks at what the descriptor is: a file of the Minix file system has an inode in the kernel's table of open
+files (\texttt{mx\_status}); a pipe is a FIFO of size 0; the terminal and the devices are character special files. The dates have
+no nanoseconds (the file system stores whole seconds).
+
+<<linux_abi.c: file status, directories and descriptors>>=
+extern struct mx_filestat mx_status[];
+#define FS_PIPE_NR 4                                            // the file system number of pipes (pipes.c)
+
+struct kstat {                                                  // struct stat of Linux/AArch64, 128 bytes
+  u64 st_dev, st_ino;
+  unsigned st_mode, st_nlink, st_uid, st_gid;
+  u64 st_rdev, pad1;
+  long st_size;
+  int st_blksize, pad2;
+  long st_blocks;
+  long atime, atime_ns, mtime, mtime_ns, ctime, ctime_ns;
+  unsigned unused[2];
+};
+
+static void kstat_clear (struct kstat *k) { memset (k, 0, sizeof *k); k->st_blksize = 1024; k->st_nlink = 1; }
+
+static void kstat_from_book (struct kstat *k, struct stat *s) {
+  kstat_clear (k);
+  k->st_dev = s->st_dev;  k->st_ino = s->st_ino;  k->st_mode = s->st_mode;  k->st_nlink = s->st_nlink;
+  k->st_uid = s->st_uid;  k->st_gid = s->st_gid;  k->st_rdev = s->st_rdev;  k->st_size = s->st_size;
+  k->st_blocks = (s->st_size + 511) / 512;
+  k->atime = s->st_atime;  k->mtime = s->st_mtime;  k->ctime = s->st_ctime;
+}
+
+static long linux_fstat (int fd, struct kstat *k) {
+  if (!user_ok ((u64) k, sizeof *k, 1)) return -LE_EFAULT;
+  int gfd = pfd2gfd (fd);
+  if (fd < 0 || gfd == -1) return -LE_EBADF;
+  kstat_clear (k);
+  if (gfd < 0 || (gfd >> 8) == FS_DEV || (gfd >> 8) == 5) { k->st_mode = S_IFCHR | 0620; return 0; }    // the terminal (negative numbers) and the devices
+  if ((gfd >> 8) == FS_PIPE_NR)        { k->st_mode = S_IFIFO | 0600; return 0; }
+  if ((gfd >> 8) != FS_MINIX) return -LE_EBADF;
+  struct int_minix2_inode *in = mx_status[gfd & 0xff].int_inode;
+  if (!in) return -LE_EBADF;
+  k->st_dev = in->device;  k->st_ino = in->ino;  k->st_mode = in->i_mode;  k->st_nlink = in->i_nlinks;
+  k->st_uid = in->i_uid;   k->st_gid = in->i_gid;  k->st_size = in->i_size;  k->st_blocks = (in->i_size + 511) / 512;
+  k->atime = in->i_atime;  k->mtime = in->i_mtime;  k->ctime = in->i_ctime;
+  return 0;
+}
+
+#define AT_EMPTY_PATH 0x1000
+
+// stat, lstat and fstat: musl's stat () is newfstatat (AT_FDCWD, path); the file system does not follow links in stat
+static long linux_newfstatat (int dirfd, const char *path, struct kstat *k, int flags) {
+  if (!user_string_ok ((u64) path) || !user_ok ((u64) k, sizeof *k, 1)) return -LE_EFAULT;
+  if (path[0] == 0) return (flags & AT_EMPTY_PATH) ? linux_fstat (dirfd, k) : -LE_ENOENT;
+  if (dirfd != AT_FDCWD && path[0] != '/') return -LE_ENOSYS;
+  struct stat st = { 0 };
+  if (u_stat (path, &st) != 0) return -LE_ENOENT;
+  kstat_from_book (k, &st);
+  return 0;
+}
+
+@
+\paragraph{Directories.} A program reads a directory with \texttt{getdents64}: the descriptor is a directory that was opened with
+\texttt{open}, and the call fills a buffer with as many variable-length records as fit. The Minix directory is an array of 32-byte
+entries (a 2-byte inode number and a 30-byte name), and the position of the open file, in bytes, is the position in that array,
+so that \texttt{lseek (fd, 0, SEEK\_SET)} (\texttt{rewinddir}) works without any new code. Free entries (inode 0) are skipped. The
+type of each entry is read from its inode (musl's \texttt{readdir} passes it on as \texttt{d\_type}).
+
+<<linux_abi.c: file status, directories and descriptors>>=
+#define DT_DIR_ 4
+#define DT_REG_ 8
+
+static long linux_getdents64 (int fd, char *buf, u64 size) {
+  int gfd = pfd2gfd (fd);
+  if (fd < 0 || gfd < 0 || (gfd >> 8) != FS_MINIX || !mx_status[gfd & 0xff].int_inode) return -LE_EBADF;
+  struct mx_filestat *f = &mx_status[gfd & 0xff];
+  struct int_minix2_inode *dir = f->int_inode;
+  if ((dir->i_mode & S_IFMT) != S_IFDIR) return -LE_ENOTDIR;
+  if (!user_ok ((u64) buf, size, 1)) return -LE_EFAULT;
+  u64 used = 0;
+  while (f->pos < (int) dir->i_size) {
+    struct minix_dir_entry d;
+    if (mx_read_dir_entry (dir->device, dir->ino, f->pos / 32, &d) == -1) break;
+    if (d.inode == 0) { f->pos += 32; continue; }                // a free slot
+    int n = 0;
+    while (n < 30 && d.name[n]) n++;
+    u64 reclen = (19 + n + 1 + 7) & ~7UL;                        // d_ino, d_off, d_reclen, d_type, the name with its zero, padded to 8
+    if (used + reclen > size) return used ? (long) used : -LE_EINVAL;   // the buffer is too small for even one entry
+    struct minix2_inode ino;
+    int type = 0;
+    if (mx_read_inode (dir->device, d.inode, &ino)) type = (ino.i_mode & S_IFMT) == S_IFDIR ? DT_DIR_ : (ino.i_mode & S_IFMT) == S_IFREG ? DT_REG_ : 0;
+    char *e = buf + used;
+    f->pos += 32;
+    *(u64 *) e = d.inode;                                        // d_ino
+    *(long *) (e + 8) = f->pos;                                  // d_off: where the next call goes on
+    *(unsigned short *) (e + 16) = reclen;
+    e[18] = type;
+    memcpy (e + 19, d.name, n);
+    e[19 + n] = 0;
+    used += reclen;
+  }
+  return used;
+}
+
+@
+\paragraph{Descriptors.} \texttt{dup}, \texttt{dup3} and \texttt{fcntl (F\_DUPFD)} copy an entry of the process's descriptor table with
+\texttt{u\_reopen}, the function that \texttt{fork} uses. For a file that gives the copy \emph{its own} read/write position, which
+is a difference from Unix (there both descriptors share the position); for a pipe end it is one more user of the same end. The
+table has 16 entries (\texttt{MAX\_PFD} of the book), so \texttt{EMFILE} comes early. \texttt{pipe2} and \texttt{dup3} use the
+book's calls from \texttt{pipes.c}; the flags \texttt{O\_CLOEXEC} and \texttt{O\_NONBLOCK} are accepted and ignored (a descriptor
+is never closed by \texttt{exec} yet, and reads on pipes always block).
+
+<<linux_abi.c: file status, directories and descriptors>>=
+extern void syscall_pipe (context_t *r), syscall_dup2 (context_t *r);
+
+static long linux_dup_from (int old, int from) {
+  TCB *t = &thread_table[thread_table[current_task].pid];
+  int gfd = pfd2gfd (old);
+  if (old < 0 || old >= MAX_PFD || gfd == -1) return -LE_EBADF;
+  if (from < 0 || from >= MAX_PFD) return -LE_EINVAL;
+  for (int pfd = from; pfd < MAX_PFD; pfd++)
+    if (t->files[pfd] == -1) { t->files[pfd] = gfd >= 0 ? u_reopen (gfd) : gfd;  return pfd; }
+  return -LE_EMFILE;
+}
+
+static long linux_dup3 (context_t *r, int old, int new, int flags) {
+  if (old == new) return -LE_EINVAL;                             // (dup2 allows it, dup3 does not)
+  if (flags & ~02000000) return -LE_EINVAL;
+  int k = ulix_call (r, syscall_dup2, old, new, 0, 0, 0);
+  return k < 0 ? -LE_EBADF : k;
+}
+
+static long linux_pipe2 (context_t *r, int *fds, int flags) {
+  if (!user_ok ((u64) fds, 8, 1)) return -LE_EFAULT;
+  int k = ulix_call (r, syscall_pipe, (long) fds, 0, 0, 0, 0);
+  return k < 0 ? -LE_EMFILE : 0;
+}
+
+#define F_DUPFD 0
+#define F_GETFD 1
+#define F_SETFD 2
+#define F_GETFL 3
+#define F_SETFL 4
+#define F_DUPFD_CLOEXEC 1030
+
+static long linux_fcntl (int fd, int cmd, long arg) {
+  int gfd = pfd2gfd (fd);
+  if (fd < 0 || gfd == -1) return -LE_EBADF;
+  switch (cmd) {
+    case F_DUPFD: case F_DUPFD_CLOEXEC: return linux_dup_from (fd, arg);
+    case F_GETFD: case F_SETFD: return 0;                        // no close-on-exec yet
+    case F_SETFL: if (is_sock (gfd)) sock_set_nonblock (gfd, (arg & LO_NONBLOCK) != 0);  return 0;      // (only sockets can be non-blocking)
+    case F_GETFL: {                                              // the access mode (and append) that the file was opened with
+      if (is_sock (gfd)) return 2 | (sock_is_nonblock (gfd) ? LO_NONBLOCK : 0);
+      if (gfd < 0 || (gfd >> 8) != FS_MINIX) return gfd >= 0 && (gfd >> 8) == FS_PIPE_NR ? ((gfd & 1) ? 1 : 0) : 2;
+      int m = mx_status[gfd & 0xff].mode;
+      return (m & 3) | ((m & O_APPEND) ? LO_APPEND : 0);
+    }
+  }
+  return -LE_EINVAL;
+}
+
+static long linux_ftruncate (int fd, long length) {
+  int gfd = pfd2gfd (fd);
+  if (fd < 0 || gfd < 0 || (gfd >> 8) != FS_MINIX) return -LE_EBADF;
+  return u_ftruncate (gfd, length) < 0 ? -LE_EACCES : 0;
+}
+
+static long linux_readlinkat (int dirfd, const char *path, char *buf, u64 size) {
+  if (!user_string_ok ((u64) path) || !user_ok ((u64) buf, size, 1)) return -LE_EFAULT;
+  if (dirfd != AT_FDCWD && path[0] != '/') return -LE_ENOSYS;
+  struct stat st = { 0 };
+  if (u_stat (path, &st) != 0) return -LE_ENOENT;
+  if ((st.st_mode & S_IFMT) != S_IFLNK) return -LE_EINVAL;
+  int n = u_readlink ((char *) path, buf, size);
+  return n < 0 ? -LE_EINVAL : n;
+}
+
+@
+\paragraph{Rename.} The book has no \texttt{rename}. A file gets its new name by a hard link and loses the old one (\texttt{u\_link}, then
+\texttt{u\_unlink}), and an existing target is removed first, as \texttt{rename} replaces it. That is not atomic (a crash between the two steps
+leaves both names), and directories cannot be renamed this way (the link count of \texttt{..} would be wrong), so they are refused
+with \texttt{EPERM}. CPython writes its compiled modules under a temporary name and renames them; without this call it would only
+say nothing and go on.
+
+<<linux_abi.c: file status, directories and descriptors>>=
+static long linux_renameat (int olddir, const char *old, int newdir, const char *new) {
+  if (!user_string_ok ((u64) old) || !user_string_ok ((u64) new)) return -LE_EFAULT;
+  if ((olddir != AT_FDCWD && old[0] != '/') || (newdir != AT_FDCWD && new[0] != '/')) return -LE_ENOSYS;
+  struct stat st = { 0 }, st2 = { 0 };
+  if (u_stat (old, &st) != 0) return -LE_ENOENT;
+  if ((st.st_mode & S_IFMT) == S_IFDIR) return -LE_EPERM;
+  if (u_stat (new, &st2) == 0) {
+    if ((st2.st_mode & S_IFMT) == S_IFDIR) return -LE_EISDIR;
+    if (st2.st_ino == st.st_ino && st2.st_dev == st.st_dev) return 0;       // the same file: nothing to do
+    if (u_unlink (new) != 0) return -LE_EACCES;
+  }
+  if (u_link (old, new) != 0) return -LE_EACCES;
+  return u_unlink (old) == 0 ? 0 : -LE_EACCES;
+}
+
+@
+\paragraph{Random numbers.} \texttt{getrandom} (issue \#45) gives what the hardware generator gave (\texttt{random\_get}, chapter
+\ref{ch:tls}); the flags only say how to wait or which pool to use, and there is no pool, so they are accepted and ignored. Without a
+generator the call fails with \texttt{EIO}, and a program such as the Python interpreter, which wants random numbers for its hash
+tables, then says so instead of running with numbers an attacker could guess.
+
+<<linux_abi.c: file status, directories and descriptors>>=
+extern int random_get (void *buf, int n);
+
+static long linux_getrandom (char *buf, u64 n, unsigned flags) {
+  if (flags & ~7u) return -LE_EINVAL;                            // GRND_NONBLOCK, GRND_RANDOM, GRND_INSECURE
+  if (!user_ok ((u64) buf, n, 1)) return -LE_EFAULT;
+  char tmp[256];
+  u64 done = 0;
+  while (done < n) {
+    u64 part = n - done < sizeof tmp ? n - done : sizeof tmp;
+    if (random_get (tmp, part) < 0) return done ? (long) done : -5;      // EIO
+    memcpy (buf + done, tmp, part);
+    done += part;
+  }
+  return done;
+}
+
+@
+\subsection{Sockets and \texttt{poll}}
+\label{sec:libc:sockets}
+
+The sockets themselves are chapter \ref{ch:sockets}; this is the translation. A socket address of Linux is a \texttt{struct sockaddr\_in}: the family
+(2 for IPv4) and then port and address in \emph{network} byte order, the network stack of the kernel keeps host order. Everything that is not IPv4 is
+refused with \texttt{EAFNOSUPPORT} (which is what the resolver of musl expects when it tries IPv6 first). \texttt{listen} and \texttt{accept} are not translated
+here (issue \#124 has them as calls of their own). \texttt{ppoll} and \texttt{pselect6} look at every descriptor in the list: a socket or a pipe knows whether it can be
+read or written; a file or a device is always ready (a read on it may take time but does not wait for somebody else), and so is the terminal for input
+(a read waits, but there is no call that asks the terminal driver for a key without taking it). If nothing is ready the call waits in a loop like the others do,
+until the time is up or a signal arrives.
+
+<<linux_abi.c: sockets and poll>>=
+extern int  sock_new (int type, int nonblock), sock_close (int gfd), sock_bind (int gfd, unsigned ip, unsigned short port);
+extern int  sock_connect (int gfd, unsigned ip, unsigned short port), sock_shutdown (int gfd, int how), sock_ready (int gfd), is_sock (int gfd);
+extern int  sock_name (int gfd, int peer, unsigned *ip, unsigned short *port), sock_type (int gfd), sock_is_nonblock (int gfd);
+extern long sock_send (int gfd, const void *buf, u64 n, unsigned ip, unsigned short port, int has_addr);
+extern long sock_recv (int gfd, void *buf, u64 n, unsigned *ip, unsigned short *port);
+extern void sock_set_nonblock (int gfd, int on);
+extern int  pipe_ready (int gfd);
+extern int  net_poll_once (void);
+extern int  gfd2pfd (int gfd);
+
+#define LE_EAFNOSUPPORT 97
+#define LE_ENOTSOCK     88
+#define SOCK_NONBLOCK_  04000
+#define MSG_DONTWAIT    0x40
+
+struct sockaddr_in_ { unsigned short family; unsigned char port[2], addr[4], zero[8]; };
+
+static int get_sockaddr (const void *p, u64 len, unsigned *ip, unsigned short *port) {
+  const struct sockaddr_in_ *a = p;
+  if (!p || len < sizeof *a || !user_ok ((u64) p, sizeof *a, 0)) return -LE_EFAULT;
+  if (a->family != 2) return -LE_EAFNOSUPPORT;
+  *port = (a->port[0] << 8) | a->port[1];
+  *ip = ((unsigned) a->addr[0] << 24) | (a->addr[1] << 16) | (a->addr[2] << 8) | a->addr[3];
+  return 0;
+}
+
+// writes the address (and its length, if the program asked for it): the caller has checked that the pointers are good
+static void put_sockaddr (void *p, unsigned *len, unsigned ip, unsigned short port) {
+  struct sockaddr_in_ a = { 2, { port >> 8, port & 255 }, { ip >> 24, (ip >> 16) & 255, (ip >> 8) & 255, ip & 255 }, { 0 } };
+  if (!p) return;
+  unsigned room = len ? *len : sizeof a;
+  memcpy (p, &a, room < sizeof a ? room : sizeof a);
+  if (len) *len = sizeof a;
+}
+
+static int sock_arg (int fd, long *err) {                 // the global descriptor of a socket, or -1 and the error
+  int gfd = pfd2gfd (fd);
+  if (fd < 0 || gfd == -1) { *err = -LE_EBADF;  return -1; }
+  if (!is_sock (gfd)) { *err = -LE_ENOTSOCK;  return -1; }
+  return gfd;
+}
+
+static long linux_socket (int domain, int type, int protocol) {
+  if (domain != 2) return -LE_EAFNOSUPPORT;
+  int gfd = sock_new (type & 0xf, (type & SOCK_NONBLOCK_) != 0);
+  if (gfd < 0) return linux_error (LE_EMFILE);
+  int pfd = gfd2pfd (gfd);
+  if (pfd < 0) { sock_close (gfd);  return -LE_EMFILE; }
+  return pfd;
+}
+
+static long linux_connect_or_bind (int fd, const void *addr, u64 len, int connect) {
+  long e;  int gfd = sock_arg (fd, &e);
+  unsigned ip;  unsigned short port;
+  if (gfd < 0) return e;
+  if ((e = get_sockaddr (addr, len, &ip, &port)) != 0) return e;
+  return connect ? sock_connect (gfd, ip, port) : sock_bind (gfd, ip, port);
+}
+
+static long linux_sendto (int fd, const void *buf, u64 n, int flags, const void *addr, u64 alen) {
+  long e;  int gfd = sock_arg (fd, &e);
+  unsigned ip = 0;  unsigned short port = 0;
+  if (gfd < 0) return e;
+  if (!user_ok ((u64) buf, n, 0)) return -LE_EFAULT;
+  if (addr && (e = get_sockaddr (addr, alen, &ip, &port)) != 0) return e;
+  return sock_send (gfd, buf, n, ip, port, addr != 0);
+}
+
+static long linux_recvfrom (int fd, void *buf, u64 n, int flags, void *addr, unsigned *alen) {
+  long e;  int gfd = sock_arg (fd, &e);
+  unsigned ip = 0;  unsigned short port = 0;
+  if (gfd < 0) return e;
+  if (!user_ok ((u64) buf, n, 1) || (addr && (!alen || !user_ok ((u64) alen, 4, 1) || !user_ok ((u64) addr, *alen, 1)))) return -LE_EFAULT;
+  int was = sock_is_nonblock (gfd);
+  if (flags & MSG_DONTWAIT) sock_set_nonblock (gfd, 1);
+  long k = sock_recv (gfd, buf, n, &ip, &port);
+  if (flags & MSG_DONTWAIT) sock_set_nonblock (gfd, was);
+  if (k >= 0) put_sockaddr (addr, alen, ip, port);
+  return k;
+}
+
+static long linux_getname (int fd, void *addr, unsigned *alen, int peer) {
+  long e;  int gfd = sock_arg (fd, &e);
+  unsigned ip;  unsigned short port;
+  if (gfd < 0) return e;
+  if (!alen || !user_ok ((u64) alen, 4, 1) || !user_ok ((u64) addr, *alen, 1)) return -LE_EFAULT;
+  if ((e = sock_name (gfd, peer, &ip, &port)) != 0) return e;
+  put_sockaddr (addr, alen, ip, port);
+  return 0;
+}
+
+#define SOL_SOCKET 1
+#define SO_TYPE    3
+#define SO_ERROR   4
+
+// options are accepted and ignored; the two that a program reads back have an answer
+static long linux_getsockopt (int fd, int level, int opt, int *val, unsigned *len) {
+  long e;  int gfd = sock_arg (fd, &e);
+  if (gfd < 0) return e;
+  if (!val || !len || !user_ok ((u64) val, 4, 1) || !user_ok ((u64) len, 4, 1)) return -LE_EFAULT;
+  *val = (level == SOL_SOCKET && opt == SO_TYPE) ? sock_type (gfd) : 0;                     // (SO_ERROR: no error is ever kept)
+  *len = 4;
+  return 0;
+}
+
+static long linux_setsockopt (int fd) { long e;  return sock_arg (fd, &e) < 0 ? e : 0; }
+
+static long linux_shutdown (int fd, int how) { long e;  int gfd = sock_arg (fd, &e);  return gfd < 0 ? e : sock_shutdown (gfd, how); }
+
+@
+\paragraph{Waiting for several descriptors.} \texttt{poll\_bits} says what a descriptor is ready for, in the bits of \texttt{poll} (\texttt{POLLIN} 1,
+\texttt{POLLOUT} 4, \texttt{POLLERR} 8, \texttt{POLLHUP} 16, \texttt{POLLNVAL} 32).
+
+<<linux_abi.c: sockets and poll>>=
+static int poll_bits (int fd) {
+  int gfd = pfd2gfd (fd);
+  if (gfd == -1) return 32;
+  if (is_sock (gfd)) return sock_ready (gfd);
+  if (gfd >= 0 && (gfd >> 8) == FS_PIPE_NR) return pipe_ready (gfd);
+  return 1 | 4;                                                // a file, a device or the terminal: ready
+}
+
+// wait until count () is not 0, the time is up (timeout: 0 for ever) or a signal comes; the result of count () or minus an error
+static long poll_wait (long (*count) (void *), void *arg, struct ts *timeout) {
+  unsigned long long deadline = 0;
+  if (timeout) {
+    if (!user_ok ((u64) timeout, sizeof *timeout, 0)) return -LE_EFAULT;
+    deadline = mono_ns () + timeout->sec * 1000000000ULL + timeout->nsec;
+  }
+  for (;;) {
+    long n = count (arg);
+    if (n != 0) return n;
+    if (timeout && mono_ns () >= deadline) return 0;
+    if (thread_table[current_task].sig_pending) return -LE_EINTR;
+    net_poll_once ();
+    arch_resign ();
+    arch_poll_pause ();
+  }
+}
+
+struct pollfd_ { int fd; short events, revents; };
+struct poll_args { struct pollfd_ *fds; unsigned n; };
+
+static long poll_count (void *p) {
+  struct poll_args *a = p;
+  long ready = 0;
+  for (unsigned i = 0; i < a->n; i++) {
+    struct pollfd_ *f = &a->fds[i];
+    f->revents = f->fd < 0 ? 0 : poll_bits (f->fd) & (f->events | 8 | 16 | 32);
+    if (f->revents) ready++;
+  }
+  return ready;
+}
+
+static long linux_ppoll (struct pollfd_ *fds, unsigned n, struct ts *timeout) {
+  if (n > 64 || !user_ok ((u64) fds, n * sizeof *fds, 1)) return -LE_EINVAL;
+  struct poll_args a = { fds, n };
+  return poll_wait (poll_count, &a, timeout ? timeout : 0);
+}
+
+@
+\texttt{pselect6} takes three bit sets (descriptors to read, to write, with errors) and changes them to the ones that are ready; the last argument of musl's
+\texttt{select} is a timeout in a structure, and there is a signal mask that is ignored.
+
+<<linux_abi.c: sockets and poll>>=
+struct select_args { int n; unsigned long *r, *w; unsigned long saved_r[16], saved_w[16]; };
+
+static long select_count (void *p) {
+  struct select_args *a = p;
+  long ready = 0;
+  for (int fd = 0; fd < a->n; fd++) {
+    unsigned long bit = 1UL << (fd % 64);
+    int word = fd / 64, want_r = a->r && (a->saved_r[word] & bit), want_w = a->w && (a->saved_w[word] & bit);
+    if (!want_r && !want_w) continue;
+    int bits = poll_bits (fd);
+    if (a->r) { if (want_r && (bits & (1 | 16 | 32))) { a->r[word] |= bit;  ready++; } else a->r[word] &= ~bit; }
+    if (a->w) { if (want_w && (bits & (4 | 8 | 32))) { a->w[word] |= bit;  ready++; } else a->w[word] &= ~bit; }
+  }
+  return ready;
+}
+
+static long linux_pselect6 (int n, unsigned long *r, unsigned long *w, unsigned long *x, struct ts *timeout) {
+  if (n < 0 || n > 1024) return -LE_EINVAL;
+  int words = (n + 63) / 64;
+  struct select_args a = { n, r, w };
+  if ((r && !user_ok ((u64) r, words * 8, 1)) || (w && !user_ok ((u64) w, words * 8, 1)) || (x && !user_ok ((u64) x, words * 8, 1))) return -LE_EFAULT;
+  for (int i = 0; i < words; i++) { a.saved_r[i] = r ? r[i] : 0;  a.saved_w[i] = w ? w[i] : 0; }
+  if (x) for (int i = 0; i < words; i++) x[i] = 0;                   // no exceptional conditions
+  return poll_wait (select_count, &a, timeout);
+}
+
+@
 \subsection{The translation: \texttt{linux\_syscall}}
 
 Called by \texttt{book\_syscall} instead of the book's dispatcher for a program that has \texttt{ELFOSABI\_LINUX}. A Linux program expects
@@ -623,7 +1237,7 @@ that a system call changes nothing but \texttt{x0}, and musl's inline assembler 
 frame on purpose: \texttt{execve} (new program counter and stack) and \texttt{rt\_sigreturn} (the whole frame).
 
 <<linux_abi.c: linux_syscall>>=
-static int unknown_reported[512];
+static int unknown_reported[512], enomem_reported;
 
 void linux_syscall (context_t *r) {
   long nr = r->x8, a0 = r->x0, a1 = r->x1, a2 = r->x2, a3 = r->x3, a4 = r->x4, a5 = r->x5;
@@ -651,7 +1265,31 @@ void linux_syscall (context_t *r) {
     case L_close:  ret = ulix_call (r, syscall_close, a0, 0, 0, 0, 0) < 0 ? -LE_EBADF : 0; break;
     case L_lseek:  ret = ulix_call (r, syscall_lseek, a0, a1, a2, 0, 0); if (ret < 0) ret = linux_error (LE_EINVAL); break;
     case L_ioctl:  ret = linux_ioctl (a0, a1, (unsigned short *) a2); break;
-    case L_fcntl:  ret = 0; break;                            // F_GETFD, F_SETFD, F_GETFL, F_SETFL: nothing to remember yet
+    case L_fcntl:  ret = linux_fcntl (a0, a1, a2); break;
+    case L_dup:    ret = linux_dup_from (a0, 0); break;
+    case L_dup3:   ret = linux_dup3 (r, a0, a1, a2); break;
+    case L_pipe2:  ret = linux_pipe2 (r, (int *) a0, a1); break;
+    case L_fstat:  ret = linux_fstat (a0, (struct kstat *) a1); break;
+    case L_newfstatat: ret = linux_newfstatat (a0, (const char *) a1, (struct kstat *) a2, a3); break;
+    case L_getdents64: ret = linux_getdents64 (a0, (char *) a1, a2); break;
+    case L_ftruncate:  ret = linux_ftruncate (a0, a1); break;
+    case L_readlinkat: ret = linux_readlinkat (a0, (const char *) a1, (char *) a2, a3); break;
+    case L_fsync: case L_fdatasync: ret = 0; break;            // every write goes to the disk through the buffer cache that the book flushes
+    case L_umask:  ret = 022; break;
+    case L_socket:      ret = linux_socket (a0, a1, a2); break;
+    case L_connect:     ret = linux_connect_or_bind (a0, (const void *) a1, a2, 1); break;
+    case L_bind:        ret = linux_connect_or_bind (a0, (const void *) a1, a2, 0); break;
+    case L_sendto:      ret = linux_sendto (a0, (const void *) a1, a2, a3, (const void *) a4, a5); break;
+    case L_recvfrom:    ret = linux_recvfrom (a0, (void *) a1, a2, a3, (void *) a4, (unsigned *) a5); break;
+    case L_getsockname: ret = linux_getname (a0, (void *) a1, (unsigned *) a2, 0); break;
+    case L_getpeername: ret = linux_getname (a0, (void *) a1, (unsigned *) a2, 1); break;
+    case L_setsockopt:  ret = linux_setsockopt (a0); break;
+    case L_getsockopt:  ret = linux_getsockopt (a0, a1, a2, (int *) a3, (unsigned *) a4); break;
+    case L_shutdown:    ret = linux_shutdown (a0, a1); break;
+    case L_ppoll:       ret = linux_ppoll ((struct pollfd_ *) a0, a1, (struct ts *) a2); break;
+    case L_pselect6:    ret = linux_pselect6 (a0, (unsigned long *) a1, (unsigned long *) a2, (unsigned long *) a3, (struct ts *) a4); break;
+    case L_renameat: case L_renameat2: ret = linux_renameat (a0, (const char *) a1, a2, (const char *) a3); break;
+    case L_getrandom: ret = linux_getrandom ((char *) a0, a1, a2); break;
     case L_getcwd: ret = linux_getcwd ((char *) a0, a1); break;
     case L_chdir:  ret = ulix_call (r, syscall_chdir, a0, 0, 0, 0, 0) < 0 ? -LE_ENOENT : 0; break;
     case L_mkdirat:
@@ -685,15 +1323,17 @@ void linux_syscall (context_t *r) {
 
     // processes
     case L_exit: case L_exit_group:
-      r->ebx = (int) a0;
-      syscall_exit (r);                                       // does not return
+      arch_linux_exit (r, (int) a0, nr == L_exit_group);      // the end of a thread, or of the process (does not return)
       return;
     case L_sched_yield: syscall_resign (r); ret = 0; break;
     case L_getpid:  ret = thread_table[current_task].pid; break;
-    case L_gettid:  case L_set_tid_address: ret = current_task; break;
+    case L_gettid:  ret = current_task; break;
+    case L_set_tid_address: arch_set_clear_tid (current_task, a0); ret = current_task; break;
+    case L_set_robust_list: ret = 0; break;                   // robust mutexes: a thread that dies holding one is not handled
+    case L_futex:   ret = linux_futex ((int *) a0, a1, a2, (struct ts *) a3, a5); break;
     case L_getppid: ret = thread_table[current_task].ppid; break;
     case L_getuid: case L_geteuid: case L_getgid: case L_getegid: ret = 0; break;
-    case L_clone: ret = linux_clone (r, a0); break;
+    case L_clone: ret = linux_clone (r, a0, a1, (int *) a2, a3, (int *) a4); break;
     case L_wait4: ret = linux_wait4 (r, a0, (int *) a1, a2); break;
     case L_uname: ret = linux_uname ((char *) a0); break;
 
@@ -704,6 +1344,8 @@ void linux_syscall (context_t *r) {
       }
       ret = -LE_ENOSYS;
   }
+  if (ret == -LE_ENOMEM && enomem_reported++ < 20)                // (a program that runs out of memory: say which call and how much)
+    printf ("[kernel] process %d: Linux system call %ld (%lx, %lx, %lx) failed: out of memory\n", thread_table[current_task].pid, nr, a0, a1, a2);
   r->x1 = saved.x1; r->x2 = saved.x2; r->x3 = saved.x3; r->x4 = saved.x4; r->x5 = saved.x5;
   r->x8 = saved.x8;
   r->x0 = ret;
@@ -872,6 +1514,528 @@ int main (int argc, char **argv) {
   static char obuf[256];
   setvbuf (stdout, obuf, _IOFBF, sizeof obuf);
   printf ("  user ok:   stdio is flushed by exit (this line stayed in the buffer until main returned)\n");
+  return fails;
+}
+@
+\section{Existing programs on musl: \texttt{cat}, \texttt{ls} and a test of the file calls}
+\label{src:libc/filetest.c}
+
+The 59 tools of the book are written for the book's own library and the tiny \texttt{ulib}; moving them all to musl is a long
+road (issue \#35). The first step is the file system calls that every tool needs --- \texttt{fstat}, \texttt{getdents64},
+\texttt{dup3}, \texttt{pipe2}, \texttt{fcntl}, \texttt{O\_TRUNC} --- and two programs that show they work: \texttt{cat} and
+\texttt{ls}, written the way a Unix textbook writes them (with \texttt{read}/\texttt{write} and \texttt{opendir}/\texttt{readdir}).
+The old versions stay in \texttt{/bin}; the musl versions live in the directory \texttt{/musl} on the disk, so that the old
+tests keep their numbers (the directory \texttt{/bin} would change the count of its entries).
+
+<<libc/cat.c>>=
+#include <stdio.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+// cat [file ...]: copies the files (or the standard input) to the standard output
+static int copy (int fd) {
+  char buf[512];
+  long n;
+  while ((n = read (fd, buf, sizeof buf)) > 0)
+    if (write (1, buf, n) != n) return 1;
+  return n < 0;
+}
+
+int main (int argc, char **argv) {
+  int status = 0;
+  if (argc == 1) return copy (0);
+  for (int i = 1; i < argc; i++) {
+    int fd = open (argv[i], O_RDONLY);
+    if (fd < 0) { perror (argv[i]); status = 1; continue; }
+    status |= copy (fd);
+    close (fd);
+  }
+  return status;
+}
+@
+<<libc/ls.c>>=
+#include <stdio.h>
+#include <string.h>
+#include <dirent.h>
+#include <sys/stat.h>
+
+// ls [-l] [dir ...]: the names in a directory, one per line; -l adds type, size and link count (from stat)
+static int list (const char *dir, int longform) {
+  DIR *d = opendir (dir);
+  if (!d) { perror (dir); return 1; }
+  struct dirent *e;
+  while ((e = readdir (d)) != 0) {
+    if (!strcmp (e->d_name, ".") || !strcmp (e->d_name, "..")) continue;
+    if (!longform) { printf ("%s\n", e->d_name); continue; }
+    char path[300];
+    struct stat st;
+    snprintf (path, sizeof path, "%s/%s", dir, e->d_name);
+    if (stat (path, &st) != 0) { perror (path); continue; }
+    printf ("%c %2d %8ld %s\n", S_ISDIR (st.st_mode) ? 'd' : S_ISLNK (st.st_mode) ? 'l' : '-', (int) st.st_nlink, (long) st.st_size, e->d_name);
+  }
+  closedir (d);
+  return 0;
+}
+
+int main (int argc, char **argv) {
+  int longform = argc > 1 && !strcmp (argv[1], "-l"), first = 1 + longform, status = 0;
+  if (first >= argc) return list (".", longform);
+  for (int i = first; i < argc; i++) status |= list (argv[i], longform);
+  return status;
+}
+@
+The test program checks one call after the other and prints a line \texttt{user ok:} or \texttt{user FAIL:} for each, like the
+program of the previous section; it makes a file in the root directory, uses it and removes it again.
+
+<<libc/filetest.c>>=
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <sys/random.h>
+
+static int fails = 0;
+#define CHECK(c, msg) do { if (c) printf ("  user ok:   %s\n", msg); \
+                           else { printf ("  user FAIL: %s\n", msg); fails++; } } while (0)
+
+int main (int argc, char **argv) {
+  int norandom = argc > 1 && !strcmp (argv[1], "-n");      // -n: this machine has no random number generator (the kernel test asks)
+  struct stat st, st2;
+  char buf[64];
+
+  // stat and fstat
+  CHECK (stat ("/etc/rc.conf", &st) == 0 && S_ISREG (st.st_mode) && st.st_size > 0, "stat: /etc/rc.conf is a regular file with a size");
+  int fd = open ("/etc/rc.conf", O_RDONLY);
+  CHECK (fd >= 0 && fstat (fd, &st2) == 0 && st2.st_size == st.st_size && st2.st_ino == st.st_ino, "fstat on an open file: same size and inode as stat");
+  CHECK (stat ("/bin", &st) == 0 && S_ISDIR (st.st_mode), "stat: /bin is a directory");
+  errno = 0;
+  CHECK (stat ("/no/such/file", &st) == -1 && errno == ENOENT, "stat of a missing file fails with ENOENT");
+  CHECK (fstat (1, &st) == 0 && S_ISCHR (st.st_mode), "fstat (1): the terminal is a character device");
+  errno = 0;
+  CHECK (fstat (99, &st) == -1 && errno == EBADF, "fstat of a descriptor that is not open: EBADF");
+
+  // directories
+  DIR *d = opendir ("/bin");
+  int count = 0, found = 0, regular = 0;
+  struct dirent *e;
+  while (d && (e = readdir (d)) != 0) { count++; if (!strcmp (e->d_name, "cat")) { found = 1; regular = e->d_type == DT_REG; } }
+  CHECK (d && count > 50 && found && regular, "opendir/readdir: /bin has more than 50 entries, among them cat (d_type DT_REG)");
+  if (d) { rewinddir (d); int again = 0; while (readdir (d)) again++; CHECK (again == count, "rewinddir: the second round has as many entries"); closedir (d); }
+  errno = 0;
+  CHECK (opendir ("/etc/rc.conf") == 0 && errno == ENOTDIR, "opendir of a file fails with ENOTDIR");
+
+  // writing: O_TRUNC, O_EXCL, ftruncate, lseek, unlink
+  const char *name = "/filetest.tmp";
+  unlink (name);
+  int w = open (name, O_WRONLY | O_CREAT | O_EXCL, 0644);
+  CHECK (w >= 0 && write (w, "0123456789", 10) == 10, "open (O_CREAT | O_EXCL) and write");
+  errno = 0;
+  CHECK (open (name, O_WRONLY | O_CREAT | O_EXCL, 0644) == -1 && errno == EEXIST, "O_CREAT | O_EXCL on an existing file fails with EEXIST");
+  close (w);
+  w = open (name, O_RDWR | O_TRUNC);
+  CHECK (w >= 0 && fstat (w, &st) == 0 && st.st_size == 0, "O_TRUNC: the file is empty after open");
+  write (w, "abcdef", 6);
+  CHECK (ftruncate (w, 3) == 0 && fstat (w, &st) == 0 && st.st_size == 3, "ftruncate (3)");
+  CHECK (lseek (w, 0, SEEK_SET) == 0 && read (w, buf, 10) == 3 && !memcmp (buf, "abc", 3), "lseek and read back what is left");
+  close (w);
+
+  // descriptors: dup, dup3, fcntl, pipe2
+  int p[2];
+  CHECK (pipe2 (p, 0) == 0 && p[0] != p[1], "pipe2");
+  int copy = dup (p[1]);
+  CHECK (copy > p[1] && write (copy, "xy", 2) == 2 && read (p[0], buf, 2) == 2 && !memcmp (buf, "xy", 2), "dup: a write through the copy arrives at the read end");
+  CHECK (dup3 (p[1], 12, 0) == 12 && write (12, "z", 1) == 1 && read (p[0], buf, 1) == 1 && buf[0] == 'z', "dup3 to descriptor 12");
+  errno = 0;
+  CHECK (dup3 (p[1], p[1], 0) == -1 && errno == EINVAL, "dup3 with the same number twice fails with EINVAL");
+  CHECK (fcntl (p[0], F_DUPFD, 14) == 14, "fcntl (F_DUPFD, 14) returns descriptor 14");
+  CHECK ((fcntl (p[1], F_GETFL) & O_ACCMODE) == O_WRONLY, "fcntl (F_GETFL) on the write end of a pipe: write only");
+  CHECK (fstat (p[0], &st) == 0 && S_ISFIFO (st.st_mode), "fstat on a pipe: FIFO");
+  close (12); close (14); close (copy); close (p[0]); close (p[1]);
+  CHECK (unlink (name) == 0 && stat (name, &st) == -1, "unlink removes the test file");
+
+  // random numbers and the files that the kernel makes up (issue #45)
+  unsigned char r1[32], r2[32];
+  int u = open ("/dev/urandom", O_RDONLY), z = open ("/dev/zero", O_RDONLY), n = open ("/dev/null", O_RDWR);
+  if (norandom) {
+    errno = 0;
+    CHECK (u >= 0 && read (u, r1, 32) == -1 && errno == EIO, "no generator: /dev/urandom can be opened, but reading fails with EIO (no made-up numbers)");
+    CHECK (getrandom (r2, 32, 0) == -1 && errno == EIO, "no generator: getrandom fails with EIO");
+  } else {
+    CHECK (u >= 0 && read (u, r1, 32) == 32 && read (u, r2, 32) == 32 && memcmp (r1, r2, 32) != 0, "/dev/urandom: two reads of 32 bytes differ");
+    memset (r2, 0, 32);
+    CHECK (getrandom (r2, 32, 0) == 32 && memcmp (r1, r2, 32) != 0 && memcmp (r2, "\0\0\0\0\0\0\0\0", 8) != 0, "getrandom (32 bytes) gives other numbers than /dev/urandom");
+    char big[1000];
+    CHECK (getrandom (big, sizeof big, 0) == sizeof big, "getrandom of 1000 bytes (more than the kernel asks the generator for at once)");
+  }
+  CHECK (z >= 0 && read (z, r1, 32) == 32 && r1[0] == 0 && r1[31] == 0, "/dev/zero reads zero bytes");
+  CHECK (n >= 0, "open (\"/dev/null\", O_RDWR)");
+  CHECK (write (n, "gone", 4) == 4, "/dev/null swallows a write of 4 bytes");
+  CHECK (read (n, r1, 4) == 0, "/dev/null reads as empty");
+  return fails;
+}
+@
+\section{Test of threads: \texttt{threadtest}}
+\label{src:libc/threadtest.c}
+
+The test uses what a program with threads uses: \texttt{pthread\_create} and \texttt{pthread\_join}, a mutex, a condition variable,
+a semaphore, a variable per thread (\texttt{\_Thread\_local}, which needs the \texttt{PT\_TLS} segment of the linker script), the error number
+of each thread, a timed wait, and the end of a process with threads that still run.
+
+<<libc/threadtest.c>>=
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <pthread.h>
+#include <semaphore.h>
+#include <time.h>
+#include <unistd.h>
+#include <sys/wait.h>
+
+static int fails = 0;
+#define CHECK(c, msg) do { if (c) printf ("  user ok:   %s\n", msg); \
+                           else { printf ("  user FAIL: %s\n", msg); fails++; } } while (0)
+
+static void *return_arg (void *arg) { return (char *) arg + 1; }
+
+static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+static long counter;
+static void *count_up (void *arg) {
+  for (int i = 0; i < 5000; i++) { pthread_mutex_lock (&lock); counter++; pthread_mutex_unlock (&lock); }
+  return 0;
+}
+
+static pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
+static int ready, answer;
+static void *producer (void *arg) {
+  struct timespec nap = { 0, 20 * 1000000 };
+  nanosleep (&nap, 0);
+  pthread_mutex_lock (&lock);
+  answer = 42;  ready = 1;
+  pthread_cond_signal (&cond);
+  pthread_mutex_unlock (&lock);
+  return 0;
+}
+
+static _Thread_local int mine = 7;
+static void *set_mine (void *arg) { mine = (long) arg; errno = 99; return (void *) (long) mine; }
+
+static sem_t sem;
+static void *post_later (void *arg) { sem_post (&sem); return 0; }
+
+static void *forever (void *arg) { for (;;) ; }
+
+int main (void) {
+  pthread_t t, ts[4];
+  void *result = 0;
+
+  CHECK (pthread_create (&t, 0, return_arg, (void *) 100) == 0 && pthread_join (t, &result) == 0 && result == (void *) 101, "pthread_create and pthread_join: the thread's return value arrives");
+
+  int ok = 1;
+  for (int i = 0; i < 4; i++) if (pthread_create (&ts[i], 0, count_up, 0)) ok = 0;
+  for (int i = 0; i < 4; i++) if (ok) pthread_join (ts[i], 0);
+  CHECK (ok && counter == 20000, "4 threads count 5000 times each under a mutex: 20000");
+
+  pthread_mutex_lock (&lock);
+  pthread_create (&t, 0, producer, 0);
+  while (!ready) pthread_cond_wait (&cond, &lock);
+  pthread_mutex_unlock (&lock);
+  pthread_join (t, 0);
+  CHECK (answer == 42, "condition variable: the waiting thread wakes up when the other signals");
+
+  mine = 5;  errno = 3;
+  pthread_create (&t, 0, set_mine, (void *) 9);
+  pthread_join (t, &result);
+  CHECK (result == (void *) 9 && mine == 5, "_Thread_local: the thread has its own copy (9), main keeps its own (5)");
+  CHECK (errno == 3, "errno is per thread: the thread's 99 did not reach main");
+
+  sem_init (&sem, 0, 0);
+  pthread_create (&t, 0, post_later, 0);
+  CHECK (sem_wait (&sem) == 0, "sem_wait returns after the other thread's sem_post");
+  pthread_join (t, 0);
+
+  struct timespec soon;
+  clock_gettime (CLOCK_REALTIME, &soon);
+  soon.tv_nsec += 30 * 1000000;
+  if (soon.tv_nsec >= 1000000000) { soon.tv_sec++; soon.tv_nsec -= 1000000000; }
+  pthread_mutex_lock (&lock);
+  ready = 0;
+  CHECK (pthread_cond_timedwait (&cond, &lock, &soon) == ETIMEDOUT, "pthread_cond_timedwait with nobody to signal: ETIMEDOUT after 30 ms");
+  pthread_mutex_unlock (&lock);
+
+  pthread_t me = pthread_self ();
+  pthread_create (&t, 0, return_arg, 0);
+  CHECK (!pthread_equal (me, t), "pthread_self differs between the threads");
+  pthread_join (t, 0);
+
+  // exit () while another thread still runs: the process ends with the status, in a child so that this program goes on
+  int pid = fork ();
+  if (pid == 0) {
+    pthread_create (&t, 0, forever, 0);
+    struct timespec nap = { 0, 50 * 1000000 };
+    nanosleep (&nap, 0);
+    exit (7);
+  }
+  int status = 0;
+  CHECK (waitpid (pid, &status, 0) == pid && WIFEXITED (status) && WEXITSTATUS (status) == 7, "exit (7) while a second thread loops: the process ends, waitpid sees 7");
+  return fails;
+}
+@
+\section{Python: CPython on Ulix}
+\label{sec:libc:python}
+
+The aim of the epic ``Python'' (issue \#7) is that \texttt{python3} runs on Ulix. The interpreter is CPython 3.12.7, an unmodified submodule
+(\texttt{third\_party/cpython}, licence check in \texttt{third\_party/LICENCE-CHECK-cpython.md}), built \emph{statically} against musl. This section is the
+log of how it is attached; the files of this part are not literate sources (they are build scripts and data, like \texttt{libc/Makefile}):
+
+\begin{description}
+\item[\texttt{libc/musl-cc}] A shell script that calls \texttt{aarch64-elf-gcc} with the headers, the start files and \texttt{libc.a} of the musl
+  that \texttt{libc/Makefile} installed (\texttt{libc/build/sysroot}), and with nothing of the host. CPython's \texttt{configure} wants a compiler that
+  can compile \emph{and link} a test program, and this one can; it also links with \texttt{libc/musl.ld} when \texttt{MUSL\_LDSCRIPT} says so.
+\item[\texttt{libc/python-setup.local}] The list of extension modules. There is no \texttt{dlopen} (issue \#40: static linking only, see
+  below), so every module that the interpreter should have is compiled into it. \texttt{Modules/Setup.bootstrap} of CPython already
+  has the ones needed to start (\texttt{posix}, \texttt{\_io}, \texttt{\_sre}, \texttt{time}, \texttt{\_thread}, \ldots); the file adds \texttt{math},
+  \texttt{\_struct}, \texttt{array}, \texttt{binascii}, \texttt{\_json}, \texttt{select} and a few more. A module that needs a library that musl does not have
+  (zlib, OpenSSL, SQLite) is not in the list.
+\item[\texttt{libc/Makefile}] \texttt{make PYTHON=1} configures CPython out of the tree (\texttt{libc/build/python}) with
+  \texttt{--host=aarch64-linux-musl --disable-shared --without-ensurepip}, builds \texttt{python.exe}, strips it and marks it for the kernel
+  (\texttt{mark\_musl.py}). CPython builds itself in two steps (it runs a small interpreter on the build machine to freeze the
+  modules \texttt{os}, \texttt{site}, \texttt{io}, \ldots\ into the executable), so a \texttt{python3.12} must be on the host (\texttt{BUILD\_PYTHON}).
+  The default is on when the submodule is checked out; \texttt{make PYTHON=0} leaves it out and it is not even compiled.
+\item[\texttt{/musl/python}, \texttt{/usr/local/lib/python3.12/encodings/}] The disk gets the interpreter (7.4 MByte, stripped) and the part of
+  the standard library that start-up needs: the \texttt{encodings} package. Everything else that \texttt{import} may ask for comes from the frozen
+  modules inside the executable. More of \texttt{Lib/} is a matter of adding file names to \texttt{PYTHON\_LIB\_FILES} in the \texttt{Makefile}.
+\end{description}
+
+\paragraph{What the first runs showed} (this is the ``spike'', issue \#57; every line is something that really happened, in this order):
+\begin{enumerate}
+\item It compiled and linked on the first try (no patch, 4.4 MByte of code, 1.4 MByte of data). The default linker script put the program headers
+  outside the loaded image, so musl's start-up code (\texttt{AT\_PHDR}) failed; with \texttt{libc/musl.ld} it starts. The script got a \texttt{PT\_TLS}
+  segment for the thread-local variables of CPython (\texttt{\_Py\_thread\_local}) and of musl.
+\item \texttt{Fatal Python error: \_PyErr\_NoMemory}: the second \texttt{mmap} of the same size failed. The search for a free address range of
+  \texttt{linux\_mmap} returned the \emph{lowest} page of the run it had found and the function then subtracted the length of the run once more,
+  so the new mapping overlapped the pages below it. The test program of musl only ever mapped into free space and never saw it.
+\item \texttt{ModuleNotFoundError: No module named 'encodings'}: the standard library has to be on the disk. The disk image of the book (1.4 MByte,
+  480 inodes, the zone map in one block) is too small for a 7 MByte file. The Makefile now makes a new file system of 16 MByte and copies the files of
+  the book's image into it (\texttt{tools/minix\_copy.py}; \texttt{minix\_add.py} learned to write files with a double indirect block, the kernel could
+  read them already). One thing about the book had to be respected: \texttt{mx\_unlink} frees a zone with the constant \texttt{33}, the number of
+  the \emph{first data zone minus one} of the floppy image, so the new file system must also start its data at zone 34. It has 464 inodes
+  and a zone map of two blocks for that (\texttt{minix\_mkfs.py --inodes=464}).
+\item A fault at an address 64 KByte below the stack pointer: CPython's parser has a function with a 64 KByte array. The stack grew by one page
+  when the page just below it was touched, as in the book; now it grows by as many pages as needed if the address is at most 1 MByte below (an
+  access further away is still a wild pointer and kills the process, as before).
+\item \texttt{renameat} (38) was missing: the interpreter writes compiled modules under a temporary name and renames them (now implemented
+  with \texttt{u\_link} and \texttt{u\_unlink}, see above), and a call to \texttt{socket} (198) that is answered with \texttt{ENOSYS} (the sockets for
+  programs are the next chapter's work); the interpreter does not need either to go on.
+\item After that: \texttt{print (6 * 7)}, a script with the \texttt{math} module, \texttt{os.getcwd ()}, sets and sorting run, and the exit status is right.
+\end{enumerate}
+
+\paragraph{The decision for \#40 (\texttt{dlopen}).} Python extension modules are usually shared objects, loaded with \texttt{dlopen}. Ulix does not
+have a dynamic linker (musl's static \texttt{dlopen} answers ``Dynamic loading not supported''); it would need a \texttt{PT\_INTERP} loader, position independent
+code, relocations and file mappings in the kernel. All modules that are wanted are linked in instead (list above). Python's \texttt{ctypes}
+and third-party packages with C code are out for now. The decision is revisited together with file mappings (not before they exist).
+
+\paragraph{The decision for \#57 (MicroPython or CPython).} Both were looked at. MicroPython has no standard library to speak of and a different
+set of modules; programs for ``Python 3'' that the user will expect (the \texttt{json}, \texttt{re}, \texttt{socket} modules of the standard library) are CPython programs.
+CPython ran on the first attempt without a patch, and what it needs from the kernel (see the numbered list) is what any C program that uses
+threads, sockets and files needs; that work is useful for every other program. So CPython it is. The price is size: 7.4 MByte on the disk instead of a few
+hundred KByte, and the 16 MByte root file system.
+
+\paragraph{Test.} \texttt{tools/python\_test.py} (\texttt{make python-test}, job \texttt{python} of \texttt{make pcheck}) boots the shell kernel with a disk that has
+the interpreter, logs in and runs \texttt{python -c print(6*7)} and the script \texttt{/musl/hello.py}; the output is compared line by line. It prints
+a message and succeeds if the build has no interpreter (\texttt{PYTHON=0}).
+\section{Test of sockets: \texttt{sockettest}}
+\label{src:libc/sockettest.c}
+
+The program talks to two servers that \texttt{tools/socket\_test.py} runs on the host (qemu's user network makes the host \texttt{10.0.2.2}): a TCP server that answers
+every line in capital letters and closes when the client has finished sending, and a UDP server that does the same for every datagram. It is started
+as \texttt{sockettest 10.0.2.2 TCPPORT UDPPORT}. The checks go through the ways in which the calls are used by real programs: blocking and non-blocking sockets, \texttt{poll} and \texttt{select}
+with a pipe and a socket, an error from \texttt{connect}, and \texttt{getaddrinfo} with names from \texttt{/etc/hosts}.
+
+<<libc/sockettest.c>>=
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <poll.h>
+#include <netdb.h>
+#include <arpa/inet.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+
+static int fails = 0;
+#define CHECK(c, msg) do { if (c) printf ("  user ok:   %s\n", msg); \
+                           else { printf ("  user FAIL: %s\n", msg); fails++; } } while (0)
+
+static struct sockaddr_in address (const char *ip, int port) {
+  struct sockaddr_in a;
+  memset (&a, 0, sizeof a);
+  a.sin_family = AF_INET;  a.sin_port = htons (port);  inet_pton (AF_INET, ip, &a.sin_addr);
+  return a;
+}
+
+int main (int argc, char **argv) {
+  if (argc != 4) { printf ("usage: sockettest HOST TCPPORT UDPPORT\n");  return 2; }
+  struct sockaddr_in tcp = address (argv[1], atoi (argv[2])), udp = address (argv[1], atoi (argv[3])), from;
+  socklen_t fromlen = sizeof from;
+  char buf[200];
+
+  errno = 0;
+  CHECK (socket (AF_INET6, SOCK_STREAM, 0) == -1 && errno == EAFNOSUPPORT, "socket (AF_INET6) is refused with EAFNOSUPPORT");
+
+  // datagrams: sendto and recvfrom, with the address of the sender
+  int u = socket (AF_INET, SOCK_DGRAM, 0);
+  struct pollfd pfd = { u, POLLIN, 0 };
+  CHECK (u >= 0 && sendto (u, "ping", 4, 0, (struct sockaddr *) &udp, sizeof udp) == 4, "UDP: sendto a datagram to the host server");
+  CHECK (poll (&pfd, 1, 3000) == 1 && (pfd.revents & POLLIN), "poll: the answer makes the socket readable");
+  int n = recvfrom (u, buf, sizeof buf, 0, (struct sockaddr *) &from, &fromlen);
+  CHECK (n == 4 && !memcmp (buf, "PING", 4) && from.sin_port == udp.sin_port, "UDP: recvfrom gives PING and the port of the server");
+  CHECK (poll (&pfd, 1, 100) == 0, "poll with nothing to read: returns 0 after the timeout (100 ms)");
+  int nb = recv (u, buf, sizeof buf, MSG_DONTWAIT);
+  CHECK (nb == -1 && errno == EAGAIN, "recv (MSG_DONTWAIT) with nothing there: EAGAIN");
+  CHECK (connect (u, (struct sockaddr *) &udp, sizeof udp) == 0 && send (u, "pong", 4, 0) == 4 && recv (u, buf, sizeof buf, 0) == 4 && !memcmp (buf, "PONG", 4), "UDP: connect, send and recv");
+  struct sockaddr_in me;  socklen_t melen = sizeof me;
+  CHECK (getsockname (u, (struct sockaddr *) &me, &melen) == 0 && ntohs (me.sin_port) >= 1024, "getsockname: the socket got a local port");
+  close (u);
+
+  // a stream: connect, write, read, shutdown, the end of the stream
+  int s = socket (AF_INET, SOCK_STREAM, 0);
+  CHECK (s >= 0 && connect (s, (struct sockaddr *) &tcp, sizeof tcp) == 0, "TCP: connect to the host server");
+  struct sockaddr_in peer;  socklen_t peerlen = sizeof peer;
+  CHECK (getpeername (s, (struct sockaddr *) &peer, &peerlen) == 0 && peer.sin_port == tcp.sin_port, "getpeername: the port of the server");
+  CHECK (write (s, "hello\n", 6) == 6, "write 6 bytes to the stream");
+  pfd.fd = s;
+  CHECK (poll (&pfd, 1, 3000) == 1 && (pfd.revents & POLLIN), "poll: the answer makes the stream readable");
+  n = read (s, buf, sizeof buf);
+  CHECK (n == 6 && !memcmp (buf, "HELLO\n", 6), "read gives HELLO");
+  CHECK (shutdown (s, SHUT_WR) == 0, "shutdown (SHUT_WR)");
+  n = read (s, buf, sizeof buf);
+  CHECK (n == 0, "after the server has closed: read returns 0 (end of the stream)");
+  close (s);
+
+  // a connection that is refused
+  struct sockaddr_in closed = address (argv[1], 1);
+  s = socket (AF_INET, SOCK_STREAM, 0);
+  errno = 0;
+  CHECK (connect (s, (struct sockaddr *) &closed, sizeof closed) == -1 && errno == ECONNREFUSED, "connect to a port where nobody listens: ECONNREFUSED");
+  close (s);
+
+  // non-blocking connect: EINPROGRESS, then poll says writable
+  s = socket (AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+  errno = 0;
+  int c = connect (s, (struct sockaddr *) &tcp, sizeof tcp);
+  pfd.fd = s;  pfd.events = POLLOUT;
+  CHECK (c == -1 && errno == EINPROGRESS && poll (&pfd, 1, 5000) == 1 && (pfd.revents & POLLOUT), "non-blocking connect: EINPROGRESS, then poll reports POLLOUT");
+  errno = 0;
+  CHECK (read (s, buf, sizeof buf) == -1 && errno == EAGAIN, "read on a non-blocking stream with nothing there: EAGAIN");
+  close (s);
+
+  // select () with a pipe: not ready, then ready
+  int p[2];
+  pipe (p);
+  fd_set rs;
+  struct timeval tv = { 0, 50000 };
+  FD_ZERO (&rs);  FD_SET (p[0], &rs);
+  CHECK (select (p[0] + 1, &rs, 0, 0, &tv) == 0, "select on an empty pipe: nothing is ready after 50 ms");
+  write (p[1], "x", 1);
+  FD_ZERO (&rs);  FD_SET (p[0], &rs);
+  tv.tv_usec = 50000;
+  CHECK (select (p[0] + 1, &rs, 0, 0, &tv) == 1 && FD_ISSET (p[0], &rs), "select: after a write the read end of the pipe is ready");
+  struct pollfd two[2] = { { p[0], POLLIN, 0 }, { p[1], POLLOUT, 0 } };
+  CHECK (poll (two, 2, 0) == 2 && (two[0].revents & POLLIN) && (two[1].revents & POLLOUT), "poll on both ends of a pipe: readable and writable");
+  close (p[0]);  close (p[1]);
+
+  // getaddrinfo with the names in /etc/hosts (and numbers)
+  struct addrinfo hints, *res = 0;
+  memset (&hints, 0, sizeof hints);
+  hints.ai_family = AF_INET;  hints.ai_socktype = SOCK_STREAM;
+  int g = getaddrinfo ("localhost", "80", &hints, &res);
+  CHECK (g == 0 && res && ((struct sockaddr_in *) res->ai_addr)->sin_addr.s_addr == htonl (INADDR_LOOPBACK) && ((struct sockaddr_in *) res->ai_addr)->sin_port == htons (80), "getaddrinfo (\"localhost\", \"80\"): 127.0.0.1, port 80 (from /etc/hosts)");
+  if (res) freeaddrinfo (res);
+  g = getaddrinfo ("10.0.2.2", 0, &hints, &res);
+  CHECK (g == 0 && res && ((struct sockaddr_in *) res->ai_addr)->sin_addr.s_addr == inet_addr ("10.0.2.2"), "getaddrinfo of a numeric address");
+  if (res) freeaddrinfo (res);
+  g = getaddrinfo ("gateway.ulix", 0, &hints, &res);
+  CHECK (g == 0 && res && ((struct sockaddr_in *) res->ai_addr)->sin_addr.s_addr == inet_addr ("10.0.2.2"), "getaddrinfo (\"gateway.ulix\"): 10.0.2.2 (from /etc/hosts)");
+  if (res) freeaddrinfo (res);
+  return fails;
+}
+@
+\section{Locale, wide characters and regular expressions: \texttt{localetest}}
+\label{src:libc/localetest.c}
+
+There is nothing to port here (issue \#39): musl has all of it in its own source (\texttt{src/locale}, \texttt{src/multibyte}, \texttt{src/regex}, which is TRE, and
+the Unicode tables for \texttt{towupper} and friends), and none of it needs a system call. What musl does \emph{not} have is a locale database: there are exactly two
+locales, \texttt{C} (bytes above 127 are not characters) and \texttt{C.UTF-8} (UTF-8, a character is one to four bytes); any other name is accepted and behaves like \texttt{C.UTF-8}, musl only keeps the name (so \texttt{setlocale (LC\_ALL, ``de\_DE.UTF-8'')} succeeds and the month names stay English).
+There is no \texttt{iconv} for most legacy encodings and no translated messages (\texttt{gettext} finds no files). A program for this system must not rely on more; the
+test says what is there. (The kernel's terminal is a text terminal with one byte per character: the program never prints the non-ASCII text, it only works with it.)
+
+<<libc/localetest.c>>=
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <locale.h>
+#include <langinfo.h>
+#include <wchar.h>
+#include <wctype.h>
+#include <regex.h>
+#include <time.h>
+
+static int fails = 0;
+#define CHECK(c, msg) do { if (c) printf ("  user ok:   %s\n", msg); \
+                           else { printf ("  user FAIL: %s\n", msg); fails++; } } while (0)
+
+int main (void) {
+  const char *text = "Gr\xc3\xbc\xc3\x9f" "e, \xe2\x82\xac";                       // "Grüße, €" in UTF-8: 8 characters, 12 bytes
+  wchar_t w[20];
+
+  CHECK (setlocale (LC_ALL, "C.UTF-8") != 0 && !strcmp (nl_langinfo (CODESET), "UTF-8"), "setlocale (LC_ALL, \"C.UTF-8\") works, the code set is UTF-8");
+  CHECK (setlocale (LC_ALL, "de_DE.UTF-8") != 0 && !strcmp (nl_langinfo (CODESET), "UTF-8"), "setlocale (LC_ALL, \"de_DE.UTF-8\") is accepted, but it is only C.UTF-8 under another name (musl keeps the name, there is no data)");
+  CHECK (!strcmp (nl_langinfo (MON_1), "January") && !strcmp (nl_langinfo (DAY_1), "Sunday"), "so the month and day names are still English");
+  setlocale (LC_ALL, "C.UTF-8");
+
+  CHECK (strlen (text) == 12 && mbstowcs (w, text, 20) == 8 && wcslen (w) == 8, "mbstowcs: 12 bytes of UTF-8 are 8 characters; wcslen is 8");
+  CHECK (w[2] == 0xfc && w[3] == 0xdf && w[7] == 0x20ac, "the characters are the code points: u-umlaut 0xfc, sharp s 0xdf, euro 0x20ac");
+  char back[32];
+  CHECK (wcstombs (back, w, sizeof back) == 12 && !strcmp (back, text), "wcstombs turns them back into the same 12 bytes");
+
+  mbstate_t st;  memset (&st, 0, sizeof st);
+  wchar_t one;
+  CHECK (mbrtowc (&one, "\xe2\x82", 2, &st) == (size_t) -2 && mbrtowc (&one, "\xac", 1, &st) == 1 && one == 0x20ac, "mbrtowc: a character that arrives in two pieces (-2, then 1)");
+  memset (&st, 0, sizeof st);
+  errno = 0;
+  CHECK (mbrtowc (&one, "\xff", 1, &st) == (size_t) -1, "mbrtowc: the byte 0xff is not UTF-8 (-1)");
+
+  CHECK (towupper (0xfc) == 0xdc && towlower (0xc4) == 0xe4 && iswalpha (0xe9) && !iswalpha (0x20ac) && iswupper (0xc9), "towupper, towlower, iswalpha, iswupper work for non-ASCII letters");
+
+  wchar_t line[40];
+  swprintf (line, 40, L"%ls|%5.2f|%lc", L"wä", 3.14159, (wint_t) 0x20ac);
+  CHECK (!wcscmp (line, L"wä| 3.14|€"), "swprintf with %ls, %f and %lc");
+
+  regex_t re;
+  regmatch_t m[3];
+  CHECK (regcomp (&re, "^([a-z]+)@([a-z]+)\\.org$", REG_EXTENDED) == 0 && regexec (&re, "ulix@example.org", 3, m, 0) == 0 &&
+         m[1].rm_so == 0 && m[1].rm_eo == 4 && m[2].rm_so == 5 && m[2].rm_eo == 12, "regcomp and regexec (extended): the groups of an e-mail address are found");
+  CHECK (regexec (&re, "ulix@example.com", 0, 0, 0) == REG_NOMATCH, "regexec: no match for a .com address");
+  regfree (&re);
+  CHECK (regcomp (&re, "gr.\\{1,2\\}e", REG_ICASE) == 0 && regexec (&re, text, 0, 0, 0) == 0, "a basic regular expression with REG_ICASE matches \"Gr\xc3\xbc\xc3\x9f" "e\" (the dot is one character, two bytes)");
+  regfree (&re);
+
+  struct tm t;
+  memset (&t, 0, sizeof t);
+  t.tm_year = 126;  t.tm_mon = 10;  t.tm_mday = 13;  t.tm_hour = 9;  t.tm_min = 5;  t.tm_sec = 7;  t.tm_wday = 5;
+  char date[64];
+  CHECK (strftime (date, sizeof date, "%Y-%m-%d %H:%M:%S %a %b", &t) == 27 && !strcmp (date, "2026-11-13 09:05:07 Fri Nov"), "strftime: ISO date and the English day and month names");
+
+  CHECK (strcoll ("apple", "banana") < 0 && strtod ("3.5", 0) == 3.5, "strcoll (bytewise) and strtod (decimal point) in the C.UTF-8 locale");
   return fails;
 }
 @
