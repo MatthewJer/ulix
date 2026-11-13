@@ -1128,6 +1128,7 @@ static inline int resolve_host (char *name, unsigned *address) {
 }
 
 <<userland/arm64-extra.h: tls>>
+<<userland/arm64-extra.h: servers>>
 #endif
 
 @

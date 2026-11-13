@@ -369,8 +369,10 @@ never sees the pointer, only the slot number. Because [[tcp.c]] re-uses a connec
 also keeps the connection's [[id]] (a number that [[tcp.c]] gives every new connection); a socket whose connection was
 closed and re-used answers ``closed'' and does not read somebody else's data.
 
-Waiting works as everywhere else in the network code: while the kernel waits for the network, it looks into the card
-([[net_poll_once]]) and gives the CPU to the others ([[arch_resign]]).
+Waiting for the network: [[tcp_connect]] and [[tcp_send]] look into the card ([[net_poll_once]]) and give the CPU to the others
+([[arch_resign]]) until they are done. [[tcp_recv]] is the call that may wait for a long time, so it \emph{sleeps} in the queue of the network
+waiters until the network thread has made another round ([[net_wait]], chapter on servers); a server that has a connection open for hours
+should not use a CPU for it.
 
 <<net_syscalls.c: syscall_tls>>=
 extern int  random_get (void *buf, int n);
@@ -452,13 +454,19 @@ struct tcp_msg { int handle; unsigned char *buf; int len; int timeout_ms; };
 
 static int sock_ok (int h) { return h >= 0 && h < SOCKETS && socks[h].c && socks[h].owner == current_task; }
 
-void syscall_tcp_connect (context_t *r) {
-  struct tcp_connect_args *a = (struct tcp_connect_args *)r->ebx;
+// a free slot (-1: none). A socket whose owner has died without closing it is closed first, so that it does not stay for ever.
+static int free_socket (void) {
   int h = -1;
   for (int i = 0; i < SOCKETS; i++) {
-    if (socks[i].c && !alive (socks[i].owner)) { tcp_close (socks[i].c);  socks[i].c = 0; }       // (the owner has died: close it)
+    if (socks[i].c && !alive (socks[i].owner)) { tcp_close (socks[i].c);  socks[i].c = 0; }
     if (!socks[i].c && h < 0) h = i;
   }
+  return h;
+}
+
+void syscall_tcp_connect (context_t *r) {
+  struct tcp_connect_args *a = (struct tcp_connect_args *)r->ebx;
+  int h = free_socket ();
   if (h < 0) eax_return (-1);
   tcp_conn *c = tcp_connect (a->ip, a->port);
   if (!c) eax_return (-1);
@@ -509,7 +517,7 @@ void syscall_tcp_recv (context_t *r) {
     if (n != 0) eax_return (n);                                      // data, or -1: the other side has closed
     if (net_now_ms () - start >= (unsigned)m->timeout_ms) eax_return (0);
     net_poll_once ();
-    arch_resign ();
+    net_wait ();                                                     // sleep until the network thread has looked at the card again
   }
 }
 

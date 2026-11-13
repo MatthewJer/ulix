@@ -1,0 +1,195 @@
+\chapter{Servers as programs}
+\label{ch:servers}
+
+Up to now the two servers of Ulix, telnet and SSH, are part of the kernel: the network thread accepts the connections, speaks the
+protocol and feeds the keys into the terminal. The chapter on daemons says why that is only a shortcut: a server that runs in the
+kernel can crash the system, its mistakes cost kernel memory, and the cryptography of the SSH server has to fit on the 16~KByte stack
+of a kernel thread. A server should be a \emph{program} that the administrator starts with \texttt{service}, that the kernel can
+end like any other process, and that has a normal stack.
+
+Such a program needs three things from the kernel that it did not have:
+
+\begin{enumerate}
+\item \emph{Server sockets}: a way to say ``I accept connections to port 23'' and to wait for the next one. That is the first
+  section of this chapter.
+\item \emph{A way to attach a session to a terminal}: what the kernel's telnet code did with \texttt{telnet\_input} and
+  \texttt{telnet\_putch}, as system calls. That is the second section (a minimal pseudo terminal).
+\item \emph{A convention for starting}: the files in \texttt{/etc/rc.d}, which the chapter on daemons describes.
+\end{enumerate}
+
+The TCP code of the kernel does not change: it has always been able to accept connections (\texttt{tcp\_listen} and
+\texttt{tcp\_accept} in \texttt{tcp.c}), the kernel servers used it. This chapter only puts system calls on top.
+
+\section{Server sockets: \texttt{tcp\_listen} and \texttt{tcp\_accept}}
+\label{src:servers:listen}
+
+A program that connects to a server already has the system calls \texttt{tcp\_connect}, \texttt{tcp\_send}, \texttt{tcp\_recv} and
+\texttt{tcp\_close}. They work with a small number, the \emph{socket}: a slot in a table of the kernel that points to a connection. The
+server side needs two more calls, and the rest stays the same: a connection that was accepted is a socket like any other.
+
+\begin{quote}\begin{verbatim}
+    tcp_listen (port)                accept connections to this port: 0 = ok, -1 = no room, -2 = only root may use ports below 1024 (630)
+    tcp_accept (port, timeout_ms)    wait for the next client: a socket (then tcp_send, tcp_recv, tcp_close),
+                                     -1 = no room for another socket, -2 = time over (631)
+\end{verbatim}\end{quote}
+
+\paragraph{Why the port and not a socket number.} The Unix \texttt{listen} works on a socket that \texttt{socket} and \texttt{bind} have
+made before. The TCP code of Ulix knows no such object: a listener is only a port number in a table. A call that names the port is
+all it takes, and a student can see at once what it does. (\texttt{socket}, \texttt{bind} and friends are a matter for the Linux
+interface of the kernel, which has to offer the system calls of musl anyway; they are not part of this step.) The price: two programs cannot listen on the same
+port, and a second \texttt{tcp\_listen} for a port that is already open succeeds without doing anything. That is what lets a server
+that was ended and started again take over its port. (A port stays open after its server has ended; connections that arrive in the
+meantime wait for the next server.)
+
+\paragraph{Only root opens low ports.} As on every Unix, ports below 1024 are reserved for the administrator: whoever listens on port
+23 or 22 decides what a user's password is typed into. The system call looks at the effective user ID (the same test as \texttt{net\_set}).
+
+\paragraph{\texttt{tcp\_accept} sleeps.} A server spends nearly all its time waiting for the next client, and a program that waits in
+a loop (\texttt{yield}, look, \texttt{yield}, \ldots) uses a CPU for nothing. The process therefore \emph{sleeps} in a blocked queue,
+as a process that waits for the disk or for a pipe. Who wakes it? Everything that can end the wait comes in through the network card,
+and the network thread looks at the card whenever the card has something and at least twenty times a second. After each round it
+wakes everybody who waits for the network (\texttt{net\_wake\_all}), and each of them looks whether its own condition is true now. That is
+the same idea as the one queue of the pipes: a wrong guess costs one look. A wake-up that falls between the look and the sleep is not lost
+for long, because the next round of the network thread is at most 50 milliseconds away.
+
+The same waiting is used by \texttt{tcp\_recv}, which used to poll in a loop. That was the shortcut of the first TLS program; it is not
+good enough for a server that has a connection open for hours.
+
+\paragraph{A signal does not interrupt the sleep.} A process that gets \texttt{SIGKILL} while it sleeps must die at once, so it leaves
+the queue first (\texttt{net\_before\_kill}, called from \texttt{u\_kill} like \texttt{pipes\_before\_kill}). A signal that has a handler
+(\texttt{SIGTERM} of a daemon) is only seen when the system call returns. So a server waits with a time limit of a second and looks at its
+flag after every wait. The system call has no \texttt{EINTR}; to add one, the sleeping loops would need to know whether a signal is pending, and
+that is a change in the book's signal code that this step does not need.
+
+<<net_syscalls.c: waiting>>=
+#define TSTATE_WAITNET 14                    // a process sleeps in net_queue (12 is the serial disk, 13 a pipe)
+
+static blocked_queue net_queue;              // everybody who waits for the network: accept, recv
+
+// a process may only sleep if it is a real process: the idle thread and the boot code poll (see the book)
+static int net_can_sleep (void) { return current_task > 1 && scheduler_is_active; }
+
+void net_wake_all (void) {                   // the network thread has looked at the card: the waiters look at their condition again
+  while (net_queue.next != 0) deblock (net_queue.next, &net_queue);
+}
+
+// a process that is killed while it sleeps here must leave the queue first (the book's u_kill knows only its own queues)
+void net_before_kill (int pid) {
+  if (pid > 1 && pid < MAX_THREADS && thread_table[pid].used && thread_table[pid].state == TSTATE_WAITNET) deblock (pid, &net_queue);
+}
+
+// sleep until the network thread has made a round (the caller then looks again); without a scheduler: let the others run
+static void net_wait (void) {
+  if (!net_can_sleep ()) { arch_resign ();  return; }
+  block (&net_queue, TSTATE_WAITNET);
+  arch_resign ();                            // here the process sleeps
+}
+@
+
+First the declarations that the file needs in addition (the TCP functions are the ones of [[tcp.c]]; [[tcp_connect]] and the others are declared in the chapter on TLS):
+
+<<net_syscalls.c: servers>>=
+extern int       tcp_listen (unsigned short port);
+extern tcp_conn *tcp_accept (unsigned short port);
+@
+
+The two system calls. \texttt{tcp\_accept} first needs a free socket slot (\texttt{free\_socket} also closes the sockets of processes that
+have ended); it then asks the TCP code for a new connection to the port and sleeps while there is none. A timeout below zero waits
+for ever.
+
+<<net_syscalls.c: servers>>=
+void syscall_tcp_listen (context_t *r) {
+  int port = (int)r->ebx;
+  if (port < 1 || port > 65535) eax_return (-1);
+  if (port < 1024 && !is_root ()) eax_return (-2);
+  eax_return (tcp_listen (port));
+}
+
+void syscall_tcp_accept (context_t *r) {
+  int port = (int)r->ebx, timeout_ms = (int)r->ecx;
+  int h = free_socket ();
+  if (h < 0) eax_return (-1);
+  unsigned long long start = net_now_ms ();
+  for (;;) {
+    tcp_conn *c = tcp_accept (port);
+    if (c) { socks[h].c = c;  socks[h].id = tcp_id (c);  socks[h].owner = current_task;  eax_return (h); }
+    if (timeout_ms >= 0 && net_now_ms () - start >= (unsigned)timeout_ms) eax_return (-2);
+    net_poll_once ();
+    net_wait ();
+  }
+}
+
+@
+\paragraph{The user side.} The wrappers join the header that the network programs use. They take the arguments in registers, like
+\texttt{getrandom}, so no structure is needed.
+
+<<userland/arm64-extra.h: servers>>=
+// server sockets (net_syscalls.c, chapter "Servers as programs")
+#define __NR_tcp_listen   630
+#define __NR_tcp_accept   631
+static inline int tcp_listen (int port)                  { return syscall2 (__NR_tcp_listen, port); }                       // 0 = ok, -1 = no room, -2 = only root may use ports below 1024
+static inline int tcp_accept (int port, int timeout_ms)  { return syscall3 (__NR_tcp_accept, port, timeout_ms); }           // a socket, -1 = no room, -2 = time over; timeout -1: wait for ever
+@
+
+\section{A test server: \texttt{echod}}
+\label{src:userland:echod.c}
+
+The smallest server that is not a toy answers every byte with the same byte (RFC 862, \emph{echo}). \texttt{echod PORT} listens, accepts one client
+at a time, sends back what it receives until the client hangs up, and goes back to \texttt{accept}. It is a service as well, with
+\texttt{/etc/rc.d/echod}: switched off unless \texttt{rc.conf} says \texttt{echod\_enable="YES"}.
+
+Two things show how a server is written. The main loop waits for a client with a time limit of one second, not for ever, and looks at
+a flag after every wait, because \texttt{SIGTERM} (what \texttt{service stop} sends) only makes the handler run when the system call
+returns. And a client that has gone must not leave the server stuck: \texttt{tcp\_recv} says $-1$ and the server closes its end.
+
+<<userland/echod.c>>=
+#include "../ulixlib.h"
+#include "../arm64-extra.h"
+
+static volatile int stop = 0;
+static void on_term (int signo) { stop = 1; }              // SIGTERM: end after the current wait
+
+static void echo (int sock) {                              // everything that arrives goes back, until the client hangs up
+  unsigned char buf[512];
+  struct tcp_msg m;
+  while (!stop) {
+    m.handle = sock;  m.buf = buf;  m.len = sizeof buf;  m.timeout_ms = 1000;
+    int n = tcp_recv (&m);
+    if (n < 0) return;                                     // closed
+    if (n == 0) continue;                                  // nothing for a second: look at the flag
+    m.len = n;  m.timeout_ms = 10000;
+    if (tcp_send (&m) < 0) return;
+  }
+}
+
+int main (int argc, char **argv) {
+  int port = argc > 1 ? atoi (argv[1]) : 7007;
+  signal (SIGTERM, on_term);
+  if (tcp_listen (port) != 0) { printf ("echod: cannot listen on port %d\n", port);  return 1; }
+  while (!stop) {
+    int sock = tcp_accept (port, 1000);                    // sleeps until a client comes (at most a second)
+    if (sock == -1) { waitkey (100);  continue; }          // no room for a socket: try again soon
+    if (sock < 0) continue;                                // time over
+    echo (sock);
+    tcp_close (sock);
+  }
+  return 0;
+}
+@
+
+<<etc/rc.d/echod>>=
+# echod: the echo server (a test and an example of a server written as a program); listens on port 7007
+command="/bin/echod 7007"
+rcvar="echod_enable"
+default="NO"
+pidfile="/var/run/echod.pid"
+@
+
+\section{The test}
+
+\texttt{make listen-test} (\texttt{tools/listen\_test.py}) boots the shell kernel with a network card, on a copy of the disk whose
+\texttt{rc.conf} switches \texttt{echod} on. The boot starts the service before the login appears, and qemu forwards a port of the host
+to port 7007 of the kernel. The test then behaves like clients: one that sends text and gets it back, a second one that comes while the
+first one is still connected (it has to wait: the server serves one client at a time, and the queue of connections is the one of TCP), one
+that connects and leaves without a word, and one that sends 20000 bytes (more than the buffers of TCP hold). A boot with the default
+(\texttt{echod} off) must not answer on the port.

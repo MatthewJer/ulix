@@ -35,7 +35,7 @@ USERLAND_BIN = userland/build/bin
 userland/build/bin/init.elf: FORCE
 	$(MAKE) -C userland
 
-disk.img: $(wildcard userland/build/bin/*.elf) ../bin-build/minixdata.img etc/rc.conf user/hello.elf user/cat.elf user/crash.elf user/forktest.elf user/sigtest.elf user/contest.elf user/cowtest.elf user/thtest.elf user/badptr.elf user/swaptest.elf user/screentest.elf user/stacktest.elf user/memtest.elf user/pipetest.elf libc/build/hello.elf userland/build/bin/init.elf tools/minix_add.py etc/ssl/cacert.pem etc/rc.d/heartbeat $(if $(filter 1,$(TLS)),etc/ssh/ssh_host_ecdsa_key)
+disk.img: $(wildcard userland/build/bin/*.elf) ../bin-build/minixdata.img etc/rc.conf user/hello.elf user/cat.elf user/crash.elf user/forktest.elf user/sigtest.elf user/contest.elf user/cowtest.elf user/thtest.elf user/badptr.elf user/swaptest.elf user/screentest.elf user/stacktest.elf user/memtest.elf user/pipetest.elf libc/build/hello.elf userland/build/bin/init.elf tools/minix_add.py etc/ssl/cacert.pem etc/rc.d/heartbeat etc/rc.d/echod $(if $(filter 1,$(TLS)),etc/ssh/ssh_host_ecdsa_key)
 	cp ../bin-build/minixdata.img $@
 	# two deliberately broken variants of hello.elf for the loader tests:
 	# e_machine = EM_386, and a code segment with flags RWX
@@ -43,7 +43,7 @@ disk.img: $(wildcard userland/build/bin/*.elf) ../bin-build/minixdata.img etc/rc
 	python3 -c "d=bytearray(open('user/hello.elf','rb').read()); d[68]=7; open('bad-wx.elf','wb').write(d)"
 	python3 tools/minix_add.py $@ --grow=4096 --chmod=/tmp:1777 hello64=user/hello.elf cat64=user/cat.elf crash64=user/crash.elf forktest64=user/forktest.elf sigtest64=user/sigtest.elf contest64=user/contest.elf cowtest64=user/cowtest.elf thtest64=user/thtest.elf badptr64=user/badptr.elf swaptest64=user/swaptest.elf screentest64=user/screentest.elf stacktest64=user/stacktest.elf memtest64=user/memtest.elf pipetest64=user/pipetest.elf muslhello64=libc/build/hello.elf \
 		badarch64=bad-arch.elf badwx64=bad-wx.elf \
-		/init=$(USERLAND_BIN)/init.elf /etc/rc.conf=etc/rc.conf --mkdir=/etc/rc.d /etc/rc.d/heartbeat=etc/rc.d/heartbeat \
+		/init=$(USERLAND_BIN)/init.elf /etc/rc.conf=etc/rc.conf --mkdir=/etc/rc.d /etc/rc.d/heartbeat=etc/rc.d/heartbeat /etc/rc.d/echod=etc/rc.d/echod \
 		$(if $(filter 1,$(TLS)),--mkdir=/etc/ssl /etc/ssl/cacert.pem=etc/ssl/cacert.pem --mkdir=/etc/ssh /etc/ssh/ssh_host_ecdsa_key=etc/ssh/ssh_host_ecdsa_key --chmod=/etc/ssh/ssh_host_ecdsa_key:600) \
 		$$(for f in $(USERLAND_BIN)/*.elf; do n=$$(basename $$f .elf); [ $$n != init ] && echo /bin/$$n=$$f; done)
 
@@ -330,6 +330,10 @@ dhcp-retry-test: ulix-console.bin $(DISK)
 # the telnet server: a client of the host logs in on terminal 5, runs programs, hangs up; the server can be switched off in /etc/rc.conf
 telnet-test: ulix-shell.bin $(DISK)
 	python3 tools/telnet_test.py ulix-shell.bin $(DISK)
+
+# server sockets for programs: the program echod listens and accepts (chapter "Servers as programs")
+listen-test: ulix-shell.bin $(DISK)
+	python3 tools/listen_test.py ulix-shell.bin $(DISK)
 
 # user-space services: service, daemon, /etc/rc.d, pid file, start at boot (chapter "Daemons and services")
 daemon-test: ulix-shell.bin $(DISK)

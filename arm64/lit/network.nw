@@ -1474,6 +1474,7 @@ static tcp_conn *allocate (void) {
 static u32 new_sequence (void) { return (u32)net_now_ms () * 250000 + 12345; }       // (the first sequence number should be hard to guess)
 
 int tcp_listen (u16 port) {
+  for (int i = 0; i < LISTENERS; i++) if (listeners[i] == port) return 0;        // (a server that is started again takes over its port)
   for (int i = 0; i < LISTENERS; i++) if (!listeners[i]) { listeners[i] = port; return 0; }
   return -1;
 }
@@ -2712,7 +2713,7 @@ extern int  telnet_step (void);
 extern int  ssh_start (void) __attribute__ ((weak));         // sshd.c (only when the system is built with TLS=1)
 extern int  ssh_step (void) __attribute__ ((weak));
 extern int  rc_conf_enabled (const char *variable, int fallback);
-extern int  rc_conf_enabled (const char *variable, int fallback);
+extern void net_wake_all (void);                            // net_syscalls.c: wake the programs that wait for the network
 extern void gic_enable (int irq);
 extern void arch_resign (void);
 extern int  arch_thread_create_high (void (*entry) (void *), void *arg, const char *name);
@@ -2863,6 +2864,7 @@ static void netd (void *arg) {
     netd_link6 ();                                                                            // (IPv6: a router solicitation, until a router has answered)
     netd_link ();                                                                             // (every two seconds: link? an address yet?)
     netlog_flush ();                                                                          // (the network log, if there is something for it)
+    net_wake_all ();                                                                          // (programs that wait for the network look again)
     netd_sleep ();                                                                            // then sleep until we are woken
   }
 }
@@ -3191,6 +3193,8 @@ The complete file is put together from these parts:
 <<net_syscalls.c>>=
 <<net_syscalls.c: includes>>
 
+<<net_syscalls.c: waiting>>
+
 <<net_syscalls.c: net_info>>
 
 <<net_syscalls.c: part 3>>
@@ -3205,6 +3209,8 @@ The complete file is put together from these parts:
 <<net_syscalls.c: syscall_net6>>
 
 <<net_syscalls.c: syscall_tls>>
+
+<<net_syscalls.c: servers>>
 @
 
 <<net_syscalls.c: includes>>=

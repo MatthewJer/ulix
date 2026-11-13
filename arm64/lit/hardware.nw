@@ -814,6 +814,7 @@ extern u64  secondary_tcr;
 extern void book_scheduler (context_t *r, int source);
 extern int  book_u_kill (int pid, int signo);
 extern void pipes_before_kill (int pid, int signo);
+extern void net_before_kill (int pid);                 // net_syscalls.c: leave the queue of the network waiters
 extern void arch_sync_ttbr0 (void);
 extern void irq_init_cpu (void);
 
@@ -941,6 +942,13 @@ int smp_running_elsewhere (thread_id t) {
 <<smp.c: deferred_sig>>=
 static volatile u32 deferred_sig[MAX_THREADS];
 
+// what the kernel has to do for a process before the book's u_kill signals it: a process that sleeps in a pipe or in the network
+// code leaves its queue (the book knows only its own queues), and a process that ends closes its pipe ends
+static void before_kill (int pid, int signo) {
+  pipes_before_kill (pid, signo);            // pipes.c: leave the pipe queue, close the pipe ends of a process that ends
+  net_before_kill (pid);                     // net_syscalls.c: leave the queue of the network waiters
+}
+
 int u_kill (int pid, int signo) {            // the book's u_kill is book_u_kill
   if (ncpus_online > 1 && pid > 1 && pid < MAX_THREADS && signo >= 0 && signo <= 31 && thread_table[pid].used) {
     int me = smp_cpu ();
@@ -952,7 +960,7 @@ int u_kill (int pid, int signo) {            // the book's u_kill is book_u_kill
       }
     }
   }
-  pipes_before_kill (pid, signo);            // pipes.c: leave the pipe queue, close the pipe ends of a process that ends
+  before_kill (pid, signo);
   return book_u_kill (pid, signo);
 }
 
@@ -965,7 +973,7 @@ void smp_run_deferred (void) {
   while (t > 1 && deferred_sig[t]) {
     u32 bits = deferred_sig[t];
     deferred_sig[t] = 0;
-    for (int s = 0; s < 32; s++) if (bits & (1u @<< s)) { pipes_before_kill (t, s);  book_u_kill (t, s); }
+    for (int s = 0; s < 32; s++) if (bits & (1u @<< s)) { before_kill (t, s);  book_u_kill (t, s); }
     if (thread_table[t].state != TSTATE_READY) return;
   }
 }
