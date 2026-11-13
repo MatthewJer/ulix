@@ -1368,9 +1368,14 @@ int hd_sleeps = 0, hd_interrupts = 0;        // statistics, checked by the tests
 extern void book_mutex_lock (lock lockvar);       // the book's mutex_lock (the Makefile renames it)
 extern boolean mutex_try_lock (lock lockvar);
 
+void arch_idle (void);                            // smp.c: wait for an interrupt (interrupts are enabled meanwhile)
+
 void mutex_lock (lock lockvar) {                  // the wrapper has the book's name
   if (current_task != 1) { book_mutex_lock (lockvar); return; }
-  while (!mutex_try_lock (lockvar)) arch_resign ();        // thread 1 must not sleep: it asks again and again
+  while (!mutex_try_lock (lockvar)) {              // thread 1 must not sleep: it asks again and again
+    arch_resign ();                                // (other threads may run: the holder of the lock, perhaps)
+    arch_idle ();                                  // and if nobody can run, the holder waits for the interrupt of the disk: let it in
+  }
 }
 
 static int hd_transfer (int hd, int type, int blockno, char *buffer) {
