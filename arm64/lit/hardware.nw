@@ -815,6 +815,7 @@ extern void book_scheduler (context_t *r, int source);
 extern int  book_u_kill (int pid, int signo);
 extern void pipes_before_kill (int pid, int signo);
 extern void net_before_kill (int pid);                 // net_syscalls.c: leave the queue of the network waiters
+extern void pty_before_kill (int pid, int signo);      // pty.c: a signal that ends the holder of the pseudo terminal ends the session
 extern void arch_sync_ttbr0 (void);
 extern void irq_init_cpu (void);
 
@@ -947,6 +948,7 @@ static volatile u32 deferred_sig[MAX_THREADS];
 static void before_kill (int pid, int signo) {
   pipes_before_kill (pid, signo);            // pipes.c: leave the pipe queue, close the pipe ends of a process that ends
   net_before_kill (pid);                     // net_syscalls.c: leave the queue of the network waiters
+  pty_before_kill (pid, signo);              // pty.c: the holder of the pseudo terminal ends: hang up the session
 }
 
 int u_kill (int pid, int signo) {            // the book's u_kill is book_u_kill

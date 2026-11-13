@@ -174,6 +174,7 @@ void syscall_pipe (context_t *r), syscall_dup2 (context_t *r);                //
 void syscall_tcp_connect (context_t *r), syscall_tcp_send (context_t *r), syscall_tcp_recv (context_t *r), syscall_tcp_close (context_t *r);
 void syscall_rc_enabled (context_t *r);
 void syscall_tcp_listen (context_t *r), syscall_tcp_accept (context_t *r);           // net_syscalls.c (chapter on servers)
+void syscall_pty_attach (context_t *r), syscall_pty_read (context_t *r), syscall_pty_write (context_t *r), syscall_pty_hangup (context_t *r);   // pty.c
 void arch_clock_init (void);
 void syscall_read_screen (context_t *r);          // the book defines these without prototypes
 void syscall_write_screen (context_t *r);
@@ -561,6 +562,10 @@ Returns the initial user stack pointer, 0 on error.
 #define ARCH_NR_PIPE         626             // AArch64 only: pipes (pipes.c); dup2 has the number of the book
 #define ARCH_NR_TCP_LISTEN   630             // AArch64 only: server sockets (net_syscalls.c, chapter on servers)
 #define ARCH_NR_TCP_ACCEPT   631
+#define ARCH_NR_PTY_ATTACH   632             // AArch64 only: the pseudo terminal of a server (pty.c)
+#define ARCH_NR_PTY_READ     633
+#define ARCH_NR_PTY_WRITE    634
+#define ARCH_NR_PTY_HANGUP   635
 
 static int map_sigpage (u64 l0) {
   u64 pa = alloc_frame_try ();
@@ -1175,6 +1180,10 @@ static void arch_syscalls_init (void) {
   install_syscall_handler (__NR_dup2,          syscall_dup2);
   install_syscall_handler (ARCH_NR_TCP_LISTEN, syscall_tcp_listen);
   install_syscall_handler (ARCH_NR_TCP_ACCEPT, syscall_tcp_accept);
+  install_syscall_handler (ARCH_NR_PTY_ATTACH, syscall_pty_attach);
+  install_syscall_handler (ARCH_NR_PTY_READ,   syscall_pty_read);
+  install_syscall_handler (ARCH_NR_PTY_WRITE,  syscall_pty_write);
+  install_syscall_handler (ARCH_NR_PTY_HANGUP, syscall_pty_hangup);
 }
 
 @

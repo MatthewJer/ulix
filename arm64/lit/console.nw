@@ -31,7 +31,7 @@ The complete file is put together from these parts:
 
 <<arch_console.c: console_interrupt>>
 
-<<arch_console.c: telnet>>
+<<arch_console.c: pty>>
 
 <<arch_console.c: console_input>>
 
@@ -75,7 +75,7 @@ prompt back the ones left over would still take the keys that belong to the shel
 that started waiting last: that is the one the user is talking to, normally the shell.
 
 <<arch_console.c: console_enqueue>>=
-static void console_enqueue_vt (int vt, char c) {         // a key for terminal vt (the console: the visible one; a telnet session: its own)
+static void console_enqueue_vt (int vt, char c) {         // a key for terminal vt (the console: the visible one; a remote session: its own)
   terminal_t *term = &terminals[vt];
   if (term->kbd_count >= SYSTEM_KBD_BUFLEN) return;
   term->kbd[term->kbd_pos] = c;
@@ -128,20 +128,20 @@ static void kill_job (int vt, int whole_session) {
 static void console_interrupt (void) { kill_job (cur_vt, 0); }
 
 @
-A telnet session (see [[telnet.c]]) has its own terminal, which is not necessarily the visible one: its keys go into the
-buffer of that terminal ([[telnet_input]], translated like the keys of the UART), and Ctrl-C ends the job on that terminal.
-When a session begins, [[telnet_attach]] throws away keys that are still in the buffer. When it ends, [[console_hangup]]
+A remote session (telnet or SSH, a server program that holds the terminal through the pseudo terminal of the chapter on servers) has its own terminal, which is not necessarily the visible one: its keys go into the
+buffer of that terminal ([[pty_input]], translated like the keys of the UART), and Ctrl-C ends the job on that terminal.
+When a session begins, [[console_attach]] throws away keys that are still in the buffer. When it ends, [[console_hangup]]
 ends \emph{all} programs of the terminal, the shell too, as if a modem line had been hung up: [[login]] then asks for a name again.
 
-<<arch_console.c: telnet>>=
-void telnet_input (int vt, unsigned char c) {
+<<arch_console.c: pty>>=
+void pty_input (int vt, unsigned char c) {
   if (c == '\r') c = '\n';
   if (c == 0x7f) c = 0x08;
   if (c == 0x03) { kill_job (vt, 0); return; }
   console_enqueue_vt (vt, (char)c);
 }
 
-void telnet_attach (int vt) {
+void console_attach (int vt) {
   terminal_t *term = &terminals[vt];
   term->kbd_count = 0;  term->kbd_pos = 0;  term->kbd_lastread = -1;
 }
@@ -248,7 +248,7 @@ a terminal emulator that understands ANSI escape sequences, so
 \item [[kputch ()]] updates the model of the terminal it writes to (cursor, wrapping, scrolling: as in the book) and sends the character on if that terminal is the visible one;
 \item [[set_xy ()]], [[clrscr ()]], [[write_screen ()]] and switching terminals repaint the visible terminal from its model with cursor positioning and color sequences (``synchronized'' mode: the console has a scroll region of the 24 lines, so that scrolling there is the same as in the model).
 \end{itemize}
-Until a program uses one of those functions the console just receives the characters. A telnet session (see below, [[telnet.c]]) sees the same terminal
+Until a program uses one of those functions the console just receives the characters. A remote session (see below, and the chapter on servers) sees the same terminal
 through the same functions.
 The status line (line 25) does not exist.
 
@@ -265,7 +265,7 @@ The complete file is put together from these parts:
 
 <<arch_vt.c: host_repaint>>
 
-<<arch_vt.c: telnet>>
+<<arch_vt.c: pty>>
 
 <<arch_vt.c: kputch>>
 
@@ -282,10 +282,10 @@ The complete file is put together from these parts:
 
 extern void putch (char c);
 void vt_scroll_mem (word *address);                // the book defines it without a prototype
-extern int  telnet_vt;                             // telnet.c: the terminal that a telnet session shows (-1: none)
-extern void telnet_putch (char c);
+extern int  pty_vt;                             // pty.c: the terminal that a remote session shows (-1: none)
+extern void pty_putch (char c);
 
-static void (*out) (char) = putch;                 // where the host_... functions send their characters: the UART, or (for a moment) the telnet session
+static void (*out) (char) = putch;                 // where the host_... functions send their characters: the UART, or (for a moment) the remote session
 
 #define BLANK       (0x20 | VT_NORMAL_BACKGROUND)
 static int vt_ready = 0;
@@ -383,23 +383,23 @@ static void host_repaint (int t) {
 }
 
 @
-A telnet session ([[telnet.c]]) shows one terminal, just as the console shows the visible one. Its screen is sent with the same
+A remote session shows one terminal, just as the console shows the visible one. Its screen is sent with the same
 functions, [[host_move]] and [[host_repaint]]; only the place where the characters go is different. For the moment
-that a function of the session is running, [[out]] is [[telnet_putch]] instead of [[putch]], and [[synced]] is the state of the
+that a function of the session is running, [[out]] is [[pty_putch]] instead of [[putch]], and [[synced]] is the state of the
 session (does its screen show the model exactly?) instead of that of the console.
 
-<<arch_vt.c: telnet>>=
-static int tsynced = 0;                            // like synced, but for the telnet session
+<<arch_vt.c: pty>>=
+static int psynced = 0;                            // like synced, but for the remote session
 static int saved_synced;
 
-static void telnet_begin (void) { saved_synced = synced;  synced = tsynced;  out = telnet_putch; }
-static void telnet_end (void)   { tsynced = synced;  synced = saved_synced;  out = putch; }
+static void pty_begin (void) { saved_synced = synced;  synced = psynced;  out = pty_putch; }
+static void pty_end (void)   { psynced = synced;  synced = saved_synced;  out = putch; }
 
-void arch_vt_telnet_attach (void) {                // a session begins: it gets the whole screen of its terminal
-  tsynced = 0;
-  telnet_begin ();
-  host_repaint (telnet_vt);
-  telnet_end ();
+void arch_vt_pty_attach (void) {                // a session begins: it gets the whole screen of its terminal
+  psynced = 0;
+  pty_begin ();
+  host_repaint (pty_vt);
+  pty_end ();
 }
 
 @
@@ -434,9 +434,9 @@ void kputch (byte c) {
     if (wrapped) putch ('\n');                     // (putch sends CR LF)
     if ((c == '\n' || wrapped) && sl_dirty && synced) host_status_draw ();
   }
-  if (t == telnet_vt) {                            // a telnet session shows this terminal, too
-    telnet_putch ((char)c);
-    if (wrapped) telnet_putch ('\n');
+  if (t == pty_vt) {                            // a remote session shows this terminal, too
+    pty_putch ((char)c);
+    if (wrapped) pty_putch ('\n');
   }
 }
 
@@ -455,7 +455,7 @@ void vt_clrscr (void) {
   memsetw ((word *)vt[t].mem, BLANK, VT_SIZE / 2);
   vt[t].x = vt[t].y = 0;
   if (t == cur_vt) host_repaint (t);
-  if (t == telnet_vt) { telnet_begin ();  host_repaint (t);  telnet_end (); }
+  if (t == pty_vt) { pty_begin ();  host_repaint (t);  pty_end (); }
 }
 
 void vt_get_xy (char *x, char *y) {
@@ -473,7 +473,7 @@ void vt_set_xy (char x, char y) {
   vt[t].x = x;
   vt[t].y = y;
   if (t == cur_vt) { if (synced) host_move (x, y); else host_repaint (t); }
-  if (t == telnet_vt) { telnet_begin ();  if (synced) host_move (x, y); else host_repaint (t);  telnet_end (); }
+  if (t == pty_vt) { pty_begin ();  if (synced) host_move (x, y); else host_repaint (t);  pty_end (); }
 }
 
 void read_write_screen (char *buf, boolean read_flag) {
@@ -485,7 +485,7 @@ void read_write_screen (char *buf, boolean read_flag) {
   } else {
     memcpy (video_address, buf, VT_SIZE);          // write the screen
     if (t == cur_vt) host_repaint (t);
-    if (t == telnet_vt) { telnet_begin ();  host_repaint (t);  telnet_end (); }
+    if (t == pty_vt) { pty_begin ();  host_repaint (t);  pty_end (); }
   }
 }
 

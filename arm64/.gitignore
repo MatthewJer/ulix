@@ -125,3 +125,5 @@ userland/service.c
 userland/heartbeat.c
 etc/rc.d/
 userland/echod.c
+pty.c
+userland/ptytest.c

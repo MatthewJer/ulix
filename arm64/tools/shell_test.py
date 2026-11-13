@@ -128,6 +128,7 @@ try:
     send('chown 5 /hello.c\\r'); expect(r'root@ulix\[\d+\]:/root# ', 'chown as root is not refused')
     send('stat /hello.c\\r'); expect(r'uid/gid: 5\r?\n', 'stat shows the new owner')
     send('chown 1000 /hello.c\\r'); expect(r'root@ulix\[\d+\]:/root# ', 'owner set back')
+    run('ptytest', r'(?s)pty ok:\s+pty_attach \(4\) takes terminal 5.*ptytest: 0 check\(s\) failed', 'ptytest: a program holds terminal 5 through the pseudo terminal, logs in on it and hangs up', r'root@ulix\[\d+\]:/root# ')
     if os.environ.get('HAVE_NET'):                       # root configures the network like on a BSD
         R = r'root@ulix\[\d+\]:/root# '
         run('ifconfig vioif0 inet 10.0.2.16 netmask 255.255.255.0', r'', 'ifconfig sets the address 10.0.2.16', R)

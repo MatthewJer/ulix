@@ -236,11 +236,7 @@ The complete file is put together from these parts:
 #define CHANNEL_WINDOW  65536                   // how many bytes the client may send before we say that there is more room
 #define MAX_PACKET      4096                    // the biggest packet we accept (the data of one CHANNEL_DATA is at most 2048)
 
-extern void telnet_input (int vt, unsigned char c);       // arch_console.c: a key from the session
-extern void telnet_attach (int vt);                       // arch_console.c: the session takes over the terminal
 extern void console_hangup (int vt);                      // arch_console.c: end the programs of the terminal
-extern void arch_vt_telnet_attach (void);                 // arch_vt.c: send the screen of the terminal to the session
-extern int  telnet_vt;                                    // telnet.c: the terminal of a remote session, -1 = none
 extern int  random_get (void *buf, int n);                // random.c
 extern u32  minix_lookup (const char *path);
 extern long minix_read (u32 ino_nr, u32 offset, void *buf, u32 len);
@@ -542,9 +538,9 @@ static int kex_reply (const u8 *m, int n) {
 @
 \subsection{the messages of the session}
 
-The terminal. What the client types goes into the keyboard buffer of terminal 5 ([[telnet_input]]); Enter arrives as CR (a terminal) or LF
-(a program that pipes lines), and CR LF counts once. What the programs print goes into a ring buffer ([[ssh_putch]], called by [[telnet_putch]] when
-no telnet session is there) and is sent as [[CHANNEL_DATA]] as far as the client's window allows.
+The terminal. What the client types goes into the keyboard buffer of terminal 5 ([[pty_input]]); Enter arrives as CR (a terminal) or LF
+(a program that pipes lines), and CR LF counts once. What the programs print is collected by the pseudo terminal ([[pty.c]]); [[pty_get]]
+takes it out, and it is sent as [[CHANNEL_DATA]] as far as the client's window allows.
 
 <<sshd.c: messages>>=
 static int shell_open = 0;                             // the session has a shell: it owns the terminal
@@ -552,17 +548,6 @@ static u32 channel_remote = 0;  static int channel_is_open = 0;
 static u32 remote_window = 0, remote_max_packet = 0;   // how many bytes we may still send; the biggest data piece the client takes
 static u32 consumed = 0;                               // bytes received since the last WINDOW_ADJUST
 static int after_cr = 0;
-
-static u8 ring[8192];
-static volatile unsigned head = 0, tail = 0;
-
-void ssh_putch (char c) {                               // called by telnet_putch when the session is ours: must be quick and must not wait
-  if (!shell_open) return;
-  int was_empty = (head == tail);
-  if (c == '\n' && head - tail < sizeof ring) ring[head++ % sizeof ring] = '\r';
-  if (head - tail < sizeof ring) ring[head++ % sizeof ring] = (u8)c;
-  if (was_empty) netd_nudge ();
-}
 
 static void send_simple (u8 type) { send_packet (&type, 1); }
 
@@ -574,7 +559,7 @@ static void send_channel_reply (u8 type) {              // CHANNEL_SUCCESS or CH
 static void from_client (u8 c) {                        // one byte typed by the person
   if (after_cr) { after_cr = 0;  if (c == '\n' || c == 0) return; }
   if (c == '\r') after_cr = 1;
-  telnet_input (SSH_VT, c);
+  pty_input (SSH_VT, c);
 }
 
 @
@@ -590,12 +575,9 @@ static void channel_request (const u8 *m, int n) {
   int want_reply = m[off];
   if (same_text (type, type_len, "pty-req")) { if (want_reply) send_channel_reply (MSG_CHANNEL_SUCCESS); return; }
   if (same_text (type, type_len, "shell")) {
-    if (telnet_vt != -1 || shell_open) { if (want_reply) send_channel_reply (MSG_CHANNEL_FAILURE); return; }      // the terminal is in use
-    shell_open = 1;  telnet_vt = SSH_VT;
-    head = tail = 0;  after_cr = 0;
-    telnet_attach (SSH_VT);
+    if (shell_open || pty_open (SSH_VT, 0) != 0) { if (want_reply) send_channel_reply (MSG_CHANNEL_FAILURE); return; }      // the terminal is in use
+    shell_open = 1;  after_cr = 0;                                  // (pty_open has painted the terminal into the ring: the client sees the prompt of login)
     if (want_reply) send_channel_reply (MSG_CHANNEL_SUCCESS);
-    arch_vt_telnet_attach ();                                       // paints the terminal into the ring
     return;
   }
   if (want_reply) send_channel_reply (MSG_CHANNEL_FAILURE);
@@ -742,7 +724,7 @@ int ssh_start (void) {
 }
 
 static void session_end (void) {
-  if (shell_open) { shell_open = 0;  telnet_vt = -1;  console_hangup (SSH_VT); }       // the programs of the session end, login starts again
+  if (shell_open) { shell_open = 0;  pty_close (); }                                  // the programs of the session end, login starts again
   conn = 0;
   for (int i = 0; i < 32; i++) { mac_key_in[i] = 0;  mac_key_out[i] = 0;  session_id[i] = 0; }
 }
@@ -754,7 +736,7 @@ static void session_start (tcp_conn *c) {
   conn = c;  started_at = net_now_ms ();
   stage = S_BANNER;  broken = 0;  tx_len = 0;  rx_len = 0;  seq_in = seq_out = 0;
   enc_in = enc_out = 0;  first_block_decrypted = 0;
-  channel_is_open = 0;  shell_open = 0;  head = tail = 0;
+  channel_is_open = 0;  shell_open = 0;
   static const char banner[] = "SSH-2.0-Ulix_1\r\n";
   for (int i = 0; i < (int)sizeof banner - 1; i++) tx[tx_len++] = banner[i];
 }
@@ -767,17 +749,17 @@ packet, send what the terminal has written, send the queue. 1 means that somethi
 
 <<sshd.c: ssh_step>>=
 static void pump_output (void) {
-  while (shell_open && channel_is_open && tail != head && remote_window > 0 && tx_len < (int)sizeof tx - 2 * MAX_PACKET) {
+  while (shell_open && channel_is_open && remote_window > 0 && tx_len < (int)sizeof tx - 2 * MAX_PACKET) {
     u8 m[9 + 1024];
-    u32 n = head - tail;
-    if (n > 1024) n = 1024;
-    if (n > remote_window) n = remote_window;
-    if (n > remote_max_packet) n = remote_max_packet;
-    if (n == 0) break;
+    u32 room = 1024;                                                // as much as the client's window and packet size allow
+    if (room > remote_window) room = remote_window;
+    if (room > remote_max_packet) room = remote_max_packet;
+    if (room == 0) break;
+    int n = pty_get (m + 9, room);                                  // what the programs have printed
+    if (n <= 0) break;
     m[0] = MSG_CHANNEL_DATA;  put32 (m + 1, channel_remote);  put32 (m + 5, n);
-    for (u32 i = 0; i < n; i++) m[9 + i] = ring[(tail + i) % sizeof ring];
     send_packet (m, 9 + n);
-    tail += n;  remote_window -= n;
+    remote_window -= n;
   }
 }
 

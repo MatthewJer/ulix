@@ -179,7 +179,7 @@ passes the signal on to the book:
 
 <<pipes.c: kill>>=
 // does the book's u_kill end the process? (the list of the book: default action of these signals is to terminate)
-static int signal_ends_process (TCB *t, int signo) {
+int signal_ends_process (TCB *t, int signo) {       // (pty.c uses it, too)
   if (signo == SIGKILL) return 1;
   if (t->sighandlers[signo] != SIG_DFL) return 0;
   return signo == SIGABRT || signo == SIGALRM || signo == SIGBUS || signo == SIGFPE || signo == SIGHUP || signo == SIGILL ||

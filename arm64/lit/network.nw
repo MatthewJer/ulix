@@ -75,9 +75,14 @@ extern int net_ssh;                               // the SSH server is on (sshd_
 int  ssh_start (void);                            // open port 22: 0 = ok (needs a host key and random numbers)
 int  ssh_step (void);                             // serve the session a bit: 1 = something was moved
 int  telnet_step (void);                          // serve the session a bit: 1 = something was moved
-extern int telnet_vt;                             // the terminal that the session shows (-1: nobody is connected)
-void telnet_putch (char c);                       // what a process writes to that terminal (arch_vt.c)
 void netd_nudge (void);                           // wake the network thread now (it has something to send)
+
+// ---- the pseudo terminal that a server (here: telnet.c and sshd.c; later programs) uses to hold a terminal (pty.c) ----
+extern int pty_vt;                                // the terminal that the session shows (-1: nobody holds one)
+int  pty_open (int vt, int who);                  // take the terminal vt: 0 = ok, -1 = in use, -3 = no such terminal (who: the process, 0 for the kernel)
+int  pty_get (u8 *buf, int max);                  // what the programs have written to the terminal since the last call (0: nothing)
+void pty_close (void);                            // hang up: the programs of the terminal end, the terminal is free again
+void pty_input (int vt, unsigned char c);         // a key typed in the session (arch_console.c)
 
 // ---- the echo service (echo.c) ----
 int  echo_start (void);                           // open port 7 (UDP and TCP): 0 = ok
@@ -2967,17 +2972,16 @@ network. Ulix already has ten virtual terminals (like the PC version of the book
 and acts as its keyboard and its screen.
 
 \begin{quote}\begin{verbatim}
-    keys:   TCP connection --> telnet_step () --> input buffer of terminal 4 --> login, shell, ...
-    screen: login, shell, ... --> kputch () --> model of terminal 4 --> telnet_putch () --> ring --> TCP connection
+    keys:   TCP connection --> telnet_step () --> pty_input () --> input buffer of terminal 4 --> login, shell, ...
+    screen: login, shell, ... --> kputch () --> model of terminal 4 --> pty_putch () --> ring --> pty_get () --> TCP connection
 \end{verbatim}\end{quote}
 
 \paragraph{The way in.} What arrives over the connection is put into the keyboard buffer of terminal 4, just like the UART
-does it for the console ([[telnet_input]] in [[arch_console.c]]). The programs on that terminal do not know the difference.
+does it for the console ([[pty_input]] in [[arch_console.c]]). The programs on that terminal do not know the difference.
 
 \paragraph{The way out.} [[kputch]] ([[arch_vt.c]]) writes every character that a process prints into the model of its terminal.
-If the terminal is the one of the telnet session, it also calls [[telnet_putch]] here. That function must be quick and must not wait,
-so it only puts the character into a \emph{ring buffer}: an array that is written at [[head]] and read at [[tail]]; both only count up,
-and the place in the array is the count modulo the size. The network thread sends the ring over the connection ([[telnet_step]]). If
+If the terminal is the one of the session, it also calls [[pty_putch]] ([[pty.c]], the pseudo terminal of the chapter on servers). That function must be quick and must not wait,
+so it only puts the character into a \emph{ring buffer}. The network thread takes the ring's content with [[pty_get]] and sends it over the connection ([[telnet_step]]). If
 the ring is full, characters are lost; with 8 KByte that happens only when the other side does not read.
 
 \paragraph{The telnet protocol} is almost nothing: bytes are sent as they are, except that the byte 255 ([[IAC]], ``interpret as
@@ -3020,11 +3024,6 @@ The complete file is put together from these parts:
 #define TELNET_PORT 23
 #define TELNET_VT   4                           // the terminal (Ctrl-T 5) on which the session runs: a login waits there
 
-extern void telnet_input (int vt, unsigned char c);       // arch_console.c: a key from the session
-extern void telnet_attach (int vt);                       // arch_console.c: the session takes over the terminal
-extern void console_hangup (int vt);                      // arch_console.c: end the programs of the terminal
-extern void arch_vt_telnet_attach (void);                 // arch_vt.c: send the screen of the terminal to the session
-
 #define IAC   255                               // the telnet commands that we use
 #define WILL  251
 #define WONT  252
@@ -3036,32 +3035,47 @@ extern void arch_vt_telnet_attach (void);                 // arch_vt.c: send the
 #define OPT_ECHO 1
 #define OPT_SGA  3
 
-int telnet_vt = -1;                             // the terminal of the session, -1 = no session
-static tcp_conn *conn = 0;                      // the connection of the session
+static tcp_conn *conn = 0;                      // the connection of the session (0: nobody is connected)
 
-@
-The ring buffer. [[telnet_putch]] is called by the process that prints, in the middle of a system call; it wakes the network thread
-(only when the ring was empty before, to save work).
-
-<<telnet.c: the ring>>=
-static u8 ring[8192];
-static volatile unsigned head = 0, tail = 0;    // written at head, read at tail; the place is the count modulo the size
-
-static void put (u8 c) {
-  if (head - tail >= sizeof ring) return;       // full: this character is lost
-  ring[head % sizeof ring] = c;
-  head++;
+static void say_busy (tcp_conn *c) {            // somebody has the terminal: tell the new client and hang up
+  static const char busy[] = "Ulix: this terminal is in use.\r\n";
+  tcp_write (c, (const u8 *)busy, sizeof busy - 1);
+  tcp_close (c);
 }
 
-void ssh_putch (char c) __attribute__ ((weak));       // sshd.c: the terminal is used by an SSH session (a system built with TLS=1)
+@
+What the programs print. The pseudo terminal ([[pty.c]], chapter on servers) collects it in a ring buffer; [[pty_get]] takes it out. A byte that
+is sent to the client may not be put out when TCP does not accept it, so what has been taken out and not yet sent waits in [[pending]]. The telnet
+rules for the output are two: the byte 255 in the text is sent twice, and each line ends with CR LF (the pseudo terminal has already made that of
+every \verb|\n|).
 
-void telnet_putch (char c) {
-  if (conn == 0) { if (ssh_putch) ssh_putch (c); return; }          // (the SSH server shares this terminal: see sshd.c)
-  int was_empty = (head == tail);
-  if (c == '\n') put ('\r');                    // a line ends with CR LF
-  put ((u8)c);
-  if ((u8)c == IAC) put (IAC);                  // the byte 255 in the text is sent twice
-  if (was_empty) netd_nudge ();
+<<telnet.c: the ring>>=
+static u8 pending[512];                         // taken from the pseudo terminal, not yet accepted by TCP
+static int pending_len = 0;
+
+static int send_pending (void) {                // 1 = some bytes went out
+  if (pending_len == 0) return 0;
+  int sent = tcp_write (conn, pending, pending_len);
+  if (sent <= 0) return 0;                      // the send buffer is full: the rest stays
+  for (int i = sent; i < pending_len; i++) pending[i - sent] = pending[i];
+  pending_len -= sent;
+  return 1;
+}
+
+// the output of the terminal, as much as TCP takes
+static int send_output (void) {
+  int moved = 0;
+  for (;;) {
+    if (pending_len == 0) {
+      u8 raw[200];
+      int n = pty_get (raw, sizeof raw);
+      if (n <= 0) break;
+      for (int i = 0; i < n; i++) { if (raw[i] == IAC) pending[pending_len++] = IAC;  pending[pending_len++] = raw[i]; }     // (255 is sent twice)
+    }
+    if (!send_pending ()) break;
+    moved = 1;
+  }
+  return moved;
 }
 
 @
@@ -3078,8 +3092,8 @@ static void from_client (u8 c) {
       state = 0;
       if (c == WILL || c == WONT || c == DO || c == DONT) state = 2;
       else if (c == SB) state = 3;
-      else if (c == IP) telnet_input (TELNET_VT, 3);          // interrupt process: like Ctrl-C
-      else if (c == IAC) telnet_input (TELNET_VT, IAC);       // the byte 255 as text
+      else if (c == IP) pty_input (TELNET_VT, 3);          // interrupt process: like Ctrl-C
+      else if (c == IAC) pty_input (TELNET_VT, IAC);       // the byte 255 as text
       return;
     case 2: state = 0; return;                  // the option that WILL/WONT/DO/DONT is about: ignored
     case 3: if (c == IAC) state = 4; return;
@@ -3091,29 +3105,29 @@ static void from_client (u8 c) {
     if (c == '\n' || c == 0) return;
   }
   if (c == '\r') after_cr = 1;
-  telnet_input (TELNET_VT, c);                  // (CR becomes Enter there)
+  pty_input (TELNET_VT, c);                     // (CR becomes Enter there)
 }
 
 @
-Beginning and end of a session. At the beginning the client is told to send single keys and not to echo. The terminal is taken
-over (its keyboard buffer is emptied) and its screen is sent, so that the client sees the prompt of [[login]] at once.
+Beginning and end of a session. At the beginning the client is told to send single keys and not to echo; then the terminal is taken
+over through the pseudo terminal ([[pty_open]] empties its keyboard buffer and paints its screen, so that the client sees the prompt of
+[[login]] at once). If somebody else holds the terminal (a telnet or SSH session), the new client is told so and sent away.
 
 <<telnet.c: the session>>=
 static void session_start (tcp_conn *c) {
+  static const u8 hello[] = { IAC, WILL, OPT_ECHO,       // "I echo": the client must not show the keys itself
+                              IAC, WILL, OPT_SGA };      // "send every key at once"
+  if (pty_open (TELNET_VT, 0) != 0) { say_busy (c);  return; }
   conn = c;
-  head = tail = 0;
+  pending_len = 0;
   state = 0;  after_cr = 0;
-  telnet_vt = TELNET_VT;
-  put (IAC); put (WILL); put (OPT_ECHO);        // "I echo": the client must not show the keys itself
-  put (IAC); put (WILL); put (OPT_SGA);         // "send every key at once"
-  telnet_attach (TELNET_VT);
-  arch_vt_telnet_attach ();                     // paints the terminal into the ring
+  tcp_write (c, hello, sizeof hello);
 }
 
 static void session_end (void) {
   conn = 0;
-  telnet_vt = -1;
-  console_hangup (TELNET_VT);                   // the programs of the session end, login starts again
+  pending_len = 0;
+  pty_close ();                                 // the programs of the session end, login starts again
 }
 
 int telnet_start (void) {
@@ -3127,12 +3141,11 @@ again before it sleeps.
 
 <<telnet.c: telnet_step>>=
 int telnet_step (void) {
-  static const char busy[] = "Ulix: this terminal is in use.\r\n";
   int moved = 0;
 
   tcp_conn *other = tcp_accept (TELNET_PORT);
   if (other) {
-    if (conn || telnet_vt >= 0) { tcp_write (other, (const u8 *)busy, sizeof busy - 1); tcp_close (other); }      // (a session of telnet or ssh has the terminal)
+    if (conn) say_busy (other);                                 // (we are serving a client already)
     else session_start (other);
     moved = 1;
   }
@@ -3149,17 +3162,7 @@ int telnet_step (void) {
     session_end ();
     return 1;
   }
-
-  while (tail != head) {                                        // send what the programs have written
-    u8 chunk[256];
-    int len = 0;
-    while (len < (int)sizeof chunk && tail + len != head) { chunk[len] = ring[(tail + len) % sizeof ring]; len++; }
-    int sent = tcp_write (conn, chunk, len);
-    if (sent <= 0) break;                                       // the send buffer is full: the rest stays in the ring
-    tail += sent;
-    moved = 1;
-  }
-  return moved;
+  return moved | send_output ();
 }
 
 @

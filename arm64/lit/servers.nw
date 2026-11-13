@@ -79,7 +79,7 @@ void net_before_kill (int pid) {
 }
 
 // sleep until the network thread has made a round (the caller then looks again); without a scheduler: let the others run
-static void net_wait (void) {
+void net_wait (void) {
   if (!net_can_sleep ()) { arch_resign ();  return; }
   block (&net_queue, TSTATE_WAITNET);
   arch_resign ();                            // here the process sleeps
@@ -129,6 +129,274 @@ void syscall_tcp_accept (context_t *r) {
 #define __NR_tcp_accept   631
 static inline int tcp_listen (int port)                  { return syscall2 (__NR_tcp_listen, port); }                       // 0 = ok, -1 = no room, -2 = only root may use ports below 1024
 static inline int tcp_accept (int port, int timeout_ms)  { return syscall3 (__NR_tcp_accept, port, timeout_ms); }           // a socket, -1 = no room, -2 = time over; timeout -1: wait for ever
+@
+
+\section{A pseudo terminal: \texttt{pty\_attach}, \texttt{pty\_read}, \texttt{pty\_write}}
+\label{src:pty.c}
+
+A network server that offers a login does one more thing than moving bytes: it must be the \emph{keyboard and the screen of a terminal}.
+Ulix has ten virtual terminals, and \texttt{login} waits on the first five. The programs on a terminal read the keys from its keyboard buffer and
+print through \texttt{kputch} into its model of the screen. The console shows the visible terminal and takes its keys from the UART; a
+remote session needs the same for \emph{another} terminal, with the TCP connection in place of the UART.
+
+Unix solves this with a \emph{pseudo terminal}: two ends that are connected like a terminal and a cable. Programs use one end (the
+\emph{slave}) as their terminal; the server holds the other (the \emph{master}), writes the keys into it and reads the screen output from it. Ulix has no
+device files for terminals, and it has only one kind of terminal; so the master end is a small set of system calls that is attached to one of the virtual
+terminals, and a student can read all of it on three pages. The kernel already had exactly this for its own telnet server (\texttt{telnet\_input} and
+\texttt{telnet\_putch}); this section is that code, made available to programs.
+
+\begin{quote}\begin{verbatim}
+    pty_attach (vt)        take the terminal vt (0 to 4): 0 = ok, -1 = somebody has it, -2 = only root, -3 = no such terminal (632)
+    pty_read (&m)          m.buf, m.len, m.timeout_ms: the output of the terminal: its length, 0 = time over, -1 = you do not hold it (633)
+    pty_write (&m)         m.buf, m.len: keys for the terminal, as if they were typed: m.len, or -1 (634)
+    pty_hangup ()          end all programs on the terminal and let it go (635)
+\end{verbatim}\end{quote}
+
+\begin{quote}\begin{verbatim}
+    keys:    server --> pty_write () --> pty_input () --> keyboard buffer of the terminal --> login, shell, ...
+    screen:  login, shell, ... --> kputch () --> model of the terminal --> pty_putch () --> ring --> pty_read () --> server
+\end{verbatim}\end{quote}
+
+\paragraph{One session at a time.} There is one ring buffer, so one remote session can exist. \texttt{pty\_attach} says $-1$ to a second server,
+which is what makes the second telnet client hear ``this terminal is in use'', and what keeps an SSH client out while a telnet session runs. A
+more general system would number the pseudo terminals; the simple version is easier to follow and is all that the telnet and the SSH server need.
+
+\paragraph{Only root attaches.} Whoever holds the terminal sees everything that is printed there and types into the shell that is logged in: that is a job for a server
+that the administrator has started.
+
+\paragraph{Output.} \texttt{kputch} (chapter on the console) calls \texttt{pty\_putch} for every character that a process prints on the
+terminal of the session. It must be quick and must not wait (it runs in the middle of the system call of the process that prints), so it only puts the
+character into a \emph{ring buffer}, an array that is written at \texttt{head} and read at \texttt{tail}; both only count up and the place in the array is the count
+modulo the size. A newline is stored as CR LF, as the console does it (the terminal ``cooks'' its output). If the ring is full, characters are lost; with 8 KByte that
+happens only when the server does not read. When the ring was empty before, the server is woken: it may be asleep in \texttt{pty\_read}.
+
+\paragraph{Input.} \texttt{pty\_write} gives every byte to \texttt{pty\_input} of the console code, which does what it does for a key of the UART: Enter and
+Delete are translated, Ctrl-C ends the foreground job of the terminal, everything else goes into the keyboard buffer and wakes the process that waits for a key.
+The server does not translate anything but its own protocol.
+
+\paragraph{The end.} \texttt{pty\_hangup} ends the session like a modem line that is hung up: all programs on the terminal, the shell too, are killed, and \texttt{login}
+starts again, ready for the next person. That is what keeps the next person from finding the shell of the last one. The same must happen when the \emph{server} dies
+without hanging up (it is killed, it crashes): a root shell without a client would stay on the terminal. So \texttt{pty\_before\_kill}, which the kernel calls
+for every signal, hangs up when the signal ends the holder. (A holder that has vanished in another way is noticed by the next \texttt{pty\_attach}.)
+
+<<pty.c: state>>=
+#define PTY_LAST_VT 4                         // a session may take the terminals 0 to 4: the ones on which login waits
+
+int pty_vt = -1;                              // the terminal of the session; -1: nobody holds one (arch_vt.c looks at it)
+static int holder = 0;                        // the process that holds it (0: a server inside the kernel)
+static unsigned char ring[8192];
+static volatile unsigned head = 0, tail = 0;  // written at head, read at tail; the place is the count modulo the size
+
+static int is_root (void) { return thread_table[current_task].euid == 0; }
+@
+
+The ring. \texttt{pty\_putch} is the kernel's way in (from \texttt{kputch}), \texttt{pty\_get} the way out. The line \texttt{netd\_nudge} is for the telnet
+server that still lives in the network thread, and goes away with it.
+
+<<pty.c: ring>>=
+static void put (unsigned char c) {
+  if (head - tail >= sizeof ring) return;     // full: this character is lost
+  ring[head % sizeof ring] = c;
+  head++;
+}
+
+void pty_putch (char c) {                     // called by kputch for the session's terminal
+  if (pty_vt < 0) return;
+  int was_empty = (head == tail);
+  if (c == '\n') put ('\r');                  // a line ends with CR LF
+  put ((unsigned char)c);
+  if (was_empty) { net_wake_all ();  netd_nudge (); }       // the server may sleep: wake it
+}
+
+int pty_get (unsigned char *buf, int max) {              // what has been written since the last call, at most max bytes
+  int n = 0;
+  while (n < max && tail != head) { buf[n++] = ring[tail % sizeof ring];  tail++; }
+  return n;
+}
+@
+
+Taking and giving back the terminal. \texttt{pty\_open} first looks whether the holder is still alive (a process that has vanished without \texttt{pty\_hangup} would block
+the terminal for ever). It empties the ring, \texttt{console\_attach} throws away keys that are still in the keyboard buffer, and \texttt{arch\_vt\_pty\_attach} paints the whole screen
+of the terminal into the ring, so that the client sees the prompt of \texttt{login} at once and not only what is printed from now on.
+
+<<pty.c: open and close>>=
+int pty_open (int vt, int who) {
+  if (vt < 0 || vt > PTY_LAST_VT) return -3;
+  if (pty_vt >= 0 && holder > 0 && !thread_table[holder].used) pty_close ();      // the holder has died without hanging up
+  if (pty_vt >= 0) return -1;
+  head = tail = 0;
+  holder = who;  pty_vt = vt;
+  console_attach (vt);
+  arch_vt_pty_attach ();
+  return 0;
+}
+
+void pty_close (void) {
+  if (pty_vt < 0) return;
+  int vt = pty_vt;
+  pty_vt = -1;  holder = 0;
+  console_hangup (vt);                        // the programs of the session end, login starts again
+}
+
+// u_kill calls this before it signals a process: if that ends the process that holds the terminal, the session ends with it
+void pty_before_kill (int pid, int signo) {
+  if (pty_vt >= 0 && holder > 0 && pid == holder && signal_ends_process (&thread_table[pid], signo)) pty_close ();
+}
+@
+
+The system calls. All but \texttt{pty\_attach} check that the caller is the holder. \texttt{pty\_read} sleeps in the queue of the network waiters
+(the section above) while the ring is empty; the ring and the network thread wake it, and the time limit is looked at after every wake-up. A server that
+has more than one thing to wait for (the TCP connection and the terminal) uses short time limits and looks at both, as \texttt{telnetd} does below.
+
+<<pty.c: system calls>>=
+struct pty_msg { unsigned char *buf; int len, timeout_ms; };       // the same as in userland/arm64-extra.h
+
+static int mine (void) { return pty_vt >= 0 && holder == current_task; }
+
+void syscall_pty_attach (context_t *r) {
+  if (!is_root ()) eax_return (-2);
+  eax_return (pty_open ((int)r->ebx, current_task));
+}
+
+void syscall_pty_read (context_t *r) {
+  struct pty_msg *m = (struct pty_msg *)r->ebx;
+  if (!mine ()) eax_return (-1);
+  unsigned long long start = net_now_ms ();
+  for (;;) {
+    int n = pty_get (m->buf, m->len);
+    if (n > 0) eax_return (n);
+    if (m->timeout_ms >= 0 && net_now_ms () - start >= (unsigned)m->timeout_ms) eax_return (0);
+    net_wait ();
+    if (!mine ()) eax_return (-1);            // hung up while we slept
+  }
+}
+
+void syscall_pty_write (context_t *r) {
+  struct pty_msg *m = (struct pty_msg *)r->ebx;
+  if (!mine ()) eax_return (-1);
+  for (int i = 0; i < m->len; i++) pty_input (pty_vt, m->buf[i]);
+  eax_return (m->len);
+}
+
+void syscall_pty_hangup (context_t *r) {
+  if (mine ()) pty_close ();
+  r->eax = 0;
+}
+@
+
+<<pty.c>>=
+#define hash pty_hash                           // (the book's header defines a function of this name: keep it out of the link)
+#include "ulix-api.h"
+#undef hash
+
+extern void console_attach (int vt);            // arch_console.c: empty the keyboard buffer of the terminal
+extern void console_hangup (int vt);            // arch_console.c: end the programs of the terminal
+extern void pty_input (int vt, unsigned char c);       // arch_console.c: a key
+extern void arch_vt_pty_attach (void);          // arch_vt.c: paint the screen of the terminal into the ring
+extern void net_wake_all (void);                // net_syscalls.c: wake the sleepers of the network waiters' queue
+extern void net_wait (void);
+extern void netd_nudge (void);
+extern unsigned long long net_now_ms (void);
+extern int  signal_ends_process (TCB *t, int signo);   // pipes.c
+
+int  pty_open (int vt, int who);
+void pty_close (void);
+
+<<pty.c: state>>
+<<pty.c: ring>>
+<<pty.c: open and close>>
+<<pty.c: system calls>>
+@
+
+The wrappers for programs:
+
+<<userland/arm64-extra.h: servers>>=
+// a pseudo terminal: a session (telnetd, sshd) holds one of the first five terminals (pty.c, chapter "Servers as programs")
+#define __NR_pty_attach   632
+#define __NR_pty_read     633
+#define __NR_pty_write    634
+#define __NR_pty_hangup   635
+struct pty_msg { unsigned char *buf; int len, timeout_ms; };
+static inline int pty_attach (int vt)             { return syscall2 (__NR_pty_attach, vt); }                      // 0 = ok, -1 = in use, -2 = only root, -3 = no such terminal
+static inline int pty_read (struct pty_msg *m)    { return syscall2 (__NR_pty_read, (int)(long)m); }              // bytes, 0 = time over, -1 = not yours (hung up)
+static inline int pty_write (struct pty_msg *m)   { return syscall2 (__NR_pty_write, (int)(long)m); }            // bytes, -1 = not yours
+static inline int pty_hangup (void)               { return syscall1 (__NR_pty_hangup); }
+@
+
+\subsection{A test program: \texttt{ptytest}}
+\label{src:userland:ptytest.c}
+
+\texttt{ptytest} is a miniature telnet server without the network: it holds terminal 5 (\texttt{tty4}) and talks to \texttt{login} that waits there, as a person
+would. It looks for what \texttt{login} prints (\texttt{pty\_read}), types the user name and the password (\texttt{pty\_write}), runs \texttt{ps} in the shell to
+see that the shell has the terminal \texttt{tty4}, and checks the rules: a second attach is refused, only the holder may read, and after \texttt{pty\_hangup} the programs of the
+session are gone and \texttt{login} asks for a name again. The test session of the console starts it (\texttt{tools/shell\_test.py}).
+
+<<userland/ptytest.c>>=
+#include "../ulixlib.h"
+#include "../arm64-extra.h"
+
+static int fails = 0;
+#define CHECK(c, msg) do { if (c) printf ("  pty ok:   %s\n", msg); \
+                           else { printf ("  pty FAIL: %s\n", msg); fails++; } } while (0)
+
+static char screen[4096];  static int screen_len = 0;           // what the terminal has printed since the last wait_for
+
+static void collect (int ms) {                                  // read what the terminal prints, for up to ms milliseconds
+  struct pty_msg m;
+  m.buf = (unsigned char *)screen + screen_len;  m.len = sizeof screen - 1 - screen_len;  m.timeout_ms = ms;
+  int n = pty_read (&m);
+  if (n > 0) screen_len += n;
+  screen[screen_len] = 0;
+}
+
+static int contains (const char *text) {
+  for (int i = 0; i + (int)strlen (text) <= screen_len; i++) if (strncmp (screen + i, text, strlen (text)) == 0) return 1;
+  return 0;
+}
+
+// wait until the text appears (at most 10 seconds), then forget everything that was printed
+static int wait_for (const char *text) {
+  for (int i = 0; i < 100 && !contains (text); i++) collect (100);
+  int found = contains (text);
+  screen_len = 0;  screen[0] = 0;
+  return found;
+}
+
+static void type (const char *s) {
+  struct pty_msg m;
+  m.buf = (unsigned char *)s;  m.len = strlen (s);  m.timeout_ms = 0;
+  pty_write (&m);
+}
+
+int main (int argc, char **argv) {
+  struct pty_msg m;
+  unsigned char tmp[8];
+
+  CHECK (pty_attach (9) == -3, "pty_attach (9): only the first five terminals can be held");
+  m.buf = tmp;  m.len = 1;  m.timeout_ms = 0;
+  CHECK (pty_read (&m) == -1 && pty_write (&m) == -1, "without holding a terminal, pty_read and pty_write say -1");
+  CHECK (pty_attach (4) == 0, "pty_attach (4) takes terminal 5 (tty4)");
+  CHECK (pty_attach (4) == -1, "a second attach is refused: the terminal is in use");
+  CHECK (wait_for ("ulix login: "), "the screen of the terminal is painted into the ring: login waits for a user name");
+
+  type ("root\r");
+  CHECK (wait_for ("Password: "), "the keys typed with pty_write reach login (it asks for the password)");
+  type ("xyz\r");
+  CHECK (wait_for ("root@ulix"), "the password is accepted: a root shell runs on the terminal");
+  type ("ps\r");
+  CHECK (wait_for ("tty4"), "ps run in that shell shows processes on tty4, the terminal that was taken");
+  m.buf = tmp;  m.len = 8;  m.timeout_ms = 300;
+  CHECK (pty_read (&m) >= 0, "pty_read with a time limit returns when nothing is printed");
+
+  pty_hangup ();
+  CHECK (pty_read (&m) == -1, "after pty_hangup the terminal is not ours any more");
+  for (int i = 0; i < 50; i++) resign ();
+  CHECK (pty_attach (4) == 0, "after the hang up the terminal can be taken again");
+  CHECK (wait_for ("ulix login: "), "login was started again: its prompt is on the screen (the shell of the session is gone)");
+  pty_hangup ();
+  printf ("ptytest: %d check(s) failed\n", fails);
+  return fails;
+}
 @
 
 \section{A test server: \texttt{echod}}

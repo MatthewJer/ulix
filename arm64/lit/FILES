@@ -91,3 +91,5 @@ userland/heartbeat.c
 etc/rc.d/heartbeat
 userland/echod.c
 etc/rc.d/echod
+pty.c
+userland/ptytest.c
