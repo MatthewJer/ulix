@@ -12,7 +12,7 @@ OBJCOPY = $(CROSS)objcopy
 CFLAGS = -I$(GENDIR) -mno-outline-atomics -O0 -g -ffreestanding -nostdlib -fno-builtin -fno-stack-protector -mgeneral-regs-only -std=c99 -Wall
 
 # the programs linked with musl besides /muslhello64: they live in the directory /musl of the disk (see lit/libc.nw)
-MUSL_NAMES = cat ls filetest threadtest sockettest localetest
+MUSL_NAMES = cat ls filetest readtest threadtest sockettest localetest
 
 # the Python interpreter (third_party/cpython, chapter "Python" of lit/libc.nw, issue #59): make PYTHON=0 leaves it out. It is part of the
 # system when the submodule is checked out (git submodule update --init third_party/cpython) and a Python 3.12 is on the host.

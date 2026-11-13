@@ -1785,6 +1785,45 @@ int main (void) {
   return fails;
 }
 @
+\section{Reading a whole file: \texttt{readtest}}
+\label{src:libc/readtest.c}
+
+A tool for the measurements of the chapter on disks (section ``Reading many blocks with one request''): it reads a file with
+\texttt{read} calls of a given size, adds up the bytes and says how long that took. The sum is the same one the kernel computes
+for the same file, so the test of the kernel can compare the two readers; the time is only for people (the clock of the
+system has a resolution of 10 ms).
+
+<<libc/readtest.c>>=
+#include <stdio.h>
+#include <stdlib.h>
+#include <fcntl.h>
+#include <time.h>
+#include <unistd.h>
+
+// readtest FILE [CHUNK]: read FILE with read () calls of CHUNK bytes (default 65536), print size, sum of the bytes, milliseconds
+int main (int argc, char **argv) {
+  if (argc < 2) { fprintf (stderr, "usage: readtest FILE [CHUNK]\n"); return 2; }
+  long chunk = argc > 2 ? atol (argv[2]) : 65536;
+  static char buf[65536];
+  if (chunk < 1 || chunk > (long) sizeof buf) chunk = sizeof buf;
+  int fd = open (argv[1], O_RDONLY);
+  if (fd < 0) { perror (argv[1]); return 1; }
+  struct timespec t0, t1;
+  clock_gettime (CLOCK_MONOTONIC, &t0);
+  long total = 0, n;
+  unsigned sum = 0;
+  while ((n = read (fd, buf, chunk)) > 0) {
+    for (long i = 0; i < n; i++) sum += (unsigned char) buf[i];
+    total += n;
+  }
+  clock_gettime (CLOCK_MONOTONIC, &t1);
+  close (fd);
+  if (n < 0) { perror ("read"); return 1; }
+  long ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+  printf ("readtest: %s %ld bytes sum %u chunk %ld time %ld ms\n", argv[1], total, sum, chunk, ms);
+  return 0;
+}
+@
 \section{Python: CPython on Ulix}
 \label{sec:libc:python}
 

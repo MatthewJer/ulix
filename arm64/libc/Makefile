@@ -13,7 +13,7 @@ SYSROOT = $(abspath $(B)/sysroot)
 # the flags of the kernel's user space: no PIC, no outlined atomics (they need a run-time check of the CPU features)
 CFLAGS = -O1 -g0 -fno-pic -mno-outline-atomics -std=gnu11 -Wall
 
-PROGS = hello cat ls filetest threadtest sockettest localetest
+PROGS = hello cat ls filetest readtest threadtest sockettest localetest
 
 # CPython (third_party/cpython, issue #59): make PYTHON=1 also builds build/python.elf. It is configured out of the tree for
 # --host=aarch64-linux-musl with the compiler wrapper musl-cc, which links with the script musl.ld like every program here

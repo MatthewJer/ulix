@@ -750,6 +750,34 @@ int proc_test (void) {
   CHECK (pid > 0 && thread_table[pid].exitcode == 0 && count_in (out, "filetest") == 1 && count_in (out, " cat") == 1 && count_in (out, " ls") == 1, "/musl/ls -l /musl lists cat, ls and filetest");
   CHECK (live_threads () == 0, "no process is left");
 
+  // reading a big file (chapter "Disks", section "Reading many blocks with one request"): readtest reads /muslhello64 with
+  // read () calls of 64 KByte and the kernel counts the requests that went to the device
+  extern int hd_requests, hd_sectors;
+  extern unsigned minix_lookup (const char *path);
+  extern unsigned minix_size (unsigned ino_nr);
+  extern long minix_read (unsigned ino_nr, unsigned offset, void *buf, unsigned len);
+  extern int sprintf (char *out, const char *fmt, ...);
+  unsigned big = minix_lookup ("/muslhello64"), bigsize = minix_size (big);
+  char *rt_argv[] = { "readtest", "/muslhello64", "65536", 0 };
+  int req0 = hd_requests, sec0 = hd_sectors;  unsigned tick0 = system_ticks;
+  capture_start ();
+  pid = run ("/musl/readtest", 3, rt_argv);
+  capture_stop (&out);
+  arch_threads_reap ();
+  int requests = hd_requests - req0, sectors = hd_sectors - sec0;
+  printf ("  info: reading %u bytes with read (64 KByte) and starting the program: %d disk requests, %d sectors, %u ticks\n",
+          bigsize, requests, sectors, system_ticks - tick0);
+  static unsigned char chunk[4096] __attribute__ ((aligned (16)));
+  unsigned kernel_sum = 0;                                  // the same file read the old way, by the kernel, a page at a time
+  for (unsigned off = 0; off < bigsize; off += sizeof chunk) {
+    long n = minix_read (big, off, chunk, sizeof chunk);
+    for (long i = 0; i < n; i++) kernel_sum += chunk[i];
+  }
+  char expect[64];
+  sprintf (expect, "%u bytes sum %u chunk", bigsize, kernel_sum);
+  CHECK (pid > 0 && thread_table[pid].exitcode == 0 && bigsize > 65536 && count_in (out, expect) == 1, "readtest reads /muslhello64: size and sum of the bytes are the ones the kernel finds");
+  CHECK (live_threads () == 0, "no process is left");
+
   arch_threads_reap ();
   CHECK (frames_in_use == frames_before, "no frame leaked: address spaces and kernel stacks freed");
   return fails;
