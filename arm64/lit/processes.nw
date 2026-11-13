@@ -3,7 +3,7 @@
 
 The scheduler, the queues, the mutexes and the system calls come unchanged from the book (the files in \texttt{gen/} are
 tangled from the book's chunks). What the book writes for the x86 is written again here for AArch64: the context switch, the
-creation of processes and threads, \texttt{fork}, \texttt{exec}, signals, the ELF loader, and the glue between the book's file
+creation of processes and threads, \texttt{fork}, exec, signals, the ELF loader, and the glue between the book's file
 system code and the disk drivers.
 
 @
@@ -1860,6 +1860,11 @@ static struct sb sb;
 static u64 inode_table_block;
 static int dirent_size, name_len;
 
+// The buffers of this reader are local variables, on the stack of the caller. They used to be static, which is only safe as long as two
+// threads never read at the same time. But readblock sleeps until the disk interrupt, and another thread that starts a program (every
+// exec reads its file with these functions) then ran the same code and overwrote the buffers of the sleeper. With one daemon started
+// at boot that happened rarely; with two it showed as garbage in a program or as a failed exec.
+
 @
 through the buffer cache of the book, so that blocks that were written but not synced yet are seen
 
@@ -1871,7 +1876,7 @@ static int read_zone (u32 zone, void *buf) {
 }
 
 int minix_mount (void) {
-  static u8 b[ZONE_SIZE] __attribute__ ((aligned (16)));
+  u8 b[ZONE_SIZE] __attribute__ ((aligned (16)));
   if (read_zone (1, b)) return -1;
   sb = *(struct sb *)b;
   if (sb.magic == MINIX2_30)      { dirent_size = 32; name_len = 30; }
@@ -1883,7 +1888,7 @@ int minix_mount (void) {
 }
 
 static int get_inode (u32 n, struct inode *out) {
-  static u8 b[ZONE_SIZE] __attribute__ ((aligned (16)));
+  u8 b[ZONE_SIZE] __attribute__ ((aligned (16)));
   if (n == 0 || n > sb.ninodes) return -1;
   u32 idx = n - 1;                          // 16 inodes of 64 bytes per zone
   if (read_zone (inode_table_block + idx / 16, b)) return -1;
@@ -1897,7 +1902,7 @@ zone number of the n-th zone of a file (0 = hole)
 
 <<minixfs.c: file_zone>>=
 static u32 file_zone (struct inode *ino, u32 n) {
-  static u32 ind[ZONE_SIZE / 4] __attribute__ ((aligned (16)));
+  u32 ind[ZONE_SIZE / 4] __attribute__ ((aligned (16)));
   if (n < 7) return ino->zone[n];
   n -= 7;
   if (n < 256) {
@@ -1916,7 +1921,7 @@ read up to len bytes at offset; returns number of bytes read
 
 <<minixfs.c: minix_read>>=
 long minix_read (u32 ino_nr, u32 offset, void *buf, u32 len) {
-  static u8 z[ZONE_SIZE] __attribute__ ((aligned (16)));
+  u8 z[ZONE_SIZE] __attribute__ ((aligned (16)));
   struct inode ino;
   if (get_inode (ino_nr, &ino)) return -1;
   if (offset >= ino.size) return 0;
@@ -1949,7 +1954,7 @@ iterate over a directory: call fn for every used entry
 
 <<minixfs.c: minix_readdir>>=
 int minix_readdir (u32 dir, void (*fn)(u32 ino, const char *name, void *arg), void *arg) {
-  static u8 ent[64];
+  u8 ent[64];
   struct inode d;
   if (get_inode (dir, &d) || (d.mode & 0170000) != 0040000) return -1;
   int count = 0;
