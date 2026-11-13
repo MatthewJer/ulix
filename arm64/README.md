@@ -50,10 +50,10 @@ In the shell: `ls`, `cat`, `cd`, `cp`, `rm`, `mkdir`, `rmdir`, `touch`, `wc`, `g
 
 `top` shows the load of every CPU, the memory and the processes (`q` or Ctrl-C ends it).
 
-**Telnet:** the kernel runs a telnet server on port 23. It shows terminal 5 (`tty4`, Ctrl-T 5 on the console): `telnet <address> 23`,
+**Telnet:** a telnet server (the program `telnetd`, started by the boot as the service `telnetd`) listens on port 23. It shows terminal 5 (`tty4`, Ctrl-T 5 on the console): `telnet <address> 23`,
 then log in as on the console. One session at a time; when you hang up, the programs of the session end and `login` asks again.
 (The password goes over the network unencrypted: private networks only.) The server is switched on and off in `/etc/rc.conf`
-(`telnetd_enable="YES"` is the default, `"NO"` switches it off; the file is read at boot; edit it as root with `vi`). `netlog_enable="YES"` (default `"NO"`) makes the network code write its messages (link, DHCP) to `/var/log/net.log`; the console stays quiet either way.
+(`telnetd_enable="YES"` is the default, `"NO"` switches it off; the file is read at boot; edit it as root with `vi`; the server is a service like the others: `service telnetd status|stop|start`; the same holds for `sshd`). `netlog_enable="YES"` (default `"NO"`) makes the network code write its messages (link, DHCP) to `/var/log/net.log`; the console stays quiet either way.
 The address is shown by `ifconfig` (with `status: active` or `no carrier`; the network code writes on the console only during the boot and once when DHCP has given an address, so that nothing is printed into the middle of your typing). The cable may be plugged in after the boot: the network
 thread notices the link (every two seconds) and then asks DHCP by itself.
 
@@ -111,6 +111,7 @@ tools/           minix_add.py, minix_check.py (host-side file system tools), dis
 sdcard.c         SD card (Raspberry Pi)             virtionet.c     network card (qemu virt)
 genet.c          Ethernet (Raspberry Pi 4)          netdev.c        which network card is there
 net.c  tcp.c     Ethernet, ARP, IP, ICMP, UDP, TCP  net.h           what the network layers offer each other
+pty.c            pseudo terminal for a server       userland/telnetd.c, sshd.c   the telnet and SSH servers, programs started as services
 ```
 
 ## Tests (`make check`, or `make pcheck` for the parallel version)
@@ -134,6 +135,8 @@ net.c  tcp.c     Ethernet, ARP, IP, ICMP, UDP, TCP  net.h           what the net
 * **`make net-test`**: the network. The kernel (own image `ulix-net.bin`) runs on qemu's user-mode network and a Python program on the
   host talks to it with ordinary sockets: ping of the router, UDP echo, TCP echo of 100 and 20000 bytes, and the kernel as a TCP client
   that loses its first SYN and its first data segment on purpose and must send them again.
+* **`make listen-test`** (`tools/listen_test.py`): server sockets for programs. The program `echod` (a service, switched on in `rc.conf` for the test) listens with `tcp_listen`, sleeps in `tcp_accept`, serves clients one after the other, queues a second client, and echoes 20000 bytes. `ptytest` (run in the root shell of `make shell-test`) holds terminal 5 through the pseudo terminal, logs in on it and hangs up.
+* **`make telnet-test`** and **`make ssh-test`**: the telnet and SSH servers are programs (`telnetd`, `sshd`, started by the boot as services); the tests log in over the network, run programs, try a second connection, hang up and connect again, and switch the server off in `rc.conf`.
 * **`make sdisk-test`**: the kernel tests with a second serial port that `tools/serial_disk.py` serves as a disk (the book's serial
   disk, `/dev/sdisk`); block I/O, the Minix code of the book on it, the buffer cache, two threads reading at the same time, and a
   check of the image on the host afterwards.
@@ -201,8 +204,8 @@ Ulix is a teaching system; what the port and the Raspberry Pi work follow from t
 * On the Raspberry Pi only one CPU is used (the firmware parks the other three; no PSCI), the machine cannot be switched off or restarted
   by software yet (no PSCI; the watchdog registers would do), and the 4 and 8 GByte models are not supported (RAM and peripherals share one
   GByte of the boot tables). The SD card driver has no DMA and no 1.8 V mode.
-* The network is small on purpose: for user programs only raw ICMP and TCP client sockets (no `bind`/`listen`/`accept`, no UDP, no `poll`; section 27 of `ARM64-PORT.md`), the DHCP lease is not
-  renewed, no name resolution, one interface, no fragmentation, no congestion control in TCP. The telnet server serves one session, on one terminal, without encryption, and answers none of the client's option requests; the SSH server (`make TLS=0` leaves it out) shares that terminal and has the limits listed in section 27 (only the interactive shell, user authentication by `login` on the terminal). TLS is version 1.2 only (BearSSL has no 1.3; SSL 2.0/3.0 are not implemented on purpose).
+* The network is small on purpose: for user programs only raw ICMP, TCP client sockets and TCP server sockets (`tcp_listen`, `tcp_accept`; no `socket`/`bind`/`connect` of the Unix kind, no UDP, no `poll`; sections 27 and 30 of `ARM64-PORT.md`), the DHCP lease is not
+  renewed, no name resolution, one interface, no fragmentation, no congestion control in TCP. The telnet server (a program, section 30) serves one session, on one terminal, without encryption, and answers none of the client's option requests; the SSH server (a program, too; `make TLS=0` leaves it out) shares that terminal and has the limits listed in section 27 (only the interactive shell, user authentication by `login` on the terminal). TLS is version 1.2 only (BearSSL has no 1.3; SSL 2.0/3.0 are not implemented on purpose).
 * IPv6 has no TCP, no duplicate address detection, no lifetimes of prefixes and routers, no DHCPv6, and `ifconfig` and `route` cannot set IPv6 addresses or routes (section 26 of `ARM64-PORT.md`). Not yet tried on the board: the home router must send a router advertisement.
 * `/dev/fd0` has no drive behind it (a stand-in for the second floppy, `/dev/fd1`, is the only one).
 * Not checked: the x86 build with the compiler that the makefiles name (`gcc-4.4`); all checks used GCC 16 (`i686-elf-gcc`). `ulixlib.c` still
