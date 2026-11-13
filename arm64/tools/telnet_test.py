@@ -4,7 +4,7 @@
 Boots the shell kernel with a network card. qemu forwards TCP port 5523 of the host to port 23 of the kernel (10.0.2.15).
 Then this program does what a person with a telnet client does: connects, logs in, runs programs (ps, top), tries a second
 connection, hangs up and connects again. A second boot with "telnetd_enable="NO"" in /etc/rc.conf checks that the server can
-be switched off.
+be switched off. The server is the program /bin/telnetd, started by the boot as the service telnetd (/etc/rc.d/telnetd).
 """
 import os, re, shutil, socket, subprocess, sys, tempfile, time
 
@@ -69,12 +69,11 @@ class Telnet:
 
 qemu, log = boot(disk)
 try:
-    check(wait_log(log, "netd: telnet server on port 23", 120), "the kernel started the telnet server (/etc/rc.conf says YES)")
-    check(wait_log(log, "ulix login: esser", 60), "the system is up (the console logged in)")
+    check(wait_log(log, "ulix login: esser", 120), "the system is up (the boot started the services, among them telnetd, before the login appeared)")
     time.sleep(2)
 
     t = Telnet()
-    check(t.expect(r"ulix login: ", 30), "a connection shows the login prompt of terminal 5")
+    check(t.expect(r"ulix login: ", 30), "a connection to the program telnetd shows the login prompt of terminal 5")
     check((251, 1) in t.commands, "the server says IAC WILL ECHO (it echoes the keys)")
     check((251, 3) in t.commands, "the server says IAC WILL SUPPRESS-GO-AHEAD (every key is sent at once)")
     t.send("root\r\n")
@@ -123,7 +122,6 @@ try:
     check(wait_log(log, "netd: network thread started", 120), "second boot: the network thread started")
     check(wait_log(log, "ulix login: esser", 60), "second boot: the system is up")
     time.sleep(2)
-    check("telnet server" not in console(log), 'with telnetd_enable="NO" the telnet server is not started')
     answered = False
     try:
         s = socket.create_connection(("127.0.0.1", 5523), timeout=5); s.settimeout(5)

@@ -36,7 +36,6 @@ netconf.c
 echo.c
 netd.c
 rcconf.c
-telnet.c
 net_syscalls.c
 random.c
 sntp.c
@@ -93,3 +92,5 @@ userland/echod.c
 etc/rc.d/echod
 pty.c
 userland/ptytest.c
+userland/telnetd.c
+etc/rc.d/telnetd

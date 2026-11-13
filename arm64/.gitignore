@@ -127,3 +127,4 @@ etc/rc.d/
 userland/echod.c
 pty.c
 userland/ptytest.c
+userland/telnetd.c

@@ -208,6 +208,10 @@ void pty_putch (char c) {                     // called by kputch for the sessio
   if (was_empty) { net_wake_all ();  netd_nudge (); }       // the server may sleep: wake it
 }
 
+int pty_ready (void) {                        // has the terminal output for the calling process (its holder)? net_syscalls.c asks
+  return pty_vt >= 0 && holder == current_task && head != tail;
+}
+
 int pty_get (unsigned char *buf, int max) {              // what has been written since the last call, at most max bytes
   int n = 0;
   while (n < max && tail != head) { buf[n++] = ring[tail % sizeof ring];  tail++; }
@@ -398,6 +402,227 @@ int main (int argc, char **argv) {
   return fails;
 }
 @
+
+\section{The telnet server as a program: \texttt{telnetd}}
+\label{src:telnetd.c}
+
+\emph{Telnet} sends the keys of a terminal over a TCP connection and shows what the other computer writes: a terminal over the
+network. Ulix already has ten virtual terminals (like the PC version of the book), and on each of the first five a program
+\texttt{login} waits for a user name. The telnet server needs no new kind of terminal: it takes one of these, \texttt{TELNET\_VT}
+(terminal 5, \texttt{tty4}), through the pseudo terminal of the previous section and acts as its keyboard and its screen. The
+first version of this server lived in the kernel's network thread (\texttt{telnet.c}); that code has been moved here almost unchanged. What
+changed is only where the bytes come from and go to: system calls instead of function calls.
+
+\begin{quote}\begin{verbatim}
+    keys:   TCP connection --> tcp_recv () --> telnetd --> pty_write () --> input buffer of terminal 4 --> login, shell, ...
+    screen: login, shell, ... --> kputch () --> model of terminal 4 --> pty_putch () --> ring --> pty_read () --> telnetd --> tcp_send ()
+\end{verbatim}\end{quote}
+
+\paragraph{The telnet protocol} is almost nothing: bytes are sent as they are, except that the byte 255 (\texttt{IAC}, ``interpret as
+command'') begins a command of two or three bytes, which says that the sender \emph{will} or \emph{won't} do something, or asks the
+other side to \emph{do} or \emph{not do} it (RFC 854). Two things are needed to make an ordinary telnet client behave like a terminal:
+\begin{itemize}
+\item The client must send every key at once and not collect a whole line: we say \texttt{WILL SGA} (suppress go-ahead).
+\item The client must not show the keys itself: Ulix echoes what is typed (the program that reads the line does this, as on the
+console), so we say \texttt{WILL ECHO}: ``I do the echo.''
+\end{itemize}
+All answers and all other commands of the client are read and ignored; for these two options that is good enough. A line ends with
+CR LF (or CR NUL), which the server turns into one Enter. The pseudo terminal has already made CR LF of every line end of the output; the byte 255 in the
+text is sent twice. \texttt{IAC IP} (``interrupt process'', what some clients send for Ctrl-C) becomes the key Ctrl-C.
+
+\paragraph{One session, and a busy message for the rest.} Only one person can use terminal 5 at a time. The server accepts clients one after the other, but
+it must also answer a second client \emph{while} the first one is served, with a message and a hang-up. A program that waits for the next key, the next screen output and
+the next client at once would need \texttt{select}; Ulix does not have it, so the server makes rounds, and every round does the three things in turn, each with
+a short wait or none: it waits for keys (at most half a second; \texttt{tcp\_recv} also returns early when the terminal has output for us, see the section on the
+pseudo terminal), it forwards the output of the terminal, and it looks (without waiting) whether a second client has arrived. A round
+that has nothing to do sleeps.
+
+\paragraph{The end of a session.} When the client closes the connection (or the connection breaks), the server calls \texttt{pty\_hangup}: the programs on the terminal are
+ended, as if the line had been hung up, and \texttt{login} asks for a user name again, ready for the next connection. That the person is the right one
+is checked by \texttt{login}, with the password, as on the console. \emph{Telnet sends the password unencrypted:}
+it is for a private network, a teaching system and trying things out. The same happens when the server itself is stopped (\texttt{service telnetd stop}): it hangs up before
+it ends, and if it is killed without the chance, the kernel hangs up for it.
+
+\paragraph{The server as a service.} \texttt{/etc/rc.d/telnetd} makes it a service that is switched on unless \texttt{rc.conf} says \texttt{telnetd\_enable="NO"}
+(the default has not changed). The boot starts it with the other services; it listens on port 23 and prints a line on terminal 9, where daemons
+write. Before this change the kernel read \texttt{telnetd\_enable} itself.
+
+<<userland/telnetd.c: definitions>>=
+#include "../ulixlib.h"
+#include "../arm64-extra.h"
+
+#define TELNET_PORT 23
+#define TELNET_VT   4                           // the terminal (Ctrl-T 5) on which the session runs: a login waits there
+
+#define IAC   255                               // the telnet commands that we use
+#define WILL  251
+#define WONT  252
+#define DO    253
+#define DONT  254
+#define SB    250                               // begin of a sub negotiation (ended by IAC SE)
+#define SE    240
+#define IP    244                               // "interrupt process": what some clients send for Ctrl-C
+#define OPT_ECHO 1
+#define OPT_SGA  3
+
+static volatile int stop = 0;
+static void on_term (int signo) { stop = 1; }   // SIGTERM (service telnetd stop): end after the current round
+
+static int sock = -1;                           // the connection of the session (-1: nobody is connected)
+@
+What the client sends. A small state machine reads the bytes one by one: normally a byte is a key; behind \texttt{IAC} a command follows
+whose bytes are skipped. \texttt{after\_cr} remembers that the last key was Enter (CR), so that the LF or NUL behind it is not a second Enter. The keys
+are collected in a small buffer and given to the terminal together, after the whole message of the client has been read (one system call, not one per key).
+
+<<userland/telnetd.c: from the client>>=
+static int state = 0;                           // 0 = text, 1 = after IAC, 2 = after WILL/WONT/DO/DONT (one byte to skip), 3 = in SB ... SE, 4 = IAC inside SB
+static int after_cr = 0;
+static unsigned char keys[512];  static int nkeys = 0;      // the keys of this message, for pty_write
+
+static void key (unsigned char c) { if (nkeys < (int)sizeof keys) keys[nkeys++] = c; }
+
+static void from_client (unsigned char c) {
+  switch (state) {
+    case 1:                                     // the byte behind IAC
+      state = 0;
+      if (c == WILL || c == WONT || c == DO || c == DONT) state = 2;
+      else if (c == SB) state = 3;
+      else if (c == IP) key (3);                // interrupt process: like Ctrl-C
+      else if (c == IAC) key (IAC);             // the byte 255 as text
+      return;
+    case 2: state = 0; return;                  // the option that WILL/WONT/DO/DONT is about: ignored
+    case 3: if (c == IAC) state = 4; return;
+    case 4: state = (c == SE) ? 0 : 3; return;
+  }
+  if (c == IAC) { state = 1; return; }
+  if (after_cr) {                               // the byte behind Enter: LF or NUL belongs to it
+    after_cr = 0;
+    if (c == '\n' || c == 0) return;
+  }
+  if (c == '\r') after_cr = 1;
+  key (c);                                      // (CR becomes Enter in the kernel)
+}
+
+static void give_keys_to_terminal (void) {
+  struct pty_msg m;
+  m.buf = keys;  m.len = nkeys;  m.timeout_ms = 0;
+  if (nkeys > 0) pty_write (&m);
+  nkeys = 0;
+}
+@
+Sending is the other way round. The output of the terminal is copied into a buffer with the byte 255 doubled, and \texttt{tcp\_send} takes it
+(it waits until TCP has taken everything, at most ten seconds; a client that does not read for so long is dropped).
+
+<<userland/telnetd.c: to the client>>=
+static int send_bytes (const unsigned char *data, int len) {      // 0 = ok, -1 = the connection is gone
+  struct tcp_msg m;
+  m.handle = sock;  m.buf = (unsigned char *)data;  m.len = len;  m.timeout_ms = 10000;
+  return tcp_send (&m) == len ? 0 : -1;
+}
+
+static int forward_output (void) {              // what the programs have printed goes to the client; -1 = the session is over
+  unsigned char raw[200], out[400];
+  struct pty_msg m;
+  for (;;) {
+    m.buf = raw;  m.len = sizeof raw;  m.timeout_ms = 0;
+    int n = pty_read (&m);
+    if (n < 0) return -1;                       // somebody hung up the terminal
+    if (n == 0) return 0;
+    int k = 0;
+    for (int i = 0; i < n; i++) { if (raw[i] == IAC) out[k++] = IAC;  out[k++] = raw[i]; }     // (255 is sent twice)
+    if (send_bytes (out, k) != 0) return -1;
+  }
+}
+@
+Beginning and end of a session. At the beginning the terminal is taken over (\texttt{pty\_attach} empties its keyboard buffer and paints its screen, so that
+the client sees the prompt of \texttt{login} at once), then the client is told to send single keys and not to echo. If somebody else holds the terminal (a telnet
+or an SSH session), the new client is told so and sent away.
+
+<<userland/telnetd.c: the session>>=
+static void say_busy (int s) {                  // somebody has the terminal: tell the new client and hang up
+  static const char busy[] = "Ulix: this terminal is in use.\r\n";
+  struct tcp_msg m;
+  m.handle = s;  m.buf = (unsigned char *)busy;  m.len = sizeof busy - 1;  m.timeout_ms = 1000;
+  tcp_send (&m);
+  tcp_close (s);
+}
+
+static void session_start (int s) {
+  static const unsigned char hello[] = { IAC, WILL, OPT_ECHO,       // "I echo": the client must not show the keys itself
+                                         IAC, WILL, OPT_SGA };      // "send every key at once"
+  if (pty_attach (TELNET_VT) != 0) { say_busy (s);  return; }
+  sock = s;
+  state = 0;  after_cr = 0;  nkeys = 0;
+  send_bytes (hello, sizeof hello);
+}
+
+static void session_end (void) {
+  pty_hangup ();                                // the programs of the session end, login starts again
+  tcp_close (sock);
+  sock = -1;
+}
+@
+The main loop. Without a session the server sleeps in \texttt{tcp\_accept}. With one, each round is: wait for the client's keys, forward them, forward
+the output, look for a second client.
+
+<<userland/telnetd.c: main>>=
+static void round_of_session (void) {
+  unsigned char buf[256];
+  struct tcp_msg m;
+  m.handle = sock;  m.buf = buf;  m.len = sizeof buf;  m.timeout_ms = 500;
+  int n = tcp_recv (&m);                        // sleeps until keys arrive, the terminal has output, or half a second has passed
+  if (n < 0) { session_end ();  return; }       // the client has closed the connection
+  for (int i = 0; i < n; i++) from_client (buf[i]);
+  give_keys_to_terminal ();
+  if (forward_output () < 0) { session_end ();  return; }
+  int other = tcp_accept (TELNET_PORT, 0);      // a second client? (no waiting)
+  if (other >= 0) say_busy (other);
+}
+
+int main (int argc, char **argv) {
+  signal (SIGTERM, on_term);
+  if (tcp_listen (TELNET_PORT) != 0) { printf ("telnetd: cannot open port %d (only root may)\n", TELNET_PORT);  return 1; }
+  printf ("telnetd: telnet server on port %d\n", TELNET_PORT);
+  while (!stop) {
+    if (sock < 0) {
+      int s = tcp_accept (TELNET_PORT, 1000);   // sleeps until a client comes (at most a second, to look at the flag)
+      if (s >= 0) session_start (s);
+      else if (s == -1) waitkey (100);          // no room for a socket: try again soon
+    } else {
+      round_of_session ();
+    }
+  }
+  if (sock >= 0) session_end ();                // (stopped in the middle of a session: hang up)
+  return 0;
+}
+@
+
+<<userland/telnetd.c>>=
+<<userland/telnetd.c: definitions>>
+
+<<userland/telnetd.c: from the client>>
+
+<<userland/telnetd.c: to the client>>
+
+<<userland/telnetd.c: the session>>
+
+<<userland/telnetd.c: main>>
+@
+
+<<etc/rc.d/telnetd>>=
+# telnetd: the telnet server (port 23, a login on terminal 5); switched on unless rc.conf says telnetd_enable="NO"
+command="/bin/telnetd"
+rcvar="telnetd_enable"
+default="YES"
+pidfile="/var/run/telnetd.pid"
+@
+
+\subsection{The test}
+
+\texttt{make telnet-test} (\texttt{tools/telnet\_test.py}) did this test for the kernel's telnet server, and does it unchanged for the program: a client of the host connects through
+a port that qemu forwards, logs in with a password, runs \texttt{ps} and \texttt{top} (cursor control through telnet), is refused when it is the second, hangs up and connects again; a boot with
+\texttt{telnetd\_enable="NO"} in \texttt{rc.conf} does not answer. Only the way to learn that the server is up has changed: the kernel used to print a line on the console, now the test
+tries to connect until the server answers with its login prompt (a daemon writes to terminal 9, which the console log does not show).
 
 \section{A test server: \texttt{echod}}
 \label{src:userland:echod.c}

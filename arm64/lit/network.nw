@@ -67,14 +67,11 @@ void netlog (const char *line);                   // a line for the network log 
 extern int net_dhcp_wanted, net_dhcp_done;        // "ip=dhcp" was on the command line / an address from DHCP has been obtained (netd tries again when the cable is plugged in)
 extern int net_echo;                              // the kernel command line said "netecho": answer on port 7 (UDP and TCP) with what comes in
 
-// ---- the configuration file /etc/rc.conf (rcconf.c) and the telnet server (telnet.c) ----
+// ---- the configuration file /etc/rc.conf (rcconf.c) ----
 int  rc_conf_enabled (const char *variable, int fallback);   // is 'variable' set to YES in /etc/rc.conf? 'fallback' if the file or the line is missing
-extern int net_telnet;                            // the telnet server is on (telnetd_enable in /etc/rc.conf)
-int  telnet_start (void);                         // open port 23: 0 = ok
 extern int net_ssh;                               // the SSH server is on (sshd_enable in /etc/rc.conf; only in a system built with TLS=1: sshd.c)
 int  ssh_start (void);                            // open port 22: 0 = ok (needs a host key and random numbers)
 int  ssh_step (void);                             // serve the session a bit: 1 = something was moved
-int  telnet_step (void);                          // serve the session a bit: 1 = something was moved
 void netd_nudge (void);                           // wake the network thread now (it has something to send)
 
 // ---- the pseudo terminal that a server (here: telnet.c and sshd.c; later programs) uses to hold a terminal (pty.c) ----
@@ -2704,7 +2701,7 @@ extern int  net_dev_start_irq (void);
 extern void net_dev_ack (void);
 extern int  echo_start (void);
 extern int  echo_step (void);
-extern int  net_echo, net_telnet, net_dhcp_wanted, net_dhcp_done;
+extern int  net_echo, net_dhcp_wanted, net_dhcp_done;
 extern int  net_dev_link (void);
 extern int  dhcp_run (int timeout_ms, void (*idle) (void));
 extern unsigned long long net_now_ms (void);
@@ -2713,8 +2710,6 @@ extern void ip6_solicit (void);
 extern void ip6_format (char *out, const unsigned char *address);
 extern unsigned char ip6_global[16], ip6_router[16];
 extern int  ip6_have_global, ip6_have_router;
-extern int  telnet_start (void);
-extern int  telnet_step (void);
 extern int  ssh_start (void) __attribute__ ((weak));         // sshd.c (only when the system is built with TLS=1)
 extern int  ssh_step (void) __attribute__ ((weak));
 extern int  rc_conf_enabled (const char *variable, int fallback);
@@ -2728,7 +2723,6 @@ void netlog (const char *line);
 
 int netd_irq = 0;
 int net_ssh = 0;                              // the SSH server is on: sshd_enable in /etc/rc.conf (default YES), and the system has one
-int net_telnet = 0;                           // the telnet server is on: /etc/rc.conf says telnetd_enable="YES" (or says nothing)
 static int running = 0, ticks_seen = 0;
 
 static void wake (void) {
@@ -2736,7 +2730,7 @@ static void wake (void) {
   if (t) deblock (t, &floppy_queue);
 }
 
-void netd_nudge (void) { wake (); }            // a process has written something for the telnet session: send it now, not in 50 ms
+void netd_nudge (void) { wake (); }            // a process has written something for the SSH session: send it now, not in 50 ms
 
 void netd_interrupt (void) {                  // the card has something: say so to the card, wake the thread
   net_dev_ack ();
@@ -2865,7 +2859,7 @@ static void netd_link6 (void) {
 static void netd (void *arg) {
   for (;;) {
     int moved;
-    do { moved = net_poll_once (); if (net_echo) moved |= echo_step (); if (net_telnet) moved |= telnet_step (); if (net_ssh) moved |= ssh_step (); } while (moved);       // everything that is there
+    do { moved = net_poll_once (); if (net_echo) moved |= echo_step (); if (net_ssh) moved |= ssh_step (); } while (moved);       // everything that is there
     netd_link6 ();                                                                            // (IPv6: a router solicitation, until a router has answered)
     netd_link ();                                                                             // (every two seconds: link? an address yet?)
     netlog_flush ();                                                                          // (the network log, if there is something for it)
@@ -2878,14 +2872,11 @@ void netd_start (void) {
   netd_irq = net_dev_start_irq ();
   if (netd_irq) gic_enable (netd_irq);
   if (net_echo && echo_start () != 0) printf ("netd: cannot open port 7\n");
-  net_telnet = rc_conf_enabled ("telnetd_enable", 1);              // on, unless /etc/rc.conf switches it off
-  if (net_telnet && telnet_start () != 0) { printf ("netd: cannot open port 23\n"); net_telnet = 0; }
   net_ssh = ssh_start && rc_conf_enabled ("sshd_enable", 1);        // (a system built with TLS=0 has no SSH server at all)
   if (net_ssh && ssh_start () != 0) net_ssh = 0;
   arch_thread_create_high (netd, 0, "netd");                       // (a high thread number: see arch_thread_create_high)
   running = 1;
   printf ("netd: network thread started (%s)%s\n", netd_irq ? "woken by the interrupt of the card" : "polling every 50 ms", net_echo ? ", echo service on port 7" : "");
-  if (net_telnet) printf ("netd: telnet server on port 23\n");
   if (net_ssh) printf ("netd: ssh server on port 22\n");
 }
 
@@ -2902,9 +2893,10 @@ Which services a BSD system starts is written down in the file \texttt{/etc/rc.c
 \end{verbatim}\end{quote}
 Ulix does the same. A line has the form [[name="YES"]] or [[name="NO"]] (the quotes may be left out; everything behind a
 [[#]] is a comment). The file is read once, when the network thread starts. The kernel asks for one setting at a time
-with [[rc_conf_enabled]], and says what is to be assumed when the file or the line does not exist (the \emph{default}). For the
-telnet server that is ``on'': a system without \texttt{rc.conf} behaves like one that says \texttt{telnetd\_enable="YES"}. To switch the
-server off, write [[telnetd_enable="NO"]] into \texttt{/etc/rc.conf} as root.
+with [[rc_conf_enabled]], and says what is to be assumed when the file or the line does not exist (the \emph{default}). (The services that are
+programs, such as the telnet server, are not switched by the kernel: the program \texttt{service} reads the same file, see the chapters on daemons and servers.
+A system without \texttt{rc.conf} behaves like one that says \texttt{telnetd\_enable="YES"}; to switch the server off, write [[telnetd_enable="NO"]] into
+\texttt{/etc/rc.conf} as root.)
 
 The kernel reads the file with the small reader for the Minix file system ([[minixfs.c]]) that the ELF loader uses, because
 no process exists yet. The file may be at most 1 KByte long; what lies behind that is ignored.
@@ -2960,209 +2952,6 @@ int rc_conf_enabled (const char *variable, int fallback) {
     if (*line == '\n') line++;
   }
   return answer;
-}
-
-@
-\section{The telnet server}
-\label{src:telnet.c}
-
-\emph{Telnet} sends the keys of a terminal over a TCP connection and shows what the other computer writes: a terminal over the
-network. Ulix already has ten virtual terminals (like the PC version of the book), and on each of the first five a program
-\texttt{login} waits for a user name. The telnet server needs no new kind of terminal: it takes one of these, [[TELNET_VT]],
-and acts as its keyboard and its screen.
-
-\begin{quote}\begin{verbatim}
-    keys:   TCP connection --> telnet_step () --> pty_input () --> input buffer of terminal 4 --> login, shell, ...
-    screen: login, shell, ... --> kputch () --> model of terminal 4 --> pty_putch () --> ring --> pty_get () --> TCP connection
-\end{verbatim}\end{quote}
-
-\paragraph{The way in.} What arrives over the connection is put into the keyboard buffer of terminal 4, just like the UART
-does it for the console ([[pty_input]] in [[arch_console.c]]). The programs on that terminal do not know the difference.
-
-\paragraph{The way out.} [[kputch]] ([[arch_vt.c]]) writes every character that a process prints into the model of its terminal.
-If the terminal is the one of the session, it also calls [[pty_putch]] ([[pty.c]], the pseudo terminal of the chapter on servers). That function must be quick and must not wait,
-so it only puts the character into a \emph{ring buffer}. The network thread takes the ring's content with [[pty_get]] and sends it over the connection ([[telnet_step]]). If
-the ring is full, characters are lost; with 8 KByte that happens only when the other side does not read.
-
-\paragraph{The telnet protocol} is almost nothing: bytes are sent as they are, except that the byte 255 ([[IAC]], ``interpret as
-command'') begins a command of two or three bytes, which says that the sender \emph{will} or \emph{won't} do something, or asks the
-other side to \emph{do} or \emph{not do} it (RFC 854). Two things are needed to make an ordinary telnet client behave like a terminal:
-\begin{itemize}
-\item The client must send every key at once and not collect a whole line: we say [[WILL SGA]] (suppress go-ahead).
-\item The client must not show the keys itself: Ulix echoes what is typed (the program that reads the line does this, as on the
-console), so we say [[WILL ECHO]]: ``I do the echo.''
-\end{itemize}
-All answers and all other commands of the client are read and ignored; for these two options that is good enough. A line ends with
-CR LF (or CR NUL), which the server turns into one Enter. Output has to end its lines with CR LF as well, so each \verb|\n| becomes
-two bytes. The byte 255 in the text is sent twice.
-
-\paragraph{One session.} Only one person can use terminal 4 at a time. A second connection gets a message and is closed. When the
-session ends (the client closes the connection), the programs on the terminal are ended, as if the line had been hung up
-([[console_hangup]]); [[login]] then asks for a user name again, ready for the next connection. That the person is the right one
-is checked by [[login]], with the password, as on the console. \emph{Telnet sends the password unencrypted:}
-it is for a private network, a teaching system and trying things out.
-
-@
-
-The complete file is put together from these parts:
-
-<<telnet.c>>=
-<<telnet.c: includes>>
-
-<<telnet.c: the ring>>
-
-<<telnet.c: from the client>>
-
-<<telnet.c: the session>>
-
-<<telnet.c: telnet_step>>
-@
-
-<<telnet.c: includes>>=
-#include "net.h"
-
-#define TELNET_PORT 23
-#define TELNET_VT   4                           // the terminal (Ctrl-T 5) on which the session runs: a login waits there
-
-#define IAC   255                               // the telnet commands that we use
-#define WILL  251
-#define WONT  252
-#define DO    253
-#define DONT  254
-#define SB    250                               // begin of a sub negotiation (ended by IAC SE)
-#define SE    240
-#define IP    244                               // "interrupt process": what some clients send for Ctrl-C
-#define OPT_ECHO 1
-#define OPT_SGA  3
-
-static tcp_conn *conn = 0;                      // the connection of the session (0: nobody is connected)
-
-static void say_busy (tcp_conn *c) {            // somebody has the terminal: tell the new client and hang up
-  static const char busy[] = "Ulix: this terminal is in use.\r\n";
-  tcp_write (c, (const u8 *)busy, sizeof busy - 1);
-  tcp_close (c);
-}
-
-@
-What the programs print. The pseudo terminal ([[pty.c]], chapter on servers) collects it in a ring buffer; [[pty_get]] takes it out. A byte that
-is sent to the client may not be put out when TCP does not accept it, so what has been taken out and not yet sent waits in [[pending]]. The telnet
-rules for the output are two: the byte 255 in the text is sent twice, and each line ends with CR LF (the pseudo terminal has already made that of
-every \verb|\n|).
-
-<<telnet.c: the ring>>=
-static u8 pending[512];                         // taken from the pseudo terminal, not yet accepted by TCP
-static int pending_len = 0;
-
-static int send_pending (void) {                // 1 = some bytes went out
-  if (pending_len == 0) return 0;
-  int sent = tcp_write (conn, pending, pending_len);
-  if (sent <= 0) return 0;                      // the send buffer is full: the rest stays
-  for (int i = sent; i < pending_len; i++) pending[i - sent] = pending[i];
-  pending_len -= sent;
-  return 1;
-}
-
-// the output of the terminal, as much as TCP takes
-static int send_output (void) {
-  int moved = 0;
-  for (;;) {
-    if (pending_len == 0) {
-      u8 raw[200];
-      int n = pty_get (raw, sizeof raw);
-      if (n <= 0) break;
-      for (int i = 0; i < n; i++) { if (raw[i] == IAC) pending[pending_len++] = IAC;  pending[pending_len++] = raw[i]; }     // (255 is sent twice)
-    }
-    if (!send_pending ()) break;
-    moved = 1;
-  }
-  return moved;
-}
-
-@
-What the client sends. A small state machine reads the bytes one by one: normally a byte is a key; behind [[IAC]] a command follows
-whose bytes are skipped. [[after_cr]] remembers that the last key was Enter (CR), so that the LF or NUL behind it is not a second Enter.
-
-<<telnet.c: from the client>>=
-static int state = 0;                           // 0 = text, 1 = after IAC, 2 = after WILL/WONT/DO/DONT (one byte to skip), 3 = in SB ... SE, 4 = IAC inside SB
-static int after_cr = 0;
-
-static void from_client (u8 c) {
-  switch (state) {
-    case 1:                                     // the byte behind IAC
-      state = 0;
-      if (c == WILL || c == WONT || c == DO || c == DONT) state = 2;
-      else if (c == SB) state = 3;
-      else if (c == IP) pty_input (TELNET_VT, 3);          // interrupt process: like Ctrl-C
-      else if (c == IAC) pty_input (TELNET_VT, IAC);       // the byte 255 as text
-      return;
-    case 2: state = 0; return;                  // the option that WILL/WONT/DO/DONT is about: ignored
-    case 3: if (c == IAC) state = 4; return;
-    case 4: state = (c == SE) ? 0 : 3; return;
-  }
-  if (c == IAC) { state = 1; return; }
-  if (after_cr) {                               // the byte behind Enter: LF or NUL belongs to it
-    after_cr = 0;
-    if (c == '\n' || c == 0) return;
-  }
-  if (c == '\r') after_cr = 1;
-  pty_input (TELNET_VT, c);                     // (CR becomes Enter there)
-}
-
-@
-Beginning and end of a session. At the beginning the client is told to send single keys and not to echo; then the terminal is taken
-over through the pseudo terminal ([[pty_open]] empties its keyboard buffer and paints its screen, so that the client sees the prompt of
-[[login]] at once). If somebody else holds the terminal (a telnet or SSH session), the new client is told so and sent away.
-
-<<telnet.c: the session>>=
-static void session_start (tcp_conn *c) {
-  static const u8 hello[] = { IAC, WILL, OPT_ECHO,       // "I echo": the client must not show the keys itself
-                              IAC, WILL, OPT_SGA };      // "send every key at once"
-  if (pty_open (TELNET_VT, 0) != 0) { say_busy (c);  return; }
-  conn = c;
-  pending_len = 0;
-  state = 0;  after_cr = 0;
-  tcp_write (c, hello, sizeof hello);
-}
-
-static void session_end (void) {
-  conn = 0;
-  pending_len = 0;
-  pty_close ();                                 // the programs of the session end, login starts again
-}
-
-int telnet_start (void) {
-  return tcp_listen (TELNET_PORT);
-}
-
-@
-The network thread calls [[telnet_step]] again and again. It accepts a new connection (or sends a busy message to it), reads what the
-client has sent, and sends what is in the ring. The return value 1 tells the thread that something happened, so that it looks
-again before it sleeps.
-
-<<telnet.c: telnet_step>>=
-int telnet_step (void) {
-  int moved = 0;
-
-  tcp_conn *other = tcp_accept (TELNET_PORT);
-  if (other) {
-    if (conn) say_busy (other);                                 // (we are serving a client already)
-    else session_start (other);
-    moved = 1;
-  }
-  if (conn == 0) return moved;
-
-  if (tcp_closed (conn)) { session_end (); return 1; }          // (reset by the other side: the pointer must not be used any more)
-  u8 buf[256];
-  int n = tcp_read (conn, buf, sizeof buf);
-  if (n > 0) {
-    for (int i = 0; i < n; i++) from_client (buf[i]);
-    moved = 1;
-  } else if (n < 0) {                                           // the client has closed the connection: so do we
-    tcp_close (conn);
-    session_end ();
-    return 1;
-  }
-  return moved | send_output ();
 }
 
 @

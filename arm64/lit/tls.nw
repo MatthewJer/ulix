@@ -387,6 +387,7 @@ extern int  tcp_read (tcp_conn *c, unsigned char *buf, int max);
 extern int  tcp_write (tcp_conn *c, const unsigned char *data, int len);
 extern void tcp_close (tcp_conn *c);
 extern unsigned tcp_id (tcp_conn *c);
+extern int  pty_ready (void);                                       // pty.c: the pseudo terminal has output for the caller
 
 @
 The random numbers are copied through a buffer in the kernel, 256 bytes at a time.
@@ -518,6 +519,7 @@ void syscall_tcp_recv (context_t *r) {
     if (net_now_ms () - start >= (unsigned)m->timeout_ms) eax_return (0);
     net_poll_once ();
     net_wait ();                                                     // sleep until the network thread has looked at the card again
+    if (pty_ready ()) eax_return (0);                                // a server that holds a terminal: the terminal has output, look at it now
   }
 }
 

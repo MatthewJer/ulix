@@ -19,7 +19,7 @@ DISK ?= disk.img
 # make TLS=0 builds a system without TLS: no BearSSL, no CA list on the disk, https only says so, and no SSH server (see lit/tls.nw, lit/ssh.nw)
 TLS ?= 1
 
-OBJS = start.o vectors.o linux_abi.o pipes.o pty.o irq.o mmu.o virtio.o sdcard.o virtionet.o genet.o netdev.o net.o ip6.o tcp.o dhcp.o dns.o netconf.o echo.o net_test.o net_syscalls.o random.o sntp.o netd.o rcconf.o telnet.o stats.o minixfs.o elf.o ulix-port.o glue.o arch_thread.o arch_console.o arch_clock.o arch_swap.o arch_vt.o dt.o gic.o smp.o \
+OBJS = start.o vectors.o linux_abi.o pipes.o pty.o irq.o mmu.o virtio.o sdcard.o virtionet.o genet.o netdev.o net.o ip6.o tcp.o dhcp.o dns.o netconf.o echo.o net_test.o net_syscalls.o random.o sntp.o netd.o rcconf.o stats.o minixfs.o elf.o ulix-port.o glue.o arch_thread.o arch_console.o arch_clock.o arch_swap.o arch_vt.o dt.o gic.o smp.o \
        bookfs_test.o thread_test.o proc_test.o kmain.o
 
 # the SSH server and the cryptography of BearSSL (the same archive as for the program https) are part of the kernel only with TLS=1
@@ -35,7 +35,7 @@ USERLAND_BIN = userland/build/bin
 userland/build/bin/init.elf: FORCE
 	$(MAKE) -C userland
 
-disk.img: $(wildcard userland/build/bin/*.elf) ../bin-build/minixdata.img etc/rc.conf user/hello.elf user/cat.elf user/crash.elf user/forktest.elf user/sigtest.elf user/contest.elf user/cowtest.elf user/thtest.elf user/badptr.elf user/swaptest.elf user/screentest.elf user/stacktest.elf user/memtest.elf user/pipetest.elf libc/build/hello.elf userland/build/bin/init.elf tools/minix_add.py etc/ssl/cacert.pem etc/rc.d/heartbeat etc/rc.d/echod $(if $(filter 1,$(TLS)),etc/ssh/ssh_host_ecdsa_key)
+disk.img: $(wildcard userland/build/bin/*.elf) ../bin-build/minixdata.img etc/rc.conf user/hello.elf user/cat.elf user/crash.elf user/forktest.elf user/sigtest.elf user/contest.elf user/cowtest.elf user/thtest.elf user/badptr.elf user/swaptest.elf user/screentest.elf user/stacktest.elf user/memtest.elf user/pipetest.elf libc/build/hello.elf userland/build/bin/init.elf tools/minix_add.py etc/ssl/cacert.pem etc/rc.d/heartbeat etc/rc.d/echod etc/rc.d/telnetd $(if $(filter 1,$(TLS)),etc/ssh/ssh_host_ecdsa_key)
 	cp ../bin-build/minixdata.img $@
 	# two deliberately broken variants of hello.elf for the loader tests:
 	# e_machine = EM_386, and a code segment with flags RWX
@@ -43,7 +43,7 @@ disk.img: $(wildcard userland/build/bin/*.elf) ../bin-build/minixdata.img etc/rc
 	python3 -c "d=bytearray(open('user/hello.elf','rb').read()); d[68]=7; open('bad-wx.elf','wb').write(d)"
 	python3 tools/minix_add.py $@ --grow=4096 --chmod=/tmp:1777 hello64=user/hello.elf cat64=user/cat.elf crash64=user/crash.elf forktest64=user/forktest.elf sigtest64=user/sigtest.elf contest64=user/contest.elf cowtest64=user/cowtest.elf thtest64=user/thtest.elf badptr64=user/badptr.elf swaptest64=user/swaptest.elf screentest64=user/screentest.elf stacktest64=user/stacktest.elf memtest64=user/memtest.elf pipetest64=user/pipetest.elf muslhello64=libc/build/hello.elf \
 		badarch64=bad-arch.elf badwx64=bad-wx.elf \
-		/init=$(USERLAND_BIN)/init.elf /etc/rc.conf=etc/rc.conf --mkdir=/etc/rc.d /etc/rc.d/heartbeat=etc/rc.d/heartbeat /etc/rc.d/echod=etc/rc.d/echod \
+		/init=$(USERLAND_BIN)/init.elf /etc/rc.conf=etc/rc.conf --mkdir=/etc/rc.d /etc/rc.d/heartbeat=etc/rc.d/heartbeat /etc/rc.d/echod=etc/rc.d/echod /etc/rc.d/telnetd=etc/rc.d/telnetd \
 		$(if $(filter 1,$(TLS)),--mkdir=/etc/ssl /etc/ssl/cacert.pem=etc/ssl/cacert.pem --mkdir=/etc/ssh /etc/ssh/ssh_host_ecdsa_key=etc/ssh/ssh_host_ecdsa_key --chmod=/etc/ssh/ssh_host_ecdsa_key:600) \
 		$$(for f in $(USERLAND_BIN)/*.elf; do n=$$(basename $$f .elf); [ $$n != init ] && echo /bin/$$n=$$f; done)
 
@@ -176,7 +176,7 @@ glue.o: glue.c $(GENFILES) $(GENDIR)/ulix-api.h
 	$(CC) $(BOOKFLAGS) -Dhash=glue_unused_hash -c -o $@ $<
 
 irq.o mmu.o virtio.o sdcard.o dt.o gic.o smp.o kmain.o kmain-console.o kmain-shell.o kmain-net.o: plat.h gic.h smp.h ulix.h arch_pte.h
-virtionet.o genet.o netdev.o net.o ip6.o tcp.o dhcp.o dns.o netconf.o echo.o net_test.o rcconf.o telnet.o sntp.o: net.h plat.h ulix.h cache.h delay.h
+virtionet.o genet.o netdev.o net.o ip6.o tcp.o dhcp.o dns.o netconf.o echo.o net_test.o rcconf.o sntp.o: net.h plat.h ulix.h cache.h delay.h
 random.o: plat.h ulix.h cache.h
 sshd.o: net.h plat.h ulix.h
 
