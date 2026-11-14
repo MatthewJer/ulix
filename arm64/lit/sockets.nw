@@ -57,6 +57,7 @@ extern void arch_resign (void), arch_poll_pause (void);
 #define MAX_SOCKS 16
 #define SOCK_STREAM_ 1
 #define SOCK_DGRAM_  2
+#define LBUF 4096                                  // the receive buffer of one end of a socketpair
 
 // errors: the numbers of Linux (the functions that linux_abi.c calls directly return them as minus numbers; sock_read and sock_write turn
 // EAGAIN into the book's 35, because they are called by the book's descriptor functions and linux_error () of linux_abi.c turns 35 back into 11)
@@ -89,6 +90,8 @@ struct sock {
   u32 peer_ip;  u16 peer_port, local_port;           // (host byte order)
   int connected;                                     // datagram: connect () has set the peer
   struct dgram q[4];  int qhead, qcount;             // datagram: what has arrived and not been read
+  int local, peer, peer_gone, eof;                   // socketpair: this is one end, the slot of the other end, the other end is closed, it said SHUT_WR
+  u8 lbuf[LBUF];  unsigned long lwritten, lread;      // socketpair: bytes the other end has written / this end has read (the difference is in the buffer)
 };
 
 static struct sock socks[MAX_SOCKS];
@@ -137,6 +140,7 @@ int sock_new (int type, int nonblock) {
 }
 
 static void sock_release (struct sock *s) {
+  if (s->local && !s->peer_gone) socks[s->peer].peer_gone = 1;      // the other end now sees the end of the stream (and EPIPE when it writes)
   if (s->type == SOCK_STREAM_ && s->c) { if (tcp_id (s->c) == s->id) tcp_close (s->c);  s->c = 0; }
   if (s->type == SOCK_DGRAM_ && s->local_port) udp_unbind (s->local_port);
   s->used = 0;
@@ -158,6 +162,27 @@ int sock_reopen (int gfd) {
 void sock_set_nonblock (int gfd, int on) { struct sock *s = sock_of (gfd); if (s) s->nonblock = on; }
 int  sock_is_nonblock (int gfd) { struct sock *s = sock_of (gfd); return s && s->nonblock; }
 int  sock_type (int gfd) { struct sock *s = sock_of (gfd); return s ? s->type : 0; }
+
+@
+\subsection{A pair of connected sockets (\texttt{socketpair})}
+
+Programs such as Python's \texttt{asyncio} make a pair of connected sockets to wake up their own event loop (\texttt{AF\_UNIX}, \texttt{SOCK\_STREAM}).
+There is no network and no name here: each end has a small receive buffer (\texttt{lbuf}) and writes into the buffer of the other end, so it is a pipe that works in
+both directions and can be used with \texttt{poll}. When one end is closed the other one reads the rest and then the end of the stream, and writing gives \texttt{EPIPE}.
+A socket has nothing but its slot number to name the other end; this is safe because \texttt{peer\_gone} is set when the other end closes and the number is not used after that.
+
+<<sockets.c>>=
+// two connected stream sockets: 0 and the two global descriptors, or -1 (errno says why)
+int sock_pair (int *g0, int *g1, int nonblock) {
+  *g0 = sock_new (SOCK_STREAM_, nonblock);
+  if (*g0 < 0) return -1;
+  *g1 = sock_new (SOCK_STREAM_, nonblock);
+  if (*g1 < 0) { sock_close (*g0);  return -1; }
+  struct sock *a = sock_of (*g0), *b = sock_of (*g1);
+  a->local = b->local = 1;
+  a->peer = *g1 & 0xff;  b->peer = *g0 & 0xff;
+  return 0;
+}
 
 @
 \subsection{Waiting}
@@ -243,7 +268,53 @@ static int stream_check (struct sock *s) {                          // the conne
   return 0;
 }
 
+// Two CPUs can use the two ends at the same time, and the kernel has no lock for this. So each counter has exactly one owner: the writer (the other end)
+// only changes lwritten, the reader (this end) only changes lread; the bytes in the buffer are the difference. A byte is written before the counter
+// says so (release), and read after the counter was looked at (acquire).
+// waiting for the other end: no network is involved, so the network is not polled (two CPUs inside net_poll_once at the same time is not what it expects)
+static int local_wait (void) {
+  if (thread_table[current_task].sig_pending) return E_INTR;
+  arch_resign ();
+  arch_poll_pause ();
+  return 0;
+}
+
+#define LCOUNT(p) (__atomic_load_n (&(p)->lwritten, __ATOMIC_ACQUIRE) - (p)->lread)
+
+static long local_send (struct sock *s, const u8 *buf, u64 n) {
+  u64 sent = 0;
+  while (sent < n) {
+    if (s->shut_write || s->peer_gone) return sent ? (long) sent : -E_PIPE;
+    struct sock *p = &socks[s->peer];
+    unsigned long w = p->lwritten;
+    unsigned long room = LBUF - (w - __atomic_load_n (&p->lread, __ATOMIC_ACQUIRE));
+    u64 k = n - sent < room ? n - sent : room;
+    for (u64 i = 0; i < k; i++) p->lbuf[(w + i) % LBUF] = buf[sent + i];
+    __atomic_store_n (&p->lwritten, w + k, __ATOMIC_RELEASE);
+    sent += k;
+    if (sent == n) break;
+    if (k) continue;
+    if (s->nonblock) return sent ? (long) sent : -E_AGAIN;
+    if (local_wait ()) return sent ? (long) sent : -E_INTR;
+  }
+  return sent;
+}
+
+static long local_recv (struct sock *s, u8 *buf, u64 n) {
+  while (LCOUNT (s) == 0) {
+    if (s->peer_gone || s->eof) { if (LCOUNT (s) == 0) return 0;  break; }
+    if (s->nonblock) return -E_AGAIN;
+    if (local_wait ()) return -E_INTR;
+  }
+  unsigned long avail = LCOUNT (s);
+  u64 k = n < avail ? n : avail;
+  for (u64 i = 0; i < k; i++) buf[i] = s->lbuf[(s->lread + i) % LBUF];
+  __atomic_store_n (&s->lread, s->lread + k, __ATOMIC_RELEASE);
+  return k;
+}
+
 static long stream_send (struct sock *s, const u8 *buf, u64 n) {
+  if (s->local) return local_send (s, buf, n);
   int e = stream_check (s);
   if (e) return e;
   if (s->shut_write) return -E_PIPE;
@@ -263,6 +334,7 @@ static long stream_send (struct sock *s, const u8 *buf, u64 n) {
 }
 
 static long stream_recv (struct sock *s, u8 *buf, u64 n) {
+  if (s->local) return local_recv (s, buf, n);
   int e = stream_check (s);
   if (e) return e;
   unsigned long long start = net_now_ms ();
@@ -326,6 +398,10 @@ int sock_write (int gfd, void *buf, int n) { return as_book (sock_send (gfd, buf
 int sock_shutdown (int gfd, int how) {
   struct sock *s = sock_of (gfd);
   if (!s) return -E_NOTSOCK;
+  if (s->local) {
+    if ((how == 1 || how == 2) && !s->shut_write && !s->peer_gone) { s->shut_write = 1;  socks[s->peer].eof = 1; }
+    return 0;
+  }
   if (s->type == SOCK_STREAM_) {
     if (!s->c) return -E_NOTCONN;
     if (how == 1 || how == 2) { s->shut_write = 1;  tcp_close (s->c); }       // (the connection says goodbye; reading the rest still works)
@@ -337,6 +413,7 @@ int sock_shutdown (int gfd, int how) {
 int sock_name (int gfd, int peer, u32 *ip, u16 *port) {
   struct sock *s = sock_of (gfd);
   if (!s) return -E_NOTSOCK;
+  if (s->local) { *ip = 0;  *port = 0;  return 0; }                    // a socketpair has no address (Python's ssl asks getpeername whether it is connected)
   if (peer) {
     if (s->type == SOCK_STREAM_ ? !s->c : !s->connected) return -E_NOTCONN;
     *ip = s->peer_ip;  *port = s->peer_port;
@@ -358,6 +435,7 @@ int sock_ready (int gfd) {
   struct sock *s = sock_of (gfd);
   if (!s) return 32;                                                   // POLLNVAL
   if (s->type == SOCK_DGRAM_) return (s->qcount ? 1 : 0) | 4;
+  if (s->local) return (LCOUNT (s) || s->eof ? 1 : 0) | (s->peer_gone ? 1 | 4 | 16 : (LCOUNT (&socks[s->peer]) < LBUF ? 4 : 0));
   if (!s->c) return 4 | 16;                                            // not connected (any more): POLLOUT | POLLHUP, like Linux
   if (tcp_id (s->c) != s->id) return 8 | 16;
   if (s->connecting) { if (tcp_established (s->c)) { s->connecting = 0; return 4; }  return tcp_closed (s->c) ? 8 | 16 : 0; }

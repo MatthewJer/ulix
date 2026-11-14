@@ -23143,7 +23143,12 @@ int mx_close (int mfd) {
   // REENABLE: printf ("DEBUG: I have set mx_status[%d].inode = NULL !\n", mfd);  // REMOVE_DEBUGGING_CODE
   
   if (inode->refcount == 0) {  // usage count down to 0? Then synchronize inode
-    if (inode->clean == 0) {
+    if (inode->i_nlinks == 0) {
+      // Unix semantics: the last name was removed (mx_unlink) while the file was open, and this was the last user: now the file goes
+      struct minix2_inode gone = *(struct minix2_inode*) inode;
+      mx_free_inode (device, inode->ino, &gone);
+      mx_write_inode (device, inode->ino, &gone);
+    } else if (inode->clean == 0) {
       int ext_ino = inode->ino;
       mx_write_inode (device, ext_ino, (struct minix2_inode*) inode);
     }
@@ -23803,11 +23808,48 @@ int mx_unlink (int device, const char *path) {
   if (found==false) { return -1; }  // error: not found in directory
   
   inode.i_nlinks--;   // one name less
-  if (inode.i_nlinks == 0) { <<free this inode>> }
+  if (inode.i_nlinks == 0) {
+    struct int_minix2_inode *open_inode = mx_find_open_inode (device, inodenr);
+    if (open_inode) {         // still open: the data stays until the last mx_close (mx_close frees it); only the name is gone
+      open_inode->i_nlinks = 0;
+      open_inode->clean = 0;
+    } else {
+      <<free this inode>>
+    }
+  }
   mx_write_inode (device, inodenr, &inode);
   return 0;
 }
 @ %def mx_unlink
+
+A file that is deleted while a program still has it open (a very common Unix trick: make a temporary file, delete it at once, go on using it) must not lose
+its blocks and its inode number before the program is done. The book's first version freed both immediately: the next new file got the same inode number,
+the internal inode of the open file and the one of the new file then shared a number, and a later [[mx_close]] wrote the old contents over the new inode (a
+directory that was reported as a plain file, found on the ARM64 port when Python's [[multiprocessing]] did exactly that). So [[mx_unlink]] only removes the name
+if the file is open (the link count of the internal inode becomes 0), and the last [[mx_close]] frees the blocks and the inode. The freeing is the same code as in
+[[mx_unlink]], in a function of its own:
+
+%nouse
+<<function prototypes>>=
+void mx_free_inode (int device, int inodenr, struct minix2_inode *ext);
+struct int_minix2_inode *mx_find_open_inode (int device, int inodenr);
+@
+
+<<minix filesystem implementation>>=
+void mx_free_inode (int device, int inodenr, struct minix2_inode *ext) {
+  char ind_block[BLOCK_SIZE], double_ind_block[BLOCK_SIZE];
+  struct minix2_inode inode = *ext;
+  <<free this inode>>
+  *ext = inode;
+}
+
+// the internal inode of a file that is open now (refcount > 0), or NULL
+struct int_minix2_inode *mx_find_open_inode (int device, int inodenr) {
+  for (int i = 0;  i < MAX_INT_INODES;  i++)
+    if (mx_inodes[i].refcount > 0 && mx_inodes[i].ino == inodenr && mx_inodes[i].device == device) return &mx_inodes[i];
+  return NULL;
+}
+@ %def mx_free_inode mx_find_open_inode
 
 We must take care of the case when the last link has been
 removed---then we have an inode with a reference count of 0, and

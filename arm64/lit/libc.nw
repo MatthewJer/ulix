@@ -76,6 +76,8 @@ The complete file is put together from these parts:
 
 <<linux_abi.c: sockets and poll>>
 
+<<linux_abi.c: semaphores>>
+
 <<linux_abi.c: linux_syscall>>
 @
 
@@ -93,6 +95,7 @@ extern void arch_resign (void), arch_poll_pause (void);
 extern int  pfd2gfd (int pfd);
 extern int  is_sock (int gfd), sock_is_nonblock (int gfd);                // sockets.c (used by fcntl and ioctl)
 extern void sock_set_nonblock (int gfd, int on);
+extern int  sock_pair (int *g0, int *g1, int nonblock);
 
 typedef unsigned long u64;
 typedef unsigned char u8;
@@ -168,6 +171,7 @@ void linux_abi_fork (int old_as, int new_as) {
 #define L_gettid        178
 #define L_brk           214
 #define L_munmap        215
+#define L_msync         227
 #define L_mremap        216
 #define L_clone         220
 #define L_execve        221
@@ -176,7 +180,22 @@ void linux_abi_fork (int old_as, int new_as) {
 #define L_madvise       233
 #define L_wait4         260
 #define L_renameat2     276
+#define L_statfs        43
+#define L_fchdir        50
+#define L_fchmod        52
+#define L_fchmodat      53
+#define L_fchownat      54
+#define L_fchown        55
+#define L_utimensat     88
+#define L_fstatfs       44
+#define L_usem_open     640
+#define L_usem_wait     641
+#define L_usem_post     642
+#define L_usem_value    643
+#define L_usem_close    644
+#define L_usem_unlink   645
 #define L_socket        198
+#define L_socketpair    199
 #define L_bind          200
 #define L_connect       203
 #define L_getsockname   204
@@ -368,12 +387,53 @@ static void unmap_range (u64 va, u64 len) {
   flush_tlb_all ();
 }
 
+@
+\paragraph{Shared mappings and files.} \texttt{mmap} used to know only anonymous memory. Python's \texttt{mmap} module and \texttt{multiprocessing}'s shared heap
+(\texttt{Value}, \texttt{Array}) need two more things, and the kernel has neither file mappings nor shared memory, so both are made out of what there is:
+
+\begin{itemize}
+\item \emph{A mapping that is shared} (\texttt{MAP\_SHARED}) marks its page table entries with \texttt{PTE\_SHARED}. \texttt{fork} (the copy of the tables, chapter \ref{ch:processes}) gives
+  the child the same \emph{writable} frames for those entries, without copy-on-write, so that parent and child see each other's writes. That is all that
+  \texttt{multiprocessing} needs, because the children of a pool are forked from the process that made the mapping. Unrelated processes do not share anything.
+\item \emph{A file mapping} reads the file into fresh pages when the mapping is made (copy in), as \texttt{MAP\_PRIVATE} does on every system. For a shared mapping that may be written,
+  the kernel remembers the file (a table of 16 entries: address range, a duplicate of the file descriptor, offset, size); \texttt{msync} and \texttt{munmap} write the
+  pages back, nothing else does, and a program that ends without \texttt{munmap} loses its changes. So a file is not a way for two programs to talk to each other here.
+\end{itemize}
+
+<<linux_abi.c: memory>>=
+extern int u_lseek (int gfd, int offset, int whence), u_read (int gfd, void *buf, int n), u_write (int gfd, void *buf, int n), u_close (int gfd), u_reopen (int gfd);
+extern int pfd2gfd (int pfd);
+#define MAP_SHARED_  0x01
+
+struct fmap { int used, gfd, as;  u64 base, len;  long off, size; };      // a shared, writable file mapping that msync and munmap write back
+static struct fmap fmaps[16];
+
+// write the part of the file mapping f that lies in [lo, hi) back to the file
+static void fmap_writeback (struct fmap *f, u64 lo, u64 hi) {
+  if (lo < f->base) lo = f->base;
+  if (hi > f->base + f->len) hi = f->base + f->len;
+  for (u64 va = lo & ~4095UL; va < hi; va += 4096) {
+    long pos = f->off + (long) (va - f->base);
+    if (pos >= f->size || !user_ok (va, 4096, 0)) continue;
+    long n = f->size - pos < 4096 ? f->size - pos : 4096;
+    u_lseek (f->gfd, pos, 0);
+    u_write (f->gfd, (void *) va, n);
+  }
+}
+
+static long linux_mprotect (u64 addr, u64 len, int prot);
+
 static long linux_mmap (u64 addr, u64 len, int prot, int flags, int fd, long off) {
   u64 l0 = arch_as_l0 (current_as), flagbits = prot_flags (prot);
   if (!len || len > MMAP_HI - MMAP_LO) return -LE_EINVAL;
   len = (len + 4095) & ~4095UL;
   if (!flagbits) return -LE_EACCES;
-  if (!(flags & MAP_ANONYMOUS)) return -19;                       // ENODEV: no files yet
+  int gfd = -1;
+  if (!(flags & MAP_ANONYMOUS)) {                                 // a file: read it into the new pages below
+    gfd = pfd2gfd (fd);
+    if (fd < 0 || gfd < 0) return -LE_EBADF;
+    if (off & 4095) return -LE_EINVAL;
+  }
   u64 base;
   if (flags & MAP_FIXED) {
     if ((addr & 4095) || addr < MMAP_LO || addr + len > MMAP_HI) return -LE_EINVAL;
@@ -383,21 +443,47 @@ static long linux_mmap (u64 addr, u64 len, int prot, int flags, int fd, long off
     base = find_free (l0, len >> 12);
     if (!base) { printf ("[kernel] mmap: no free address range of %lu pages\n", len >> 12); return -LE_ENOMEM; }
   }
+  u64 pageflags = (gfd >= 0 ? PAGE_URW : flagbits) | ((flags & MAP_SHARED_) ? PTE_SHARED : 0);   // (a file is read in first: writable for now)
   for (u64 va = base; va < base + len; va += 4096) {
     u64 pa = alloc_frame_try ();                                  // zeroed; swaps a page out if the RAM is full
-    if (!pa || map_page_in (l0, va, pa, flagbits) != 0) {
+    if (!pa || map_page_in (l0, va, pa, pageflags) != 0) {
       printf ("[kernel] mmap: %s at page %lu of %lu (frames in use: %ld)\n", pa ? "cannot map" : "no free frame", (va - base) >> 12, len >> 12, frames_in_use);
       if (pa) free_frame (pa);
       unmap_range (base, va - base);                              // all or nothing
       return -LE_ENOMEM;
     }
   }
+  if (gfd >= 0) {
+    long here = u_lseek (gfd, 0, 1), size = u_lseek (gfd, 0, 2);   // (the position of the file belongs to the program: put it back)
+    for (u64 va = base; va < base + len && (long) (off + (va - base)) < size; va += 4096) {
+      long n = size - (off + (long) (va - base)); if (n > 4096) n = 4096;
+      u_lseek (gfd, off + (long) (va - base), 0);
+      if (!user_ok (va, 4096, 1) || u_read (gfd, (void *) va, n) < 0) { u_lseek (gfd, here, 0);  unmap_range (base, len);  return -LE_EIO; }
+    }
+    u_lseek (gfd, here, 0);
+    if (!(prot & PROT_WRITE) || (prot & PROT_EXEC)) linux_mprotect (base, len, prot);       // now the protection that was asked for
+    if ((flags & MAP_SHARED_) && (prot & PROT_WRITE))
+      for (int i = 0; i < 16; i++)
+        if (!fmaps[i].used) { fmaps[i] = (struct fmap) { 1, u_reopen (gfd), current_as, base, len, off, size };  break; }
+  }
   return base;
+}
+
+static long linux_msync (u64 addr, u64 len) {
+  for (int i = 0; i < 16; i++)
+    if (fmaps[i].used && fmaps[i].as == current_as && addr < fmaps[i].base + fmaps[i].len && addr + len > fmaps[i].base) fmap_writeback (&fmaps[i], addr, addr + len);
+  return 0;
 }
 
 static long linux_munmap (u64 addr, u64 len) {
   if ((addr & 4095) || !len || addr < MMAP_LO || addr + len > MMAP_HI) return -LE_EINVAL;
-  unmap_range (addr, (len + 4095) & ~4095UL);
+  len = (len + 4095) & ~4095UL;
+  for (int i = 0; i < 16; i++)
+    if (fmaps[i].used && fmaps[i].as == current_as && addr < fmaps[i].base + fmaps[i].len && addr + len > fmaps[i].base) {
+      fmap_writeback (&fmaps[i], addr, addr + len);
+      if (addr <= fmaps[i].base && addr + len >= fmaps[i].base + fmaps[i].len) { u_close (fmaps[i].gfd);  fmaps[i].used = 0; }     // (all of it: the entry goes)
+    }
+  unmap_range (addr, len);
   return 0;
 }
 
@@ -413,7 +499,7 @@ static long linux_mprotect (u64 addr, u64 len, int prot) {
     u64 *e = pte_of (l0, va);
     if (!(*e & PTE_VALID) && page_in (current_as, va >> 12) != 0) return -LE_ENOMEM;
     e = pte_of (l0, va);
-    u64 old = *e, pa = old & PTE_ADDR, ne = pa | flagbits;
+    u64 old = *e, pa = old & PTE_ADDR, ne = pa | flagbits | (old & PTE_SHARED);
     if ((old & PTE_COW) && (ne & PTE_RO) == 0) ne |= PTE_RO | PTE_COW;   // a shared page stays shared until it is written
     else if (old & PTE_COW) ne |= PTE_COW;
     *e = ne;
@@ -717,9 +803,60 @@ static long linux_iov (context_t *r, int write, int fd, struct iovec *iov, int n
 
 static long linux_ftruncate (int fd, long length);
 
+@
+\paragraph{Directory descriptors.} Programs such as \texttt{tar} (libarchive) and Python's \texttt{shutil.rmtree} walk a directory tree with
+\texttt{openat}, \texttt{fstatat}, \texttt{unlinkat}: a name relative to a directory that is \emph{open}, given as a descriptor. The book's open file has no
+name (only an inode), so the translation keeps one: \texttt{linux\_openat} writes the absolute name that it opened into \texttt{fd\_path}, in the slot of the
+global table of open files, and \texttt{at\_name} puts a relative name behind it. The slot is overwritten by the next \texttt{openat} that gets it; an
+open file that did not come through \texttt{linux\_openat} has an empty name and is refused as a base (\texttt{ENOTDIR}), as is a name that does not fit.
+
+<<linux_abi.c: file status, directories and descriptors>>=
+#define FD_PATH 256
+static char fd_path[256][FD_PATH];                           // (the book's table of open files has MX_MAX_FILES = 256 entries)
+
+// a duplicate (dup, fcntl F_DUPFD) is a new open file in the book's table: it keeps the name
+static void copy_fd_path (int from_gfd, int to_gfd) {
+  if (from_gfd >= 0 && to_gfd >= 0 && (from_gfd >> 8) == FS_MINIX && (to_gfd >> 8) == FS_MINIX) strcpy (fd_path[to_gfd & 0xff], fd_path[from_gfd & 0xff]);
+}
+
+// the name to use for an *at call: the path itself if it is absolute or relative to the working directory, else the name of the directory and the path
+static const char *at_name (int dirfd, const char *path, char *buf, long *err) {
+  // Linux programs keep shared memory in /dev/shm (Python's multiprocessing makes its heap there). There is no such directory here, and /dev/ names are devices, so
+  // /dev/shm is /tmp: the name is changed on the way in.
+  if (strncmp (path, "/dev/shm", 8) == 0 && (path[8] == 0 || path[8] == '/') && strlen (path + 8) + 5 <= FD_PATH) { memcpy (buf, "/tmp", 4);  strcpy (buf + 4, path + 8);  return buf; }
+  if (dirfd == AT_FDCWD || path[0] == '/') return path;
+  int gfd = pfd2gfd (dirfd);
+  if (dirfd < 0 || gfd == -1) { *err = -LE_EBADF;  return 0; }
+  if ((gfd >> 8) != FS_MINIX || !fd_path[gfd & 0xff][0]) { *err = -LE_ENOTDIR;  return 0; }
+  const char *d = fd_path[gfd & 0xff];
+  unsigned n = strlen (d), m = strlen (path);
+  if (n + 1 + m + 1 > FD_PATH) { *err = -LE_EINVAL;  return 0; }
+  memcpy (buf, d, n);
+  if (n && d[n - 1] != '/') buf[n++] = '/';
+  memcpy (buf + n, path, m + 1);
+  return buf;
+}
+
+@
+<<linux_abi.c: file status, directories and descriptors>>=
+// statfs and fstatfs (musl's statvfs, which tar asks for): the numbers of a Minix file system with 1 KByte blocks and 30-character names;
+// the counts of free blocks are not known here, so the file system is reported as half full
+static long linux_statfs (const char *path, void *buf) {      // path is 0 for fstatfs
+  if (!user_ok ((u64) buf, 120, 1)) return -LE_EFAULT;
+  if (path) { struct stat st;  if (!user_string_ok ((u64) path)) return -LE_EFAULT;  char nb[FD_PATH];  long er = 0;  const char *name = at_name (AT_FDCWD, path, nb, &er);  if (!name || u_stat (name, &st) != 0 || strncmp (name, "/dev/", 5) == 0) return -LE_ENOENT; }   // (a name that does not exist: Python probes /dev/shm)
+  long *f = buf;
+  memset (buf, 0, 120);
+  f[0] = 0x2478;  f[1] = 1024;  f[2] = 32768;  f[3] = f[4] = 16384;  f[5] = 2048;  f[6] = 1024;   // type, bsize, blocks, bfree, bavail, files, ffree
+  f[8] = 30;  f[9] = 1024;                                    // (f[7] is the fsid) namelen, frsize
+  return 0;
+}
+
 static long linux_openat (context_t *r, int dirfd, const char *path, int flags) {
   if (!user_string_ok ((u64) path)) return -LE_EFAULT;
-  if (dirfd != AT_FDCWD && path[0] != '/') return -LE_ENOSYS;
+  char nbuf[FD_PATH];  long err = 0;
+  const char *name = at_name (dirfd, path, nbuf, &err);
+  if (!name) return err;
+  path = name;
   int uflags = flags & 3;                                     // O_RDONLY, O_WRONLY, O_RDWR have the same values
   struct stat st = { 0 };
   int exists = strncmp (path, "/dev/", 5) != 0 && u_stat (path, &st) == 0;   // (a device is no file and no directory: the file system calls do not apply)
@@ -733,6 +870,18 @@ static long linux_openat (context_t *r, int dirfd, const char *path, int flags) 
   if ((flags & LO_TRUNC) && (flags & 3) != 0 && linux_ftruncate (fd, 0) < 0) {   // the book has no O_TRUNC: shorten the file now
     ulix_call (r, syscall_close, fd, 0, 0, 0, 0);
     return -LE_EACCES;
+  }
+  {                                                           // remember the absolute name for later *at calls with this descriptor
+    int gfd = pfd2gfd (fd);
+    if (gfd >= 0 && (gfd >> 8) == FS_MINIX) {
+      char *dst = fd_path[gfd & 0xff];
+      unsigned n = 0;
+      if (path[0] != '/') {                                   // relative to the working directory: put that in front
+        if (u_getcwd (dst, FD_PATH)) n = strlen (dst);
+        if (n && dst[n - 1] != '/') dst[n++] = '/';
+      }
+      if (n + strlen (path) + 1 <= FD_PATH) strcpy (dst + n, path); else dst[0] = 0;
+    }
   }
   return fd;
 }
@@ -801,13 +950,34 @@ static long linux_clone (context_t *r, u64 flags, u64 stack, int *ptid, u64 tls,
   return tid;
 }
 
+// Which child to wait for. The book's waitpid waits for one named child and for ever; Linux programs also ask for "any child" (pid -1) and for
+// WNOHANG (options bit 1: do not wait, say 0 if the child is still running). Python's multiprocessing does the second one all the time
+// (Process.start looks at the other children first), and with the book's behaviour it waited for a worker that was never going to end: the
+// Pool hung. So the answer is decided here, before the book's call: a child that is a zombie is reaped by the book's waitpid (which then does
+// not wait), a child that is not is waited for only if the program wants that.
+#define LW_NOHANG 1
 static long linux_wait4 (context_t *r, int pid, int *status, int options) {
-  if (pid < 1) return -LE_ECHILD;                             // "any child" is not supported: name the child
   if (status && !user_ok ((u64) status, 4, 1)) return -LE_EFAULT;
-  long k = ulix_call (r, syscall_waitpid, pid, 0, options, 0, 0);
-  if (k < 0) return -LE_ECHILD;
-  if (status) *status = (thread_table[pid].exitcode & 0xff) @<< 8;   // (the table entry is free but still holds the value)
-  return k;
+  int me = thread_table[current_task].pid;
+  for (;;) {
+    int zombie = 0, children = 0;
+    for (int t = 2; t < MAX_THREADS; t++) {                  // (the children of this process: the main threads whose parent we are)
+      if (!thread_table[t].used || thread_table[t].ppid != me || thread_table[t].pid != t) continue;
+      if (pid > 0 && t != pid) continue;
+      children++;
+      if (thread_table[t].state == TSTATE_ZOMBIE && !zombie) zombie = t;
+    }
+    if (!children) return -LE_ECHILD;
+    if (zombie || !(options & LW_NOHANG)) {
+      int c = zombie ? zombie : pid;                         // (a named child that still runs: the book waits for it)
+      if (c < 1) { if (thread_table[current_task].sig_pending) return -LE_EINTR;  arch_resign ();  arch_poll_pause ();  continue; }   // "any child": look again
+      long k = ulix_call (r, syscall_waitpid, c, 0, options & ~LW_NOHANG, 0, 0);
+      if (k < 0) return -LE_ECHILD;
+      if (status) *status = (thread_table[c].exitcode & 0xff) @<< 8;   // (the table entry is free but still holds the value)
+      return k;
+    }
+    return 0;                                                // WNOHANG and nobody has ended yet
+  }
 }
 
 @
@@ -867,7 +1037,8 @@ static long linux_fstat (int fd, struct kstat *k) {
 static long linux_newfstatat (int dirfd, const char *path, struct kstat *k, int flags) {
   if (!user_string_ok ((u64) path) || !user_ok ((u64) k, sizeof *k, 1)) return -LE_EFAULT;
   if (path[0] == 0) return (flags & AT_EMPTY_PATH) ? linux_fstat (dirfd, k) : -LE_ENOENT;
-  if (dirfd != AT_FDCWD && path[0] != '/') return -LE_ENOSYS;
+  char nbuf[FD_PATH];  long err = 0;
+  if (!(path = at_name (dirfd, path, nbuf, &err))) return err;
   struct stat st = { 0 };
   if (u_stat (path, &st) != 0) return -LE_ENOENT;
   kstat_from_book (k, &st);
@@ -934,7 +1105,7 @@ static long linux_dup_from (int old, int from) {
   if (old < 0 || old >= MAX_PFD || gfd == -1) return -LE_EBADF;
   if (from < 0 || from >= MAX_PFD) return -LE_EINVAL;
   for (int pfd = from; pfd < MAX_PFD; pfd++)
-    if (t->files[pfd] == -1) { t->files[pfd] = gfd >= 0 ? u_reopen (gfd) : gfd;  return pfd; }
+    if (t->files[pfd] == -1) { t->files[pfd] = gfd >= 0 ? u_reopen (gfd) : gfd;  copy_fd_path (gfd, t->files[pfd]);  return pfd; }
   return -LE_EMFILE;
 }
 
@@ -942,6 +1113,7 @@ static long linux_dup3 (context_t *r, int old, int new, int flags) {
   if (old == new) return -LE_EINVAL;                             // (dup2 allows it, dup3 does not)
   if (flags & ~02000000) return -LE_EINVAL;
   int k = ulix_call (r, syscall_dup2, old, new, 0, 0, 0);
+  if (k >= 0) copy_fd_path (pfd2gfd (old), pfd2gfd (k));
   return k < 0 ? -LE_EBADF : k;
 }
 
@@ -971,6 +1143,9 @@ static long linux_fcntl (int fd, int cmd, long arg) {
       int m = mx_status[gfd & 0xff].mode;
       return (m & 3) | ((m & O_APPEND) ? LO_APPEND : 0);
     }
+    // record locks (SQLite and others ask): the kernel has no lock table, so a lock is always granted and nobody else is ever found holding one
+    case 5: if (!user_ok ((u64) arg, 32, 1)) return -LE_EFAULT;  *(short *) arg = 2;  return 0;          // F_GETLK: struct flock, l_type = F_UNLCK
+    case 6: case 7: return 0;                                    // F_SETLK, F_SETLKW
   }
   return -LE_EINVAL;
 }
@@ -1001,17 +1176,28 @@ static long linux_prlimit64 (int pid, int res, const struct rlim *new, struct rl
   return 0;
 }
 
+#define LE_EFBIG_ 27
+extern int u_lseek (int gfd, int offset, int whence), u_write (int gfd, void *buf, int n);
 static long linux_ftruncate (int fd, long length) {
   int gfd = pfd2gfd (fd);
   if (fd < 0 || gfd < 0 || (gfd >> 8) != FS_MINIX) return -LE_EBADF;
   struct int_minix2_inode *in = mx_status[gfd & 0xff].int_inode;
   if (in && (long) in->i_size == length) return 0;             // nothing to cut off (the book refuses that: open (..., O_CREAT | O_TRUNC) of a new file failed)
+  if (in && length > (long) in->i_size) {                      // growing: the book's ftruncate only cuts, so the new part is written as zeros
+    static char zeros[1024];
+    long here = u_lseek (gfd, 0, 1), at = in->i_size;
+    u_lseek (gfd, at, 0);
+    while (at < length) { int n = length - at < 1024 ? (int) (length - at) : 1024;  if (u_write (gfd, zeros, n) != n) { u_lseek (gfd, here, 0);  return -LE_EFBIG_; }  at += n; }
+    u_lseek (gfd, here, 0);
+    return 0;
+  }
   return u_ftruncate (gfd, length) < 0 ? -LE_EACCES : 0;
 }
 
 static long linux_readlinkat (int dirfd, const char *path, char *buf, u64 size) {
   if (!user_string_ok ((u64) path) || !user_ok ((u64) buf, size, 1)) return -LE_EFAULT;
-  if (dirfd != AT_FDCWD && path[0] != '/') return -LE_ENOSYS;
+  char nbuf[FD_PATH];  long err = 0;
+  if (!(path = at_name (dirfd, path, nbuf, &err))) return err;
   struct stat st = { 0 };
   if (u_stat (path, &st) != 0) return -LE_ENOENT;
   if ((st.st_mode & S_IFMT) != S_IFLNK) return -LE_EINVAL;
@@ -1029,7 +1215,8 @@ say nothing and go on.
 <<linux_abi.c: file status, directories and descriptors>>=
 static long linux_renameat (int olddir, const char *old, int newdir, const char *new) {
   if (!user_string_ok ((u64) old) || !user_string_ok ((u64) new)) return -LE_EFAULT;
-  if ((olddir != AT_FDCWD && old[0] != '/') || (newdir != AT_FDCWD && new[0] != '/')) return -LE_ENOSYS;
+  char obuf[FD_PATH], nbuf[FD_PATH];  long err = 0;
+  if (!(old = at_name (olddir, old, obuf, &err)) || !(new = at_name (newdir, new, nbuf, &err))) return err;
   struct stat st = { 0 }, st2 = { 0 };
   if (u_stat (old, &st) != 0) return -LE_ENOENT;
   if ((st.st_mode & S_IFMT) == S_IFDIR) return -LE_EPERM;
@@ -1127,6 +1314,19 @@ static long linux_socket (int domain, int type, int protocol) {
   int pfd = gfd2pfd (gfd);
   if (pfd < 0) { sock_close (gfd);  return -LE_EMFILE; }
   return pfd;
+}
+
+// socketpair (AF_UNIX, SOCK_STREAM): two connected sockets for the program's own use (chapter \ref{ch:sockets})
+static long linux_socketpair (context_t *r, int domain, int type, int protocol, int *sv) {
+  if (domain != 1) return -LE_EAFNOSUPPORT;
+  if ((type & 0xf) != 1) return -LE_EINVAL;
+  if (!user_ok ((u64) sv, 8, 1)) return -LE_EFAULT;
+  int g0, g1;
+  if (sock_pair (&g0, &g1, (type & SOCK_NONBLOCK_) != 0) < 0) return linux_error (LE_EMFILE);
+  int p0 = gfd2pfd (g0), p1 = p0 < 0 ? -1 : gfd2pfd (g1);
+  if (p1 < 0) { if (p0 >= 0) ulix_call (r, syscall_close, p0, 0, 0, 0, 0);  sock_close (g0);  sock_close (g1);  return -LE_EMFILE; }
+  sv[0] = p0;  sv[1] = p1;
+  return 0;
 }
 
 static long linux_connect_or_bind (int fd, const void *addr, u64 len, int connect) {
@@ -1270,6 +1470,91 @@ static long linux_pselect6 (int n, unsigned long *r, unsigned long *w, unsigned 
 }
 
 @
+\subsection{Semaphores that processes share (for \texttt{multiprocessing})}
+\label{sec:libc:sem}
+
+Python's \texttt{multiprocessing} makes locks, events and queues for several \emph{processes} out of POSIX named semaphores (\texttt{sem\_open}). musl builds
+them on a file in \texttt{/dev/shm} that all processes map into memory, and Ulix has neither shared memory nor file mappings. So the kernel keeps the
+semaphores: a table of 32, each with a name, a value and a count of the processes that have it open. These are system calls of Ulix's own (numbers
+640 to 645, outside the numbers of Linux), and \texttt{libc/semshim.c} turns \texttt{sem\_open}, \texttt{sem\_wait}, \texttt{sem\_post} and the others into
+calls to them. A semaphore is identified by its slot number, which stays valid in a child after \texttt{fork}.
+
+The value is changed with an atomic compare-and-swap, because two CPUs may wait for the same semaphore. Waiting does what every wait in this chapter does:
+look again, give the CPU away, and stop when a signal is pending or the time is up. \texttt{usem\_wait} takes a mode: 0 waits for ever, 1 only tries, 2 waits at most
+the given number of nanoseconds.
+
+<<linux_abi.c: semaphores>>=
+#define MAX_USEM 32
+struct usem { char name[32];  int used, unlinked, refs;  int value; };
+static struct usem usems[MAX_USEM];
+
+static struct usem *usem_of (long id) { return (id >= 0 && id < MAX_USEM && usems[id].used) ? &usems[id] : 0; }
+
+// sem_open: the slot of the semaphore called name (made with this value if LO_CREAT is in flags and there is none), or minus an error
+static long linux_usem_open (const char *name, int flags, int value) {
+  if (!user_string_ok ((u64) name)) return -LE_EFAULT;
+  if (strlen (name) >= 32 || value < 0) return -LE_EINVAL;
+  for (int i = 0; i < MAX_USEM; i++)
+    if (usems[i].used && !usems[i].unlinked && strcmp (usems[i].name, name) == 0) {
+      if ((flags & LO_CREAT) && (flags & LO_EXCL)) return -LE_EEXIST;
+      usems[i].refs++;
+      return i;
+    }
+  if (!(flags & LO_CREAT)) return -LE_ENOENT;
+  for (int i = 0; i < MAX_USEM; i++)
+    if (!usems[i].used) {
+      memset (&usems[i], 0, sizeof usems[i]);
+      strcpy (usems[i].name, name);
+      usems[i].used = 1;  usems[i].refs = 1;  usems[i].value = value;
+      return i;
+    }
+  return -LE_ENOMEM;
+}
+
+static long linux_usem_wait (long id, int mode, long long timeout_ns) {
+  struct usem *u = usem_of (id);
+  if (!u) return -LE_EINVAL;
+  unsigned long long deadline = mono_ns () + (timeout_ns > 0 ? timeout_ns : 0);
+  for (;;) {
+    int v = __atomic_load_n (&u->value, __ATOMIC_ACQUIRE);
+    if (v > 0) { if (__atomic_compare_exchange_n (&u->value, &v, v - 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return 0;  continue; }
+    if (mode == 1) return -LE_EAGAIN;
+    if (mode == 2 && mono_ns () >= deadline) return -LE_ETIMEDOUT;
+    if (thread_table[current_task].sig_pending) return -LE_EINTR;
+    arch_resign ();
+    arch_poll_pause ();
+  }
+}
+
+static long linux_usem_post (long id) {
+  struct usem *u = usem_of (id);
+  if (!u) return -LE_EINVAL;
+  __atomic_fetch_add (&u->value, 1, __ATOMIC_ACQ_REL);
+  return 0;
+}
+
+static long linux_usem_value (long id) { struct usem *u = usem_of (id);  return u ? __atomic_load_n (&u->value, __ATOMIC_ACQUIRE) : -LE_EINVAL; }
+
+// the slot goes back to the table when the last user has closed it and it has been unlinked (sem_unlink only takes the name away)
+static long linux_usem_close (long id) {
+  struct usem *u = usem_of (id);
+  if (!u) return -LE_EINVAL;
+  if (--u->refs <= 0 && u->unlinked) u->used = 0;
+  return 0;
+}
+
+static long linux_usem_unlink (const char *name) {
+  if (!user_string_ok ((u64) name)) return -LE_EFAULT;
+  for (int i = 0; i < MAX_USEM; i++)
+    if (usems[i].used && !usems[i].unlinked && strcmp (usems[i].name, name) == 0) {
+      usems[i].unlinked = 1;
+      if (usems[i].refs <= 0) usems[i].used = 0;
+      return 0;
+    }
+  return -LE_ENOENT;
+}
+
+@
 \subsection{The translation: \texttt{linux\_syscall}}
 
 Called by \texttt{book\_syscall} instead of the book's dispatcher for a program that has \texttt{ELFOSABI\_LINUX}. A Linux program expects
@@ -1317,7 +1602,26 @@ void linux_syscall (context_t *r) {
     case L_readlinkat: ret = linux_readlinkat (a0, (const char *) a1, (char *) a2, a3); break;
     case L_fsync: case L_fdatasync: ret = 0; break;            // every write goes to the disk through the buffer cache that the book flushes
     case L_umask:  ret = 022; break;
+    // owner, mode and times of an existing file: accepted and ignored (the kernel keeps the owner and mode the file was made with and sets the time itself);
+    // tar and unzip ask for them after every file they extract and would report an error for each one
+    case L_fchmod: case L_fchmodat: case L_fchown: case L_fchownat: case L_utimensat: ret = 0; break;
+    case L_fchdir: {                                           // the name that linux_openat remembered
+      int gfd = pfd2gfd (a0);
+      if (a0 < 0 || gfd == -1) { ret = -LE_EBADF; break; }
+      if ((gfd >> 8) != FS_MINIX || !fd_path[gfd & 0xff][0]) { ret = -LE_ENOTDIR; break; }
+      ret = ulix_call (r, syscall_chdir, (long) fd_path[gfd & 0xff], 0, 0, 0, 0) < 0 ? -LE_ENOENT : 0;
+      break;
+    }
+    case L_statfs:  ret = linux_statfs ((const char *) a0, (void *) a1); break;
+    case L_fstatfs: ret = linux_statfs (0, (void *) a1); break;
+    case L_usem_open:   ret = linux_usem_open ((const char *) a0, a1, a2); break;
+    case L_usem_wait:   ret = linux_usem_wait (a0, a1, a2); break;
+    case L_usem_post:   ret = linux_usem_post (a0); break;
+    case L_usem_value:  ret = linux_usem_value (a0); break;
+    case L_usem_close:  ret = linux_usem_close (a0); break;
+    case L_usem_unlink: ret = linux_usem_unlink ((const char *) a0); break;
     case L_socket:      ret = linux_socket (a0, a1, a2); break;
+    case L_socketpair:  ret = linux_socketpair (r, a0, a1, a2, (int *) a3); break;
     case L_connect:     ret = linux_connect_or_bind (a0, (const void *) a1, a2, 1); break;
     case L_bind:        ret = linux_connect_or_bind (a0, (const void *) a1, a2, 0); break;
     case L_sendto:      ret = linux_sendto (a0, (const void *) a1, a2, a3, (const void *) a4, a5); break;
@@ -1333,18 +1637,22 @@ void linux_syscall (context_t *r) {
     case L_getrandom: ret = linux_getrandom ((char *) a0, a1, a2); break;
     case L_getcwd: ret = linux_getcwd ((char *) a0, a1); break;
     case L_chdir:  ret = ulix_call (r, syscall_chdir, a0, 0, 0, 0, 0) < 0 ? -LE_ENOENT : 0; break;
-    case L_mkdirat:
-      if (a0 != AT_FDCWD && ((char *) a1)[0] != '/') { ret = -LE_ENOSYS; break; }
-      ret = ulix_call (r, syscall_mkdir, a1, a2, 0, 0, 0) < 0 ? linux_error (LE_EACCES) : 0; break;
-    case L_unlinkat:
-      if (a0 != AT_FDCWD && ((char *) a1)[0] != '/') { ret = -LE_ENOSYS; break; }
-      ret = ulix_call (r, (a2 & 0x200) ? syscall_rmdir : syscall_unlink, a1, 0, 0, 0, 0) < 0 ? linux_error (LE_ENOENT) : 0; break;
-    case L_faccessat: { struct stat st; ret = u_stat ((const char *) a1, &st) == 0 ? 0 : -LE_ENOENT; break; }
+    case L_mkdirat: case L_unlinkat: case L_faccessat: {      // (the name may be relative to an open directory: at_name)
+      char nbuf[FD_PATH];  long err = 0;
+      if (!user_string_ok (a1)) { ret = -LE_EFAULT; break; }
+      const char *name = at_name (a0, (const char *) a1, nbuf, &err);
+      if (!name) { ret = err; break; }
+      if (nr == L_mkdirat) ret = ulix_call (r, syscall_mkdir, (long) name, a2, 0, 0, 0) < 0 ? linux_error (LE_EACCES) : 0;
+      else if (nr == L_unlinkat) ret = ulix_call (r, (a2 & 0x200) ? syscall_rmdir : syscall_unlink, (long) name, 0, 0, 0, 0) < 0 ? linux_error (LE_ENOENT) : 0;
+      else { struct stat st; ret = u_stat (name, &st) == 0 ? 0 : -LE_ENOENT; }
+      break;
+    }
 
     // memory
     case L_brk:      ret = linux_brk (a0); break;
     case L_mmap:     ret = linux_mmap (a0, a1, a2, a3, a4, a5); break;
     case L_munmap:   ret = linux_munmap (a0, a1); break;
+    case L_msync:    ret = linux_msync (a0, a1); break;
     case L_mprotect: ret = linux_mprotect (a0, a1, a2); break;
     case L_clock_getres: ret = linux_clock_getres (a0, (struct ts *) a1); break;
     case L_getrlimit: ret = linux_getrlimit (a0, (struct rlim *) a1); break;
@@ -1897,7 +2205,7 @@ log of how it is attached; the files of this part are not literate sources (they
   modules \texttt{os}, \texttt{site}, \texttt{io}, \ldots\ into the executable), so a \texttt{python3.12} must be on the host (\texttt{BUILD\_PYTHON}).
   The default is on when the submodule is checked out; \texttt{make PYTHON=0} leaves it out and it is not even compiled.
 \item[\texttt{/musl/python}, \texttt{/usr/local/lib/python3.12/}] The disk gets the interpreter (8.3 MByte, stripped) and the standard library: every \texttt{*.py} file
-  of \texttt{Lib/} in the submodule (488 files, 32 directories, 9 MByte) except the tests, \texttt{tkinter}, \texttt{ctypes}, \texttt{sqlite3}, \texttt{curses}, \texttt{idlelib} and a few
+  of \texttt{Lib/} in the submodule (488 files, 32 directories, 9 MByte) except the tests, \texttt{tkinter}, \texttt{idlelib} and a few
   more (the list \texttt{PYLIB\_EXCLUDE} in the Makefile). \texttt{tools/minix\_add.py --tree} copies it when the disk is made; there is no copy of the library in the repository.
   The root file system has 32 MByte and 2048 inodes for it (see below). The frozen modules of the interpreter (\texttt{os}, \texttt{site}, \texttt{io}, \ldots) are not read from the disk.
 \item[\texttt{libc/modtest.py}, \texttt{libc/\_sysconfigdata\_\_linux\_.py}] The test of the library (below), and a short stand-in for a file that CPython's own build writes by running the interpreter,
@@ -1960,8 +2268,32 @@ counts every closed entry down; so the counter fell to 0 although files were ope
 \texttt{\_header\_value\_parser} do not fit into the 30 characters of a Minix name. So the library is on the disk as source (and compiled at every start), and a start of a program that imports \texttt{argparse} or \texttt{unittest} takes
 five to ten seconds under qemu on top of the seven of the empty interpreter. A file system with longer names comes first.
 
-\emph{What works and what does not} is in section 33 of \texttt{ARM64-PORT.md}; the list of modules that cannot work (no \texttt{zlib}, \texttt{ssl}, \texttt{ctypes}, \texttt{sqlite3}, \texttt{curses}, \texttt{multiprocessing}'s semaphores, \texttt{socketpair} for \texttt{asyncio.run})
-is checked by the test.
+\emph{What works and what does not} is in sections 33 and 34 of \texttt{ARM64-PORT.md}; the few modules that still cannot work (\texttt{lzma}, \texttt{readline}, \texttt{tkinter}, \texttt{mmap},
+\texttt{\_uuid}, \texttt{\_crypt}) are checked by the test.
+
+\subsection{The libraries behind the modules}
+
+The modules that need a C library get it from \texttt{third\_party}, unmodified, and \texttt{libc/Makefile} builds each one into the sysroot next to musl
+(\texttt{libc/build/sysroot}), so that every program can link it: zlib (\texttt{zlib}, \texttt{gzip}, \texttt{zipfile}, \texttt{tarfile}), bzip2 (\texttt{bz2}), SQLite
+(\texttt{sqlite3}; the amalgamation is made on the host, without WAL, memory-mapped i/o and extensions), libffi (\texttt{ctypes}; its five AArch64 files are compiled
+with a hand-written \texttt{libc/fficonfig.h} because upstream needs autoconf), ncurses (\texttt{curses}; the descriptions of a few terminals are compiled in, no terminfo
+directory), OpenSSL 3.0 (\texttt{ssl} and \texttt{\_hashlib}; BearSSL stays for the system's own programs). Their licences are in
+\texttt{third\_party/LICENCE-CHECK-libs-for-python.md}. libarchive gives the programs \texttt{tar} and \texttt{unzip} (\texttt{bsdtar}, \texttt{bsdunzip}: tar, gzip, bzip2 and zip).
+
+\paragraph{\texttt{ctypes} without a dynamic linker.} \texttt{ctypes} wants \texttt{dlopen} and \texttt{dlsym}. \texttt{libc/dlshim.c} answers \texttt{dlopen (NULL)} and the names of the
+system libraries with one handle, and \texttt{dlsym} looks the name up in a table of the executable's own symbols; \texttt{libc/gen\_dlsyms.py} writes the table from
+the finished program, so the interpreter is linked twice (first with an empty table). \texttt{libc/dlundef.ld} makes the linker take every public function
+of \texttt{libc.a}, so all of them can be called. A library from a disk cannot be loaded. Calls from Python into C work, and so do callbacks (\texttt{CFUNCTYPE}): libffi's closures need code that the program writes, which the kernel's W\textasciicircum X rule
+allows only as a transition. \texttt{libc/ffi\_closures.c} gives each closure a page of its own, lets libffi fill it while it is read+write, and then switches it to read+execute (the kernel cleans the
+instruction cache; \texttt{SCTLR\_EL1.UCT} and \texttt{UCI} let \texttt{\_\_clear\_cache} do its part in the program).
+
+\paragraph{Processes and semaphores.} Python's \texttt{multiprocessing} needs named semaphores. musl keeps them in a shared file mapping, which Ulix does not have, so the
+kernel has a small table of them (section~\ref{sec:libc:sem}) and \texttt{libc/semshim.c} turns \texttt{sem\_open} and its relatives into calls to it; the
+linker option \texttt{-{}-wrap} sends only the calls that find the marker of such a semaphore there, and the semaphores that threads use stay with musl.
+
+\paragraph{What the system calls learned for this.} \texttt{socketpair} (chapter \ref{ch:sockets}); \texttt{openat} and the other calls with a directory descriptor, by
+remembering the name of every file that \texttt{linux\_openat} opens (\texttt{fd\_path}, \texttt{at\_name}); \texttt{fchdir}, \texttt{statfs}, record locks that are always granted, and
+\texttt{fchmod}, \texttt{fchown}, \texttt{utimensat} that are accepted and ignored.
 
 \paragraph{Test.} \texttt{tools/python\_test.py} (\texttt{make python-test}, job \texttt{python} of \texttt{make pcheck}) boots the shell kernel with a disk that has
 the interpreter, logs in and runs \texttt{python -c print(6*7)}, the script \texttt{/musl/hello.py} and \texttt{libc/modtest.py}; the output is compared line by line. The last one imports 137 modules

@@ -10,7 +10,7 @@ PHDRS {
 SECTIONS
 {
   . = 0x400000 + SIZEOF_HEADERS;
-  .text   : { *(.text.start) *(.text*) } :text
+  .text   : { *(.text.start) *(.text*) KEEP(*(.init)) KEEP(*(.fini)) } :text      /* (_init and _fini: crti.o starts them, crtn.o ends them; --gc-sections must not drop crtn's half) */
   . = ALIGN(4096);
   .rodata : { *(.rodata*) *(.gcc_except_table*) } :rodata
   . = ALIGN(4096);

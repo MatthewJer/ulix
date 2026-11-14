@@ -42,3 +42,26 @@ _blake2 _blake2/blake2module.c _blake2/blake2b_impl.c _blake2/blake2s_impl.c
 _decimal _decimal/_decimal.c _decimal/libmpdec/basearith.c _decimal/libmpdec/constants.c _decimal/libmpdec/context.c _decimal/libmpdec/convolute.c _decimal/libmpdec/crt.c _decimal/libmpdec/difradix2.c _decimal/libmpdec/fnt.c _decimal/libmpdec/fourstep.c _decimal/libmpdec/io.c _decimal/libmpdec/mpalloc.c _decimal/libmpdec/mpdecimal.c _decimal/libmpdec/numbertheory.c _decimal/libmpdec/sixstep.c _decimal/libmpdec/transpose.c -I$(srcdir)/Modules/_decimal/libmpdec -DCONFIG_64 -DANSI -DHAVE_UINT128_T
 pyexpat pyexpat.c expat/xmlparse.c expat/xmlrole.c expat/xmltok.c -I$(srcdir)/Modules/expat -DHAVE_EXPAT_CONFIG_H -DUSE_PYEXPAT_CAPI -DXML_DEV_URANDOM
 _elementtree _elementtree.c -I$(srcdir)/Modules/expat -DHAVE_EXPAT_CONFIG_H -DUSE_PYEXPAT_CAPI
+# zlib: the library is built by libc/Makefile from third_party/zlib and installed in the sysroot (libz.a, zlib.h)
+zlib zlibmodule.c -DHAVE_ZLIB_COPY -lz
+# sqlite3: the library is built by libc/Makefile from third_party/sqlite (the amalgamation) and installed in the sysroot
+_sqlite3 _sqlite/blob.c _sqlite/connection.c _sqlite/cursor.c _sqlite/microprotocols.c _sqlite/module.c _sqlite/prepare_protocol.c _sqlite/row.c _sqlite/statement.c _sqlite/util.c -lsqlite3
+# ctypes: libffi is built by libc/Makefile (see there) and installed in the sysroot; dlopen and dlsym come from libc/dlshim.c
+_ctypes _ctypes/_ctypes.c _ctypes/callbacks.c _ctypes/callproc.c _ctypes/stgdict.c _ctypes/cfield.c -lffi -DHAVE_FFI_PREP_CIF_VAR -DHAVE_FFI_PREP_CLOSURE_LOC -DHAVE_FFI_CLOSURE_ALLOC
+# curses: ncurses is built by libc/Makefile and installed in the sysroot (wide characters; the terminal descriptions are compiled in)
+_curses _cursesmodule.c -lncursesw -DHAVE_NCURSESW -DHAVE_NCURSES_H -DHAVE_CURSES_FILTER -DHAVE_CURSES_HAS_KEY -DHAVE_CURSES_IMMEDOK -DHAVE_CURSES_SYNCOK -DHAVE_CURSES_IS_PAD -DHAVE_CURSES_WCHGAT -DHAVE_CURSES_TYPEAHEAD -DHAVE_CURSES_RESIZETERM -DHAVE_CURSES_RESIZE_TERM -DHAVE_CURSES_IS_TERM_RESIZED -DHAVE_CURSES_USE_ENV -DHAVE_CURSES_GET_WCH -DHAVE_CURSES_PUTWIN -DHAVE_CURSES_SET_ESCDELAY -DHAVE_CURSES_ALTCHARSET -DHAVE_CURSES_SYNCOK -DHAVE_CURSES_INSCH -DHAVE_CURSES_ISENDWIN
+_curses_panel _curses_panel.c -lpanelw -lncursesw -DHAVE_NCURSESW
+# ssl and hashlib's OpenSSL part: OpenSSL is built by libc/Makefile and installed in the sysroot
+_ssl _ssl.c -lssl -lcrypto
+_hashlib _hashopenssl.c -lcrypto
+# multiprocessing: processes, queues, pools and locks work; the locks are the kernel's semaphores (libc/semshim.c). Not built: _posixshmem
+# (shared memory needs file mappings that are shared between processes)
+_multiprocessing _multiprocessing/multiprocessing.c _multiprocessing/semaphore.c
+# bz2: libbz2 is built by libc/Makefile from third_party/bzip2
+_bz2 _bz2module.c -lbz2
+# lzma, readline, _crypt: liblzma (xz), GNU readline (with ncurses) are built by libc/Makefile; crypt () is in musl
+_lzma _lzmamodule.c -llzma
+readline readline.c -lreadline -lncursesw
+_crypt _cryptmodule.c -lcrypt
+# mmap: anonymous and file mappings (the kernel emulates files by copying; see the chapter on the C library)
+mmap mmapmodule.c

@@ -7,6 +7,8 @@ SYSROOT=$HERE/build/sysroot
 CC=${CROSS:-aarch64-elf-}gcc
 GCCINC=$($CC -print-file-name=include)
 FLAGS="-fno-pic -mno-outline-atomics"
+# (-pthread means nothing to the bare-metal gcc: the threads are in libc.a; OpenSSL and others pass it)
+for a in "$@"; do shift; case "$a" in -pthread) ;; *) set -- "$@" "$a" ;; esac; done
 for a in "$@"; do
   case "$a" in -c|-E|-S) exec $CC $FLAGS -nostdinc -isystem "$SYSROOT/include" -isystem "$GCCINC" "$@" ;; esac
 done

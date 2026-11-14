@@ -124,7 +124,7 @@ int u_open (char *path, int oflag, int open_link) {
 
 \section{The data structures}
 
-There are 16 pipes of 4~KByte. A fixed table is enough for a teaching system, and a full table is an ordinary error
+There are 64 pipes of 4~KByte (16 were not enough for \texttt{multiprocessing}: a pool of two workers needs about ten). A fixed table is enough for a teaching system, and a full table is an ordinary error
 (\texttt{pipe} returns $-1$) instead of a case that needs memory management. The ring buffer has a read position and a count (the
 write position is the sum of the two, modulo the size). \texttt{readers} and \texttt{writers} count the \emph{descriptors} that
 refer to an end, in all processes.
@@ -132,11 +132,11 @@ refer to an end, in all processes.
 All processes that wait for any pipe sleep in one queue, \texttt{pipe\_queue}. Whenever something happens on a pipe (data
 arrived, space is free, an end was closed) \emph{all} sleepers wake and look again whether their pipe is ready; a wrong guess
 costs one look and one more sleep. One queue instead of one per pipe keeps the code at a single line per wake-up and cannot lose
-a wake-up; for 16 pipes that is fast enough.
+a wake-up; for 64 pipes that is fast enough.
 
 <<pipes.c: pipe table>>=
 #define FS_PIPE      4                        // the file system number of pipes (Minix is 1, devices are 3)
-#define MAX_PIPES    16
+#define MAX_PIPES    64
 #define PIPE_SIZE    4096
 #define TSTATE_WAITPIPE 13                    // a process sleeps in pipe_queue (12 is the serial disk)
 

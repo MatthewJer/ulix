@@ -40,6 +40,8 @@ typedef unsigned long u64;
 #define PTE_UXN     (1UL @<< 54)
 #define PTE_COW     (1UL @<< 55)             // software bit (ignored by the hardware): copy-on-write page
 #define PTE_SWAPPED (1UL @<< 56)             // software bit: the page is in the swap file (valid bit clear)
+#define PTE_SHARED  (1UL @<< 58)             // software bit: a MAP_SHARED mapping: fork gives the child the same writable frame (no copy-on-write)
+#define PTE_EVICTING (1UL @<< 57)            // software bit: page_out is just writing the page to the swap file (valid bit clear, PTE_SWAPPED set)
 #define PTE_ADDR    0x0000FFFFFFFFF000UL
 
 #define PAGE_RW     (PTE_PAGE | PTE_ATTR (1) | PTE_SH | PTE_AF | PTE_PXN | PTE_UXN)
@@ -598,6 +600,28 @@ static int swap_io_enter (void) {
 }
 static void swap_io_leave (int locked) { if (locked) mutex_unlock (swap_io_lock); }
 
+// \emph{A page must not be written while it is copied.} The first version of page\_out copied the page to the swap file while the page was still
+// mapped read+write, and cleared the page table entry afterwards. The copy takes a long time (it waits for the disk, and other threads run), and a thread of
+// the program that owns the page, on the other CPU or after the next switch, may change the page in that time: the change is in the frame, the frame
+// is freed, and the swap file has the old contents. Python's heap was found with such holes (an object with a bad pointer, a module that
+// would not import, now and then, in one run out of ten). The right order is: take the page away first (the entry is not valid, the TLB entries of
+// all CPUs are flushed: nobody can touch the page any more), then copy it. A thread that touches it meanwhile faults, finds PTE\_EVICTING and waits
+// in page\_in until the eviction is over (then the page comes back from the swap file), or has failed (then the entry is valid again).
+//
+// The address space must not go away under the writer (exit, exec): \texttt{evicting\_as} says which one is busy; exit leaves the destruction to page\_out
+// (\texttt{destroy\_pending}), exec waits.
+extern void arch_resign (void), arch_poll_pause (void);
+static volatile addr_space_id evicting_as = 0, destroy_pending = 0;
+extern void arch_destroy_finish (addr_space_id as);                   // arch_thread.c: the second half of destroy_address_space
+int arch_swap_evicting (addr_space_id as) { return as && evicting_as == as; }
+void arch_swap_destroy_later (addr_space_id as) { destroy_pending = as; }
+void arch_swap_wait_evicting (addr_space_id as) { while (arch_swap_evicting (as)) { arch_resign ();  arch_poll_pause (); } }
+
+static void evict_over (int as) {
+  evicting_as = 0;
+  if (destroy_pending == (addr_space_id) as) { destroy_pending = 0;  arch_destroy_finish (as); }
+}
+
 int page_out (int as, int pageno) {
   u64 l0 = arch_as_l0 (as), va = (u64)pageno @<< 12;
   if (!l0 || swap_fd == -1 || va < USER_LO || va >= USER_HI) return -1;
@@ -618,20 +642,26 @@ int page_out (int as, int pageno) {
   int l = swap_io_enter ();
   e = pte_of (l0, va);                                     // (the tables may have changed while we waited)
   if (!e || !(*e & PTE_VALID) || (*e & PTE_ADDR) != pa) { swap_io_leave (l); return -1; }
-  if (write_swap_page (as, pageno, (int)(pa >> 12)) != 0) { swap_io_leave (l); return -1; }
+  u64 old = *e;
+  *e = (old & ~PTE_VALID) | PTE_SWAPPED | PTE_EVICTING;    // take the page away: from now on every access faults and waits
+  evicting_as = as;
+  flush_page (as, va);                                     // (on all CPUs; the frame stays ours: pa is still in the entry)
+  if (write_swap_page (as, pageno, (int)(pa >> 12)) != 0) { *e = old;  swap_io_leave (l);  evict_over (as);  return -1; }
   int index = swap_index (as, pageno);
   if (index < 0 || u_lseek (swap_fd, 0, SEEK_END) < (index + 1) * (int)PAGE) {   // the disk is full
     if (index >= 0) paging[index].used = false;
+    *e = old;
     swap_io_leave (l);
     swap_full = 1;
+    evict_over (as);
     return -1;
   }
   swap_io_leave (l);
   swap_has_data = 1;
   if (index + 1 > swap_file_pages) swap_file_pages = index + 1;
-  *e = (*e & ~PTE_VALID) | PTE_SWAPPED;                    // mark page non-present and paged-out
-  flush_page (as, va);
+  *e = (*e & ~PTE_EVICTING);                               // paged out for good (not valid, PTE_SWAPPED)
   free_frame (pa);                                         // the frame is free again
+  evict_over (as);                                         // (and if the program ended meanwhile, its address space is destroyed now)
   return 0;
 }
 
@@ -639,6 +669,7 @@ int page_in (int as, int pageno) {
   u64 l0 = arch_as_l0 (as), va = (u64)pageno @<< 12;
   if (!l0 || swap_fd == -1) return -1;
   u64 *e = pte_of (l0, va);
+  while (e && (*e & PTE_EVICTING) && arch_swap_evicting (as)) { arch_resign ();  arch_poll_pause ();  e = pte_of (l0, va); }   // page_out is writing it: wait
   if (!e || (*e & PTE_VALID) || !(*e & PTE_SWAPPED)) return -1;      // fail: page was not paged out
   if (swap_index (as, pageno) < 0) return -1;
   u64 pa = alloc_frame_try ();                             // reserve a frame

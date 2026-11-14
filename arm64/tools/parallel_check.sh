@@ -36,6 +36,7 @@ JOBLIST=(
   "telnet|telnet server: login on terminal 5 over TCP, top, second connection, hang up, switched off in /etc/rc.conf|telnet|virt||128"
   "listen|server sockets: the program echod (tcp_listen, tcp_accept sleeps), clients one after the other and queued, 20000 bytes|listen|virt||128"
   "python|CPython: the interpreter (static, linked with musl) runs a script|python|virt||256"
+  "archive|tar and unzip (libarchive): tar, tar.gz and zip files are made, listed and extracted|archive|virt||256"
   "socket|sockets for programs: socket, connect, sendto, recvfrom, poll, select, non-blocking, getaddrinfo against servers of the host|socket|virt||128"
   "daemon|services: service and daemon, /etc/rc.d, pid file, a daemon on its own terminal, started at boot by rc.conf|daemon|virt||128"
   "https|TLS 1.2: https client against a test CA and a TLS server on the host, random numbers, SNTP, tls_enable switch|https|virt||128"
@@ -112,6 +113,11 @@ if [ "$1" = "--job" ]; then
     python)
       if [ -f libc/build/python.elf ]; then python3 tools/python_test.py ulix-shell.bin $DISK > "$log" 2>&1
       else echo "python test: all passed (the interpreter is not part of this build: PYTHON=0)" > "$log"; fi
+      rc=$?; sum=$(tail -1 "$log")
+      [ $rc -eq 0 ] && grep -q "all passed" <<< "$sum" && st=ok || st=FAILED ;;
+    archive)
+      if [ -f libc/build/bsdtar.elf ]; then python3 tools/archive_test.py ulix-shell.bin $DISK > "$log" 2>&1
+      else echo "archive test: all passed (tar and unzip are not part of this build: ARCHIVE=0)" > "$log"; fi
       rc=$?; sum=$(tail -1 "$log")
       [ $rc -eq 0 ] && grep -q "all passed" <<< "$sum" && st=ok || st=FAILED ;;
     socket)

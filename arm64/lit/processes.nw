@@ -478,6 +478,10 @@ static int as_alloc (void) {
 the book calls this from [[syscall_exit()]]; we may be running in the address space that is destroyed
 
 <<arch_thread.c: destroy_address_space>>=
+extern void arch_destroy_finish (addr_space_id id);
+extern int arch_swap_evicting (addr_space_id as);
+extern void arch_swap_destroy_later (addr_space_id as), arch_swap_wait_evicting (addr_space_id as);
+
 void destroy_address_space (addr_space_id id) {
   if (id < 2 || address_spaces[id].status == AS_FREE) return;
   if (--address_spaces[id].refcount > 0) {           // other threads still use it (as in the book)
@@ -485,6 +489,13 @@ void destroy_address_space (addr_space_id id) {
     return;
   }
   if (current_as == id) arch_activate_as (1);        // leave it first: TTBR0 = empty table
+  // The swapper is writing a page of this address space to the swap file (page_out, section on swapping): the tables must stay until it is
+  // done. This code cannot wait (the exiting thread is not in the ready queue any more, nobody would wake it), so page_out finishes the job.
+  if (arch_swap_evicting (id)) { address_spaces[id].pid = -1;  arch_swap_destroy_later (id);  return; }
+  arch_destroy_finish (id);
+}
+
+void arch_destroy_finish (addr_space_id id) {         // the second half: the references are gone and nobody is writing a page of it
   if (as_l0[id]) { arch_swap_release_as (id); asid_flush (id); free_user_space (as_l0[id]); }
   as_l0[id] = 0;
   address_spaces[id].status = AS_FREE;
@@ -510,7 +521,7 @@ static int clone_level (u64 old_pa, u64 new_l0, int lvl, u64 va_prefix) {
       if (clone_level (e & PTE_ADDR, new_l0, lvl + 1, va) < 0) return -1;
     } else {
       u64 pa = e & PTE_ADDR;
-      if (!(e & PTE_RO)) {                                  // writable: copy-on-write from now on
+      if (!(e & PTE_RO) && !(e & PTE_SHARED)) {             // writable: copy-on-write from now on (not a MAP_SHARED mapping: parent and child share it for good)
         e |= PTE_RO | PTE_COW;
         t[i] = e;                                           // the parent's entry, too
       }
@@ -893,6 +904,7 @@ static int u_execv_loading (char *filename, char *const argv[], memaddress *news
   u64 sp = build_user_stack (nl0, argc, kargv, elf_linux);
   if (!sp) { free_user_space (nl0); return -1; }
 
+  arch_swap_wait_evicting (current_as);                  // (the swapper may be writing a page of the old program: its tables must stay until it is done)
   u64 old = as_l0[current_as];                           // from here on there is no way back
   as_l0[current_as] = nl0;
   linux_abi_as[current_as] = elf_linux;                  // the new program may speak the other system call interface
@@ -1034,13 +1046,24 @@ extern void bkl_lock (void);
 // A thread that waits in a loop (nanosleep, futex) calls arch_resign () to let the others run. With several CPUs that is not enough:
 // when no other thread is ready on this CPU, the loop would keep the big kernel lock for ever and a thread on the other CPU could
 // never enter the kernel to wake it. So the lock is given up for a moment, as the idle loop does.
+//
+// \emph{Interrupts are let in as well.} Kernel code runs with interrupts masked, and the device interrupts (the disk, the network
+// card) are all routed to CPU 0. A thread that waits in a loop on CPU 0 and finds nobody else to run (the other threads wait for the
+// disk) would keep every interrupt away from the only CPU that gets it: the disk request never completes, and the thread that waits
+// for it never wakes. That is a real hang, found with a TLS handshake between two threads (one spun in \texttt{local\_recv},
+// the other waited for a page of a file). So the window in which the lock is free is also a window in which an interrupt can come in;
+// the interrupt code takes the lock for itself.
 void arch_poll_pause (void) {
   int d = bkl_depth ();
+  u64 flags = irq_save ();
   bkl_set_depth (1);
   bkl_unlock ();
+  __asm__ volatile ("msr daifclr, #2");
   for (int i = 0; i < 200; i++) __asm__ volatile ("yield");
+  __asm__ volatile ("msr daifset, #2");
   bkl_lock ();
   bkl_set_depth (d);
+  irq_restore (flags);
 }
 static u64 clear_tid[MAX_THREADS];                                 // the word that the kernel clears when the thread ends (0: none)
 static int as_dying[MAX_ADDR_SPACES], as_exit_code[MAX_ADDR_SPACES];     // exit_group is under way in this address space

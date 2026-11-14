@@ -20,20 +20,26 @@ PYTHON ?= $(if $(and $(wildcard ../third_party/cpython/configure),$(shell comman
 PYLIB = /usr/local/lib/python3.12
 # the standard library (Lib/ of the submodule) is copied to the root disk by tools/minix_add.py --tree: every *.py file below PYLIB, except
 # what is listed in PYLIB_EXCLUDE (names of directories or files, at any depth): the tests, the programs that need a module that the
-# interpreter does not have (tkinter, ctypes, sqlite3, curses), development tools and data that nobody needs on the target. There is no copy
+# interpreter does not have (tkinter), development tools and data that nobody needs on the target. There is no copy
 # of the library in the repository: the disk is made from the submodule (see section 33 of ../ARM64-PORT.md)
-PYLIB_EXCLUDE = test,tests,idlelib,tkinter,turtledemo,turtle.py,ensurepip,lib2to3,ctypes,sqlite3,curses,venv,pydoc_data,__pycache__,__phello__
+PYLIB_EXCLUDE = test,tests,idlelib,tkinter,turtledemo,turtle.py,ensurepip,lib2to3,venv,pydoc_data,__pycache__,__phello__
 ifeq ($(PYTHON),1)
 MUSL_NAMES += python
 PYTHON_DISK_FILES = /musl/hello.py=libc/hello.py /musl/modtest.py=libc/modtest.py --mkdir=/usr/local --mkdir=/usr/local/lib --mkdir=$(PYLIB) --mkdir=$(PYLIB)/lib-dynload --exclude=$(PYLIB_EXCLUDE) \
                     --tree=$(PYLIB)=../third_party/cpython/Lib $(PYLIB)/_sysconfigdata__linux_.py=libc/_sysconfigdata__linux_.py
 endif
-MUSL_PROGS = $(foreach p,$(MUSL_NAMES),libc/build/$(p).elf)
+# tar and unzip (bsdtar and bsdunzip of libarchive, third_party/libarchive, chapter "Python" of lit/libc.nw): make ARCHIVE=0 leaves them out
+ARCHIVE ?= 1
+ifeq ($(ARCHIVE),1)
+ARCHIVE_PROGS = libc/build/bsdtar.elf libc/build/bsdunzip.elf
+ARCHIVE_DISK_FILES = /bin/tar=libc/build/bsdtar.elf /bin/unzip=libc/build/bsdunzip.elf
+endif
+MUSL_PROGS = $(foreach p,$(MUSL_NAMES),libc/build/$(p).elf) $(ARCHIVE_PROGS)
 
 # Disk image: the Minix image of the x86 version plus the AArch64 user programs.
 # "-snapshot" keeps the file unmodified when running.
 DISK ?= disk.img
-ROOT_ZONES ?= 32768
+ROOT_ZONES ?= 65536
 ROOT_INODES ?= 2048
 
 
@@ -61,7 +67,7 @@ disk.img: $(wildcard userland/build/bin/*.elf) $(if $(filter 1,$(PYTHON)),libc/h
 	python3 -c "d=bytearray(open('user/hello.elf','rb').read()); d[68]=7; open('bad-wx.elf','wb').write(d)"
 	python3 tools/minix_add.py $@ --chmod=/tmp:1777 hello64=user/hello.elf cat64=user/cat.elf crash64=user/crash.elf forktest64=user/forktest.elf sigtest64=user/sigtest.elf contest64=user/contest.elf cowtest64=user/cowtest.elf thtest64=user/thtest.elf badptr64=user/badptr.elf swaptest64=user/swaptest.elf screentest64=user/screentest.elf stacktest64=user/stacktest.elf memtest64=user/memtest.elf pipetest64=user/pipetest.elf muslhello64=libc/build/hello.elf \
 		badarch64=bad-arch.elf badwx64=bad-wx.elf \
-		--mkdir=/musl $(foreach p,$(MUSL_NAMES),/musl/$(p)=libc/build/$(p).elf) $(PYTHON_DISK_FILES) /init=$(USERLAND_BIN)/init.elf /etc/rc.conf=etc/rc.conf /etc/hosts=etc/hosts /etc/resolv.conf=etc/resolv.conf /etc/services=etc/services --mkdir=/etc/rc.d /etc/rc.d/heartbeat=etc/rc.d/heartbeat /etc/rc.d/echod=etc/rc.d/echod /etc/rc.d/telnetd=etc/rc.d/telnetd \
+		--mkdir=/musl $(foreach p,$(MUSL_NAMES),/musl/$(p)=libc/build/$(p).elf) $(PYTHON_DISK_FILES) $(ARCHIVE_DISK_FILES) /init=$(USERLAND_BIN)/init.elf /etc/rc.conf=etc/rc.conf /etc/hosts=etc/hosts /etc/resolv.conf=etc/resolv.conf /etc/services=etc/services --mkdir=/etc/rc.d /etc/rc.d/heartbeat=etc/rc.d/heartbeat /etc/rc.d/echod=etc/rc.d/echod /etc/rc.d/telnetd=etc/rc.d/telnetd \
 		$(if $(filter 1,$(TLS)),--mkdir=/etc/ssl /etc/ssl/cacert.pem=etc/ssl/cacert.pem --mkdir=/etc/ssh /etc/ssh/ssh_host_ecdsa_key=etc/ssh/ssh_host_ecdsa_key --chmod=/etc/ssh/ssh_host_ecdsa_key:600 /etc/rc.d/sshd=etc/rc.d/sshd) \
 		$$(for f in $(USERLAND_BIN)/*.elf; do n=$$(basename $$f .elf); [ $$n != init ] && echo /bin/$$n=$$f; done)
 
@@ -93,7 +99,7 @@ user/%.elf: FORCE
 
 # the programs linked with musl (libc/Makefile builds musl first, from the unmodified submodule third_party/musl)
 libc/build/%.elf: FORCE
-	$(MAKE) -C libc PYTHON=$(PYTHON)
+	$(MAKE) -C libc PYTHON=$(PYTHON) ARCHIVE=$(ARCHIVE)
 
 # the book of the ARM64 part (lit/build/ulix-arm64.pdf)
 book:
@@ -358,6 +364,10 @@ daemon-test: ulix-shell.bin $(DISK)
 # CPython: the interpreter runs scripts in a login session (chapter "Python"; needs libc/build/python.elf, see PYTHON in this Makefile)
 python-test: ulix-shell.bin $(DISK)
 	python3 tools/python_test.py ulix-shell.bin $(DISK)
+
+# tar and unzip (libarchive): packs, lists and unpacks tar, tar.gz and zip files in a login session
+archive-test: ulix-shell.bin $(DISK)
+	python3 tools/archive_test.py ulix-shell.bin $(DISK)
 
 # sockets for programs: a program of /musl talks to TCP and UDP servers of the host (chapter "Sockets for Programs")
 socket-test: ulix-shell.bin $(DISK)

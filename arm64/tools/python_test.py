@@ -93,9 +93,9 @@ try:
     out = s.run('/musl/python -B /musl/modtest.py', r'modtest: \d+ ok, \d+ failed|Fatal Python|Killed', 'modtest.py: the module test ends', timeout=300)
     m = re.search(r'modtest: (\d+) ok, (\d+) failed', out)
     check(m is not None and int(m.group(2)) == 0, 'modtest.py: no check failed')
-    check(m is not None and int(m.group(1)) >= 170, 'modtest.py: at least 170 checks passed (%s)' % (m.group(1) if m else 'none'))
+    check(m is not None and int(m.group(1)) >= 180, 'modtest.py: at least 180 checks passed (%s)' % (m.group(1) if m else 'none'))
     for what in ['import json', 'import re', 'import socket', 'import select', 'import threading', 'import hashlib', 'import decimal', 'import xml.etree.ElementTree',
-                 'import zlib fails (known not to work)', 'program: hashlib: md5, sha1, sha2, sha3, blake2', 'program: threading: four threads and a lock',
+                 'import zlib', 'import sqlite3', 'import ctypes', 'import curses', 'import ssl', 'program: zlib, gzip, bz2, lzma, zipfile (deflate), tarfile (gz)', 'program: sqlite3: memory database and a file', 'program: ctypes: C functions, structures, pythonapi, a callback', 'program: curses: terminal description, tparm, panel', 'program: ssl: certificate store, TLS handshake and data (memory BIOs)', 'program: socket.socketpair (kernel: AF_UNIX stream pair)', 'program: tempfile: mkdtemp, a file in it, rmtree', 'program: hashlib: md5, sha1, sha2, sha3, blake2', 'program: threading: four threads and a lock',
                  'program: socket and select', 'program: subprocess runs /musl/cat (fork, exec, pipes)']:
         check('ok:   ' + what in out, 'modtest.py: ' + what)
     for line in out.splitlines():

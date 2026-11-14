@@ -115,7 +115,7 @@ int bookfs_test (void) {
   CHECK (mx_stat (DEV, "/bin", &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR, "mx_stat: /bin is a directory");
   CHECK (mx_stat (DEV, "/nonexistent", &st) == -1, "mx_stat: missing file");
   CHECK (count_entries ("/") == 34, "mx_getdent: / has 34 used entries (16 from x86 Ulix + 18 AArch64 files and directories)");
-  CHECK (count_entries ("/bin") == 83, "mx_getdent: /bin has 83 entries");
+  CHECK (count_entries ("/bin") == 83 || count_entries ("/bin") == 85, "mx_getdent: /bin has 83 entries (85 with tar and unzip)");
   CHECK (mx_file_exists (DEV, "/bin/vi") && mx_file_is_directory (DEV, "/bin") &&
          !mx_file_is_directory (DEV, "/bin/vi"), "mx_file_exists / mx_file_is_directory");
 
@@ -195,6 +195,27 @@ int bookfs_test (void) {
     CHECK (a >= 0 && b >= 0 && b != a && count_open_files == base + 2, "mx_open and mx_reopen: two open files are counted");
     mx_close (a);  mx_close (b);
     CHECK (count_open_files == base, "both closed: count_open_files is back where it was");
+  }
+
+  // ---- a file that is deleted while it is open stays until the last close (Python's multiprocessing makes its heap like that) ----
+  // (the book freed the inode at once; the next new file got the same number, and the close of the old file then overwrote the new inode)
+  {
+    struct stat gs, ns;
+    int g = mx_open (DEV, "/ghost.bin", O_CREAT | O_RDWR);
+    CHECK (g >= 0 && write_pattern (g, 5000, 77) == 5000, "ghost: a file of 5000 bytes is open");
+    mx_stat (DEV, "/ghost.bin", &gs);
+    CHECK (mx_unlink (DEV, "/ghost.bin") == 0 && !mx_file_exists (DEV, "/ghost.bin"), "ghost: unlinked while open: the name is gone");
+    CHECK (mx_mkdir (DEV, "/ghostdir", 0755) == 0 && mx_stat (DEV, "/ghostdir", &ns) == 0 && ns.st_ino != gs.st_ino && ((ns.st_mode & S_IFMT) == S_IFDIR),
+           "ghost: a new directory does not get the inode number of the open file, and it is a directory");
+    mx_lseek (g, 0, SEEK_SET);
+    CHECK (verify_pattern (g, 5000) == 5000, "ghost: the open file can still be read, all 5000 bytes");
+    CHECK (mx_write (g, (void *)"more", 4) == 4, "ghost: and written");
+    mx_close (g);
+    CHECK (mx_stat (DEV, "/ghostdir", &ns) == 0 && ((ns.st_mode & S_IFMT) == S_IFDIR), "ghost: the last close does not damage the new directory");
+    int again = mx_open (DEV, "/again.bin", O_CREAT | O_RDWR);
+    CHECK (again >= 0 && mx_stat (DEV, "/again.bin", &ns) == 0 && ns.st_ino == gs.st_ino, "ghost: after the last close the inode number is free again");
+    mx_close (again);
+    mx_unlink (DEV, "/again.bin");  mx_rmdir (DEV, "/ghostdir", "/ghostdir");
   }
 
   // ---- what the standard library of Python needs: a name of the full 30 characters, in a directory three levels deep ----
