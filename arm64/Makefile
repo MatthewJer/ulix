@@ -25,7 +25,7 @@ PYLIB = /usr/local/lib/python3.12
 PYLIB_EXCLUDE = test,tests,idlelib,tkinter,turtledemo,turtle.py,ensurepip,lib2to3,venv,pydoc_data,__pycache__,__phello__
 ifeq ($(PYTHON),1)
 MUSL_NAMES += python
-PYTHON_DISK_FILES = /musl/hello.py=libc/hello.py /musl/modtest.py=libc/modtest.py --mkdir=/usr/local --mkdir=/usr/local/lib --mkdir=$(PYLIB) --mkdir=$(PYLIB)/lib-dynload --exclude=$(PYLIB_EXCLUDE) \
+PYTHON_DISK_FILES = /musl/hello.py=libc/hello.py /musl/hello_http.py=libc/hello_http.py /musl/modtest.py=libc/modtest.py --mkdir=/usr/local --mkdir=/usr/local/lib --mkdir=$(PYLIB) --mkdir=$(PYLIB)/lib-dynload --exclude=$(PYLIB_EXCLUDE) \
                     --tree=$(PYLIB)=../third_party/cpython/Lib $(PYLIB)/_sysconfigdata__linux_.py=libc/_sysconfigdata__linux_.py
 endif
 # tar and unzip (bsdtar and bsdunzip of libarchive, third_party/libarchive, chapter "Python" of lit/libc.nw): make ARCHIVE=0 leaves them out
@@ -57,7 +57,7 @@ USERLAND_BIN = userland/build/bin
 userland/build/bin/init.elf: FORCE
 	$(MAKE) -C userland
 
-disk.img: $(wildcard userland/build/bin/*.elf) $(if $(filter 1,$(PYTHON)),libc/hello.py libc/modtest.py libc/_sysconfigdata__linux_.py) ../bin-build/minixdata.img etc/rc.conf etc/hosts etc/resolv.conf etc/services user/hello.elf user/cat.elf user/crash.elf user/forktest.elf user/sigtest.elf user/contest.elf user/cowtest.elf user/thtest.elf user/badptr.elf user/swaptest.elf user/screentest.elf user/stacktest.elf user/memtest.elf user/pipetest.elf libc/build/hello.elf $(MUSL_PROGS) userland/build/bin/init.elf tools/minix_add.py tools/minix_copy.py tools/minix_mkfs.py etc/ssl/cacert.pem etc/rc.d/heartbeat etc/rc.d/echod etc/rc.d/telnetd $(if $(filter 1,$(TLS)),etc/ssh/ssh_host_ecdsa_key etc/rc.d/sshd)
+disk.img: $(wildcard userland/build/bin/*.elf) $(if $(filter 1,$(PYTHON)),libc/hello.py libc/hello_http.py libc/modtest.py libc/_sysconfigdata__linux_.py) ../bin-build/minixdata.img etc/rc.conf etc/hosts etc/resolv.conf etc/services user/hello.elf user/cat.elf user/crash.elf user/forktest.elf user/sigtest.elf user/contest.elf user/cowtest.elf user/thtest.elf user/badptr.elf user/swaptest.elf user/screentest.elf user/stacktest.elf user/memtest.elf user/pipetest.elf libc/build/hello.elf $(MUSL_PROGS) userland/build/bin/init.elf tools/minix_add.py tools/minix_copy.py tools/minix_mkfs.py etc/ssl/cacert.pem etc/rc.d/heartbeat etc/rc.d/echod etc/rc.d/telnetd $(if $(filter 1,$(TLS)),etc/ssh/ssh_host_ecdsa_key etc/rc.d/sshd)
 	# a root file system of ROOT_ZONES KByte: the image of the book is too small for big programs (tools/minix_copy.py)
 	python3 tools/minix_mkfs.py $@ $(ROOT_ZONES) --inodes=$(ROOT_INODES) > /dev/null
 	python3 tools/minix_copy.py ../bin-build/minixdata.img $@ > /dev/null
@@ -364,6 +364,10 @@ daemon-test: ulix-shell.bin $(DISK)
 # CPython: the interpreter runs scripts in a login session (chapter "Python"; needs libc/build/python.elf, see PYTHON in this Makefile)
 python-test: ulix-shell.bin $(DISK)
 	python3 tools/python_test.py ulix-shell.bin $(DISK)
+
+# a web server in Python (libc/hello_http.py): the host asks it with curl (sockets: listen and accept)
+httpd-test: ulix-shell.bin $(DISK)
+	python3 tools/httpd_test.py ulix-shell.bin $(DISK)
 
 # scp: the host's scp copies files to and from the machine (sshd, port 2222)
 scp-test: ulix-shell.bin $(DISK)

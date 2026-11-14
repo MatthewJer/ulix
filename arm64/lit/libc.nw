@@ -96,6 +96,7 @@ extern int  pfd2gfd (int pfd);
 extern int  is_sock (int gfd), sock_is_nonblock (int gfd);                // sockets.c (used by fcntl and ioctl)
 extern void sock_set_nonblock (int gfd, int on);
 extern int  sock_pair (int *g0, int *g1, int nonblock);
+extern int  sock_listen (int gfd, int backlog), sock_accept (int gfd, int *new_gfd, unsigned *ip, unsigned short *port, int nonblock_new);
 
 typedef unsigned long u64;
 typedef unsigned char u8;
@@ -196,6 +197,9 @@ void linux_abi_fork (int old_as, int new_as) {
 #define L_usem_unlink   645
 #define L_socket        198
 #define L_socketpair    199
+#define L_listen        201
+#define L_accept        202
+#define L_accept4       242
 #define L_bind          200
 #define L_connect       203
 #define L_getsockname   204
@@ -1258,8 +1262,7 @@ static long linux_getrandom (char *buf, u64 n, unsigned flags) {
 
 The sockets themselves are chapter \ref{ch:sockets}; this is the translation. A socket address of Linux is a \texttt{struct sockaddr\_in}: the family
 (2 for IPv4) and then port and address in \emph{network} byte order, the network stack of the kernel keeps host order. Everything that is not IPv4 is
-refused with \texttt{EAFNOSUPPORT} (which is what the resolver of musl expects when it tries IPv6 first). \texttt{listen} and \texttt{accept} are not translated
-here (issue \#124 has them as calls of their own). \texttt{ppoll} and \texttt{pselect6} look at every descriptor in the list: a socket or a pipe knows whether it can be
+refused with \texttt{EAFNOSUPPORT} (which is what the resolver of musl expects when it tries IPv6 first). \texttt{listen} and \texttt{accept} (\texttt{accept4}) are translated, too (chapter \ref{ch:sockets}: a server socket). \texttt{ppoll} and \texttt{pselect6} look at every descriptor in the list: a socket or a pipe knows whether it can be
 read or written; a file or a device is always ready (a read on it may take time but does not wait for somebody else), and so is the terminal for input
 (a read waits, but there is no call that asks the terminal driver for a key without taking it). If nothing is ready the call waits in a loop like the others do,
 until the time is up or a signal arrives.
@@ -1357,6 +1360,24 @@ static long linux_recvfrom (int fd, void *buf, u64 n, int flags, void *addr, uns
   if (flags & MSG_DONTWAIT) sock_set_nonblock (gfd, was);
   if (k >= 0) put_sockaddr (addr, alen, ip, port);
   return k;
+}
+
+// listen and accept (accept4 adds SOCK_NONBLOCK for the new socket)
+static long linux_listen (int fd, int backlog) {
+  long e;  int gfd = sock_arg (fd, &e);
+  return gfd < 0 ? e : sock_listen (gfd, backlog);
+}
+
+static long linux_accept (int fd, void *addr, unsigned *alen, int flags) {
+  long e;  int gfd = sock_arg (fd, &e);
+  if (gfd < 0) return e;
+  if (addr && (!alen || !user_ok ((u64) alen, 4, 1) || !user_ok ((u64) addr, *alen, 1))) return -LE_EFAULT;
+  int ng;  unsigned ip;  unsigned short port;
+  if ((e = sock_accept (gfd, &ng, &ip, &port, (flags & SOCK_NONBLOCK_) != 0)) != 0) return e;
+  int pfd = gfd2pfd (ng);
+  if (pfd < 0) { sock_close (ng);  return -LE_EMFILE; }
+  put_sockaddr (addr, alen, ip, port);
+  return pfd;
 }
 
 static long linux_getname (int fd, void *addr, unsigned *alen, int peer) {
@@ -1623,6 +1644,9 @@ void linux_syscall (context_t *r) {
     case L_socket:      ret = linux_socket (a0, a1, a2); break;
     case L_socketpair:  ret = linux_socketpair (r, a0, a1, a2, (int *) a3); break;
     case L_connect:     ret = linux_connect_or_bind (a0, (const void *) a1, a2, 1); break;
+    case L_listen:      ret = linux_listen (a0, a1); break;
+    case L_accept:      ret = linux_accept (a0, (void *) a1, (unsigned *) a2, 0); break;
+    case L_accept4:     ret = linux_accept (a0, (void *) a1, (unsigned *) a2, a3); break;
     case L_bind:        ret = linux_connect_or_bind (a0, (const void *) a1, a2, 0); break;
     case L_sendto:      ret = linux_sendto (a0, (const void *) a1, a2, a3, (const void *) a4, a5); break;
     case L_recvfrom:    ret = linux_recvfrom (a0, (void *) a1, a2, a3, (void *) a4, (unsigned *) a5); break;

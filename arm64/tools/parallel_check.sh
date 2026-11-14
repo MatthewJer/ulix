@@ -36,6 +36,7 @@ JOBLIST=(
   "telnet|telnet server: login on terminal 5 over TCP, top, second connection, hang up, switched off in /etc/rc.conf|telnet|virt||128"
   "listen|server sockets: the program echod (tcp_listen, tcp_accept sleeps), clients one after the other and queued, 20000 bytes|listen|virt||128"
   "python|CPython: the interpreter (static, linked with musl) runs a script|python|virt||256"
+  "httpd|a web server in Python: sockets listen and accept, the host asks it with curl|httpd|virt||256"
   "scp|scp: files go to the machine and come back over the SSH server on port 2222 (password login, no shell)|scp|virt||256"
   "archive|tar and unzip (libarchive): tar, tar.gz and zip files are made, listed and extracted|archive|virt||256"
   "socket|sockets for programs: socket, connect, sendto, recvfrom, poll, select, non-blocking, getaddrinfo against servers of the host|socket|virt||128"
@@ -114,6 +115,11 @@ if [ "$1" = "--job" ]; then
     python)
       if [ -f libc/build/python.elf ]; then python3 tools/python_test.py ulix-shell.bin $DISK > "$log" 2>&1
       else echo "python test: all passed (the interpreter is not part of this build: PYTHON=0)" > "$log"; fi
+      rc=$?; sum=$(tail -1 "$log")
+      [ $rc -eq 0 ] && grep -q "all passed" <<< "$sum" && st=ok || st=FAILED ;;
+    httpd)
+      if [ -f libc/build/python.elf ]; then python3 tools/httpd_test.py ulix-shell.bin $DISK > "$log" 2>&1
+      else echo "httpd test: all passed (no Python in this build: PYTHON=0)" > "$log"; fi
       rc=$?; sum=$(tail -1 "$log")
       [ $rc -eq 0 ] && grep -q "all passed" <<< "$sum" && st=ok || st=FAILED ;;
     scp)

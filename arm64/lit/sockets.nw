@@ -44,6 +44,9 @@ extern int  tcp_established (tcp_conn *c), tcp_closed (tcp_conn *c), tcp_readabl
 extern int  tcp_read (tcp_conn *c, u8 *buf, int max), tcp_write (tcp_conn *c, const u8 *data, int len);
 extern void tcp_close (tcp_conn *c);
 extern u32  tcp_id (tcp_conn *c);
+extern int  tcp_listen (u16 port), tcp_pending (u16 port);
+extern tcp_conn *tcp_accept (u16 port);
+extern void tcp_peer (tcp_conn *c, u32 *ip, u16 *port);
 typedef void (*udp_handler) (u32 src_ip, u16 src_port, const u8 *data, int len);
 extern int  udp_bind (u16 port, udp_handler handler);
 extern void udp_unbind (u16 port);
@@ -90,6 +93,7 @@ struct sock {
   u32 peer_ip;  u16 peer_port, local_port;           // (host byte order)
   int connected;                                     // datagram: connect () has set the peer
   struct dgram q[4];  int qhead, qcount;             // datagram: what has arrived and not been read
+  int listening;                                     // stream: listen () was called, accept () takes the connections of local_port
   int local, peer, peer_gone, eof;                   // socketpair: this is one end, the slot of the other end, the other end is closed, it said SHUT_WR
   u8 lbuf[LBUF];  unsigned long lwritten, lread;      // socketpair: bytes the other end has written / this end has read (the difference is in the buffer)
 };
@@ -409,6 +413,51 @@ int sock_shutdown (int gfd, int how) {
   return 0;
 }
 
+@
+\subsection{A server: \texttt{listen} and \texttt{accept}}
+
+A server socket is a stream socket that was bound to a port and then told \texttt{listen}: the TCP code of the kernel is asked to accept connections to that port
+(\texttt{tcp\_listen}, the same call as the one of the programs of chapter \ref{ch:servers}), and \texttt{accept} takes the next one. The connection becomes a socket of its
+own, an ordinary stream socket that is already connected. \texttt{accept} waits like every other wait of this chapter (or answers \texttt{EAGAIN} on a non-blocking socket),
+and \texttt{poll} and \texttt{select} call a listening socket readable when a connection is waiting (Python's \texttt{socketserver} asks exactly that every half second). The port stays
+open for the TCP code after the socket is closed, as with the calls \texttt{tcp\_listen} and \texttt{tcp\_accept}: a server that starts again takes it over.
+
+<<sockets.c>>=
+int sock_listen (int gfd, int backlog) {
+  struct sock *s = sock_of (gfd);
+  if (!s) return -E_NOTSOCK;
+  if (s->type != SOCK_STREAM_ || s->c || !s->local_port) return -E_INVAL;     // (a socket that was not bound has no port to listen on)
+  if (tcp_listen (s->local_port) != 0) return -E_NOBUFS;
+  s->listening = 1;
+  return 0;
+}
+
+// the next connection: 0 and the global descriptor of the new socket, or minus an error number
+int sock_accept (int gfd, int *new_gfd, u32 *ip, u16 *port, int nonblock_new) {
+  struct sock *s = sock_of (gfd);
+  if (!s) return -E_NOTSOCK;
+  if (!s->listening) return -E_INVAL;
+  unsigned long long start = net_now_ms ();
+  for (;;) {
+    tcp_conn *c = tcp_accept (s->local_port);
+    if (c) {
+      int g = sock_new (SOCK_STREAM_, nonblock_new);
+      if (g < 0) { tcp_close (c);  return -E_MFILE; }
+      struct sock *n = sock_of (g);
+      n->c = c;  n->id = tcp_id (c);  n->local_port = s->local_port;
+      tcp_peer (c, &n->peer_ip, &n->peer_port);
+      *new_gfd = g;  *ip = n->peer_ip;  *port = n->peer_port;
+      return 0;
+    }
+    if (s->nonblock) return -E_AGAIN;
+    if (wait_a_little (start, -1)) return -E_INTR;
+  }
+}
+
+@
+the addresses of a socket (host byte order); 0, or minus an error number
+
+<<sockets.c>>=
 // the addresses of a socket (host byte order); 0, or minus an error number
 int sock_name (int gfd, int peer, u32 *ip, u16 *port) {
   struct sock *s = sock_of (gfd);
@@ -435,6 +484,7 @@ int sock_ready (int gfd) {
   struct sock *s = sock_of (gfd);
   if (!s) return 32;                                                   // POLLNVAL
   if (s->type == SOCK_DGRAM_) return (s->qcount ? 1 : 0) | 4;
+  if (s->listening) return tcp_pending (s->local_port) ? 1 : 0;           // a connection is waiting
   if (s->local) return (LCOUNT (s) || s->eof ? 1 : 0) | (s->peer_gone ? 1 | 4 | 16 : (LCOUNT (&socks[s->peer]) < LBUF ? 4 : 0));
   if (!s->c) return 4 | 16;                                            // not connected (any more): POLLOUT | POLLHUP, like Linux
   if (tcp_id (s->c) != s->id) return 8 | 16;
