@@ -62,3 +62,12 @@ See `LICENCE-CHECK-musl.md`.
 | licence | Mozilla Public License 2.0 (the data of the Mozilla root store) |
 | why compatible with GPLv3 | the MPL 2.0 lists the GNU GPL (version 2.0 and later versions) as a "Secondary License": the data may be combined with GPL code; the file is unmodified and keeps its header |
 | update | `arm64/tools/update_cacert.sh`, then commit; there is no automatic update on the system |
+
+### zlib, bzip2, xz, readline, libffi, libarchive, sqlite, ncurses, openssl (the whole Python standard library, and tar/zip)
+
+Nine submodules (all shallow, each pinned to a tag), checked 2026-11-14 in one file: `LICENCE-CHECK-libs-for-python.md` (tags, licences, what each
+one is used for). Unmodified; the rules that build them are in `arm64/libc/Makefile` (zlib, SQLite, libffi, ncurses, OpenSSL into the sysroot
+`arm64/libc/build/sysroot`; libarchive with cmake), the Python modules that use them in `arm64/libc/python-setup.local`.
+`make ARCHIVE=0` leaves out `tar` and `unzip`. Fetch: `git submodule update --init --depth 1 third_party/zlib third_party/libffi third_party/libarchive
+third_party/sqlite third_party/ncurses third_party/openssl third_party/bzip2 third_party/xz third_party/readline`. Build needs on the host: cmake (libarchive), perl (OpenSSL), tclsh (SQLite) and a C compiler (ncurses'
+`tic`).

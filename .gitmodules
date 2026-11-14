@@ -8,3 +8,39 @@
 	path = third_party/cpython
 	url = https://github.com/python/cpython.git
 	shallow = true
+[submodule "third_party/zlib"]
+	path = third_party/zlib
+	url = https://github.com/madler/zlib.git
+	shallow = true
+[submodule "third_party/libffi"]
+	path = third_party/libffi
+	url = https://github.com/libffi/libffi.git
+	shallow = true
+[submodule "third_party/libarchive"]
+	path = third_party/libarchive
+	url = https://github.com/libarchive/libarchive.git
+	shallow = true
+[submodule "third_party/sqlite"]
+	path = third_party/sqlite
+	url = https://github.com/sqlite/sqlite.git
+	shallow = true
+[submodule "third_party/ncurses"]
+	path = third_party/ncurses
+	url = https://github.com/ThomasDickey/ncurses-snapshots.git
+	shallow = true
+[submodule "third_party/openssl"]
+	path = third_party/openssl
+	url = https://github.com/openssl/openssl.git
+	shallow = true
+[submodule "third_party/bzip2"]
+	path = third_party/bzip2
+	url = https://sourceware.org/git/bzip2.git
+	shallow = true
+[submodule "third_party/xz"]
+	path = third_party/xz
+	url = https://github.com/tukaani-project/xz.git
+	shallow = true
+[submodule "third_party/readline"]
+	path = third_party/readline
+	url = https://git.savannah.gnu.org/git/readline.git
+	shallow = true
