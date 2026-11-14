@@ -239,6 +239,7 @@ static inline u32 get32 (const u8 *p) { return ((u32)p[0] @<< 24) | ((u32)p[1] @
 static inline void put32 (u8 *p, u32 v) { p[0] = v >> 24; p[1] = (v >> 16) & 0xff; p[2] = (v >> 8) & 0xff; p[3] = v & 0xff; }
 
 #define SSH_PORT    22
+#define SCP_PORT    2222                        // scp -P 2222: password login, files only (no shell); see the section on scp
 #define SSH_VT      4                           // the terminal that telnet uses, too (Ctrl-T 5): a login waits there
 #define CHANNEL_WINDOW  65536                   // how many bytes the client may send before we say that there is more room
 #define MAX_PACKET      4096                    // the biggest packet we accept (the data of one CHANNEL_DATA is at most 2048)
@@ -567,6 +568,214 @@ static void from_client (u8 c) {                        // one byte typed by the
   pty_write (&m);                                       // (CR becomes Enter in the kernel)
 }
 
+
+@
+\subsection{scp: copying files}
+\label{sec:ssh:scp}
+
+\texttt{scp} (the old protocol, \texttt{scp -O} on a new OpenSSH) is one command on a channel: the client asks for \texttt{exec} with the text \texttt{scp -t DIRECTORY} (the server
+\emph{receives}: a sink) or \texttt{scp -f FILE} (the server \emph{sends}: a source), and then both sides speak a tiny protocol over the channel. The receiver says \texttt{0} when it is
+ready and after every item. The sender gives a line \texttt{C0644 SIZE NAME}, waits for the \texttt{0}, sends exactly SIZE bytes and a \texttt{0}, and waits for the \texttt{0} again;
+\texttt{D0755 0 NAME} and \texttt{E} enter and leave a directory (\texttt{-r}), \texttt{T} lines carry times (\texttt{-p}) and are only answered. A line that starts with \texttt{1} or \texttt{2}
+is an error message. This is so small that the server does not start a program for it: \texttt{sshd} itself does the work, in a state machine fed by the bytes of the channel.
+
+Two things are different from a login. \emph{Who may do it:} on port 22 the SSH login is accepted without a password, because the terminal asks for it (\texttt{login}); a command
+has no terminal, so the server would write files for anybody. Therefore commands are only accepted on a second port, \texttt{SCP\_PORT} (2222), where the method \texttt{none} is
+refused and the method \texttt{password} is checked against \texttt{/etc/passwd} (plain text, as the book's \texttt{login} does it); a shell is not offered there. \emph{As whom:}
+\texttt{sshd} runs as root; for every file operation it switches its effective user to the one that logged in (\texttt{seteuid}) and back, so the permissions of the file system apply.
+Relative names start in the home directory.
+
+<<userland/sshd.c: messages>>=
+static int scp_only = 0;                                 // this session came in on SCP_PORT
+static int authed = 0;  static word auth_uid, auth_gid;  static char auth_home[32];
+static int scp_mode = 0;                                 // 0 no command, 1 sink (scp -t: we receive), 2 source (scp -f: we send)
+static int scp_recursive = 0, scp_must_be_dir = 0;
+static char scp_target[128];                             // the name from the command
+static char scp_dir[8][128];  static int scp_depth = 0;  // sink: the directories entered with D (the first is the target when it is a directory)
+enum { SK_LINE, SK_DATA, SK_END };
+static int sk_state = SK_LINE;
+static char sk_line[300];  static int sk_len = 0;
+static int sk_fd = -1;  static unsigned sk_left = 0;
+enum { SRC_READY, SRC_ACK1, SRC_SEND, SRC_ACK2, SRC_DONE };
+static int src_state = SRC_READY, src_fd = -1;  static unsigned src_left = 0;
+
+static void send_channel_data (const u8 *d, int n) {      // a few bytes (acknowledgements, headers): they fit into the client's window
+  u8 m[9 + 320];
+  if (n > 320) n = 320;
+  m[0] = MSG_CHANNEL_DATA;  put32 (m + 1, channel_remote);  put32 (m + 5, n);
+  for (int i = 0; i < n; i++) m[9 + i] = d[i];
+  send_packet (m, 9 + n);
+  if (remote_window >= (u32)n) remote_window -= n; else remote_window = 0;
+}
+
+static void scp_ack (void) { u8 z = 0;  send_channel_data (&z, 1); }
+
+static void scp_error (const char *text) {              // "\1text\n": the other side prints it and goes on (or stops)
+  u8 m[200];  int n = 0;
+  m[n++] = 1;
+  while (*text && n < 190) m[n++] = *text++;
+  m[n++] = '\n';
+  send_channel_data (m, n);
+}
+
+static void scp_finish (void) {                         // the command is over: exit status 0, end of data, close the channel
+  if (sk_fd >= 0) { close (sk_fd);  sk_fd = -1; }
+  if (src_fd >= 0) { close (src_fd);  src_fd = -1; }
+  seteuid (0);
+  scp_mode = 0;
+  if (!channel_is_open) return;
+  u8 m[32];  int n = 0;
+  m[n++] = MSG_CHANNEL_REQUEST;  put32 (m + n, channel_remote);  n += 4;
+  n += put_text (m + n, "exit-status");  m[n++] = 0;  put32 (m + n, 0);  n += 4;
+  send_packet (m, n);
+  u8 e[5];  e[0] = MSG_CHANNEL_EOF;  put32 (e + 1, channel_remote);  send_packet (e, 5);
+  e[0] = MSG_CHANNEL_CLOSE;  send_packet (e, 5);
+  channel_is_open = 0;
+}
+
+// the name of a file for this user: relative names start in the home directory
+static void scp_path (char *out, int size, const char *dir, const char *name) {
+  int n = 0;
+  if (!dir || dir[0] != '/') { const char *h = auth_home;  while (*h && n < size - 2) out[n++] = *h++;  if (n && out[n - 1] != '/') out[n++] = '/'; }
+  if (dir) { while (*dir && n < size - 2) out[n++] = *dir++;  if (name && n && out[n - 1] != '/') out[n++] = '/'; }
+  if (name) while (*name && n < size - 1) out[n++] = *name++;
+  out[n] = 0;
+}
+
+static int is_dir (const char *path) { struct stat st;  return stat (path, &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR; }
+
+// sink: one control line of the sender (C, D, E, T)
+static void sink_line (void) {
+  char *l = sk_line;
+  char path[200];
+  if (l[0] == 'T') { scp_ack ();  return; }
+  if (l[0] == 'E') { if (scp_depth > 0) scp_depth--;  scp_ack ();  return; }
+  if (l[0] != 'C' && l[0] != 'D') { scp_error ("scp: unknown line");  scp_finish ();  return; }
+  unsigned mode = 0, size = 0;  int i = 1;
+  while (l[i] >= '0' && l[i] <= '7') mode = mode * 8 + (l[i++] - '0');
+  while (l[i] == ' ') i++;
+  while (l[i] >= '0' && l[i] <= '9') size = size * 10 + (l[i++] - '0');
+  while (l[i] == ' ') i++;
+  const char *name = l + i;
+  for (int k = 0; name[k]; k++) if (name[k] == '/') { scp_error ("scp: bad name");  scp_finish ();  return; }
+  const char *dir = scp_depth > 0 ? scp_dir[scp_depth - 1] : 0;
+  seteuid (auth_uid);
+  if (l[0] == 'D') {
+    scp_path (path, sizeof path, dir ? dir : scp_target, name);
+    if (!is_dir (path) && mkdir (path, mode & 0777) != 0) { seteuid (0);  scp_error ("scp: cannot make the directory");  scp_finish ();  return; }
+    seteuid (0);
+    if (scp_depth < 8) { for (int k = 0; k < 127 && path[k]; k++) scp_dir[scp_depth][k] = path[k], scp_dir[scp_depth][k + 1] = 0;  scp_depth++; }
+    scp_ack ();
+    return;
+  }
+  // a file: into the target directory (D or the target itself), or the target is the file's name
+  if (dir) scp_path (path, sizeof path, dir, name);
+  else if (is_dir (scp_target[0] == '/' ? scp_target : (scp_path (path, sizeof path, scp_target, 0), path))) scp_path (path, sizeof path, scp_target, name);
+  else if (scp_must_be_dir) { seteuid (0);  scp_error ("scp: the target is not a directory");  scp_finish ();  return; }
+  else scp_path (path, sizeof path, scp_target, 0);
+  unlink (path);                                                  // (the book has no O_TRUNC: a new file)
+  sk_fd = open (path, O_WRONLY | O_CREAT, mode & 0777);
+  seteuid (0);
+  if (sk_fd < 0) { scp_error ("scp: cannot create the file");  scp_finish ();  return; }
+  sk_left = size;
+  sk_state = size ? SK_DATA : SK_END;
+  scp_ack ();
+}
+
+static void sink_input (const u8 *d, int n) {
+  for (int i = 0; i < n && scp_mode == 1; ) {
+    if (sk_state == SK_DATA) {
+      unsigned k = n - i < (int)sk_left ? n - i : sk_left;
+      seteuid (auth_uid);
+      int w = write (sk_fd, d + i, k);
+      seteuid (0);
+      if (w != (int)k) { scp_error ("scp: write failed (disk full?)");  scp_finish ();  return; }
+      sk_left -= k;  i += k;
+      if (sk_left == 0) sk_state = SK_END;
+    } else if (sk_state == SK_END) {                              // the 0 that follows the data
+      close (sk_fd);  sk_fd = -1;
+      sk_state = SK_LINE;  sk_len = 0;
+      i++;
+      scp_ack ();
+    } else {
+      u8 c = d[i++];
+      if (c == '\n') { sk_line[sk_len] = 0;  sk_len = 0;  sink_line (); }
+      else if (sk_len < (int)sizeof sk_line - 1) sk_line[sk_len++] = c;
+    }
+  }
+}
+
+// source: the bytes of the client are acknowledgements (0) or errors
+static void source_input (const u8 *d, int n) {
+  for (int i = 0; i < n && scp_mode == 2; i++) {
+    if (d[i] != 0) { scp_finish ();  return; }                    // 1 or 2: the client does not want it
+    if (src_state == SRC_READY) {                                 // ready: the header of the file
+      char path[200], head[200];  struct stat st;
+      scp_path (path, sizeof path, scp_target, 0);
+      seteuid (auth_uid);
+      int ok = stat (path, &st) == 0 && (st.st_mode & S_IFMT) != S_IFDIR && (src_fd = open (path, O_RDONLY, 0)) >= 0;
+      seteuid (0);
+      if (!ok) { scp_error ("scp: no such file, or not a regular file (scp -r is not supported for downloads)");  scp_finish ();  return; }
+      const char *base = scp_target;  for (const char *c = scp_target; *c; c++) if (*c == '/') base = c + 1;
+      int h = 0;  head[h++] = 'C';  head[h++] = '0';                  // (four octal digits: C0644)
+      unsigned mode = st.st_mode & 0777;  head[h++] = '0' + ((mode >> 6) & 7);  head[h++] = '0' + ((mode >> 3) & 7);  head[h++] = '0' + (mode & 7);  head[h++] = ' ';
+      char dig[12];  int dn = 0;  unsigned v = st.st_size;  do { dig[dn++] = '0' + v % 10;  v /= 10; } while (v);
+      while (dn) head[h++] = dig[--dn];
+      head[h++] = ' ';
+      while (*base && h < 190) head[h++] = *base++;
+      head[h++] = '\n';
+      send_channel_data ((u8 *) head, h);
+      src_left = st.st_size;  src_state = SRC_ACK1;
+    } else if (src_state == SRC_ACK1) {
+      src_state = SRC_SEND;
+    } else if (src_state == SRC_ACK2) {
+      scp_finish ();
+      return;
+    }
+  }
+}
+
+// called in every round: the file goes out as far as the client's window and the packet size allow
+static void source_pump (void) {
+  while (scp_mode == 2 && src_state == SRC_SEND && remote_window > 0 && tx_len < (int)sizeof tx - 2 * MAX_PACKET) {
+    u8 m[9 + 1024];
+    u32 room = 1024;
+    if (room > remote_window) room = remote_window;
+    if (room > remote_max_packet) room = remote_max_packet;
+    if (room > src_left) room = src_left;
+    int n = 0;
+    if (room) { seteuid (auth_uid);  n = read (src_fd, m + 9, room);  seteuid (0); }
+    if (room && n <= 0) { scp_error ("scp: read error");  scp_finish ();  return; }
+    if (n > 0) { m[0] = MSG_CHANNEL_DATA;  put32 (m + 1, channel_remote);  put32 (m + 5, n);  send_packet (m, 9 + n);  remote_window -= n;  src_left -= n; }
+    if (src_left == 0) { close (src_fd);  src_fd = -1;  u8 z = 0;  send_channel_data (&z, 1);  src_state = SRC_ACK2; }
+  }
+}
+
+// "scp -t -d -r DIR" or "scp -f FILE": the command of the exec request
+static int scp_command (const u8 *cmd, int len) {
+  char t[200];  int n = len < 199 ? len : 199;
+  for (int i = 0; i < n; i++) t[i] = cmd[i];
+  t[n] = 0;
+  char *tok[12];  int nt = 0;
+  for (int i = 0; i < n && nt < 12; ) { while (t[i] == ' ') t[i++] = 0;  if (!t[i]) break;  tok[nt++] = t + i;  while (t[i] && t[i] != ' ') i++; }
+  if (nt < 3 || strcmp (tok[0], "scp") != 0) return -1;
+  int to = 0, from = 0;  scp_recursive = scp_must_be_dir = 0;
+  for (int k = 1; k < nt - 1; k++) {
+    if (tok[k][0] != '-') return -1;
+    for (int c = 1; tok[k][c]; c++) {
+      if (tok[k][c] == 't') to = 1; else if (tok[k][c] == 'f') from = 1; else if (tok[k][c] == 'r') scp_recursive = 1;
+      else if (tok[k][c] == 'd') scp_must_be_dir = 1; else if (tok[k][c] == 'p' || tok[k][c] == 'v' || tok[k][c] == 'q') ;
+      else return -1;
+    }
+  }
+  if (to == from) return -1;
+  const char *path = tok[nt - 1];
+  int pn = 0;  while (path[pn] && pn < 127) { scp_target[pn] = path[pn];  pn++; }  scp_target[pn] = 0;
+  scp_depth = 0;  sk_state = SK_LINE;  sk_len = 0;  sk_fd = src_fd = -1;  src_state = SRC_READY;
+  scp_mode = to ? 1 : 2;
+  if (scp_mode == 1) scp_ack ();                                  // the sink starts: "ready"
+  return 0;
+}
 @
 A request on the channel. [[pty-req]] (a terminal of some size and kind) is answered with ``yes'' and otherwise ignored: the terminal is the one of the kernel, 80 times 25
 characters. [[shell]] starts the session on the terminal, if nobody else (telnet) has it: the terminal is taken over and its screen is painted into the ring, so that the
@@ -578,9 +787,15 @@ static void channel_request (const u8 *m, int n) {
   const u8 *type;  int type_len;
   if (!get_string (m, n, &off, &type, &type_len) || off >= n) return;
   int want_reply = m[off];
-  if (same_text (type, type_len, "pty-req")) { if (want_reply) send_channel_reply (MSG_CHANNEL_SUCCESS); return; }
+  if (same_text (type, type_len, "pty-req")) { if (want_reply) send_channel_reply (scp_only ? MSG_CHANNEL_FAILURE : MSG_CHANNEL_SUCCESS); return; }
+  if (same_text (type, type_len, "exec")) {                          // scp: only on SCP_PORT, only after a password
+    int o = off + 1;  const u8 *cmd;  int cl;
+    if (!scp_only || !authed || scp_mode || !get_string (m, n, &o, &cmd, &cl) || scp_command (cmd, cl) != 0) { if (want_reply) send_channel_reply (MSG_CHANNEL_FAILURE);  return; }
+    if (want_reply) send_channel_reply (MSG_CHANNEL_SUCCESS);
+    return;
+  }
   if (same_text (type, type_len, "shell")) {
-    if (shell_open || pty_attach (SSH_VT) != 0) { if (want_reply) send_channel_reply (MSG_CHANNEL_FAILURE); return; }      // the terminal is in use
+    if (scp_only || shell_open || pty_attach (SSH_VT) != 0) { if (want_reply) send_channel_reply (MSG_CHANNEL_FAILURE); return; }      // the terminal is in use
     shell_open = 1;  after_cr = 0;                                  // (pty_attach has painted the terminal: the client sees the prompt of login)
     if (want_reply) send_channel_reply (MSG_CHANNEL_SUCCESS);
     return;
@@ -631,7 +846,24 @@ static void handle_packet (const u8 *m, int n) {
       off = 1;
       const u8 *user, *service, *method;  int ul, sl, ml;
       if (stage != S_RUNNING || !get_string (m, n, &off, &user, &ul) || !get_string (m, n, &off, &service, &sl) || !get_string (m, n, &off, &method, &ml)) { disconnect (2, "bad request"); break; }
-      if (same_text (method, ml, "none")) send_simple (MSG_USERAUTH_SUCCESS);
+      if (scp_only) {                                               // the scp port: only the method "password", checked against /etc/passwd
+        int ok = 0;
+        if (same_text (method, ml, "password") && off + 1 <= n) {
+          const u8 *pw;  int pl;  int o2 = off + 1;
+          if (get_string (m, n, &o2, &pw, &pl) && ul < 32 && pl < 32) {
+            char name[32], pass[32];  struct passwd pwd;  struct passwd *res = 0;  char buf[64];
+            for (int i = 0; i < ul; i++) name[i] = user[i];  name[ul] = 0;
+            for (int i = 0; i < pl; i++) pass[i] = pw[i];  pass[pl] = 0;
+            if (pl > 0 && getpwnam_r (name, &pwd, buf, sizeof buf, &res) == 0 && strcmp (pwd.pw_passwd, pass) == 0) {
+              ok = 1;  authed = 1;  auth_uid = pwd.pw_uid;  auth_gid = pwd.pw_gid;
+              for (int i = 0; i < 31 && pwd.pw_dir[i]; i++) auth_home[i] = pwd.pw_dir[i], auth_home[i + 1] = 0;
+            }
+          }
+        }
+        if (ok) send_simple (MSG_USERAUTH_SUCCESS);
+        else { u8 reply[24];  int rn = 0;  reply[rn++] = MSG_USERAUTH_FAILURE;  rn += put_text (reply + rn, "password");  reply[rn++] = 0;  send_packet (reply, rn); }
+      }
+      else if (same_text (method, ml, "none")) send_simple (MSG_USERAUTH_SUCCESS);
       else { u8 reply[24];  int rn = 0;  reply[rn++] = MSG_USERAUTH_FAILURE;  rn += put_text (reply + rn, "none");  reply[rn++] = 0;  send_packet (reply, rn); }
       break; }
     case MSG_GLOBAL_REQUEST:
@@ -663,6 +895,8 @@ static void handle_packet (const u8 *m, int n) {
       off = 5;
       if (channel_is_open && get_string (m, n, &off, &s, &len)) {
         if (shell_open) for (int i = 0; i < len; i++) from_client (s[i]);
+        else if (scp_mode == 1) sink_input (s, len);
+        else if (scp_mode == 2) source_input (s, len);
         consumed += len;
         if (consumed >= CHANNEL_WINDOW / 2) {                       // tell the client that there is room again
           u8 adjust[9];  adjust[0] = MSG_CHANNEL_WINDOW_ADJUST;  put32 (adjust + 1, channel_remote);  put32 (adjust + 5, consumed);
@@ -671,8 +905,9 @@ static void handle_packet (const u8 *m, int n) {
         }
       }
       break;
-    case MSG_CHANNEL_EOF: break;
+    case MSG_CHANNEL_EOF: if (scp_mode == 1 && sk_state == SK_LINE) scp_finish (); break;     // the sender has nothing more
     case MSG_CHANNEL_CLOSE:
+      if (scp_mode) scp_finish ();
       if (channel_is_open) { u8 close[5];  close[0] = MSG_CHANNEL_CLOSE;  put32 (close + 1, channel_remote);  send_packet (close, 5);  channel_is_open = 0; }
       broken = 2;
       break;
@@ -728,16 +963,18 @@ static int ssh_start (void) {
   if (getrandom (probe, 1) < 0) { printf ("sshd: this machine has no random number generator: the SSH server is off\n");  return -1; }
   hostkey_ok = 1;
   print_fingerprint ();
+  if (tcp_listen (SCP_PORT) != 0) printf ("sshd: cannot listen on port %d: no scp\n", SCP_PORT);
   return tcp_listen (SSH_PORT);
 }
 
 static void session_end (void) {
+  if (scp_mode) scp_finish ();
   if (shell_open) { shell_open = 0;  pty_hangup (); }                                 // the programs of the session end, login starts again
   if (sock >= 0) { tcp_close (sock);  sock = -1; }
   for (int i = 0; i < 32; i++) { mac_key_in[i] = 0;  mac_key_out[i] = 0;  session_id[i] = 0; }
 }
 
-static void session_start (int s) {
+static void session_start (int s, int on_scp_port) {
   u8 seed[32];
   if (getrandom (seed, 32) < 0) { tcp_close (s);  return; }
   sshc_seed (seed, 32);
@@ -745,6 +982,7 @@ static void session_start (int s) {
   stage = S_BANNER;  broken = 0;  tx_len = 0;  rx_len = 0;  seq_in = seq_out = 0;
   enc_in = enc_out = 0;  first_block_decrypted = 0;
   channel_is_open = 0;  shell_open = 0;
+  scp_only = on_scp_port;  authed = 0;  scp_mode = 0;
   static const char banner[] = "SSH-2.0-Ulix_1\r\n";
   for (int i = 0; i < (int)sizeof banner - 1; i++) tx[tx_len++] = banner[i];
 }
@@ -779,6 +1017,8 @@ static void pump_output (void) {
 static void round_of_session (void) {
   int other = tcp_accept (SSH_PORT, 0);                             // a second client? (no waiting) It is refused: one session only.
   if (other >= 0) tcp_close (other);
+  other = tcp_accept (SCP_PORT, 0);
+  if (other >= 0) tcp_close (other);
   if (stage != S_RUNNING && (clock_us () - started_at) > 30000000u) broken = 2;      // (a client that only sends half a packet must not keep the server for ever)
 
   struct tcp_msg m;
@@ -810,6 +1050,7 @@ static void round_of_session (void) {
     consume (pkt_total);
   }
   pump_output ();
+  source_pump ();
   flush ();
   if (broken) session_end ();                                       // the queue has been sent (flush waits for TCP): hang up
 }
@@ -827,9 +1068,13 @@ int main (int argc, char **argv) {
   printf ("sshd: ssh server on port %d\n", SSH_PORT);
   while (!stop) {
     if (sock < 0) {
-      int s = tcp_accept (SSH_PORT, 1000);                          // sleeps until a client comes (at most a second, to look at the flag)
-      if (s >= 0) session_start (s);
+      int s = tcp_accept (SSH_PORT, 500);                           // sleeps until a client comes (at most half a second, to look at the flag and at the other port)
+      if (s >= 0) session_start (s, 0);
       else if (s == -1) waitkey (100);                              // no room for a socket: try again soon
+      else {
+        s = tcp_accept (SCP_PORT, 500);
+        if (s >= 0) session_start (s, 1);
+      }
     } else {
       round_of_session ();
     }

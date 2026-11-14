@@ -365,6 +365,10 @@ daemon-test: ulix-shell.bin $(DISK)
 python-test: ulix-shell.bin $(DISK)
 	python3 tools/python_test.py ulix-shell.bin $(DISK)
 
+# scp: the host's scp copies files to and from the machine (sshd, port 2222)
+scp-test: ulix-shell.bin $(DISK)
+	python3 tools/scp_test.py ulix-shell.bin $(DISK)
+
 # tar and unzip (libarchive): packs, lists and unpacks tar, tar.gz and zip files in a login session
 archive-test: ulix-shell.bin $(DISK)
 	python3 tools/archive_test.py ulix-shell.bin $(DISK)
