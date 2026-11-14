@@ -43,13 +43,14 @@ $(B)/%.elf: $(B)/%.o musl.ld ../tools/mark_musl.py
 	  $(SYSROOT)/lib/crt1.o $(SYSROOT)/lib/crti.o $< $(SYSROOT)/lib/libc.a -lgcc $(SYSROOT)/lib/crtn.o
 	python3 ../tools/mark_musl.py $@
 
-$(B)/python/Makefile: $(SYSROOT)/lib/libc.a musl-cc musl.ld python-setup.local
+# (no epoll: the kernel has none, and selectors.DefaultSelector would pick it and asyncio would fail with ENOSYS; without it the poll selector is used)
+$(B)/python/Makefile: $(SYSROOT)/lib/libc.a musl-cc musl.ld python-setup.local Makefile
 	mkdir -p $(B)/python/Modules
 	cp python-setup.local $(B)/python/Modules/Setup.local          # (configure leaves an existing Setup.local alone)
 	cd $(B)/python && MUSL_LDSCRIPT=$(abspath musl.ld) CC=$(abspath musl-cc) CPP="$(abspath musl-cc) -E" AR=$(CROSS)ar RANLIB=$(CROSS)ranlib \
 	  READELF=$(CROSS)readelf $(CPYTHON)/configure --host=aarch64-linux-musl --build=$$($(CPYTHON)/config.guess) \
 	  --with-build-python=$(BUILD_PYTHON) --disable-shared --without-ensurepip --disable-ipv6 \
-	  ac_cv_file__dev_ptmx=no ac_cv_file__dev_ptc=no > configure.log 2>&1
+	  ac_cv_file__dev_ptmx=no ac_cv_file__dev_ptc=no ac_cv_func_epoll_create=no ac_cv_func_epoll_create1=no > configure.log 2>&1
 
 $(B)/python.elf: $(B)/python/Makefile FORCE ../tools/mark_musl.py
 	MUSL_LDSCRIPT=$(abspath musl.ld) $(MAKE) -C $(B)/python python.exe > $(B)/python/make.log 2>&1

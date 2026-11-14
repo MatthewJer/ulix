@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
 """Add files to a Minix v2 image (14- or 30-character names).
 
-usage: minix_add.py IMAGE [--grow=ZONES] [--mkdir=PATH ...] [--chmod=PATH:OCTAL ...] PATH=HOSTFILE [PATH=HOSTFILE ...]
+usage: minix_add.py IMAGE [--grow=ZONES] [--mkdir=PATH ...] [--chmod=PATH:OCTAL ...] [--exclude=NAME,NAME ...]
+                          [--tree=PATH=HOSTDIR ...] PATH=HOSTFILE [PATH=HOSTFILE ...]
 
 PATH may name a directory ("/bin/ls"); the directory must exist. If PATH already exists, the old
 file is removed first and its inode and zones are freed. --grow enlarges the file system to ZONES
 zones first (more room for write tests). Needed because mkfs.minix and mounting a Minix image are
 not available on macOS. Files up to 7 direct + 256 indirect + 256 * 256 double indirect zones (64 MByte) are supported.
+
+--tree=PATH=HOSTDIR copies the Python files (*.py) of a directory tree of the host, with all its subdirectories (the Python
+standard library, see the Makefile). Directories and files whose name is in an --exclude list (any depth) are left out. A name
+of more than 30 characters, or a directory of more than 224 entries (the book's directory code reads seven direct zones of
+32 entries each), stops the tool: nothing is cut off silently.
 """
-import struct, sys, time
+import os, struct, sys, time
 
 ZONE = 1024
 
@@ -178,6 +184,28 @@ class Fs:
         self.put_inode(parent, up)
         print('mkdir    %-22s inode %3d' % (path, nr))
 
+    def mkdir_p(self, path):
+        """mkdir for every directory on the way (the directories that exist stay as they are)"""
+        cur = ''
+        for part in [p for p in path.split('/') if p]:
+            cur += '/' + part
+            self.mkdir(cur)
+
+    def add_tree(self, dest, src, excluded, suffix='.py'):
+        """the files of the host directory SRC with the given suffix, and the directories on the way, below the image path DEST"""
+        self.mkdir_p(dest)
+        count = 0
+        for root, dirs, files in os.walk(src):
+            dirs[:] = sorted(d for d in dirs if d not in excluded)
+            rel = os.path.relpath(root, src)
+            target = dest if rel == '.' else dest + '/' + rel
+            self.mkdir_p(target)
+            for f in sorted(files):
+                if f.endswith(suffix) and f not in excluded:
+                    self.add_file(target + '/' + f, open(os.path.join(root, f), 'rb').read())
+                    count += 1
+        print('tree     %-22s %d files from %s' % (dest, count, src))
+
     def chmod(self, path, mode):
         dirpath, _, name = path.rstrip('/').rpartition('/')
         off, nr = self.lookup(self.resolve_dir(dirpath or '/'), name)
@@ -197,7 +225,11 @@ def main(image, specs):
     for d in [s for s in specs if s.startswith('--mkdir=')]:
         fs.mkdir(d[8:])
     chmods = [s for s in specs if s.startswith('--chmod=')]
-    specs = [s for s in specs if not s.startswith('--chmod=') and not s.startswith('--mkdir=')]
+    excluded = set(','.join(s[10:] for s in specs if s.startswith('--exclude=')).split(','))
+    for t in [s for s in specs if s.startswith('--tree=')]:
+        path, host = t[7:].split('=', 1)
+        fs.add_tree(path, host, excluded)
+    specs = [s for s in specs if not s.startswith(('--chmod=', '--mkdir=', '--exclude=', '--tree='))]
     for spec in specs:
         path, host = spec.split('=', 1)
         if not path.startswith('/'): path = '/' + path

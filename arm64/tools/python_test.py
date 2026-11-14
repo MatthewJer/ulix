@@ -88,6 +88,18 @@ try:
     check('cwd /home/esser pid > 1: True' in out, 'os.getcwd and os.getpid (system calls getcwd and getpid)')
     check('musl python ulix 14' in out, 'set, sorted, join: the last line')
     if 'musl python ulix 14' not in out: print(out[-1500:])
+    # the standard library on the disk (issue #133): modtest.py imports about 150 modules, runs small programs with them (json, re, hashlib,
+    # socket, threading, subprocess, unittest, xml, decimal, ...) and checks that the modules that cannot work do fail to import
+    out = s.run('/musl/python -B /musl/modtest.py', r'modtest: \d+ ok, \d+ failed|Fatal Python|Killed', 'modtest.py: the module test ends', timeout=300)
+    m = re.search(r'modtest: (\d+) ok, (\d+) failed', out)
+    check(m is not None and int(m.group(2)) == 0, 'modtest.py: no check failed')
+    check(m is not None and int(m.group(1)) >= 170, 'modtest.py: at least 170 checks passed (%s)' % (m.group(1) if m else 'none'))
+    for what in ['import json', 'import re', 'import socket', 'import select', 'import threading', 'import hashlib', 'import decimal', 'import xml.etree.ElementTree',
+                 'import zlib fails (known not to work)', 'program: hashlib: md5, sha1, sha2, sha3, blake2', 'program: threading: four threads and a lock',
+                 'program: socket and select', 'program: subprocess runs /musl/cat (fork, exec, pipes)']:
+        check('ok:   ' + what in out, 'modtest.py: ' + what)
+    for line in out.splitlines():
+        if 'FAIL' in line or line.startswith('slowest'): print('        ' + line)
     s.pump(0.5)
     if b'EXCEPTION' in s.log or b'killed:' in s.log:
         print('  FAIL: kernel exception or process killed by a fault'); fails += 1

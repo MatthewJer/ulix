@@ -144,6 +144,9 @@ void linux_abi_fork (int old_as, int new_as) {
 #define L_futex          98
 #define L_nanosleep     101
 #define L_clock_gettime 113
+#define L_clock_getres  114
+#define L_getrlimit     163
+#define L_prlimit64     261
 #define L_clock_nanosleep 115
 #define L_sched_yield   124
 #define L_kill          129
@@ -462,6 +465,16 @@ static long linux_clock_gettime (int clk, struct ts *t) {
   }
   t->sec = ns / 1000000000ULL;
   t->nsec = ns % 1000000000ULL;
+  return 0;
+}
+
+// the resolution of a clock: the counter of the CPU ticks many million times a second, so a nanosecond is what Linux says as well (asyncio asks)
+static long linux_clock_getres (int clk, struct ts *t) {
+  if (clk != CLOCK_REALTIME && clk != CLOCK_MONOTONIC && clk != 4 && clk != 7) return -LE_EINVAL;
+  if (t) {
+    if (!user_ok ((u64) t, sizeof *t, 1)) return -LE_EFAULT;
+    t->sec = 0;  t->nsec = 1;
+  }
   return 0;
 }
 
@@ -962,9 +975,37 @@ static long linux_fcntl (int fd, int cmd, long arg) {
   return -LE_EINVAL;
 }
 
+// the limits of a process: nothing is limited except the number of open files (the table of descriptors) and the stack
+struct rlim { unsigned long cur, max; };
+static void rlimit_of (int res, struct rlim *r) {
+  r->cur = r->max = ~0UL;                                      // RLIM_INFINITY
+  if (res == 7) r->cur = r->max = MAX_PFD;                     // RLIMIT_NOFILE
+  if (res == 3) r->cur = r->max = 64UL << 20;                  // RLIMIT_STACK: the stack grows by itself up to 64 MByte
+}
+
+static long linux_getrlimit (int res, struct rlim *r) {
+  if (res < 0 || res > 15) return -LE_EINVAL;
+  if (!user_ok ((u64) r, sizeof *r, 1)) return -LE_EFAULT;
+  rlimit_of (res, r);
+  return 0;
+}
+
+static long linux_prlimit64 (int pid, int res, const struct rlim *new, struct rlim *old) {
+  if (pid != 0 && pid != thread_table[current_task].pid) return -LE_ESRCH;
+  if (res < 0 || res > 15) return -LE_EINVAL;
+  if (new) return -LE_EPERM;                                   // nothing can be changed
+  if (old) {
+    if (!user_ok ((u64) old, sizeof *old, 1)) return -LE_EFAULT;
+    rlimit_of (res, old);
+  }
+  return 0;
+}
+
 static long linux_ftruncate (int fd, long length) {
   int gfd = pfd2gfd (fd);
   if (fd < 0 || gfd < 0 || (gfd >> 8) != FS_MINIX) return -LE_EBADF;
+  struct int_minix2_inode *in = mx_status[gfd & 0xff].int_inode;
+  if (in && (long) in->i_size == length) return 0;             // nothing to cut off (the book refuses that: open (..., O_CREAT | O_TRUNC) of a new file failed)
   return u_ftruncate (gfd, length) < 0 ? -LE_EACCES : 0;
 }
 
@@ -1305,6 +1346,9 @@ void linux_syscall (context_t *r) {
     case L_mmap:     ret = linux_mmap (a0, a1, a2, a3, a4, a5); break;
     case L_munmap:   ret = linux_munmap (a0, a1); break;
     case L_mprotect: ret = linux_mprotect (a0, a1, a2); break;
+    case L_clock_getres: ret = linux_clock_getres (a0, (struct ts *) a1); break;
+    case L_getrlimit: ret = linux_getrlimit (a0, (struct rlim *) a1); break;
+    case L_prlimit64: ret = linux_prlimit64 (a0, a1, (const struct rlim *) a2, (struct rlim *) a3); break;
     case L_mremap:   ret = -LE_ENOMEM; break;                 // musl then allocates, copies and frees
     case L_madvise:  ret = 0; break;                          // advice only
 
@@ -1344,7 +1388,7 @@ void linux_syscall (context_t *r) {
       }
       ret = -LE_ENOSYS;
   }
-  if (ret == -LE_ENOMEM && enomem_reported++ < 20)                // (a program that runs out of memory: say which call and how much)
+  if (ret == -LE_ENOMEM && nr != L_mremap && enomem_reported++ < 20)    // (a program that runs out of memory: say which call and how much; mremap always says no, by design: musl then copies)
     printf ("[kernel] process %d: Linux system call %ld (%lx, %lx, %lx) failed: out of memory\n", thread_table[current_task].pid, nr, a0, a1, a2);
   r->x1 = saved.x1; r->x2 = saved.x2; r->x3 = saved.x3; r->x4 = saved.x4; r->x5 = saved.x5;
   r->x8 = saved.x8;
@@ -1642,6 +1686,10 @@ int main (int argc, char **argv) {
   CHECK (ftruncate (w, 3) == 0 && fstat (w, &st) == 0 && st.st_size == 3, "ftruncate (3)");
   CHECK (lseek (w, 0, SEEK_SET) == 0 && read (w, buf, 10) == 3 && !memcmp (buf, "abc", 3), "lseek and read back what is left");
   close (w);
+  unlink (name);
+  w = open (name, O_WRONLY | O_CREAT | O_TRUNC, 0644);               // what Python's open (name, "w") does with a name that is new
+  CHECK (w >= 0 && write (w, "ab", 2) == 2 && fstat (w, &st) == 0 && st.st_size == 2, "O_CREAT | O_TRUNC on a new file (it used to fail: there is nothing to cut off)");
+  close (w);
 
   // descriptors: dup, dup3, fcntl, pipe2
   int p[2];
@@ -1838,16 +1886,22 @@ log of how it is attached; the files of this part are not literate sources (they
 \item[\texttt{libc/python-setup.local}] The list of extension modules. There is no \texttt{dlopen} (issue \#40: static linking only, see
   below), so every module that the interpreter should have is compiled into it. \texttt{Modules/Setup.bootstrap} of CPython already
   has the ones needed to start (\texttt{posix}, \texttt{\_io}, \texttt{\_sre}, \texttt{time}, \texttt{\_thread}, \ldots); the file adds \texttt{math},
-  \texttt{\_struct}, \texttt{array}, \texttt{binascii}, \texttt{\_json}, \texttt{select} and a few more. A module that needs a library that musl does not have
-  (zlib, OpenSSL, SQLite) is not in the list.
+  \texttt{\_struct}, \texttt{array}, \texttt{binascii}, \texttt{\_json}, \texttt{select} and a few more, and (issue \#133) everything that the standard library
+  imports when it runs on its own: \texttt{\_socket}, \texttt{\_asyncio}, \texttt{\_posixsubprocess}, \texttt{fcntl}, \texttt{termios}, \texttt{\_decimal}, \texttt{pyexpat},
+  the hash modules \texttt{\_md5}, \texttt{\_sha1}, \texttt{\_sha2}, \texttt{\_sha3}, \texttt{\_blake2} (so that \texttt{hashlib} works without OpenSSL) and some more. A module that needs a library
+  that musl does not have (zlib, OpenSSL, SQLite) is not in the list. One trap: the tool that reads the file (\texttt{makesetup}) takes every line with a
+  \texttt{=} in it for the definition of a variable and silently drops the module, so a flag is written \texttt{-DCONFIG\_64}, not \texttt{-DCONFIG\_64=1}.
 \item[\texttt{libc/Makefile}] \texttt{make PYTHON=1} configures CPython out of the tree (\texttt{libc/build/python}) with
   \texttt{--host=aarch64-linux-musl --disable-shared --without-ensurepip}, builds \texttt{python.exe}, strips it and marks it for the kernel
   (\texttt{mark\_musl.py}). CPython builds itself in two steps (it runs a small interpreter on the build machine to freeze the
   modules \texttt{os}, \texttt{site}, \texttt{io}, \ldots\ into the executable), so a \texttt{python3.12} must be on the host (\texttt{BUILD\_PYTHON}).
   The default is on when the submodule is checked out; \texttt{make PYTHON=0} leaves it out and it is not even compiled.
-\item[\texttt{/musl/python}, \texttt{/usr/local/lib/python3.12/encodings/}] The disk gets the interpreter (7.4 MByte, stripped) and the part of
-  the standard library that start-up needs: the \texttt{encodings} package. Everything else that \texttt{import} may ask for comes from the frozen
-  modules inside the executable. More of \texttt{Lib/} is a matter of adding file names to \texttt{PYTHON\_LIB\_FILES} in the \texttt{Makefile}.
+\item[\texttt{/musl/python}, \texttt{/usr/local/lib/python3.12/}] The disk gets the interpreter (8.3 MByte, stripped) and the standard library: every \texttt{*.py} file
+  of \texttt{Lib/} in the submodule (488 files, 32 directories, 9 MByte) except the tests, \texttt{tkinter}, \texttt{ctypes}, \texttt{sqlite3}, \texttt{curses}, \texttt{idlelib} and a few
+  more (the list \texttt{PYLIB\_EXCLUDE} in the Makefile). \texttt{tools/minix\_add.py --tree} copies it when the disk is made; there is no copy of the library in the repository.
+  The root file system has 32 MByte and 2048 inodes for it (see below). The frozen modules of the interpreter (\texttt{os}, \texttt{site}, \texttt{io}, \ldots) are not read from the disk.
+\item[\texttt{libc/modtest.py}, \texttt{libc/\_sysconfigdata\_\_linux\_.py}] The test of the library (below), and a short stand-in for a file that CPython's own build writes by running the interpreter,
+  which a cross build cannot do (\texttt{sysconfig} and \texttt{zoneinfo} import it).
 \end{description}
 
 \paragraph{What the first runs showed} (this is the ``spike'', issue \#57; every line is something that really happened, in this order):
@@ -1863,7 +1917,8 @@ log of how it is attached; the files of this part are not literate sources (they
   the book's image into it (\texttt{tools/minix\_copy.py}; \texttt{minix\_add.py} learned to write files with a double indirect block, the kernel could
   read them already). One thing about the book had to be respected: \texttt{mx\_unlink} frees a zone with the constant \texttt{33}, the number of
   the \emph{first data zone minus one} of the floppy image, so the new file system must also start its data at zone 34. It has 464 inodes
-  and a zone map of two blocks for that (\texttt{minix\_mkfs.py --inodes=464}).
+  and a zone map of two blocks for that (\texttt{minix\_mkfs.py --inodes=464}). (That limit is gone: the book's code now reads the first data zone from the
+  superblock, see ``The standard library on the disk'' below.)
 \item A fault at an address 64 KByte below the stack pointer: CPython's parser has a function with a 64 KByte array. The stack grew by one page
   when the page just below it was touched, as in the book; now it grows by as many pages as needed if the address is at most 1 MByte below (an
   access further away is still a wild pointer and kills the process, as before).
@@ -1884,8 +1939,34 @@ CPython ran on the first attempt without a patch, and what it needs from the ker
 threads, sockets and files needs; that work is useful for every other program. So CPython it is. The price is size: 7.4 MByte on the disk instead of a few
 hundred KByte, and the 16 MByte root file system.
 
+\paragraph{The standard library on the disk (issue \#133).} Three things had to be decided, and four bugs were found on the way.
+
+\emph{No second image, no new format.} The library has 488 files; the old root disk had 464 inodes, so something had to grow. The owner decided against a second image
+for the library. A new file system format (32-bit inode numbers, 60-character names) was considered and not done, because Minix v2 is enough: 65\,535 inodes, names of up to 30
+characters (the longest one in the library has 23), directories of up to 224 entries (the largest has 198). What does not work for any other size than the floppy of the book are the places in the book's code that
+assume its layout. \texttt{mx\_unlink} and three other functions converted a zone number into a bit of the zone map with the constant 33, which is the first data zone of the floppy minus one; with 2048 inodes the data
+starts at zone 135 and every deleted file left its own zone marked as used and freed another one. The function \texttt{mx\_zone\_bit} takes the number from the superblock now. A directory entry with a name of exactly 30
+characters has no terminating 0, which \texttt{strequal} did not know, and three buffers had no room for the 0. Both are listed in the table of bugs of the book (\texttt{arm64/README.md}).
+
+\emph{The bug that took longest: \texttt{count\_open\_files}.} With the library on the disk, a second and a third run of the interpreter crashed in different ways (null bytes in the source of a module, a pointer in a free list that looked
+like random bytes, an illegal instruction in a page of code). The disk, compared block by block with the original after a run, showed blocks of Python modules that held pages of other processes: the \emph{swap file} wrote into them. The book's \texttt{swapper}
+starts to swap when a program has used 2 MByte, which every Python run does; the swap file stays open all the time. \texttt{fork} duplicates the descriptors with \texttt{mx\_reopen}, which did not count the copy in \texttt{count\_open\_files}, and \texttt{mx\_close}
+counts every closed entry down; so the counter fell to 0 although files were open, and \texttt{mx\_open} then uses the internal inode 0 \emph{without looking} if the counter says that no file is open. That slot belonged to the swap file. One line, \texttt{count\_open\_files++}, fixes it.
+
+\emph{What else the library asked for.} \texttt{open (name, "w")} on a new file failed, because the emulation of \texttt{O\_TRUNC} calls \texttt{ftruncate (fd, 0)}, which the book refuses for a file that has no bytes;
+\texttt{clock\_getres}, \texttt{getrlimit} and \texttt{prlimit64} did not exist; and the interpreter picked \texttt{epoll} because musl has it, but the kernel does not (\texttt{asyncio} failed), so it is configured without.
+
+\emph{.py, not .pyc.} The interpreter finds precompiled modules only in \texttt{\_\_pycache\_\_/NAME.cpython-312.pyc}; that is 17 characters more than the name of the module, and \texttt{\_collections\_abc} or
+\texttt{\_header\_value\_parser} do not fit into the 30 characters of a Minix name. So the library is on the disk as source (and compiled at every start), and a start of a program that imports \texttt{argparse} or \texttt{unittest} takes
+five to ten seconds under qemu on top of the seven of the empty interpreter. A file system with longer names comes first.
+
+\emph{What works and what does not} is in section 33 of \texttt{ARM64-PORT.md}; the list of modules that cannot work (no \texttt{zlib}, \texttt{ssl}, \texttt{ctypes}, \texttt{sqlite3}, \texttt{curses}, \texttt{multiprocessing}'s semaphores, \texttt{socketpair} for \texttt{asyncio.run})
+is checked by the test.
+
 \paragraph{Test.} \texttt{tools/python\_test.py} (\texttt{make python-test}, job \texttt{python} of \texttt{make pcheck}) boots the shell kernel with a disk that has
-the interpreter, logs in and runs \texttt{python -c print(6*7)} and the script \texttt{/musl/hello.py}; the output is compared line by line. It prints
+the interpreter, logs in and runs \texttt{python -c print(6*7)}, the script \texttt{/musl/hello.py} and \texttt{libc/modtest.py}; the output is compared line by line. The last one imports 137 modules
+of the standard library, runs 26 small programs with them (\texttt{json}, \texttt{re}, \texttt{hashlib} with known digests, \texttt{socket} and \texttt{select}, four threads and a lock, \texttt{unittest},
+\texttt{xml}, \texttt{decimal}, \texttt{subprocess} starting \texttt{/musl/cat} through fork, exec and pipes, \ldots) and checks that 20 modules that cannot work here fail to import. It prints
 a message and succeeds if the build has no interpreter (\texttt{PYTHON=0}).
 \section{Test of sockets: \texttt{sockettest}}
 \label{src:libc/sockettest.c}

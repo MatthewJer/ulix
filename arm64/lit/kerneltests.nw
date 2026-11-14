@@ -185,6 +185,34 @@ int bookfs_test (void) {
   // (mx_mkdir itself does not check whether the directory exists; u_mkdir above it does)
   CHECK (mx_open (DEV, "/missing/x", O_RDONLY) == -1, "open in a missing directory fails");
 
+  // ---- fork () duplicates a descriptor with mx_reopen: the count of open files must follow ----
+  // (The book forgot to count the copy, mx_close counted it down, the number sank towards 0 with every fork and exit, and mx_open takes the
+  // internal inode 0 without looking when it is 0: on the ARM64 port that was the inode of the swap file, and Python's files were destroyed.)
+  {
+    int base = count_open_files;
+    int a = mx_open (DEV, "/keep.bin", O_RDONLY);
+    int b = mx_reopen (a);
+    CHECK (a >= 0 && b >= 0 && b != a && count_open_files == base + 2, "mx_open and mx_reopen: two open files are counted");
+    mx_close (a);  mx_close (b);
+    CHECK (count_open_files == base, "both closed: count_open_files is back where it was");
+  }
+
+  // ---- what the standard library of Python needs: a name of the full 30 characters, in a directory three levels deep ----
+  {
+    static const char deep[] = "/dl1/dl2/dl3/abcdefghijklmnopqrstuvwxyz1234";           // the last name has exactly 30 characters
+    CHECK (mx_mkdir (DEV, "/dl1", 0755) == 0 && mx_mkdir (DEV, "/dl1/dl2", 0755) == 0 && mx_mkdir (DEV, "/dl1/dl2/dl3", 0755) == 0,
+           "three directories, one in the other");
+    mfd = mx_open (DEV, deep, O_CREAT | O_RDWR);
+    CHECK (mfd >= 0 && write_pattern (mfd, 9000, 1000) == 9000, "a file with a name of 30 characters in /dl1/dl2/dl3 (9000 bytes)");
+    mx_close (mfd);
+    mfd = mx_open (DEV, deep, O_RDONLY);
+    CHECK (mfd >= 0 && verify_pattern (mfd, 9000) == 9000 && mx_stat (DEV, deep, &st) == 0 && st.st_size == 9000, "it is found by its name and reads back");
+    mx_close (mfd);
+    CHECK (mx_unlink (DEV, deep) == 0 && !mx_file_exists (DEV, deep), "and it is deleted again (the zones go back: first data zone is not 34 on this disk)");
+    CHECK (mx_rmdir (DEV, "/dl1/dl2/dl3", "/dl1/dl2/dl3") == 0 && mx_rmdir (DEV, "/dl1/dl2", "/dl1/dl2") == 0 && mx_rmdir (DEV, "/dl1", "/dl1") == 0 &&
+           !mx_file_exists (DEV, "/dl1"), "the three directories are removed again");
+  }
+
   // ---- rmdir: the removed directory goes away, the one that contained it keeps . and .. ----
   {
     int before = count_entries ("/");
@@ -719,7 +747,7 @@ int proc_test (void) {
   capture_stop (&out);
   arch_threads_reap ();
   CHECK (pid > 0 && thread_table[pid].exitcode == 0, "/musl/filetest finished with exit status 0 (no failed checks)");
-  CHECK (count_in (out, "user FAIL") == 0 && count_in (out, "user ok:") == 29 - !has_rng, "all file checks of the musl program passed (29, or 28 on a machine without random number generator)");
+  CHECK (count_in (out, "user FAIL") == 0 && count_in (out, "user ok:") == 30 - !has_rng, "all file checks of the musl program passed (30, or 29 on a machine without random number generator)");
   CHECK (count_in (out, "not implemented") == 0, "the file test needed no Linux system call that the kernel does not have");
   char *mthr_argv[] = { "threadtest", 0 };                    // threads: clone, futex, thread-local variables, exit with threads (musl's pthreads)
   capture_start ();

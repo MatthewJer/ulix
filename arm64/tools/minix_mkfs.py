@@ -4,9 +4,12 @@
 usage: minix_mkfs.py IMAGE ZONES [--inodes=N]
 
 Like mkfs.minix -2 -n 30, which is not available on macOS. The image gets an empty root directory.
---inodes sets the number of inodes (default: a quarter of the zones). The book's mx_unlink and mx_rmdir free a zone with the
-constant 33 (the floppy's first data zone is 34), so a root disk that is used with them must also start its data at zone 34:
-464 inodes and 16384 zones do that (see the Makefile). Used for the second disk of the ARM64 port (/dev/hdb, mounted on /tmp like on the x86).
+--inodes sets the number of inodes (default: a quarter of the zones). The first data zone follows from it (superblock, bitmaps and the
+inode table come first): the 1.4 MByte image of the book has 464 inodes and starts its data at zone 34, the root disk of the ARM64 port has
+2048 inodes and starts at zone 135. The book's mx_unlink, mx_rmdir and mx_ftruncate used to assume 34 (the constant 33 in the zone bitmap);
+they read the first data zone from the superblock now, so any number of inodes works (section 33 of ARM64-PORT.md). Limits of the format that
+remain: 65535 inodes, names of 30 characters, 224 entries in a directory (the book's directory code). Also used for the second disk of the
+ARM64 port (/dev/hdb, mounted on /tmp like on the x86).
 """
 import struct, sys, time
 

@@ -682,9 +682,12 @@ static u32 range_sum (u32 ino, u32 offset, u32 len, u32 piece, int *requests) {
 static void disk_test (void) {
   static u8 a[1024] __attribute__ ((aligned (16))), b[1024] __attribute__ ((aligned (16)));
   CHECK (blk_init () == 0, "virtio-blk device found and initialised");
-  CHECK (blk_capacity () == 32768, "capacity is 32768 sectors (16 MByte: the x86 image copied into a bigger file system by tools/minix_copy.py)");
+  CHECK (blk_capacity () == 65536, "capacity is 65536 sectors (32 MByte: the x86 image copied into a bigger file system by tools/minix_copy.py)");
 
   CHECK (blk_read (2, a, 2) == 0 && a[16] == 0x78 && a[17] == 0x24, "superblock read, Minix v2 magic 0x2478");
+  unsigned ninodes = a[0] | (a[1] << 8), firstdata = a[8] | (a[9] << 8);
+  printf ("  info: root file system: %u inodes, first data zone %u\n", ninodes, firstdata);
+  CHECK (ninodes >= 2048 && firstdata > 34, "the root file system has at least 2048 inodes (the library of Python needs more than the 464 of the old image) and its data starts after zone 34: no code may assume 34");
   CHECK (blk_read (blk_capacity (), a, 1) == -1, "read beyond the end of the disk is rejected");
 
   for (int i = 0; i < 1024; i++) a[i] = (u8)(i * 7 + 3);

@@ -18,19 +18,23 @@ MUSL_NAMES = cat ls filetest readtest threadtest sockettest localetest
 # system when the submodule is checked out (git submodule update --init third_party/cpython) and a Python 3.12 is on the host.
 PYTHON ?= $(if $(and $(wildcard ../third_party/cpython/configure),$(shell command -v python3.12)),1,0)
 PYLIB = /usr/local/lib/python3.12
-# the part of the standard library that is on the disk (the interpreter needs the encodings at start-up; os, site, io, ... are frozen into it)
-PYTHON_LIB_FILES = $(addprefix encodings/,__init__.py aliases.py utf_8.py latin_1.py ascii.py)
+# the standard library (Lib/ of the submodule) is copied to the root disk by tools/minix_add.py --tree: every *.py file below PYLIB, except
+# what is listed in PYLIB_EXCLUDE (names of directories or files, at any depth): the tests, the programs that need a module that the
+# interpreter does not have (tkinter, ctypes, sqlite3, curses), development tools and data that nobody needs on the target. There is no copy
+# of the library in the repository: the disk is made from the submodule (see section 33 of ../ARM64-PORT.md)
+PYLIB_EXCLUDE = test,tests,idlelib,tkinter,turtledemo,turtle.py,ensurepip,lib2to3,ctypes,sqlite3,curses,venv,pydoc_data,__pycache__,__phello__
 ifeq ($(PYTHON),1)
 MUSL_NAMES += python
-PYTHON_DISK_FILES = /musl/hello.py=libc/hello.py --mkdir=/usr/local --mkdir=/usr/local/lib --mkdir=$(PYLIB) --mkdir=$(PYLIB)/encodings \
-                    $(foreach f,$(PYTHON_LIB_FILES),$(PYLIB)/$(f)=../third_party/cpython/Lib/$(f))
+PYTHON_DISK_FILES = /musl/hello.py=libc/hello.py /musl/modtest.py=libc/modtest.py --mkdir=/usr/local --mkdir=/usr/local/lib --mkdir=$(PYLIB) --mkdir=$(PYLIB)/lib-dynload --exclude=$(PYLIB_EXCLUDE) \
+                    --tree=$(PYLIB)=../third_party/cpython/Lib $(PYLIB)/_sysconfigdata__linux_.py=libc/_sysconfigdata__linux_.py
 endif
 MUSL_PROGS = $(foreach p,$(MUSL_NAMES),libc/build/$(p).elf)
 
 # Disk image: the Minix image of the x86 version plus the AArch64 user programs.
 # "-snapshot" keeps the file unmodified when running.
 DISK ?= disk.img
-ROOT_ZONES ?= 16384
+ROOT_ZONES ?= 32768
+ROOT_INODES ?= 2048
 
 
 # make TLS=0 builds a system without TLS: no BearSSL, no CA list on the disk, https only says so, and no SSH server (see lit/tls.nw, lit/ssh.nw)
@@ -47,9 +51,9 @@ USERLAND_BIN = userland/build/bin
 userland/build/bin/init.elf: FORCE
 	$(MAKE) -C userland
 
-disk.img: $(wildcard userland/build/bin/*.elf) ../bin-build/minixdata.img etc/rc.conf etc/hosts etc/resolv.conf etc/services user/hello.elf user/cat.elf user/crash.elf user/forktest.elf user/sigtest.elf user/contest.elf user/cowtest.elf user/thtest.elf user/badptr.elf user/swaptest.elf user/screentest.elf user/stacktest.elf user/memtest.elf user/pipetest.elf libc/build/hello.elf $(MUSL_PROGS) userland/build/bin/init.elf tools/minix_add.py tools/minix_copy.py tools/minix_mkfs.py etc/ssl/cacert.pem etc/rc.d/heartbeat etc/rc.d/echod etc/rc.d/telnetd $(if $(filter 1,$(TLS)),etc/ssh/ssh_host_ecdsa_key etc/rc.d/sshd)
+disk.img: $(wildcard userland/build/bin/*.elf) $(if $(filter 1,$(PYTHON)),libc/hello.py libc/modtest.py libc/_sysconfigdata__linux_.py) ../bin-build/minixdata.img etc/rc.conf etc/hosts etc/resolv.conf etc/services user/hello.elf user/cat.elf user/crash.elf user/forktest.elf user/sigtest.elf user/contest.elf user/cowtest.elf user/thtest.elf user/badptr.elf user/swaptest.elf user/screentest.elf user/stacktest.elf user/memtest.elf user/pipetest.elf libc/build/hello.elf $(MUSL_PROGS) userland/build/bin/init.elf tools/minix_add.py tools/minix_copy.py tools/minix_mkfs.py etc/ssl/cacert.pem etc/rc.d/heartbeat etc/rc.d/echod etc/rc.d/telnetd $(if $(filter 1,$(TLS)),etc/ssh/ssh_host_ecdsa_key etc/rc.d/sshd)
 	# a root file system of ROOT_ZONES KByte: the image of the book is too small for big programs (tools/minix_copy.py)
-	python3 tools/minix_mkfs.py $@ $(ROOT_ZONES) --inodes=464 > /dev/null
+	python3 tools/minix_mkfs.py $@ $(ROOT_ZONES) --inodes=$(ROOT_INODES) > /dev/null
 	python3 tools/minix_copy.py ../bin-build/minixdata.img $@ > /dev/null
 	# two deliberately broken variants of hello.elf for the loader tests:
 	# e_machine = EM_386, and a code segment with flags RWX

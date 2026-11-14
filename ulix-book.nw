@@ -22190,6 +22190,19 @@ void mx_set_zmap_bit (int device, int i)   { mx_set_clear_zmap_bit (device, i, 1
 void mx_clear_zmap_bit (int device, int i) { mx_set_clear_zmap_bit (device, i, 0); };
 @ %def mx_set_imap_bit mx_clear_imap_bit mx_set_zmap_bit mx_clear_zmap_bit
 
+The zone bitmap is indexed by position, not by zone number (see below): the bit for zone [[z]] is [[z - s_firstdatazone + 1]]. Code that frees a zone must convert the number, and it must take [[s_firstdatazone]] from the superblock: the floppy image of this book has 34 as its first data zone, and an earlier version of the code below subtracted the constant 33. That works for this image and for no other: a file system with more inodes has a longer inode table and starts its data later (2048 inodes: zone 136), and then every [[mx_unlink]] cleared the bit of some other zone and left the zone of the file marked as used. The function is the one place that knows the formula:
+
+%nouse
+<<function prototypes>>=
+int mx_zone_bit (int device, int zone);
+@
+
+<<minix filesystem implementation>>=
+int mx_zone_bit (int device, int zone) {
+  return zone - (mx_query_superblock (device, MX_SB_FIRSTDATAZONE) - 1);
+}
+@ %def mx_zone_bit
+
 Note: An optimized implementation will not do this calculation every single time, instead when mounting the filesystem, we should copy the superblock to memory and also memorize where the zone bitmap starts. Early versions of \UlixI{} suffered from very slow disk access because reading blocks was not buffered---this led to actually reading the superblock from disk whenever we wanted to query the zone bitmap. With buffered read operations this is no longer a problem but still highly inefficient. It is, however, the simplest implementation and thus easy to grasp. Yet, you will see on the next pages that we did not stick with it because a slightly optimized version improved performance a lot.
 
 Requesting a free inode or a free block means searching the corresponding bitmap for a zero bit. We start with the simple implementation of two [[mx_request_inode()]] and [[mx_request_block()]] functions which just loop over the whole bitmaps and check the bits with [[mx_get_*_bit]]. If all inodes or blocks are in use, these functions return [[-1]].
@@ -22600,12 +22613,12 @@ In the implementations of [[basename]] and [[dirname]] we declare \verb#bname# a
 
 <<public function implementations>>=
 char *basename (char *path) {
-  static char bname[30];  static char dname[256];
+  static char bname[31];  static char dname[256];
   splitpath (path, dname, bname);  return (char *)bname;
 }
 
 char *dirname (char *path) {
-  static char bname[30];  static char dname[256];
+  static char bname[31];  static char dname[256];
   splitpath (path, dname, bname);  return (char *)dname;
 }
 @ %def basename dirname
@@ -22632,7 +22645,7 @@ void mx_write_link (int device, int inodenr, const char *path) {
       printf ("ERROR: filename %s exists!\n", path);  return;
   };
   struct minix_dir_entry dentry;  struct minix2_inode inode;
-  char dirname[256];  char filename[30];
+  char dirname[256];  char filename[31];
   splitpath (path, dirname, filename);
   int dir_inode_no = mx_pathname_to_ino (device, dirname);
   debug_printf ("DEBUG: dirname='%s' (ino: %d), "    // REMOVE_DEBUGGING_CODE
@@ -22861,6 +22874,7 @@ Inside the loop we pick the next sub-path and perform the inode lookup. We know 
 <<[[mx_pathname_to_ino]]: search loop>>=
 int i = 0;
 while (*search != '\0' && *search != '/') {
+  if (i == 30) { return -1; }        // longer than any name on the disk (and subpath is full)
   subpath[i] = *search;
   search++; i++;
 }
@@ -22882,7 +22896,7 @@ for (i = 0;  i < 32*7;  i++) {          // max. 32 * 7 entries
   debug_printf ("mx_pathname_to_ino: "           // REMOVE_DEBUGGING_CODE
                 "after mx_read_dir_entry()\n");  // REMOVE_DEBUGGING_CODE
   if (dentry.inode != 0) {
-    if (strequal (dentry.name, subpath)) {
+    if (strncmp (dentry.name, subpath, 30) == 0) {      // (a name of 30 characters has no 0 at its end: strequal would read on)
       next_dirinode_no = dentry.inode;  // found it!
       break;                            // leave for loop
     }
@@ -23151,7 +23165,7 @@ We provide an [[mx_reopen]] function that is used when file descriptors are dupl
 %nouse
 <<function prototypes>>=
 int mx_reopen (int mfd);
-@ It makes a copy of the [[mx_status[]]] entry so that the original process and its child can work with different values for the read/write position---if we simply let the child process use the same [[mx_status[]]] entry, every read or write operation would also update the position for the other process. [[u_reopen]] also increments the usage counter of the file; when one of the two processes closes (its copy of) the file, the counter is reset to the original value.
+@ It makes a copy of the [[mx_status[]]] entry so that the original process and its child can work with different values for the read/write position---if we simply let the child process use the same [[mx_status[]]] entry, every read or write operation would also update the position for the other process. [[u_reopen]] also increments the usage counter of the file; when one of the two processes closes (its copy of) the file, the counter is reset to the original value. It also counts the new entry in [[count_open_files]]. Without that, every [[fork]] followed by the exit of the child counted two closes for one open: the counter sank towards 0 although files were still open, and [[mx_open]] --- which takes the internal inode 0 without looking whenever the counter says that no file is open --- overwrote the internal inode of a file that was in use. On the ARM64 port that file was the swap file: its writes went to whichever file was opened last, and Python modules and their data were destroyed.
 
 <<minix filesystem implementation>>=
 int mx_reopen (int mfd) {
@@ -23159,7 +23173,8 @@ int mx_reopen (int mfd) {
   struct mx_filestat      *st    = &mx_status[mfd];
   struct int_minix2_inode *inode = st->int_inode;
   inode->refcount++;                               // increase reference count
- 
+  count_open_files++;                              // one more open file: [[mx_close]] counts every [[mx_status]] entry down
+
   int new_mfd = mx_get_free_status_entry ();
   memcpy (&mx_status[new_mfd], &mx_status[mfd], sizeof (struct mx_filestat));
 
@@ -23569,7 +23584,7 @@ if (indirect_zone == 0) {
   if (indirect_zone == -1) {
     debug_printf ("cannot reserve indirection "    // REMOVE_DEBUGGING_CODE
                   "block; disk full\n");           // REMOVE_DEBUGGING_CODE
-    mx_clear_zmap_bit (device, zone);         // undo reservation of data block
+    mx_clear_zmap_bit (device, mx_zone_bit (device, zone));         // undo reservation of data block
     return -1;
   }
   inode->i_zone[7] = indirect_zone;
@@ -23602,7 +23617,7 @@ if (double_indirect_zone == 0) {
   if (double_indirect_zone == -1) {
     debug_printf ("cannot reserve double "              // REMOVE_DEBUGGING_CODE
                   "indirection block; disk full\n");    // REMOVE_DEBUGGING_CODE
-    mx_clear_zmap_bit (device, zone);    // undo reservation of data block
+    mx_clear_zmap_bit (device, mx_zone_bit (device, zone));    // undo reservation of data block
     return -1;
   }
   inode->i_zone[8] = double_indirect_zone;
@@ -23622,7 +23637,7 @@ if (indirect_zone == 0) {
   if (indirect_zone == -1) {
     debug_printf ("cannot reserve indirection "    // REMOVE_DEBUGGING_CODE
                   "block; disk full\n");           // REMOVE_DEBUGGING_CODE
-    mx_clear_zmap_bit (device, zone);   // undo reservation of data block
+    mx_clear_zmap_bit (device, mx_zone_bit (device, zone));   // undo reservation of data block
     return -1;
   }
   
@@ -23768,7 +23783,7 @@ int mx_unlink (int device, const char *path) {
   int inodenr = mx_pathname_to_ino (device, path);
   struct minix2_inode inode;
   mx_read_inode (device, inodenr, &inode);
-  char dir[256], base[30];
+  char dir[256], base[31];
   splitpath (path, dir, base);            // split path into dir and base
   int dir_inodenr = mx_pathname_to_ino (device, dir);
   // printf ("dir_inodenr is %d\n", dir_inodenr);   // REMOVE_DEBUGGING_CODE
@@ -23777,7 +23792,7 @@ int mx_unlink (int device, const char *path) {
   boolean found = false;
   for (int i = 0;  i < 32*7;  i++) {
     mx_read_dir_entry (device, dir_inodenr, i, &dentry);
-    if ( dentry.inode==inodenr && strequal (dentry.name, base) ) {
+    if ( dentry.inode==inodenr && strncmp (dentry.name, base, 30) == 0 ) {
       dentry.inode = 0;
       memset (dentry.name, 0, 30);
       found = true;
@@ -23812,7 +23827,7 @@ separate steps:
 <<free this inode: (1) direct blocks>>=
 for (int i = 0;  i < 7;  i++) {
   if (inode.i_zone[i] != 0) {
-    mx_clear_zmap_bit (device, inode.i_zone[i] - 33);  // mark data block as free
+    mx_clear_zmap_bit (device, mx_zone_bit (device, inode.i_zone[i]));  // mark data block as free
     inode.i_zone[i] = 0;
   }
 }
@@ -23830,11 +23845,11 @@ if (inode.i_zone[7] != 0) {
   zoneno = (unsigned int*)ind_block;      // cast to uint*
   int count = 0;
   while (*zoneno != 0 && count < 256) {
-    mx_clear_zmap_bit (device, *zoneno - 33);        // mark data block as free
+    mx_clear_zmap_bit (device, mx_zone_bit (device, *zoneno));        // mark data block as free
     zoneno++;
     count++;
   }
-  mx_clear_zmap_bit (device, inode.i_zone[7] - 33);  // mark indir. block as free
+  mx_clear_zmap_bit (device, mx_zone_bit (device, inode.i_zone[7]));  // mark indir. block as free
   inode.i_zone[7] = 0;
 }
 @
@@ -23858,16 +23873,16 @@ if (inode.i_zone[8] != 0) {
     zoneno = (unsigned int*)ind_block;              // cast to uint*
     count2 = 0;
     while (*zoneno != 0 && count2 < 256) {
-      mx_clear_zmap_bit (device, *zoneno - 33);     // mark data block as free
+      mx_clear_zmap_bit (device, mx_zone_bit (device, *zoneno));     // mark data block as free
       zoneno++;
       count2++;
     }
-    mx_clear_zmap_bit (device, *ind_zoneno - 33);   // mark indir. block as free
+    mx_clear_zmap_bit (device, mx_zone_bit (device, *ind_zoneno));   // mark indir. block as free
     ind_zoneno++;
     count1++;
   }
 
-  mx_clear_zmap_bit (device, inode.i_zone[8] - 33); // mark double ind. block free
+  mx_clear_zmap_bit (device, mx_zone_bit (device, inode.i_zone[8])); // mark double ind. block free
   inode.i_zone[8] = 0;
 }
 @
@@ -23984,7 +23999,7 @@ int mx_ftruncate (int mfd, int length) {
       // delete block
       int zone = fileblocktozone (device, i, inode);
       printf ("DELETE ZONE %d\n", zone);               // REMOVE_DEBUGGING_CODE
-      mx_clear_zmap_bit (device, zone);
+      mx_clear_zmap_bit (device, mx_zone_bit (device, zone));
     }
   }
 

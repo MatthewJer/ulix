@@ -17,3 +17,28 @@ _opcode _opcode.c
 _pickle _pickle.c
 unicodedata unicodedata.c
 select selectmodule.c
+# the second batch (issue #133): what the standard library imports when it runs on its own
+_socket socketmodule.c
+_queue _queuemodule.c
+_csv _csv.c
+_statistics _statisticsmodule.c
+_zoneinfo _zoneinfo.c
+_asyncio _asynciomodule.c
+_lsprof _lsprof.c rotatingtree.c
+fcntl fcntlmodule.c
+grp grpmodule.c
+termios termios.c
+resource resource.c
+syslog syslogmodule.c
+_posixsubprocess _posixsubprocess.c
+# hashlib without OpenSSL: the built-in implementations (HACL* and the blake2 code that CPython carries)
+_md5 md5module.c -I$(srcdir)/Modules/_hacl/include _hacl/Hacl_Hash_MD5.c -D_BSD_SOURCE -D_DEFAULT_SOURCE
+_sha1 sha1module.c -I$(srcdir)/Modules/_hacl/include _hacl/Hacl_Hash_SHA1.c -D_BSD_SOURCE -D_DEFAULT_SOURCE
+_sha2 sha2module.c -I$(srcdir)/Modules/_hacl/include _hacl/Hacl_Hash_SHA2.c -D_BSD_SOURCE -D_DEFAULT_SOURCE
+_sha3 sha3module.c -I$(srcdir)/Modules/_hacl/include _hacl/Hacl_Hash_SHA3.c -D_BSD_SOURCE -D_DEFAULT_SOURCE
+_blake2 _blake2/blake2module.c _blake2/blake2b_impl.c _blake2/blake2s_impl.c
+# decimal (the C implementation with libmpdec, which CPython carries) and XML (expat, also carried)
+# (makesetup takes every line with a "=" for the definition of a make variable and drops the module: write -DNAME, which means 1, not -DNAME=1)
+_decimal _decimal/_decimal.c _decimal/libmpdec/basearith.c _decimal/libmpdec/constants.c _decimal/libmpdec/context.c _decimal/libmpdec/convolute.c _decimal/libmpdec/crt.c _decimal/libmpdec/difradix2.c _decimal/libmpdec/fnt.c _decimal/libmpdec/fourstep.c _decimal/libmpdec/io.c _decimal/libmpdec/mpalloc.c _decimal/libmpdec/mpdecimal.c _decimal/libmpdec/numbertheory.c _decimal/libmpdec/sixstep.c _decimal/libmpdec/transpose.c -I$(srcdir)/Modules/_decimal/libmpdec -DCONFIG_64 -DANSI -DHAVE_UINT128_T
+pyexpat pyexpat.c expat/xmlparse.c expat/xmlrole.c expat/xmltok.c -I$(srcdir)/Modules/expat -DHAVE_EXPAT_CONFIG_H -DUSE_PYEXPAT_CAPI -DXML_DEV_URANDOM
+_elementtree _elementtree.c -I$(srcdir)/Modules/expat -DHAVE_EXPAT_CONFIG_H -DUSE_PYEXPAT_CAPI
