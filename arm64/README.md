@@ -129,6 +129,7 @@ pty.c            pseudo terminal for a server       userland/telnetd.c, sshd.c  
 * IPv6 (`ip6.c`): link-local address, Neighbor Discovery, an address and the router from a router advertisement (SLAAC), ICMPv6 echo and UDP; `ifconfig` shows the `inet6` addresses and `ping6 fec0::2` works under qemu's user network (jobs `net` and `shellnet`). TCP over IPv6 is not done; see section 26 of `ARM64-PORT.md`.
 * The network is configured like on a BSD: the kernel command line (`ip=dhcp`, `ip=10.0.0.5/24 gw=… dns=…`), and as root (`su`) the
   programs `ifconfig`, `route` and `dhclient`; the tests are the `shellnet` and `netconf` jobs of `make pcheck`.
+* `debug=http` on the kernel command line (`cmdline.txt` on the Pi) makes the kernel write a heartbeat and the system calls of the Python web server to the serial console (`ARM64-PORT.md`, section 43); without it nothing is printed.
 * Host names: `host example.org` and `ping example.org` ask the name server of `ifconfig` (from DHCP or `dns=`) for an A record (`dns.c`); `make net-test` checks the resolver against a name server on the host and against qemu's forwarder.
 * **`make netd-test`**: the network thread. The console kernel with the command line `netecho` has nothing but the thread to answer; Python
   sockets of the host get UDP and TCP echo back (up to 20000 bytes) while the kernel runs its program.

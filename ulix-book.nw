@@ -16109,10 +16109,10 @@ byte scancode_DE_up_table[128] = {
 
 \index{virtual console}%
 \index{hardware!virtual console}%
-We provide ten virtual consoles (terminals), each of which has its own keyboard buffer. Such a buffer can store up to 32 characters---if an application does not react fast enough to key-press events, the buffer can become full: in that case further key-presses are lost.
+We provide ten virtual consoles (terminals), each of which has its own keyboard buffer. Such a buffer can store up to 256 characters (32 in the first version of this book; a slow machine, like the Raspberry Pi with its SD card, did not empty it fast enough for a command line that is pasted into the terminal)---if an application does not react fast enough to key-press events, the buffer can become full: in that case further key-presses are lost.
 
 <<constants>>=
-#define SYSTEM_KBD_BUFLEN 32
+#define SYSTEM_KBD_BUFLEN 256
 #define TERMINALS 10
 @ %def SYSTEM_KBD_BUFLEN TERMINALS
 

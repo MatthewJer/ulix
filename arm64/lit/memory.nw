@@ -395,7 +395,10 @@ The first write (by the process, or by the kernel inside a system call) causes a
 [[cow_fault()]] then gives the writer its own copy. Returns 1 if the fault was a COW fault and is resolved.
 
 <<mmu.c: cow_fault>>=
+extern unsigned long dbg_cows;                                                         // DBG-HTTP
+
 int cow_fault (u64 l0_pa, u64 va) {
+  dbg_cows++;                                                                            // DBG-HTTP
   if (va < USER_MIN || va >= USER_MAX) return 0;
   u64 *e = walk (KVA (l0_pa), va & ~(PAGE_SIZE - 1), 0);
   if (e && (*e & PTE_VALID) && !(*e & PTE_RO)) return 1;   // writable already: a thread on another CPU copied the page first
@@ -486,6 +489,7 @@ the book defines [[hash()]] in the header (every file that includes it gets a co
 extern u64  arch_as_l0 (addr_space_id id);
 extern u64 *pte_of (u64 l0_pa, u64 va);
 extern u64  alloc_frame (void);
+extern void sync_icache (void *p, u64 len);                // mmu.c
 extern u64  alloc_frame_try (void);
 extern void free_frame (u64 pa);
 extern int  frame_refcount (u64 pa);
@@ -622,6 +626,11 @@ static void evict_over (int as) {
   if (destroy_pending == (addr_space_id) as) { destroy_pending = 0;  arch_destroy_finish (as); }
 }
 
+extern unsigned long dbg_ufaults, dbg_pageins, dbg_pageouts, dbg_cows;                 // DBG-HTTP
+extern void dbg_note (const char *what, long a, long b);                               // DBG-HTTP
+extern unsigned long long dbg_af_calls, dbg_af_t, dbg_flt_t, dbg_cnt (void);                // DBG-HTTP
+extern int dbg_on;                                                                         // DBG-HTTP
+
 int page_out (int as, int pageno) {
   u64 l0 = arch_as_l0 (as), va = (u64)pageno @<< 12;
   if (!l0 || swap_fd == -1 || va < USER_LO || va >= USER_HI) return -1;
@@ -660,12 +669,14 @@ int page_out (int as, int pageno) {
   swap_has_data = 1;
   if (index + 1 > swap_file_pages) swap_file_pages = index + 1;
   *e = (*e & ~PTE_EVICTING);                               // paged out for good (not valid, PTE_SWAPPED)
+  dbg_pageouts++;  dbg_note ("page_out", as, pageno);                                       // DBG-HTTP
   free_frame (pa);                                         // the frame is free again
   evict_over (as);                                         // (and if the program ended meanwhile, its address space is destroyed now)
   return 0;
 }
 
 int page_in (int as, int pageno) {
+  dbg_pageins++;  dbg_note ("page_in", as, pageno);                                         // DBG-HTTP
   u64 l0 = arch_as_l0 (as), va = (u64)pageno @<< 12;
   if (!l0 || swap_fd == -1) return -1;
   u64 *e = pte_of (l0, va);
@@ -684,12 +695,19 @@ int page_in (int as, int pageno) {
   swap_io_leave (l);
   e = pte_of (l0, va);
   if (!e || (*e & PTE_VALID)) { free_frame (pa); return (e && (*e & PTE_VALID)) ? 0 : -1; }
+  if (!(*e & PTE_UXN)) sync_icache (KVA (pa), PAGE);      // a page of program code: the instruction fetch must see what the read has written (see below)
   *e = pa | ((*e & ~(PTE_ADDR | PTE_SWAPPED)) | PTE_VALID | PTE_AF);
   __asm__ volatile ("dsb ishst; isb" ::: "memory");
   return 0;
 }
 
 @
+A page of program code needs one more step when it comes back. The swap file is read into the frame by the CPU (or by a device whose data the CPU cache may still hold), and
+the instruction fetch of the Cortex-A72 does not look into the data cache: if it finds the old contents of the frame in memory (zeros, or another program's code), it
+executes those. Under \textsc{qemu} the caches are not modelled and this never shows. On the Raspberry Pi it did: a Python web server was killed after a few
+seconds with an ``undefined instruction'' (\texttt{EC=0}, \texttt{ESR=0x2000000}) at the first instruction of a function, an address that holds a valid \texttt{stp} in the file. Pages with the
+\texttt{UXN} bit clear are therefore passed to [[sync_icache]], as the code of [[exec]] and of \texttt{mmap} are.
+
 Fault handler part of the book: ``check if page was paged out''.  Also resolves the access flag faults.
 Returns 1 if the instruction can be repeated.
 The user mode stack grows when the program touches a page below it (``page fault handler:
@@ -720,7 +738,18 @@ static int grow_stack (u64 l0, u64 va) {
   return 1;
 }
 
-int arch_user_fault (u64 va) {
+static int arch_user_fault_inner (u64 va);                                                  // DBG-HTTP
+
+int arch_user_fault (u64 va) {                                                              // DBG-HTTP
+  if (!dbg_on) return arch_user_fault_inner (va);                                            // DBG-HTTP
+  unsigned long long dbg_t0 = dbg_cnt ();                                                    // DBG-HTTP
+  int r = arch_user_fault_inner (va);                                                        // DBG-HTTP
+  dbg_flt_t += dbg_cnt () - dbg_t0;                                                          // DBG-HTTP
+  return r;                                                                                  // DBG-HTTP
+}                                                                                            // DBG-HTTP
+
+static int arch_user_fault_inner (u64 va) {                                                 // DBG-HTTP
+  dbg_ufaults++;                                                                         // DBG-HTTP
   if (va < USER_LO || va >= USER_HI) return 0;
   u64 l0 = arch_as_l0 (current_as);
   if (!l0) return 0;
@@ -778,6 +807,7 @@ static void walk_pages (u64 table_pa, int lvl, u64 prefix, addr_space_id as, int
 }
 
 void arch_update_counters (void) {
+  unsigned long long dbg_t0 = dbg_on ? dbg_cnt () : 0;                                       // DBG-HTTP
   if (!mutex_try_lock (paging_lock)) return;
   for (int as = 2; as < MAX_ADDR_SPACES; as++) {
     if (address_spaces[as].status == AS_FREE || !arch_as_l0 (as)) continue;
@@ -786,6 +816,7 @@ void arch_update_counters (void) {
     flush_as (as);                                         // the cleared access flags must be noticed
   }
   mutex_unlock (paging_lock);
+  if (dbg_on) { dbg_af_calls++;  dbg_af_t += dbg_cnt () - dbg_t0; }                           // DBG-HTTP
 }
 
 void arch_rescale_counters (void) {

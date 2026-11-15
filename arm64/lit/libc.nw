@@ -1586,7 +1586,28 @@ frame on purpose: \texttt{execve} (new program counter and stack) and \texttt{rt
 <<linux_abi.c: linux_syscall>>=
 static int unknown_reported[512], enomem_reported;
 
-void linux_syscall (context_t *r) {
+// DBG-HTTP: every system call of the web server is printed with its result and its duration (dbg_http.c); the wrapper is the whole hook
+extern int  dbg_http_task (int t);                                                          // DBG-HTTP
+extern void dbg_sc_enter (long nr, long a0, const char *name), dbg_sc_leave (long nr, long ret);     // DBG-HTTP
+static void linux_syscall_inner (context_t *r);                                             // DBG-HTTP
+
+void linux_syscall (context_t *r) {                                                         // DBG-HTTP
+  long nr = r->x8, a0 = r->x0, a1 = r->x1;                                                  // DBG-HTTP
+  int traced = dbg_http_task (current_task);                                                // DBG-HTTP
+  if (traced) {                                                                             // DBG-HTTP
+    char nm[40];  nm[0] = 0;                                                                // DBG-HTTP
+    if ((nr == 56 || nr == 79 || nr == 48 || nr == 78 || nr == 35 || nr == 34 || nr == 221) && user_string_ok ((u64) a1)) {      // DBG-HTTP openat, newfstatat, faccessat, readlinkat, unlinkat, mkdirat, execve(a0)
+      const char *p = (const char *) (nr == 221 ? a0 : a1);  int i = 0;                     // DBG-HTTP
+      while (i < 39 && p[i]) { nm[i] = p[i] >= 32 && p[i] < 127 ? p[i] : '?';  i++; }       // DBG-HTTP
+      nm[i] = 0;                                                                            // DBG-HTTP
+    }                                                                                       // DBG-HTTP
+    dbg_sc_enter (nr, a0, nm);                                                              // DBG-HTTP
+  }                                                                                         // DBG-HTTP
+  linux_syscall_inner (r);                                                                  // DBG-HTTP
+  if (traced) dbg_sc_leave (nr, (long) r->x0);                                              // DBG-HTTP
+}                                                                                           // DBG-HTTP
+
+static void linux_syscall_inner (context_t *r) {
   long nr = r->x8, a0 = r->x0, a1 = r->x1, a2 = r->x2, a3 = r->x3, a4 = r->x4, a5 = r->x5;
   context_t saved = *r;
   long ret;

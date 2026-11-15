@@ -533,7 +533,15 @@ static struct {
   long polls;                              // how often the caller has looked (to give up on a card that never answers)
 } xfer;
 
+extern unsigned long dbg_sd_reads, dbg_sd_read_sectors, dbg_sd_writes, dbg_sd_write_sectors;   // DBG-HTTP
+extern unsigned long long dbg_sd_t, dbg_sd_max_t, dbg_cnt (void);                           // DBG-HTTP
+extern int dbg_on;                                                                          // DBG-HTTP
+static unsigned long long dbg_xfer_t0;                                                      // DBG-HTTP
+
 static void finish (int result) {
+  if (dbg_on) { unsigned long long t = dbg_cnt () - dbg_xfer_t0;                           // DBG-HTTP
+    if (xfer.write) { dbg_sd_writes++;  dbg_sd_write_sectors += xfer.sectors; } else { dbg_sd_reads++;  dbg_sd_read_sectors += xfer.sectors; }   // DBG-HTTP
+    dbg_sd_t += t;  if (t > dbg_sd_max_t) dbg_sd_max_t = t; }                               // DBG-HTTP
   xfer.active = 0;
   xfer.result = result;
   wr32 (R_SIG_ENABLE, 0);                  // no more interrupts until the next transfer
@@ -573,6 +581,7 @@ static int start (int write, u64 lba, void *buf, u32 count, int by_interrupt) {
   if (xfer.active || count == 0 || count > 0xffff) return -1;
   xfer.active = 1;  xfer.write = write;  xfer.by_interrupt = by_interrupt;  xfer.result = -1;
   xfer.buf = buf;  xfer.sectors = count;  xfer.done = 0;  xfer.polls = 0;
+  if (dbg_on) dbg_xfer_t0 = dbg_cnt ();                                                     // DBG-HTTP
   wr16 (R_BLKSIZE, 512);
   wr16 (R_BLKCNT, count);
   u32 arg = high_capacity ? (u32)lba : (u32)(lba * 512);

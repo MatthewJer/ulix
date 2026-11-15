@@ -423,12 +423,15 @@ and \texttt{poll} and \texttt{select} call a listening socket readable when a co
 open for the TCP code after the socket is closed, as with the calls \texttt{tcp\_listen} and \texttt{tcp\_accept}: a server that starts again takes it over.
 
 <<sockets.c>>=
+extern int dbg_on;                                                                          // DBG-HTTP
+
 int sock_listen (int gfd, int backlog) {
   struct sock *s = sock_of (gfd);
   if (!s) return -E_NOTSOCK;
   if (s->type != SOCK_STREAM_ || s->c || !s->local_port) return -E_INVAL;     // (a socket that was not bound has no port to listen on)
   if (tcp_listen (s->local_port) != 0) return -E_NOBUFS;
   s->listening = 1;
+  if (dbg_on) printf ("[DBG] listen on port %d\n", s->local_port);          // DBG-HTTP
   return 0;
 }
 
@@ -447,6 +450,7 @@ int sock_accept (int gfd, int *new_gfd, u32 *ip, u16 *port, int nonblock_new) {
       n->c = c;  n->id = tcp_id (c);  n->local_port = s->local_port;
       tcp_peer (c, &n->peer_ip, &n->peer_port);
       *new_gfd = g;  *ip = n->peer_ip;  *port = n->peer_port;
+      if (dbg_on) printf ("[DBG] accept on port %d: connection from %d.%d.%d.%d:%d\n", s->local_port, (int) (n->peer_ip >> 24), (int) ((n->peer_ip >> 16) & 255), (int) ((n->peer_ip >> 8) & 255), (int) (n->peer_ip & 255), n->peer_port);   // DBG-HTTP
       return 0;
     }
     if (s->nonblock) return -E_AGAIN;

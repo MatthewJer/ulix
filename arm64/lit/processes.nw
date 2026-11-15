@@ -267,7 +267,10 @@ static inline void irq_restore (u64 daif) {
 kernel code asks for a reschedule (the [[x86]] version does int [[0x80]] / [[syscall_resign]] here)
 
 <<arch_thread.c: arch_resign>>=
+extern void dbg_resign (void *caller, int poll);                                            // DBG-HTTP dbg_http.c
+
 void arch_resign (void) {
+  dbg_resign (__builtin_return_address (0), 0);                                              // DBG-HTTP
   u64 flags = irq_save ();
   scheduler (0, SCHED_SRC_RESIGN);
   irq_restore (flags);
@@ -1054,6 +1057,7 @@ extern void bkl_lock (void);
 // the other waited for a page of a file). So the window in which the lock is free is also a window in which an interrupt can come in;
 // the interrupt code takes the lock for itself.
 void arch_poll_pause (void) {
+  dbg_resign (__builtin_return_address (0), 1);                                              // DBG-HTTP
   int d = bkl_depth ();
   u64 flags = irq_save ();
   bkl_set_depth (1);
@@ -1374,6 +1378,15 @@ extern int linux_signal_number (int signo);
 extern u64 linux_signal_restorer (void);
 
 void arch_check_dying (context_t *f);
+// The kernel shell's [[ps]] prints the program counter, stack pointer and frame pointer of each thread from its [[regs]], which the x86 kernel fills at every
+// task switch. Here the registers of a program that is interrupted by the timer are copied into [[regs]] when its time slice runs out.
+// If the timer interrupted the kernel, [[esp]] is 0 and [[eip]] and [[ebp]] are the low 32 bits of the kernel's program counter and return address.
+void arch_note_user_state (context_t *f, int from_user) {
+  TCB *t = &thread_table[current_task];
+  if (from_user) { t->regs.eip = f->elr;  t->regs.esp = f->sp_el0;  t->regs.ebp = f->x29; }
+  else           { t->regs.eip = (unsigned int) f->elr;  t->regs.esp = 0;  t->regs.ebp = (unsigned int) f->x30; }
+}
+
 void arch_signal_check (context_t *f) {
   arch_check_dying (f);                                             // exit_group of another thread
   TCB *t = &thread_table[current_task];
@@ -1453,7 +1466,18 @@ void *u_sbrk (int incr) {
 the idle system call: wait for the next interrupt ([[x86]]: sti; hlt; cli)
 
 <<arch_thread.c: arch_syscall_idle>>=
+// The idle process ([idle], what [[init]] turns into) calls [[idle]] in a loop, and [[arch_idle]] waits for the next interrupt: the timer, 10 ms away.
+// In the round robin that cost every other process a whole time slice per round: a process that sleeps for a disk request and is woken by the
+// interrupt of the SD card had to wait behind the idle process, about 30 ms per request on the Pi (the card needs less than 1 ms), and 4000
+// requests to import a few modules of Python made the web server take more than five minutes to start. So the idle process only waits when nobody else can run.
+static int others_ready (void) {
+  for (thread_id t = thread_table[0].next; t != 0; t = thread_table[t].next)
+    if (t > 1 && t != current_task && thread_table[t].state == TSTATE_READY) return 1;
+  return 0;
+}
+
 void arch_syscall_idle (context_t *r) {
+  if (others_ready ()) { arch_resign ();  return; }
   arch_idle ();
 }
 
@@ -2334,3 +2358,150 @@ void syscall_sysinfo (context_t *r) {
   for (int t = 0; t < MAX_THREADS; t++) s->proc_ticks[t] = proc_ticks[t];
   r->eax = 0;
 }
+
+@
+\section{Debugging a program: \texttt{debug=http}}
+
+Python's web server (\texttt{/musl/hello\_http.py}) never reached its first output on the Raspberry Pi, and nothing on the board showed why. The kernel can
+therefore write what it sees to the serial console, for one program, the web server. It is \emph{off} unless the kernel command line
+(\texttt{cmdline.txt} on the Pi, \texttt{-append} under qemu) contains the word \texttt{debug=http}. Then the console shows
+
+\begin{itemize}
+\item one line every 2 seconds (the heartbeat): the state of the web server, the system call it is in and for how long, the SD card (number, sectors, time and longest
+  transfer of the reads and writes), faults, page-ins and page-outs, free frames; and a second line with the time that the kernel spent in path lookups, in
+  [[readblock]], in the sweep of the access flags and in page faults, and who calls [[arch_resign]] and [[arch_poll_pause]];
+\item every system call of the program (the first 600, then only those that take longer than 50 ms) with its result and duration;
+\item a few events: page-in, page-out, \texttt{listen}, \texttt{accept}, TCP segments to port 8080.
+\end{itemize}
+
+The program is recognized by \texttt{hello\_} in its command line. The code is this file and the lines marked [[DBG-HTTP]] in the others
+(\texttt{grep -rn DBG-HTTP arm64/lit arm64/Makefile}); with the option off the cost is a test of one variable at each of those places. What it
+showed on the Pi is in section 40 and 41 of \texttt{ARM64-PORT.md}.
+
+<<dbg_http.c>>=
+/* DBG-HTTP: debugging code for the web server on the Pi, switched on by debug=http on the kernel command line */
+#define hash dbg_http_hash
+#include "ulix-api.h"
+
+extern int smp_cpu (void);
+extern unsigned long arch_ram_frames (void);
+extern long frames_in_use;
+extern unsigned long long net_now_ms (void);
+extern const char *plat_cmdline (void);                    // dt.c
+extern int arch_switch_count;
+extern char *state_names[];
+
+int dbg_on;                                                // 1: debug=http is on the kernel command line
+
+void dbg_init (void) {                                     // (before the first process; the command line is known)
+  const char *p = plat_cmdline ();
+  while (*p) {
+    while (*p == ' ') p++;
+    const char *word = p;
+    while (*p && *p != ' ') p++;
+    if (p - word == 10 && strncmp (word, "debug=http", 10) == 0) dbg_on = 1;
+  }
+  if (dbg_on) printf ("debug: the web server is traced (debug=http)\n");
+}
+
+unsigned long dbg_sd_reads, dbg_sd_read_sectors, dbg_sd_writes, dbg_sd_write_sectors;
+unsigned long long dbg_sd_t, dbg_sd_max_t;                     // time of the SD transfers (counter ticks)
+unsigned long dbg_ufaults, dbg_pageins, dbg_pageouts, dbg_cows;
+unsigned long long dbg_af_calls, dbg_af_t, dbg_flt_t;          // the access-flag sweep of the page replacement counters (calls, counter ticks), time in arch_user_fault
+unsigned long long dbg_rb_calls, dbg_rb_t, dbg_lk_calls, dbg_lk_t, dbg_lk_max;     // readblock and mx_pathname_to_ino (calls, counter ticks)
+
+unsigned long long dbg_cnt (void) { unsigned long long v;  __asm__ volatile ("mrs %0, cntvct_el0" : "=r" (v));  return v; }
+static unsigned long long us (unsigned long long t) { unsigned long long f;  __asm__ volatile ("mrs %0, cntfrq_el0" : "=r" (f));  return t * 1000000ULL / f; }
+
+extern void book_readblock (int device, int blockno, char *buffer);               // the book's functions, renamed by the Makefile (DBG-HTTP)
+extern int  book_mx_pathname_to_ino (int device, const char *path);
+
+void readblock (int device, int blockno, char *buffer) {
+  if (!dbg_on) { book_readblock (device, blockno, buffer);  return; }
+  unsigned long long t = dbg_cnt ();
+  book_readblock (device, blockno, buffer);
+  dbg_rb_calls++;  dbg_rb_t += dbg_cnt () - t;
+}
+
+int mx_pathname_to_ino (int device, const char *path) {
+  if (!dbg_on) return book_mx_pathname_to_ino (device, path);
+  unsigned long long t = dbg_cnt ();
+  int r = book_mx_pathname_to_ino (device, path);
+  t = dbg_cnt () - t;
+  dbg_lk_calls++;  dbg_lk_t += t;  if (t > dbg_lk_max) dbg_lk_max = t;
+  return r;
+}
+
+static int http_tid;                                       // the thread of the web server (0: none seen yet)
+static unsigned utick, ktick;                              // timer interrupts that found it in user mode / in the kernel
+static unsigned long ncalls;                               // its system calls
+static int in_nr = -1;  static long in_a0;  static char in_name[40];  static unsigned long long in_since;    // the call it is in now (-1: none)
+
+int dbg_http_task (int t) {                                // is this thread the web server?
+  if (!dbg_on || t < 2 || t >= MAX_THREADS || !thread_table[t].used) return 0;
+  const char *c = thread_table[t].cmdline;
+  for (int i = 0; c[i]; i++)
+    if (c[i] == 'h' && c[i+1] == 'e' && c[i+2] == 'l' && c[i+3] == 'l' && c[i+4] == 'o' && c[i+5] == '_') return 1;
+  return 0;
+}
+
+static unsigned long resigns, polls;                       // arch_resign / arch_poll_pause calls of the web server
+static struct { void *caller;  unsigned long n; } who[8];  // who called them (return address, count)
+
+void dbg_resign (void *caller, int poll) {
+  if (!dbg_http_task (current_task)) return;
+  if (poll) polls++; else resigns++;
+  int free_slot = -1;
+  for (int i = 0; i < 8; i++) {
+    if (who[i].caller == caller) { who[i].n++;  return; }
+    if (!who[i].caller && free_slot < 0) free_slot = i;
+  }
+  if (free_slot >= 0) { who[free_slot].caller = caller;  who[free_slot].n = 1; }
+}
+
+void dbg_note (const char *what, long a, long b) {         // an event; only the first 60 are printed
+  static int n;
+  if (!dbg_on) return;
+  if (n++ < 60) printf ("[DBG %us] event %s %ld %ld\n", (unsigned) (system_ticks / 100), what, a, b);
+}
+
+void dbg_sc_enter (long nr, long a0, const char *name) {
+  in_nr = (int) nr;  in_a0 = a0;  in_since = net_now_ms ();
+  int i = 0;
+  while (name[i] && i < 39) { in_name[i] = name[i];  i++; }
+  in_name[i] = 0;
+}
+
+void dbg_sc_leave (long nr, long ret) {
+  unsigned long long ms = net_now_ms () - in_since;
+  ncalls++;
+  if (ncalls <= 600 || ms >= 50)
+    printf ("[DBG %us] S%lu %ld x0=0x%lx \"%s\" = %ld (%lu ms)%s\n", (unsigned) (system_ticks / 100), ncalls, nr, in_a0, in_name, ret, (unsigned long) ms, ms >= 50 ? "  SLOW" : "");
+  in_nr = -1;
+}
+
+void dbg_tick (int from_user, unsigned long elr) {         // every timer interrupt of CPU 0
+  static unsigned beat;
+  if (!dbg_on || smp_cpu () != 0) return;
+  int t = current_task;
+  if (dbg_http_task (t)) { http_tid = t;  if (from_user) utick++; else ktick++; }
+  if (++beat % 200) return;                                // every 2 seconds
+  unsigned secs = (unsigned) (system_ticks / 100);
+  printf ("[DBG %us] cur=%d %s ", secs, t, from_user ? "user" : "kernel");
+  if (http_tid && dbg_http_task (http_tid)) {
+    printf ("| web server %d %s user=%u kernel=%u ticks calls=%lu", http_tid, state_names[thread_table[http_tid].state], utick, ktick, ncalls);
+    if (in_nr >= 0) printf (" IN call %d x0=0x%lx \"%s\" for %lu ms", in_nr, in_a0, in_name, (unsigned long) (net_now_ms () - in_since));
+    else            printf (" (not in a system call)");
+  } else printf ("| web server: not running");
+  printf (" | switches=%d | sd: %lu reads (%lu sectors), %lu writes (%lu sectors), %llu ms, longest %llu ms", arch_switch_count,
+          dbg_sd_reads, dbg_sd_read_sectors, dbg_sd_writes, dbg_sd_write_sectors, us (dbg_sd_t) / 1000, us (dbg_sd_max_t) / 1000);
+  printf (" | faults=%lu page-in=%lu page-out=%lu cow=%lu | free frames %ld of %lu\n", dbg_ufaults, dbg_pageins, dbg_pageouts, dbg_cows,
+          (long) arch_ram_frames () - frames_in_use, arch_ram_frames ());
+  printf ("[DBG %us]   web server: resign %lu, poll pauses %lu, callers:", secs, resigns, polls);
+  for (int i = 0; i < 8; i++) if (who[i].caller) printf (" %lx x%lu", (unsigned long) who[i].caller, who[i].n);
+  printf ("\n");
+  printf ("[DBG %us]   time in the kernel: path lookups %llu (%llu ms, longest %llu ms, %llu us each), readblock %llu calls (%llu ms), access-flag sweeps %llu (%llu ms), page faults %lu (%llu ms)\n",
+          secs, dbg_lk_calls, us (dbg_lk_t) / 1000, us (dbg_lk_max) / 1000, dbg_lk_calls ? us (dbg_lk_t) / dbg_lk_calls : 0, dbg_rb_calls, us (dbg_rb_t) / 1000,
+          dbg_af_calls, us (dbg_af_t) / 1000, dbg_ufaults, us (dbg_flt_t) / 1000);
+}
+@

@@ -1556,6 +1556,8 @@ static void reset_for (u32 src, const u8 *seg, int len, int header) {       // a
   }
 }
 
+extern int dbg_on;                                                                          // DBG-HTTP
+
 void tcp_input (u32 src, const u8 *seg, int len) {
   if (len < 20 || net_checksum (seg, len, net_pseudo_sum (src, net_my_ip, 6, len)) != 0) return;
   int header = (seg[12] >> 4) * 4, flags = seg[13];
@@ -1579,9 +1581,11 @@ void tcp_input (u32 src, const u8 *seg, int len) {
         o += seg[o + 1] < 2 ? 2 : seg[o + 1];
       }
       c->state = SYN_RCVD;
+      if (dbg_on && dport == 8080) printf ("[DBG] SYN to port 8080 accepted\n");     // DBG-HTTP
       send_flags (c, c->snd_una, SYN | ACK);
       arm_timer (c);
     } else {
+      if (dbg_on && dport == 8080) printf ("[DBG] segment to port 8080 refused (flags 0x%x, listening %d)\n", flags, listening);     // DBG-HTTP
       reset_for (src, seg, len, header);
     }
     return;

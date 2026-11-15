@@ -546,6 +546,8 @@ extern void book_syscall (void *frame);
 extern void book_user_fault (void *frame);
 extern int  book_current_pid (void);
 extern void arch_signal_check (void *frame);
+extern void arch_note_user_state (void *frame, int from_user);   // DBG-HTTP arch_thread.c: remember where the interrupted program was (for [[ps]] of the kernel shell)
+extern void dbg_tick (int from_user, unsigned long elr);          // DBG-HTTP dbg_http.c: the heartbeat on the console
 extern void uart_rx_irq (void);
 extern void uart_rx_enable (void);
 extern void sdisk_irq (void);
@@ -624,7 +626,11 @@ static void exc_handler_locked (struct frame *f, int kind) {
     else if (blk_is_irq ((int)irq)) { if (book_scheduler_on) { hd_interrupt (); disk_woke_someone = 1; } else blk_irq_ack (); }   // the disk
     else if (irq < 16) ;                    // software interrupt from another CPU: entering the kernel was the point
     else if (irq < 1020) printf ("spurious IRQ %u\n", irq);
-    if (irq == IRQ_TIMER && book_scheduler_on) book_timer_tick ();   // time slice over (10 ms)
+    if (irq == IRQ_TIMER && book_scheduler_on) {
+      arch_note_user_state (f, from_user);                           // DBG-HTTP (before the switch: where was the program when its time ran out?)
+      dbg_tick (from_user, f->elr);                                  // DBG-HTTP
+      book_timer_tick ();                                            // time slice over (10 ms)
+    }
     else if (disk_woke_someone && book_scheduler_on && book_current_pid () == 1) book_timer_tick ();   // a process waited for the disk and the CPU is idle: run it now, not at the next tick
     if (from_user && book_scheduler_on) arch_signal_check (f);       // deliver pending signals
     return;
