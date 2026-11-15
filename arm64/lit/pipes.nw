@@ -42,7 +42,7 @@ int u_write (int fd, void *buf, int nbyte) {
   if (is_pipe (fd)) return pipe_write (fd, buf, nbyte);
   if (is_vdev (fd)) return vdev_write (fd, buf, nbyte);
   if (is_sock (fd)) return sock_write (fd, buf, nbyte);
-  int k = book_u_write (fd, buf, nbyte);
+  fs_enter ();  int k = book_u_write (fd, buf, nbyte);  fs_leave ();
   // the book prints the text on the terminal and then, because a return is missing, falls into the error case: a program that
   // looks at the result of write (musl stdio and every cat) must see the number of bytes
   if (k == -1 && (fd == DEV_STDOUT || fd == DEV_STDERR)) return nbyte;
@@ -118,7 +118,8 @@ static int vdev_write (int gfd, void *buf, int n) { return n; }          // ever
 int u_open (char *path, int oflag, int open_link) {
   for (int k = 0; k < VDEVS; k++)
     if (strequal (path, (char *) vdev_names[k])) return (FS_VDEV << 8) | k;
-  return book_u_open (path, oflag, open_link);
+  fs_enter ();  int r = book_u_open (path, oflag, open_link);  fs_leave ();
+  return r;
 }
 @
 
@@ -341,8 +342,9 @@ extern int  book_u_reopen (int fd);
 extern int  book_u_open (char *path, int oflag, int open_link);
 extern int  random_get (void *buf, int n);                    // random.c
 extern int  is_sock (int gfd), sock_read (int gfd, void *buf, int n), sock_write (int gfd, void *buf, int n), sock_close (int gfd), sock_reopen (int gfd);   // sockets.c
-extern void arch_resign (void);
+extern void arch_resign (void), arch_poll_pause (void);
 
+<<pipes.c: file system lock>>
 <<pipes.c: pipe table>>
 <<pipes.c: read>>
 <<pipes.c: write>>
@@ -351,6 +353,62 @@ extern void arch_resign (void);
 <<pipes.c: wrappers>>
 <<pipes.c: kill>>
 <<pipes.c: pipe and dup2>>
+@
+
+\section{One lock for the file system}
+\label{sec:pipes:fslock}
+
+The functions of the book's file system are made of several steps (find a free inode, write the inode, enter the name in the directory, find
+a free block, write the bitmap, ...), and each step can wait for the SD card: the process sleeps and another one runs. Nothing keeps that
+other process out of the same directory or the same bitmap. On the Raspberry Pi it did happen: the network thread (which writes
+\texttt{/var/log/net.log} and makes \texttt{/var} and \texttt{/var/log} for it) and the service \texttt{heartbeat} (which makes the same
+directories) were both in \texttt{mkdir} when one of them waited for the card, and \texttt{/var/log} was left with an inode full of zeros: the
+test of the services (\texttt{make pcheck}, job \texttt{daemon}) failed every time after the change of section~41 had moved the
+moment of the second request. Under qemu, where a disk request ends in microseconds, it had not shown.
+
+So everything that looks at the directory tree or changes a file takes one lock first and gives it back when the call ends:
+\texttt{u\_open}, \texttt{u\_write}, \texttt{u\_stat}, \texttt{u\_mkdir}, \texttt{u\_rmdir}, \texttt{u\_unlink}, \texttt{u\_link}, \texttt{u\_symlink},
+\texttt{u\_ftruncate}, \texttt{u\_getdent}, \texttt{u\_chdir}, \texttt{u\_readlink}, \texttt{u\_chown} and \texttt{u\_chmod}. As for the pipes the book's
+functions are renamed (\texttt{book\_u\_mkdir} and so on, by the Makefile) and the functions of this chapter have the book's names. The lock
+may be taken again by its owner (the book's \texttt{u\_open} calls other functions of the file system), and it is not the book's
+\texttt{mutex}: a process that waits for it gives the CPU away and asks again, and a lock whose owner is gone (a process that ended
+inside the file system) is taken over. Reading the contents of an open file (\texttt{u\_read}) does not take it, so a program that waits
+for the keyboard does not stop the others.
+
+<<pipes.c: file system lock>>=
+extern int  book_u_stat (const char *path, struct stat *buf);       // more of the book's functions, renamed by the Makefile
+extern int  book_u_unlink (const char *path), book_u_rmdir (const char *path), book_u_chdir (const char *path);
+extern int  book_u_link (const char *path, const char *path2), book_u_symlink (const char *path, const char *path2);
+extern int  book_u_ftruncate (int fd, int length), book_u_mkdir (const char *path, int mode);
+extern int  book_u_getdent (const char *path, int index, struct dir_entry *buf);
+extern int  book_u_readlink (char *path, char *restrict buf, size_t bufsize);
+extern int  book_u_chown (const char *path, short owner, short group), book_u_chmod (const char *path, word mode);
+
+static int fs_owner = -1, fs_depth;                  // the thread that is in the file system (-1: nobody) and how often it entered
+
+static void fs_enter (void) {
+  while (fs_owner != -1 && fs_owner != current_task) {
+    if (!thread_table[fs_owner].used || thread_table[fs_owner].state == TSTATE_ZOMBIE) { fs_owner = -1;  fs_depth = 0;  break; }    // (it ended inside)
+    arch_resign ();                                  // the owner waits for the SD card: let others run
+    arch_poll_pause ();                              // (and let the owner on another CPU take the kernel lock: this one would hold it)
+  }
+  if (fs_owner == current_task) fs_depth++;  else { fs_owner = current_task;  fs_depth = 1; }
+}
+
+static void fs_leave (void) { if (--fs_depth <= 0) { fs_owner = -1;  fs_depth = 0; } }
+
+int u_stat (const char *path, struct stat *buf)    { fs_enter ();  int r = book_u_stat (path, buf);  fs_leave ();  return r; }
+int u_unlink (const char *path)                    { fs_enter ();  int r = book_u_unlink (path);  fs_leave ();  return r; }
+int u_rmdir (const char *path)                     { fs_enter ();  int r = book_u_rmdir (path);  fs_leave ();  return r; }
+int u_chdir (const char *path)                     { fs_enter ();  int r = book_u_chdir (path);  fs_leave ();  return r; }
+int u_link (const char *path, const char *path2)   { fs_enter ();  int r = book_u_link (path, path2);  fs_leave ();  return r; }
+int u_symlink (const char *path, const char *path2) { fs_enter ();  int r = book_u_symlink (path, path2);  fs_leave ();  return r; }
+int u_ftruncate (int fd, int length)               { fs_enter ();  int r = book_u_ftruncate (fd, length);  fs_leave ();  return r; }
+int u_mkdir (const char *path, int mode)           { fs_enter ();  int r = book_u_mkdir (path, mode);  fs_leave ();  return r; }
+int u_getdent (const char *path, int index, struct dir_entry *buf) { fs_enter ();  int r = book_u_getdent (path, index, buf);  fs_leave ();  return r; }
+int u_readlink (char *path, char *restrict buf, size_t bufsize) { fs_enter ();  int r = book_u_readlink (path, buf, bufsize);  fs_leave ();  return r; }
+int u_chown (const char *path, short owner, short group) { fs_enter ();  int r = book_u_chown (path, owner, group);  fs_leave ();  return r; }
+int u_chmod (const char *path, word mode)          { fs_enter ();  int r = book_u_chmod (path, mode);  fs_leave ();  return r; }
 @
 
 \section{The test program}

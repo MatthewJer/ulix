@@ -153,6 +153,9 @@ at_el1:
         tlbi    vmalle1
         dsb     nsh
         isb
+        ic      iallu                   // what the instruction cache holds when it is switched on is not defined: forget it (all cores, not only after a reset)
+        dsb     nsh
+        isb
         mrs     x0, sctlr_el1
         orr     x0, x0, #(1 @<< 0)       // M: MMU on
         orr     x0, x0, #(1 @<< 2)       // C: data cache
@@ -190,6 +193,9 @@ sec_at_el1:
         msr     ttbr1_el1, x1
         isb
         tlbi    vmalle1
+        dsb     nsh
+        isb
+        ic      iallu                   // as above
         dsb     nsh
         isb
         mrs     x0, sctlr_el1

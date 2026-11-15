@@ -1,6 +1,11 @@
 TEX=xelatex -8bit -shell-escape
 
+# With xelatex (TeX Live) the full build "full" (index and all); without it (a Mac that only has tectonic) the tectonic build
+# (tectonic.sh: no makeindex, the index pages stay as they were). Both end in ../ulix-book.pdf.
 all:
+	@if command -v xelatex >/dev/null 2>&1; then $(MAKE) full; else $(MAKE) pdf-tectonic && cp ulix-book-tectonic.pdf ../ulix-book.pdf; fi
+
+full:
 	# preprocessing
 	grep -v "REMOVE_DEBUGGING_CODE" ../ulix-book.nw > tmp.nw
 	nodefs -auto cee tmp.nw | sort -u > noweb.defs

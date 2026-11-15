@@ -618,6 +618,35 @@ void irq_init_cpu (void) {                                   // vector table and
 volatile int expect_fault = 0, faults = 0, procs_killed = 0;
 volatile u64 fault_esr, fault_far;
 
+// A program that stops with "undefined instruction" (EC 0) at an address where the memory holds a valid instruction has fetched something old: the
+// instruction cache of this core still held the contents that the frame had before the program's code was written to it (found on the Pi with
+// several cores: the first two processes were killed at their first instruction, the page had been made visible with [[ic ialluis]] from
+// another core; and before that on one core, section 40). The core forgets its instruction cache and the instruction is tried again; at the same
+// address a fourth time it is an error of the program. Every repair is reported, so that it does not stay unnoticed.
+extern u64 user_to_phys (u64 va, int write);
+static u64 repaired_elr;
+static int repaired_times;
+
+static int repair_stale_icache (struct frame *f) {
+  if (f->elr & 3) return 0;
+  u64 pa = user_to_phys (f->elr, 0);
+  if (!pa) { printf ("[kernel] CPU %d: undefined instruction at 0x%lx: the page is not mapped\n", smp_cpu (), f->elr);  return 0; }
+  u32 word = *(volatile u32 *) f->elr;                       // what this core sees through the program's address
+  volatile u32 *k = (volatile u32 *) KVA (pa);               // the same frame through the kernel's mapping, read after the line has been dropped
+  __asm__ volatile ("dsb ish; dc ivac, %0; dsb ish" :: "r" (k) : "memory");      // (a code page is clean: sync_icache wrote it back)
+  u32 mem = *k;
+  u64 ttbr0, tcr;
+  __asm__ volatile ("mrs %0, ttbr0_el1" : "=r" (ttbr0));  __asm__ volatile ("mrs %0, tcr_el1" : "=r" (tcr));
+  printf ("[kernel] CPU %d: undefined instruction at 0x%lx: frame 0x%lx, through the program %08x, in memory %08x, ttbr0 0x%lx, tcr 0x%lx\n",
+          smp_cpu (), f->elr, pa & ~0xfffUL, word, mem, ttbr0, tcr);
+  if (mem == 0) return 0;                                    // zeros in memory too: a real error
+  if (f->elr != repaired_elr) { repaired_elr = f->elr;  repaired_times = 0; }
+  if (++repaired_times > 3) return 0;
+  __asm__ volatile ("dsb ish; ic iallu; dsb nsh; isb" ::: "memory");
+  return 1;
+}
+
+
 static void exc_handler_locked (struct frame *f, int kind) {
   int from_user = (f->spsr & 0xf) == 0;     // M[3:0] == EL0t
 
@@ -671,9 +700,10 @@ static void exc_handler_locked (struct frame *f, int kind) {
     f->elr += 4;                            // skip the faulting instruction
     return;
   }
+  if (from_user && kind == 0 && ec == 0 && repair_stale_icache (f)) return;      // (the instruction is fine in memory: try again)
   if (from_user && kind == 0) {             // user mistake: kill the process, not the kernel
-    printf ("[kernel] process %d killed: EC=0x%x ESR=0x%lx FAR=0x%lx ELR=0x%lx\n",
-            book_current_pid (), ec, esr, far, f->elr);
+    printf ("[kernel] process %d killed on CPU %d: EC=0x%x ESR=0x%lx FAR=0x%lx ELR=0x%lx\n",
+            book_current_pid (), smp_cpu (), ec, esr, far, f->elr);
     procs_killed++;
     book_user_fault (f);                            // exit(-1) through the book's syscall_exit
   }
@@ -1066,7 +1096,13 @@ Start the machine again: PSCI [[SYSTEM_RESET]]. Returns -1 (if it returns at all
 <<smp.c: secondary_main>>=
 int smp_reboot (void) { if (plat_psci ()) psci_call (0x84000009, 0, 0, 0); return -1; }
 
+extern u64 empty_l0_pa;                                      // mmu.c: the table of an address space without user pages
+
 void secondary_main (int cpu) {
+  // The core came up with the boot identity map in TTBR0 (virtual = physical), and its TLB holds entries of it that are global: they match for every
+  // ASID, so after the switch to a user address space every user address below 1 GByte would still be translated by them (found on the Pi: a program
+  // at 0x400000 ran the zeros of the kernel's frame 0x400000). The boot CPU leaves the map in [[user_mm_init]]; the others do it here.
+  __asm__ volatile ("msr ttbr0_el1, %0; isb; tlbi vmalle1; dsb nsh; isb" :: "r" (empty_l0_pa) : "memory");
   gic_init_cpu ();
   irq_init_cpu ();                           // this CPU's timer
   pc[cpu].cur_task = 1;                      // idle

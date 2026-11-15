@@ -1962,7 +1962,7 @@ static int build_query (u8 *q, const char *name) {
 }
 
 @
-the answer in 'answer': 0 and the address, DNS_NOT_FOUND (rcode 3: no such name), or DNS_FAILED (an error, no A record, garbage)
+the answer in 'answer': 0 and the address, [[DNS_NOT_FOUND]] (rcode 3: no such name), or [[DNS_FAILED]] (an error, no A record, garbage)
 
 <<dns.c: parse_answer>>=
 static int parse_answer (const u8 *m, int len, u32 *ip) {
