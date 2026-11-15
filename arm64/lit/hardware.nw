@@ -63,7 +63,8 @@ struct node {
   const u8 *compat;  int clen;
   const u8 *irq;  int irqlen;
   const u8 *mac;  int maclen;               // "mac-address" or "local-mac-address": the Ethernet address of a network controller
-  const char *devtype, *method, *bootargs;
+  const char *devtype, *method, *bootargs, *enable;
+  u64 release;  int has_release;            // "cpu-release-addr" of a CPU node (two cells)
   int coherent, has_cpu_on;  u32 cpu_on;
 };
 
@@ -114,7 +115,8 @@ static char cmdline[1024];                           // ... and a copy of it for
 
 @
 ``maxcpus=N'' on the kernel command line limits the number of CPUs that are started. On the Raspberry Pi the other three cores
-wait in a spin table of the firmware, not behind PSCI; until that is implemented the command line says ``maxcpus=1''.
+wait in a spin table of the firmware, not behind PSCI (see [[smp_start]]); the device tree of the Pi names the address of each core
+([[cpu-release-addr]] in the node [[/cpus/cpu@N]], the [[enable-method]] is [[spin-table]]), and [[classify]] keeps it.
 
 <<dt.c: command_line>>=
 static void command_line (const char *args) {
@@ -137,7 +139,10 @@ static void classify (const struct node *stack, int depth) {
   }
   if (n->devtype && str_eq (n->devtype, "cpu") && n->reg && plat.ncpus < MAX_CPUS + 1) {
     static int ncpu_nodes = 0;
-    if (ncpu_nodes < MAX_CPUS) plat.cpu_mpidr[ncpu_nodes++] = cells (n->reg, n->pac) & 0xff00ffffffUL;
+    if (ncpu_nodes < MAX_CPUS) {
+      plat.cpu_release[ncpu_nodes] = (n->enable && str_eq (n->enable, "spin-table") && n->has_release) ? n->release : 0;
+      plat.cpu_mpidr[ncpu_nodes++] = cells (n->reg, n->pac) & 0xff00ffffffUL;
+    }
     plat.ncpus = ncpu_nodes;
     return;
   }
@@ -236,6 +241,8 @@ void dt_init (u64 blob_pa) {
       else if (str_eq (pn, "mac-address") || str_eq (pn, "local-mac-address")) { n->mac = val; n->maclen = len; }
       else if (str_eq (pn, "bootargs"))        n->bootargs = (const char *)val;     // the command line (cmdline.txt on the Pi)
       else if (str_eq (pn, "dma-coherent"))    n->coherent = 1;
+      else if (str_eq (pn, "enable-method"))   n->enable = (const char *)val;
+      else if (str_eq (pn, "cpu-release-addr")) { n->release = cells (val, len / 4); n->has_release = 1; }
       else if (str_eq (pn, "cpu_on"))          { n->cpu_on = be32 (val); n->has_cpu_on = 1; }
       else if (str_eq (pn, "#address-cells"))  n->ac = be32 (val);
       else if (str_eq (pn, "#size-cells"))     n->sc = be32 (val);
@@ -266,6 +273,7 @@ int  plat_psci_hvc (void)      { return plat.psci_hvc; }
 unsigned plat_psci_cpu_on (void) { return plat.psci_cpu_on; }
 int  plat_ncpus (void)         { return plat.ncpus; }
 unsigned long plat_cpu_mpidr (int i) { return plat.cpu_mpidr[i]; }
+unsigned long plat_cpu_release (int i) { return plat.cpu_release[i]; }     // spin table address of CPU node i, 0: none
 unsigned long plat_rtc (void)  { return plat.rtc; }
 unsigned long plat_ram_size (void) { return plat.ram_size; }
 int  plat_uart_irq (void)      { return plat.uart_irq; }
@@ -731,7 +739,7 @@ The complete file is put together from these parts:
 int  smp_cpu (void);                       // number of the calling CPU (TPIDR_EL1)
 u64  smp_mpidr (int cpu);
 void smp_boot_init (void);                 // the boot CPU takes the kernel lock
-void smp_start (void);                     // bring the other CPUs up (PSCI), once the scheduler runs
+void smp_start (void);                     // bring the other CPUs up (PSCI or spin table), once the scheduler runs
 int  smp_online_cpus (void);
 void bkl_lock (void);                      // the big kernel lock: the code of the book runs on one CPU at a time
 void bkl_unlock (void);
@@ -753,7 +761,7 @@ processors share it with a big kernel lock (BKL):
 \item every CPU has its own idle context (the idle thread 1 of the book is the boot CPU's);
 \item a signal for a thread that runs on another CPU is handed to that CPU (an interrupt makes it enter the kernel), so that a thread is never ended or its address space freed under the feet of another CPU.
 \end{itemize}
-Secondary CPUs are started with PSCI ([[CPU_ON]]), as the device tree says.
+Secondary CPUs are started with PSCI ([[CPU_ON]]) when the device tree has a PSCI node (qemu), or through the spin table of the firmware (Raspberry Pi), see ``starting the other CPUs''.
 
 @
 
@@ -781,6 +789,8 @@ The complete file is put together from these parts:
 <<smp.c: smp_stop_others>>
 
 <<smp.c: psci_call_conduit>>
+
+<<smp.c: spin_table>>
 
 <<smp.c: part 12>>
 
@@ -1017,6 +1027,34 @@ static long psci_call_conduit (int hvc, u32 fn, u64 a1, u64 a2, u64 a3) {
 static long psci_call (u32 fn, u64 a1, u64 a2, u64 a3) { return psci_call_conduit (plat_psci_hvc (), fn, a1, a2, a3); }
 
 @
+The Raspberry Pi has no PSCI. Its firmware starts all four cores; three of them wait in a loop (a ``spin table'') for a
+non-zero value in a memory word of their own, the \emph{release address} that the device tree gives ([[cpu-release-addr]]; the
+Pi's loop reads the words at \verb|0xd8|, \verb|0xe0|, \verb|0xe8| and \verb|0xf0|), and jump to it. That is all the
+protocol says; to start a core we
+\begin{enumerate}
+\item name its number in [[spin_cpu]] (a core that comes out of the loop has no argument; [[spin_entry]] in [[start.S]]
+      loads the number from there, so the cores are started one after the other),
+\item write the physical address of [[spin_entry]] to its release address,
+\item push both words out of the cache ([[dc civac]]): the waiting core runs with the MMU and its caches off and reads the
+      memory itself,
+\item [[dsb]] so that the writes are done, and [[sev]] to wake the cores from their [[wfe]].
+\end{enumerate}
+The core arrives in EL2 (the firmware's stub, like our own entry at [[_start]]), with the MMU off: [[drop_to_el1]] and the rest of
+[[secondary_entry]] are the same as after PSCI.
+
+<<smp.c: spin_table>>=
+extern u64 spin_cpu;
+extern void spin_entry (void);
+extern unsigned long plat_cpu_release (int i);
+
+static void spin_table_release (u64 release, int cpu) {
+  volatile u64 *word = (volatile u64 *)(KERNEL_VA + release);
+  spin_cpu = cpu;
+  *word = (u64)spin_entry - KERNEL_VA;
+  __asm__ volatile ("dc civac, %0; dc civac, %1; dsb sy; sev" :: "r" (&spin_cpu), "r" (word) : "memory");
+}
+
+@
 Switch the machine off: the firmware function [[SYSTEM_OFF]] of PSCI (under qemu this ends qemu). Returns if there is no PSCI.
 
 <<smp.c: part 12>>=
@@ -1040,7 +1078,7 @@ void secondary_main (int cpu) {
 
 void smp_start (void) {
   static int started = 0;
-  if (started || !plat_psci () || plat_ncpus () <= 1) return;
+  if (started || plat_ncpus () <= 1) return;
   started = 1;
   u64 boot = pc[0].mpidr;
   int n = 1;
@@ -1050,8 +1088,12 @@ void smp_start (void) {
     u64 m = plat_cpu_mpidr (i);
     if (m == boot) continue;
     pc[n].mpidr = m;
-    long r = psci_call (plat_psci_cpu_on (), m, (u64)secondary_entry - KERNEL_VA, n);
-    if (r != 0) { printf ("SMP: CPU_ON for CPU %d (MPIDR 0x%lx) failed: %ld\n", n, m, r); continue; }
+    if (plat_psci ()) {
+      long r = psci_call (plat_psci_cpu_on (), m, (u64)secondary_entry - KERNEL_VA, n);
+      if (r != 0) { printf ("SMP: CPU_ON for CPU %d (MPIDR 0x%lx) failed: %ld\n", n, m, r); continue; }
+    } else if (plat_cpu_release (i)) {
+      spin_table_release (plat_cpu_release (i), n);
+    } else continue;                                   // no way to start this CPU
     u64 t0, now, freq;
     __asm__ volatile ("mrs %0, cntpct_el0; mrs %1, cntfrq_el0" : "=r" (t0), "=r" (freq));
     do {
