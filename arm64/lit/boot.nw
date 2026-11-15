@@ -165,7 +165,12 @@ at_el1:
         ldr     x0, =high_entry         // absolute (link-time) high address
         br      x0
 
-        // ---- secondary CPUs: started by PSCI CPU_ON with the MMU off; x0 = CPU number (context ID)
+        // ---- secondary CPUs: started by PSCI CPU_ON (x0 = CPU number, context ID) or released from the spin table of the
+        //      Raspberry Pi's firmware (x0 is not defined: the number is in spin_cpu); the MMU is off in both cases
+        .global spin_entry
+spin_entry:
+        adr     x1, spin_cpu
+        ldr     x0, [x1]
         .global secondary_entry
 secondary_entry:
         mov     x19, x0
@@ -243,6 +248,8 @@ pg_t1_l1:  .skip 4096
 boot_dtb:       .quad 0                 // address of the device tree blob (from x0 at entry)
         .global secondary_tcr
 secondary_tcr:  .quad 0
+        .global spin_cpu
+spin_cpu:       .quad 0                 // number of the CPU that is being released from the spin table (smp.c)
 
         .section .bss
         .balign 16
@@ -470,6 +477,7 @@ struct platform {
   u64 rng;                       // the random number generator of the Raspberry Pi 4 (RNG200), 0: none (random.c)
   int timer_irq;                 // INTID of the EL1 physical timer (a PPI)
   int ncpus;  u64 cpu_mpidr[MAX_CPUS];
+  u64 cpu_release[MAX_CPUS];     // spin table: the address where the firmware's loop waits for the entry address of each CPU (0: none)
   int psci_hvc;  u32 psci_cpu_on;  int psci;      // PSCI present, conduit (0 = smc, 1 = hvc), function ID of CPU_ON
   int nvirtio;  u64 virtio[MAX_VIRTIO];           // base addresses of the virtio-mmio devices
   int virtio_irq[MAX_VIRTIO];                     // and their interrupt numbers

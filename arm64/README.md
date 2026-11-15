@@ -86,7 +86,7 @@ The port keeps the book as the single source:
 | IDE / floppy | `virtio.c`, `glue.c`: up to three virtio-blk disks (hda, hdb, a stand-in for fd1), interrupt driven like the IDE driver; on the Raspberry Pi `sdcard.c` (SDHCI, polled) with the disks as partitions of the SD card; `minixfs.c`: small read-only reader used by the ELF loader |
 | serial disk (`/dev/sdisk`, major 42; second COM port) | `glue.c`: second PL011 with interrupt, same protocol; `tools/serial_disk.py` serves the disk on the host (`make sdisk-test`) |
 | VGA text mode, PS/2 keyboard, 10 virtual terminals | PL011 UART (`arch_console.c`); the screens of the terminals are a model of the VGA text screen (`arch_vt.c`) shown on the console with ANSI sequences |
-| device detection by BIOS/ports, one CPU | `dt.c`: device tree; `smp.c`: more than one CPU (PSCI, big kernel lock) |
+| device detection by BIOS/ports, one CPU | `dt.c`: device tree; `smp.c`: more than one CPU (PSCI or spin table, big kernel lock) |
 | swap file, page replacement | `arch_swap.c`: for the 4-level tables, with the access flag as accessed bit |
 | CMOS clock | PL031 RTC (`arch_clock.c`) |
 
@@ -204,9 +204,9 @@ Ulix is a teaching system; what the port and the Raspberry Pi work follow from t
   shell and programs of the book (`fork2` with Ctrl-C, `top`), and the network through the Ethernet controller: link detection (also when
   the cable is plugged in after the boot), receiving and sending frames, DHCP from a home router, answering a ping and a telnet login.
   Everything else has only been run on qemu (`-M virt`, GICv2 and GICv3, 1 to 4 CPUs, EL1 and EL2, and `-M raspi4b`): the other Raspberry Pi
-  models, more than one CPU on the board (PSCI is missing, see below), the interrupt of the Ethernet controller (the thread polls every 50 ms
+  models, more than one CPU on the board (started through the firmware's spin table, section 40 of `ARM64-PORT.md`; only tested in qemu `raspi4b`), the interrupt of the Ethernet controller (the thread polls every 50 ms
   anyway) and the SD card at speeds above the slow default. VirtualBox cannot run this on an ARM host; use qemu.
-* On the Raspberry Pi only one CPU is used (the firmware parks the other three; no PSCI), the machine cannot be switched off or restarted
+* On the Raspberry Pi the other three CPUs are started from the firmware's spin table (no PSCI; `maxcpus=N` on the command line limits them), the machine cannot be switched off or restarted
   by software yet (no PSCI; the watchdog registers would do), and the 4 and 8 GByte models are not supported (RAM and peripherals share one
   GByte of the boot tables). The SD card driver has no DMA and no 1.8 V mode.
 * The network is small on purpose: for user programs only raw ICMP, TCP client sockets and TCP server sockets (`tcp_listen`, `tcp_accept`; no `socket`/`bind`/`connect` of the Unix kind, no UDP, no `poll`; sections 27 and 30 of `ARM64-PORT.md`), the DHCP lease is not
