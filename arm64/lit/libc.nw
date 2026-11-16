@@ -172,12 +172,18 @@ typedef unsigned char u8;
 unsigned char linux_abi_as[MAX_ADDR_SPACES];           // 1: the program of this address space uses the Linux system call interface
 u64 linux_sig_restorer[MAX_ADDR_SPACES];               // the function musl gave to sigaction: a handler returns to it
 static unsigned sa_onstack[MAX_ADDR_SPACES];           // bit n: the handler of signal n (book's number) runs on the alternate stack
+static unsigned sa_restart[MAX_ADDR_SPACES];           // bit n: SA_RESTART for the handler of signal n (a call that a signal interrupts starts again)
+static unsigned sa_nodefer[MAX_ADDR_SPACES];           // bit n: SA_NODEFER (the signal is not blocked while its handler runs)
+static unsigned sa_nocldwait[MAX_ADDR_SPACES];         // 1: SA_NOCLDWAIT for SIGCHLD (a child that ends leaves no zombie)
+static unsigned sa_mask[MAX_ADDR_SPACES][32];          // the signals (book's mask) that the handler of signal n blocks while it runs
 
 // fork: the child speaks the same interface and has the same signal restorer
 void linux_abi_fork (int old_as, int new_as) {
   linux_abi_as[new_as] = linux_abi_as[old_as];
   linux_sig_restorer[new_as] = linux_sig_restorer[old_as];
   sa_onstack[new_as] = sa_onstack[old_as];
+  sa_restart[new_as] = sa_restart[old_as];  sa_nodefer[new_as] = sa_nodefer[old_as];  sa_nocldwait[new_as] = sa_nocldwait[old_as];
+  memcpy (sa_mask[new_as], sa_mask[old_as], sizeof sa_mask[0]);
 }
 
 @
@@ -233,6 +239,10 @@ void linux_abi_fork (int old_as, int new_as) {
 #define L_rt_sigaction  134
 #define L_rt_sigprocmask 135
 #define L_rt_sigreturn  139
+#define L_getitimer     102
+#define L_setitimer     103
+#define L_rt_sigsuspend 133
+#define L_rt_sigpending 136
 #define L_getrandom     278
 #define L_uname         160
 #define L_umask         166
@@ -754,6 +764,8 @@ that \texttt{pthread\_mutex\_lock} returns \texttt{EOWNERDEAD} to the next threa
 #define FUTEX_OWNER_DIED   0x40000000
 #define LE_ETIMEDOUT 110
 #define TSTATE_WAITFUTEX 15                   // a thread sleeps in futex_queue (12 serial disk, 13 pipe, 14 network)
+#define TSTATE_WAITPIPE 13                    // (pipes.c)
+#define TSTATE_WAITNET  14                    // (net_syscalls.c)
 
 extern int arch_as_dying (void);
 
@@ -768,10 +780,8 @@ static void futex_name (u64 addr, int shared, u64 *key, int *as) {
 }
 
 // a signal that can be delivered (a blocked one does not end a wait), or the end of the process
-static int futex_must_leave (void) {
-  TCB *t = &thread_table[current_task];
-  return (t->sig_pending & ~t->sig_blocked) != 0 || arch_as_dying ();
-}
+int signal_interrupts (void);                                 // (see the signals)
+static int futex_must_leave (void) { return signal_interrupts (); }
 
 // sleep until woken (0), until the deadline (mono_ns, 0: none; -ETIMEDOUT), or until a signal or exit_group (-EINTR)
 static long futex_sleep (u64 key, int as, unsigned long long deadline) {
@@ -809,8 +819,11 @@ static int futex_wake (u64 addr, int shared, int n) {
 
 void futex_wake_address (u64 addr, int n) { futex_wake (addr, 0, n);  futex_wake (addr, 1, n); }     // (the end of a thread: arch_thread.c; private and shared waiters)
 
+static void itimers_tick (void);                               // (the interval timers: see the signals)
+
 // from the timer tick: wake the sleepers whose time has come (they find out why when they run)
 void futex_timeouts (void) {
+  itimers_tick ();
   unsigned long long now = 0;
   thread_id t = futex_queue.next;
   while (t != 0) {
@@ -948,9 +961,15 @@ The book's signals are the base (handlers per process, a pending set, a blocked 
 
 <<linux_abi.c: signals>>=
 extern sighandler_t u_signal (int sig, sighandler_t func);
+#define SA_NOCLDSTOP_ 1
+#define SA_NOCLDWAIT_ 2
 #define SA_ONSTACK_ 0x08000000
+#define SA_RESTART_ 0x10000000
+#define SA_NODEFER_ 0x40000000
 
-struct k_sigaction { sighandler_t handler; unsigned long flags; void (*restorer) (void); unsigned mask[2]; };   // as musl passes it
+struct k_sigaction { sighandler_t handler; unsigned long flags; void (*restorer) (void); u64 mask; };   // as musl passes it
+static u64 mask_to_linux (unsigned long um);
+static unsigned long mask_to_ulix (u64 lm);
 
 static long linux_sigaction (int sig, struct k_sigaction *act, struct k_sigaction *old, u64 size) {
   signal_tables ();
@@ -961,13 +980,19 @@ static long linux_sigaction (int sig, struct k_sigaction *act, struct k_sigactio
   if (old) {
     if (!user_ok ((u64) old, sizeof *old, 1)) return -LE_EFAULT;
     old->handler = t->sighandlers[us];
-    old->flags = (sa_onstack[current_as] >> us) & 1 ? SA_ONSTACK_ : 0; old->restorer = (void (*) (void)) linux_sig_restorer[current_as]; old->mask[0] = old->mask[1] = 0;
+    old->flags = ((sa_onstack[current_as] >> us) & 1 ? SA_ONSTACK_ : 0) | ((sa_restart[current_as] >> us) & 1 ? SA_RESTART_ : 0) | ((sa_nodefer[current_as] >> us) & 1 ? SA_NODEFER_ : 0)
+               | (us == SIGCHLD && sa_nocldwait[current_as] ? SA_NOCLDWAIT_ : 0);
+    old->restorer = (void (*) (void)) linux_sig_restorer[current_as];  old->mask = mask_to_linux (sa_mask[current_as][us]);
   }
   if (act) {
     if (!user_ok ((u64) act, sizeof *act, 0)) return -LE_EFAULT;
     if (act->restorer) linux_sig_restorer[current_as] = (u64) act->restorer;
     t->sighandlers[us] = act->handler;
     if (act->flags & SA_ONSTACK_) sa_onstack[current_as] |= 1U @<< us;  else sa_onstack[current_as] &= ~(1U @<< us);
+    if (act->flags & SA_RESTART_) sa_restart[current_as] |= 1U @<< us;  else sa_restart[current_as] &= ~(1U @<< us);
+    if (act->flags & SA_NODEFER_) sa_nodefer[current_as] |= 1U @<< us;  else sa_nodefer[current_as] &= ~(1U @<< us);
+    if (us == SIGCHLD) sa_nocldwait[current_as] = (act->flags & SA_NOCLDWAIT_) != 0;
+    sa_mask[current_as][us] = mask_to_ulix (act->mask);
   }
   return 0;
 }
@@ -1039,6 +1064,85 @@ static long linux_sigprocmask (int how, u64 *set, u64 *old, u64 size) {
   return 0;
 }
 
+// What a signal does to a process of musl (the book's u_kill only knows two answers: it kills the process or it sets the pending bit):
+//  - a default action that ends the process, and SIGKILL: the bit is set and the process is woken from its sleep; it ends itself when it
+//    returns to user mode (arch_signal_check), so waitpid can say "killed by signal n" and no lock of the kernel is left locked;
+//  - a handler: the bit is set and the process is woken, the call that sleeps returns EINTR (or starts again, SA_RESTART);
+//  - SIG_IGN, and a default action that ignores the signal (SIGCHLD, SIGURG): nothing happens.
+// Stop and continue (and every process that is not a program of musl) stay with the book. The result is 1 when the signal is dealt with here.
+extern int signal_ends_process (TCB *t, int signo);                 // pipes.c: the default action ends the process
+extern void pipes_before_kill (int pid, int signo), net_before_kill (int pid);
+extern blocked_queue keyboard_queue;
+
+static int signal_target_ok (int pid) {
+  if (pid < 3 || pid >= MAX_THREADS) return 0;
+  TCB *t = &thread_table[pid];
+  return t->used && linux_abi_as[t->addr_space] && strncmp (t->cmdline, "login", 5) != 0;
+}
+
+// the process leaves the queue it sleeps in; it looks at its signals when it runs again
+static void linux_wake_for_signal (int pid, int fatal) {
+  TCB *t = &thread_table[pid];
+  pipes_before_kill (pid, 0);                                       // (signal 0: leave the pipe queue, do not close anything)
+  net_before_kill (pid);
+  futex_before_kill (pid);
+  if (t->state == TSTATE_WAITKEY) deblock (pid, &keyboard_queue);
+  if (fatal && t->state == TSTATE_STOPPED) add_to_ready_queue (pid);       // (a stopped process is killed, too)
+}
+
+int linux_signal_send (int pid, int signo) {
+  if (!signal_target_ok (pid) || signo < 1 || signo > 31) return 0;
+  if (signo == SIGSTOP || signo == SIGTSTP || signo == SIGTTIN || signo == SIGTTOU || signo == SIGCONT) return 0;
+  TCB *t = &thread_table[pid];
+  sighandler_t h = t->sighandlers[signo];
+  int fatal = signo == SIGKILL || (h == SIG_DFL && signal_ends_process (t, signo));
+  if (!fatal && (h == SIG_DFL || h == SIG_IGN)) return 1;           // ignored (the default action of SIGCHLD and SIGURG is to ignore)
+  if (t->state == TSTATE_ZOMBIE || t->state == TSTATE_EXIT) return 1;      // (nothing to signal)
+  if (signo == SIGKILL && t->state != TSTATE_READY && t->state != TSTATE_WAITPIPE && t->state != TSTATE_WAITFUTEX && t->state != TSTATE_WAITNET &&
+      t->state != TSTATE_WAITKEY && t->state != TSTATE_STOPPED && t->state != TSTATE_WAITFOR && t->state != TSTATE_FORK)
+    return 0;                                                       // asleep in a place that no signal wakes (a disk, a lock): the book's kill
+  __atomic_fetch_or (&t->sig_pending, 1UL @<< signo, __ATOMIC_SEQ_CST);     // (the process may run on the other CPU)
+  linux_wake_for_signal (pid, fatal);
+  return 1;
+}
+
+// a call that sleeps looks at this: a signal that can be delivered now (a blocked one does not end a wait), or the end of the process
+int signal_interrupts (void) {
+  TCB *t = &thread_table[current_task];
+  return (t->sig_pending & ~t->sig_blocked) != 0 || arch_as_dying ();
+}
+
+// the signals that arch_signal_check blocks while the handler of signo runs: its sa_mask, and the signal itself unless SA_NODEFER
+unsigned long linux_signal_block_mask (int signo) {
+  if (!linux_abi_as[current_as]) return 0;
+  return sa_mask[current_as][signo] | ((sa_nodefer[current_as] >> signo) & 1 ? 0UL : 1UL @<< signo);
+}
+
+// sigsuspend: the mask that the process had before the call comes back when the handler returns (it is saved in the frame of the handler)
+static unsigned long suspend_mask[MAX_THREADS];
+static unsigned char suspend_active[MAX_THREADS];
+
+unsigned long linux_signal_old_mask (void) {                         // the mask to restore after the handler that is delivered now
+  TCB *t = &thread_table[current_task];
+  if (!suspend_active[current_task]) return t->sig_blocked;
+  suspend_active[current_task] = 0;
+  return suspend_mask[current_task];
+}
+
+// the first signal that arch_signal_check will deliver: does its handler ask for SA_RESTART?
+static int signal_wants_restart (void) {
+  TCB *t = &thread_table[current_task];
+  unsigned long pend = t->sig_pending & ~t->sig_blocked;
+  for (int s = 0; s < 32; s++)
+    if ((pend >> s) & 1) return t->sighandlers[s] != SIG_DFL && t->sighandlers[s] != SIG_IGN && ((sa_restart[current_as] >> s) & 1);
+  return 0;
+}
+
+// the calls that start again after a handler with SA_RESTART (the others, such as sleeps and poll, return EINTR whatever the flag says)
+static int restartable (long nr) {
+  return nr == L_read || nr == L_write || nr == L_readv || nr == L_writev || nr == L_wait4 || nr == 202 || nr == 203 || nr == 206 || nr == 207 || nr == 211 || nr == 212;   // (accept, connect, sendto, recvfrom, sendmsg, recvmsg)
+}
+
 // kill, tkill and tgkill: musl's raise () sends the signal to its own thread
 static long linux_kill (int pid, int sig) {
   signal_tables ();
@@ -1053,7 +1157,87 @@ static long linux_kill (int pid, int sig) {
     t->sig_pending |= 1UL @<< us;                             // blocked: it stays pending until it is unblocked (musl's raise () relies on it)
     return 0;
   }
-  return u_kill (pid, to_ulix[sig]) == 0 ? 0 : linux_error (LE_EPERM);
+  if (linux_signal_send (pid, us)) return 0;                  // (a blocked signal with a default action that ends the process is queued, too: it ends the process at the unblock)
+  return u_kill (pid, us) == 0 ? 0 : linux_error (LE_EPERM);
+}
+
+// rt_sigpending: the signals that are blocked and have been sent
+static long linux_sigpending (u64 *set, u64 size) {
+  if (size != 8) return -LE_EINVAL;
+  if (!user_ok ((u64) set, 8, 1)) return -LE_EFAULT;
+  TCB *t = &thread_table[current_task];
+  *set = mask_to_linux (t->sig_pending & t->sig_blocked);
+  return 0;
+}
+
+// rt_sigsuspend: replace the mask and sleep until a signal can be delivered; the handler runs, then the old mask comes back (linux_signal_old_mask)
+static long linux_sigsuspend (u64 *set, u64 size) {
+  if (size != 8) return -LE_EINVAL;
+  if (!user_ok ((u64) set, 8, 0)) return -LE_EFAULT;
+  TCB *t = &thread_table[current_task];
+  suspend_mask[current_task] = t->sig_blocked;  suspend_active[current_task] = 1;
+  t->sig_blocked = mask_to_ulix (*set);
+  futex_sleep (0, current_as, 0);                             // (the key 0 is nobody's: only a signal or the end of the process wakes it)
+  if (!signal_interrupts ()) { t->sig_blocked = suspend_mask[current_task];  suspend_active[current_task] = 0; }
+  return -LE_EINTR;
+}
+
+// ---- the interval timer ITIMER_REAL (setitimer, getitimer, and musl's alarm) ----
+struct kitimerval { long interval_sec, interval_usec, value_sec, value_usec; };
+static unsigned long long itimer_next[MAX_THREADS], itimer_interval[MAX_THREADS];     // per process (the number of its main thread), in nanoseconds of the monotonic clock; 0: off
+static int itimers_on;                                       // how many timers run: the tick looks at the table only if there is one
+
+static void itimer_set (int pid, unsigned long long next, unsigned long long interval) {
+  if (itimer_next[pid] && !next) itimers_on--;
+  if (!itimer_next[pid] && next) itimers_on++;
+  itimer_next[pid] = next;  itimer_interval[pid] = interval;
+}
+
+// from the timer tick: a timer that has run out sends SIGALRM (and starts again if it has an interval)
+static void itimers_tick (void) {
+  if (!itimers_on) return;
+  unsigned long long now = mono_ns ();
+  for (int pid = 2; pid < MAX_THREADS; pid++) {
+    if (!itimer_next[pid] || now < itimer_next[pid]) continue;
+    if (!thread_table[pid].used) { itimer_set (pid, 0, 0);  continue; }
+    if (itimer_interval[pid]) { unsigned long long n = itimer_next[pid] + itimer_interval[pid];  itimer_set (pid, n > now ? n : now + itimer_interval[pid], itimer_interval[pid]); }
+    else itimer_set (pid, 0, 0);
+    if (!linux_signal_send (pid, SIGALRM)) u_kill (pid, SIGALRM);
+  }
+}
+
+// the process ends: its timer stops, and its parent gets SIGCHLD (called from arch_thread.c, in the process that ends)
+void linux_process_ended (int pid) {
+  if (pid < 2 || pid >= MAX_THREADS) return;
+  if (itimer_next[pid]) itimer_set (pid, 0, 0);
+  int ppid = thread_table[pid].ppid;
+  if (ppid > 1 && ppid < MAX_THREADS && thread_table[ppid].used && thread_table[ppid].pid == ppid && thread_table[pid].pid == pid)
+    linux_signal_send (ppid, SIGCHLD);                         // (nothing happens if the parent ignores it, the handler runs if it has one)
+}
+
+static long linux_setitimer (int which, struct kitimerval *nv, struct kitimerval *old) {
+  if (which != 0) return -LE_EINVAL;                           // only ITIMER_REAL (the process-time timers are not supported)
+  int pid = thread_table[current_task].pid;
+  unsigned long long now = mono_ns ();
+  if (old) {
+    if (!user_ok ((u64) old, sizeof *old, 1)) return -LE_EFAULT;
+    unsigned long long left = itimer_next[pid] > now ? itimer_next[pid] - now : (itimer_next[pid] ? 1000 : 0);
+    old->value_sec = left / 1000000000ULL;  old->value_usec = left % 1000000000ULL / 1000;
+    old->interval_sec = itimer_interval[pid] / 1000000000ULL;  old->interval_usec = itimer_interval[pid] % 1000000000ULL / 1000;
+  }
+  if (nv) {
+    if (!user_ok ((u64) nv, sizeof *nv, 0)) return -LE_EFAULT;
+    if (nv->value_usec < 0 || nv->value_usec >= 1000000 || nv->interval_usec < 0 || nv->interval_usec >= 1000000 || nv->value_sec < 0 || nv->interval_sec < 0) return -LE_EINVAL;
+    unsigned long long value = nv->value_sec * 1000000000ULL + nv->value_usec * 1000ULL;
+    unsigned long long interval = nv->interval_sec * 1000000000ULL + nv->interval_usec * 1000ULL;
+    itimer_set (pid, value ? now + value : 0, value ? interval : 0);
+  }
+  return 0;
+}
+
+static long linux_getitimer (int which, struct kitimerval *cur) {
+  if (which != 0) return -LE_EINVAL;
+  return linux_setitimer (which, 0, cur);
 }
 
 @
@@ -1252,6 +1436,7 @@ static long linux_clone (context_t *r, u64 flags, u64 stack, int *ptid, u64 tls,
   if (flags & CLONE_CHILD_SETTID)  *ctid = tid;
   if (flags & CLONE_CHILD_CLEARTID) arch_set_clear_tid (tid, (u64) ctid);
   altstack[tid].size = 0;                                           // (a new thread has no alternate signal stack)
+  itimer_set (tid, 0, 0);                                           // (a new process has no interval timer)
   return tid;
 }
 
@@ -1259,29 +1444,90 @@ static long linux_clone (context_t *r, u64 flags, u64 stack, int *ptid, u64 tls,
 // WNOHANG (options bit 1: do not wait, say 0 if the child is still running). Python's multiprocessing does the second one all the time
 // (Process.start looks at the other children first), and with the book's behaviour it waited for a worker that was never going to end: the
 // Pool hung. So the answer is decided here, before the book's call: a child that is a zombie is reaped by the book's waitpid (which then does
-// not wait), a child that is not is waited for only if the program wants that.
+// not wait). A child that still runs is waited for in ticks of 10 ms in the futex queue, which a signal ends (EINTR): the book's waitpid
+// sleeps in a queue that no signal wakes.
 #define LW_NOHANG 1
+#define EXIT_SIGNALED 0x10000                                // exitcode of a process that a signal ended: this value plus the Linux signal number (arch_thread.c)
+
+// the status that wait4 reports: the exit code shifted left by eight bits, or the number of the signal that ended the process
+static int wait_status (int exitcode) {
+  if (exitcode == -1) return 11;                             // the kernel ended the process after a fault (book_user_fault): SIGSEGV
+  if ((exitcode & ~0x7f) == EXIT_SIGNALED) return exitcode & 0x7f;
+  return (exitcode & 0xff) @<< 8;
+}
+
+// The environment of execve: copied here before the old program is gone, and taken by the kernel when it builds the first stack of the new
+// program (build_linux_stack in arch_thread.c). A program that is started by the kernel itself (init, the servers) has no copy: it gets PATH=/bin.
+#define EXEC_ENV_MAX 1200                                    // bytes of strings (the first stack page also holds the arguments)
+#define EXEC_ENV_N 24                                        // and the number of variables
+static char exec_env[EXEC_ENV_MAX];
+static int exec_env_count = -1, exec_env_len;
+
+static long exec_env_copy (char **envp) {
+  exec_env_count = -1;
+  if (!envp) return 0;                                       // (no environment given: the default one)
+  int n = 0, len = 0;
+  for (;; n++) {
+    if (!user_ok ((u64) &envp[n], 8, 0)) return -LE_EFAULT;
+    char *e = envp[n];
+    if (!e) break;
+    if (n >= EXEC_ENV_N) return -7;                          // E2BIG
+    int l = 0;
+    for (;; l++) {                                           // the string, byte by byte (every page it touches must be there)
+      u64 va = (u64) e + l;
+      if (len + l >= EXEC_ENV_MAX) return -7;
+      if ((l == 0 || (va & 4095) == 0) && !user_to_phys (va, 0)) return -LE_EFAULT;
+      if (!(exec_env[len + l] = *(char *) va)) break;
+    }
+    len += l + 1;
+  }
+  exec_env_count = n;  exec_env_len = len;
+  return 0;
+}
+
+const char *linux_exec_env (int *count, int *len) {          // (called once by the kernel for the new program)
+  *count = exec_env_count;  *len = exec_env_len;
+  exec_env_count = -1;
+  return exec_env;
+}
+
+// execve: a handler of the old program cannot survive it (ignored signals stay ignored), and the flags that went with the handlers go
+static void exec_reset_signals (void) {
+  TCB *t = &thread_table[current_task];
+  for (int s = 0; s < 32; s++) if (t->sighandlers[s] != SIG_IGN) t->sighandlers[s] = SIG_DFL;
+  sa_onstack[current_as] = sa_restart[current_as] = sa_nodefer[current_as] = sa_nocldwait[current_as] = 0;
+  memset (sa_mask[current_as], 0, sizeof sa_mask[0]);
+  altstack[current_task].size = 0;
+}
+
 static long linux_wait4 (context_t *r, int pid, int *status, int options) {
   if (status && !user_ok ((u64) status, 4, 1)) return -LE_EFAULT;
   int me = thread_table[current_task].pid;
+  int named_seen = 0;                                        // a named child was there and running before
   for (;;) {
+    int ignoring = thread_table[current_task].sighandlers[SIGCHLD] == SIG_IGN || sa_nocldwait[current_as];     // SIGCHLD ignored: a child that ends leaves no zombie
     int zombie = 0, children = 0;
     for (int t = 2; t < MAX_THREADS; t++) {                  // (the children of this process: the main threads whose parent we are)
       if (!thread_table[t].used || thread_table[t].ppid != me || thread_table[t].pid != t) continue;
       if (pid > 0 && t != pid) continue;
+      if (thread_table[t].state == TSTATE_ZOMBIE && ignoring) { ulix_call (r, syscall_waitpid, t, 0, 0, 0, 0);  continue; }
       children++;
       if (thread_table[t].state == TSTATE_ZOMBIE && !zombie) zombie = t;
     }
-    if (!children) return -LE_ECHILD;
-    if (zombie || !(options & LW_NOHANG)) {
-      int c = zombie ? zombie : pid;                         // (a named child that still runs: the book waits for it)
-      if (c < 1) { if (futex_nap () == -LE_EINTR) return -LE_EINTR;  continue; }   // "any child": look again after a tick of sleep
-      long k = ulix_call (r, syscall_waitpid, c, 0, options & ~LW_NOHANG, 0, 0);
+    if (!children) {
+      if (!named_seen || ignoring) return -LE_ECHILD;
+      if (status) *status = 9;                               // (a child that the book's kill has removed: Ctrl-C and the like: SIGKILL)
+      return pid;
+    }
+    if (zombie) {
+      long k = ulix_call (r, syscall_waitpid, zombie, 0, options & ~LW_NOHANG, 0, 0);
       if (k < 0) return -LE_ECHILD;
-      if (status) *status = (thread_table[c].exitcode & 0xff) @<< 8;   // (the table entry is free but still holds the value)
+      if (status) *status = wait_status (thread_table[zombie].exitcode);   // (the table entry is free but still holds the value)
       return k;
     }
-    return 0;                                                // WNOHANG and nobody has ended yet
+    if (options & LW_NOHANG) return 0;                       // nobody has ended yet
+    if (pid > 0) named_seen = 1;
+    if (futex_nap () == -LE_EINTR) return -LE_EINTR;         // look again after a tick of sleep (a signal ends the sleep)
   }
 }
 
@@ -1846,7 +2092,7 @@ static long poll_wait (long (*count) (void *), void *arg, struct ts *timeout) {
     long n = count (arg);
     if (n != 0) return n;
     if (timeout && mono_ns () >= deadline) return 0;
-    if (thread_table[current_task].sig_pending) return -LE_EINTR;
+    if (signal_interrupts ()) return -LE_EINTR;
     if (!net_poll_once ())                                     // a frame came: look at once; otherwise sleep one tick (no CPU time, the wake-up may be 10 ms late)
       if (futex_nap () == -LE_EINTR) return -LE_EINTR;
   }
@@ -2150,9 +2396,11 @@ static void linux_syscall_inner (context_t *r) {
     case L_rt_sigreturn: syscall_sigreturn (r); return;
     case L_execve:
       if (!user_string_ok (a0) || !a1 || !user_argv_ok (a1)) { r->x0 = -LE_EFAULT; return; }
+      if ((ret = exec_env_copy ((char **) a2)) < 0) { r->x0 = ret; return; }     // (the environment of the call, before the old program is gone)
       r->ebx = a0; r->ecx = a1;
       syscall_execv (r);                                      // on success it has set the new program counter and stack
-      if (r->eip != saved.eip) return;                        // the new program starts
+      if (r->eip != saved.eip) { exec_reset_signals ();  return; }      // the new program starts
+      exec_env_count = -1;
       *r = saved;
       { struct stat st;                                       // (the book's execv only fails: a file that is there but no program is ENOEXEC)
         r->x0 = u_stat ((const char *) a0, &st) == 0 && (st.st_mode & S_IFMT) == S_IFREG ? -8 : -LE_ENOENT; }
@@ -2270,10 +2518,14 @@ static void linux_syscall_inner (context_t *r) {
     case L_kill:           ret = linux_kill (a0, a1); break;
     case L_tkill:          ret = linux_kill (a0, a1); break;
     case L_tgkill:         ret = linux_kill (a1, a2); break;
+    case L_rt_sigpending:  ret = linux_sigpending ((u64 *) a0, a1); break;
+    case L_rt_sigsuspend:  ret = linux_sigsuspend ((u64 *) a0, a1); break;
+    case L_setitimer:      ret = linux_setitimer (a0, (struct kitimerval *) a1, (struct kitimerval *) a2); break;
+    case L_getitimer:      ret = linux_getitimer (a0, (struct kitimerval *) a1); break;
 
     // processes
     case L_exit: case L_exit_group:
-      arch_linux_exit (r, (int) a0, nr == L_exit_group);      // the end of a thread, or of the process (does not return)
+      arch_linux_exit (r, (int) a0 & 0xff, nr == L_exit_group);      // the end of a thread, or of the process (does not return)
       return;
     case L_sched_yield: syscall_resign (r); ret = 0; break;
     case L_sched_getaffinity: ret = linux_sched_getaffinity (a0, a1, (u64 *) a2); break;
@@ -2308,6 +2560,10 @@ static void linux_syscall_inner (context_t *r) {
     printf ("[kernel] process %d: Linux system call %ld (%lx, %lx, %lx) failed: out of memory\n", thread_table[current_task].pid, nr, a0, a1, a2);
   r->x1 = saved.x1; r->x2 = saved.x2; r->x3 = saved.x3; r->x4 = saved.x4; r->x5 = saved.x5;
   r->x8 = saved.x8;
+  if (ret == -LE_EINTR && restartable (nr) && signal_wants_restart ()) {      // SA_RESTART: the handler runs, then the call starts again
+    r->x0 = a0;  r->elr -= 4;                                                 // (back to the svc instruction, with the first argument in x0)
+    return;
+  }
   r->x0 = ret;
 }
 

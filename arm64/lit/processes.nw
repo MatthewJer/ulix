@@ -603,6 +603,7 @@ static int map_sigpage (u64 l0) {
 }
 
 extern int random_get (void *buf, int n);             // random.c
+extern const char *linux_exec_env (int *count, int *len);        // linux_abi.c
 static u64 build_linux_stack (byte *page, u64 base, u64 sp, int argc, u64 *ptrs);
 static u64 build_user_stack (u64 l0, int argc, char **argv, int musl_abi) {
   u64 top_pa = 0;
@@ -658,9 +659,14 @@ on a machine without one the cycle counter is used, which is enough for a canary
 
 static u64 build_linux_stack (byte *page, u64 base, u64 sp, int argc, u64 *ptrs) {
   static const char env0[] = "PATH=/bin";
-  sp -= sizeof env0;
-  memcpy (page + (sp - base), env0, sizeof env0);
-  u64 env0_va = sp;
+  int envn, envlen;
+  const char *env = linux_exec_env (&envn, &envlen);       // the environment of execve; a program that the kernel starts gets PATH=/bin
+  if (envn < 0) { env = env0;  envn = 1;  envlen = sizeof env0; }
+  if (envlen > 1200 || envn > 24) return 0;
+  sp -= envlen;
+  memcpy (page + (sp - base), env, envlen);
+  u64 envp[24], env_va = sp;
+  for (int i = 0, off = 0; i < envn; i++) { envp[i] = env_va + off;  off += strlen (env + off) + 1; }
   sp -= 16;                                              // sixteen random bytes
   u64 rnd_va = sp, t;
   if (random_get (page + (sp - base), 16) < 0) {         // no generator on this machine: the cycle counter is enough for a canary
@@ -668,14 +674,14 @@ static u64 build_linux_stack (byte *page, u64 base, u64 sp, int argc, u64 *ptrs)
     for (int i = 0; i < 16; i++) { t = t * 6364136223846793005UL + 1442695040888963407UL; page[sp - base + i] = t >> 56; }
   }
   u64 auxv[] = { AT_PHDR, elf_phdr_va, AT_PHENT, 56, AT_PHNUM, elf_phnum, AT_PAGESZ, PAGE, AT_RANDOM, rnd_va, 0, 0 };
-  int words = 1 + (argc + 1) + 2 + sizeof auxv / 8;      // argc, argv and its null, environ and its null, auxv
+  int words = 1 + (argc + 1) + (envn + 1) + sizeof auxv / 8;      // argc, argv and its null, environ and its null, auxv
   sp = (sp - words * 8) & ~15UL;
   if (sp < base + 64) return 0;
   u64 *w = (u64 *)(page + (sp - base));
   *w++ = argc;
   for (int i = 0; i < argc; i++) *w++ = ptrs[i];
   *w++ = 0;
-  *w++ = env0_va;
+  for (int i = 0; i < envn; i++) *w++ = envp[i];
   *w++ = 0;
   for (unsigned i = 0; i < sizeof auxv / 8; i++) *w++ = auxv[i];
   return sp;
@@ -1120,6 +1126,7 @@ returns to user mode, so after that it is killed like a process), then it ends t
 <<arch_thread.c: linux threads>>=
 extern u64 user_to_phys (u64 va, int write);
 
+extern void linux_process_ended (int pid);                          // linux_abi.c: stop the interval timer, SIGCHLD for the parent
 extern void futex_exit_robust (int tid), futex_wake_process (int as);        // linux_abi.c
 
 static void thread_clear_tid (void) {
@@ -1141,12 +1148,13 @@ static void main_thread_ends_process (context_t *r, int code) {
       if (t != current_task && thread_table[t].used && thread_table[t].addr_space == current_as) u_kill (t, SIGKILL);
   as_dying[current_as] = 0;
   r->ebx = code;
+  linux_process_ended (current_task);                                // the interval timer stops, the parent gets SIGCHLD
   syscall_exit (r);                                                  // does not return
 }
 
 void arch_linux_exit (context_t *r, int code, int group) {
   TCB *t = &thread_table[current_task];
-  if (address_spaces[current_as].refcount <= 1) { r->ebx = code; syscall_exit (r); return; }
+  if (address_spaces[current_as].refcount <= 1) { r->ebx = code; if (t->pid == current_task) linux_process_ended (current_task);  syscall_exit (r); return; }
   if (group || t->pid == current_task) { as_dying[current_as] = 1; as_exit_code[current_as] = code;  futex_wake_process (current_as); }   // (sleepers in futex or nanosleep leave)
   if (t->pid == current_task) { main_thread_ends_process (r, code); return; }
   thread_clear_tid ();
@@ -1241,7 +1249,8 @@ a user process did something illegal: end it like exit(-1) does
 <<arch_thread.c: book_user_fault>>=
 void book_user_fault (void *frame) {
   context_t *r = frame;
-  r->ebx = (unsigned long)-1;
+  r->ebx = (unsigned long)-1;                                       // (wait4 reports this exit code as SIGSEGV)
+  if (thread_table[current_task].pid == current_task) linux_process_ended (current_task);
   syscall_exit (r);
 }
 
@@ -1359,7 +1368,7 @@ extern u64 user_to_phys (u64 va, int write);
 
 // What is saved on the user stack for a signal: the interrupted registers, the floating point and SIMD registers (a
 // handler written for musl uses them, e.g. in memcpy and printf) and, for a program of musl, a small siginfo.
-struct sigframe { context_t ctx; u64 fpcr, fpsr, v[64]; u64 siginfo[16]; };
+struct sigframe { context_t ctx; u64 fpcr, fpsr, v[64]; u64 siginfo[16]; u64 oldmask; };    // (oldmask: the blocked signals that sigreturn brings back)
 
 static void fp_save (struct sigframe *sf) {
   __asm__ volatile ("mrs %0, fpcr" : "=r" (sf->fpcr));
@@ -1387,6 +1396,10 @@ static void fp_load (struct sigframe *sf) {
 extern int linux_signal_number (int signo);
 extern u64 linux_signal_restorer (void);
 extern u64 linux_signal_altstack (int signo, u64 sp);
+extern unsigned long linux_signal_block_mask (int signo), linux_signal_old_mask (void);
+extern int signal_ends_process (TCB *t, int signo);               // pipes.c
+extern void arch_linux_exit (context_t *r, int code, int group);
+#define EXIT_SIGNALED 0x10000                                        // exitcode of a process that a signal ended: this value plus the Linux signal number (see wait4)
 
 void arch_check_dying (context_t *f);
 // The kernel shell's [[ps]] prints the program counter, stack pointer and frame pointer of each thread from its [[regs]], which the x86 kernel fills at every
@@ -1405,9 +1418,15 @@ void arch_signal_check (context_t *f) {
   for (int signo = 0; signo < 32; signo++) {
     if (!(t->sig_pending & (1UL @<< signo))) continue;
     if (t->sig_blocked & (1U @<< signo)) continue;                  // blocked (sigprocmask): stays pending until unblocked
-    t->sig_pending &= ~(1UL @<< signo);
+    __atomic_fetch_and (&t->sig_pending, ~(1UL @<< signo), __ATOMIC_SEQ_CST);     // (another CPU may set a bit at the same time)
     sighandler_t h = t->sighandlers[signo];
-    if (h == SIG_DFL || h == SIG_IGN) return;                       // cannot happen (u_kill filters them)
+    if (h == SIG_IGN) continue;
+    if (h == SIG_DFL) {
+      // a program of musl: linux_signal_send leaves the signals that end the process (and SIGKILL) pending; the process ends here, and
+      // waitpid of the parent reports the signal. The other default actions (ignore) were filtered by the sender.
+      if (linux_abi_as[current_as] && signal_ends_process (t, signo)) arch_linux_exit (f, EXIT_SIGNALED | linux_signal_number (signo), 1);
+      continue;
+    }
     u64 sp = ((linux_abi_as[current_as] ? linux_signal_altstack (signo, f->sp_el0) : f->sp_el0) - sizeof (struct sigframe)) & ~15UL;   // (sigaltstack)
     u64 ret = linux_abi_as[current_as] ? linux_signal_restorer () : SIGPAGE_VA;
     if (!ret || !user_to_phys (sp, 1) || !user_to_phys (sp + sizeof (struct sigframe) - 1, 1)) {
@@ -1417,6 +1436,8 @@ void arch_signal_check (context_t *f) {
     }
     struct sigframe *sf = (struct sigframe *)sp;
     sf->ctx = *f;                                                   // save the interrupted state
+    sf->oldmask = linux_abi_as[current_as] ? linux_signal_old_mask () : t->sig_blocked;
+    if (linux_abi_as[current_as]) t->sig_blocked |= linux_signal_block_mask (signo);     // the handler runs with its sa_mask and the signal itself blocked
     fp_save (sf);
     int no = linux_signal_number (signo);                           // (the number the program knows)
     for (int i = 0; i < 16; i++) sf->siginfo[i] = 0;
@@ -1445,6 +1466,7 @@ void syscall_sigreturn (context_t *r) {
   context_t saved = sf->ctx;
   fp_load (sf);
   saved.spsr = r->spsr;                                             // the saved state must stay EL0t
+  if (linux_abi_as[current_as]) thread_table[current_task].sig_blocked = sf->oldmask & ~((1UL << 9) | (1UL << 17));   // (SIGKILL and SIGSTOP cannot be blocked)
   if (saved.elr >= 0x80000000UL) saved.elr = 0, saved.ebx = (unsigned long)-1;
   *r = saved;
 }

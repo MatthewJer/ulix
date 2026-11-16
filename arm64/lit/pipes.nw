@@ -182,12 +182,14 @@ returns it at once; it does \emph{not} wait for the buffer to fill, which is wha
 from the write end is an error.
 
 <<pipes.c: read>>=
+extern int signal_interrupts (void);          // linux_abi.c: a signal can be delivered to the calling thread now
 static int pipe_read (int gfd, void *buf, int n) {
   struct pipe *p = &pipes[(gfd & 0xff) / 2];
   if (gfd & 1) return -1;                                   // that is the write end
   while (p->count == 0) {
     if (p->writers == 0) return 0;                          // nobody can write any more: end of file
     if (!can_sleep ()) return -1;
+    if (signal_interrupts ()) { set_errno (4);  return -1; }  // a signal ends the wait: EINTR (the sleeper left the queue, see pipes_before_kill)
     block (&pipe_queue, TSTATE_WAITPIPE);
     arch_resign ();                                         // here the process sleeps
   }
@@ -218,6 +220,7 @@ static int pipe_write (int gfd, void *buf, int n) {
     }
     if (p->count == PIPE_SIZE) {
       if (!can_sleep ()) return done > 0 ? done : -1;
+      if (signal_interrupts ()) { if (done > 0) return done;  set_errno (4);  return -1; }      // EINTR (or what was written so far)
       block (&pipe_queue, TSTATE_WAITPIPE);
       arch_resign ();
       continue;                                             // look again
