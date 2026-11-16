@@ -48,6 +48,22 @@ ROOT_MKFS_FLAGS ?=      # make disk.img ROOT_MKFS_FLAGS=--v2 ROOT_INODES=464 bui
 # make TLS=0 builds a system without TLS: no BearSSL, no CA list on the disk, https only says so, and no SSH server (see lit/tls.nw, lit/ssh.nw)
 TLS ?= 1
 
+# Foreign code lives in git submodules (third_party/, issue #18). A clone without --recursive leaves their directories empty, and the build would
+# stop much later with a message about a missing header. This check runs first and names what to fetch. Each entry is directory:file-that-must-exist.
+SUBMODULES_NEEDED = musl:COPYRIGHT $(if $(filter 1,$(TLS)),bearssl:LICENSE.txt) \
+  $(if $(filter 1,$(PYTHON)),cpython:configure zlib:zlib.h libffi:configure.ac sqlite:configure ncurses:configure openssl:Configure bzip2:bzlib.h xz:configure.ac readline:readline.h) \
+  $(if $(filter 1,$(ARCHIVE)),libarchive:CMakeLists.txt $(if $(filter 1,$(PYTHON)),,zlib:zlib.h bzip2:bzlib.h xz:configure.ac))
+check-submodules:
+	@missing=""; for e in $(sort $(SUBMODULES_NEEDED)); do d=$${e%%:*}; f=$${e#*:}; \
+	  test -e ../third_party/$$d/$$f || missing="$$missing third_party/$$d"; done; \
+	if test -n "$$missing"; then \
+	  echo "error: these submodules are not checked out:$$missing"; \
+	  echo "  fetch them with:  git submodule update --init --depth 1$$missing   (from the top of the repository)"; \
+	  echo "  or leave a feature out: make TLS=0 (no BearSSL), make ARCHIVE=0 (no tar/unzip), make PYTHON=0 (no Python)"; \
+	  exit 1; fi
+all: check-submodules
+.PHONY: check-submodules
+
 OBJS = start.o vectors.o linux_abi.o pipes.o fastfs.o sockets.o pty.o irq.o mmu.o virtio.o sdcard.o virtionet.o genet.o netdev.o net.o ip6.o tcp.o dhcp.o dns.o netconf.o echo.o net_test.o net_syscalls.o random.o sntp.o netd.o rcconf.o stats.o dbg_http.o minixfs.o elf.o ulix-port.o glue.o arch_thread.o arch_console.o arch_clock.o arch_swap.o arch_vt.o dt.o gic.o smp.o \
        bookfs_test.o thread_test.o proc_test.o kmain.o
 
