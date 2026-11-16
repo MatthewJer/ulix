@@ -437,3 +437,8 @@ clean:
 	rm -rf check-logs
 	rm -rf sd-boot; rm -f sd.img sd-pi.img kernel8*.img ulix-rpi4*.elf start-rpi4.o rpi4-qemu.dtb
 	rm -f disk2.img disk3.img verify-fs.log check-el1.log check-el2.log *.o ulix.elf ulix-console.elf ulix-shell.elf disk.img disk-after.img verify.log bad-arch.elf bad-wx.elf
+
+# stress test (chapter "Stress Tests"): /musl/stress from many processes at once, watched from the host; about 2 minutes by default.
+# Long runs: make stress-test STRESS_SECONDS=900 STRESS_CONFIGS="1:0:128 2:1:64 4:1:128 4:0:64" STRESS_ROUNDS=4 (SMP:FAST:MByte, FAST=1 uses hvf)
+stress-test: ulix-shell.bin $(DISK) $(DISK2) $(DISK3)
+	python3 tools/stress_test.py ulix-shell.bin $(DISK) $(DISK2) $(DISK3)

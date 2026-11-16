@@ -223,11 +223,6 @@ static volatile int got_usr1;
 static void on_usr1 (int sig) { got_usr1++; }
 
 static void signal_target (int rfd) {
-  struct sigaction sa;
-  memset (&sa, 0, sizeof sa);
-  sa.sa_handler = on_usr1;
-  sa.sa_flags = rnd (2) ? SA_RESTART : 0;
-  sigaction (SIGUSR1, &sa, 0);
   int word = 0;
   for (;;) {
     char c;
@@ -244,6 +239,11 @@ static void signal_target (int rfd) {
 static void mode_signal (void) {
   while (running ()) {
     int fd[2];
+    struct sigaction sa;                                      // (installed before the fork: a SIGUSR1 that arrives early must not kill the target)
+    memset (&sa, 0, sizeof sa);
+    sa.sa_handler = on_usr1;
+    sa.sa_flags = rnd (2) ? SA_RESTART : 0;
+    sigaction (SIGUSR1, &sa, 0);
     if (pipe (fd) < 0) { FAIL ("pipe");  continue; }
     pid_t p = fork ();
     if (p < 0) { FAIL ("fork");  close (fd[0]);  close (fd[1]);  continue; }
@@ -261,7 +261,7 @@ static void mode_signal (void) {
 static void mode_mmap (void) {
   long size = (long) mb << 20, page = 4096, pages = size / page;
   unsigned char *m = mmap (0, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  if (m == MAP_FAILED) { FAIL ("mmap");  return; }
+  if (m == MAP_FAILED) { printf ("stress: %s: mmap of %d MByte says no (errno %d): the memory is in use by the others\n", mode, mb, errno);  return; }
   unsigned base = getpid ();
   for (long i = 0; i < pages; i++) { m[i * page] = pat (base, i);  m[i * page + page - 1] = pat (base, i + 1); }
   while (running ()) {
@@ -271,8 +271,9 @@ static void mode_mmap (void) {
     } else if (op == 1) {                                     // give back a piece and map it again: it is zero
       long i = rnd (pages - 8), n = 1 + rnd (8);
       CHECK (munmap (m + i * page, n * page) == 0, "munmap");
-      void *r = mmap (m + i * page, n * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-      CHECK (r == m + i * page, "mmap at a fixed address");
+      void *r = MAP_FAILED;
+      for (int tries = 0; tries < 100 && r == MAP_FAILED; tries++) { r = mmap (m + i * page, n * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);  if (r == MAP_FAILED) nap (20); }
+      if (r != m + i * page) { FAIL ("mmap at a fixed address");  return; }
       for (long j = i; j < i + n; j++) { CHECK (m[j * page] == 0, "a new page is zero");  m[j * page] = pat (base, j);  m[j * page + page - 1] = pat (base, j + 1); }
     } else if (op == 2) {                                     // copy on write
       pid_t p = fork ();
@@ -434,7 +435,9 @@ static void mode_timer (void) {
 }
 
 static void run_mode (const char *m, const char *arg, char **argv) {
-  mode = m;
+  static char label[64];                                       // what the progress lines say: fs:/tmp, fs:/mnt, mmap:2, ...
+  if (arg) snprintf (label, sizeof label, "%s:%s", m, arg); else snprintf (label, sizeof label, "%s", m);
+  mode = label;
   rng_state ^= (unsigned long long) (seed_arg + 1) * 2654435761ULL + (unsigned long long) getpid () * 40503ULL;
   for (int i = 0; i < 8; i++) rnd (2);
   if (!strcmp (m, "fork")) mode_fork ();
@@ -446,7 +449,7 @@ static void run_mode (const char *m, const char *arg, char **argv) {
   else if (!strcmp (m, "sock")) mode_sock (argv[5], argv[5] ? atoi (argv[6]) : 0, argv[5] ? atoi (argv[7]) : 0);
   else if (!strcmp (m, "timer")) mode_timer ();
   else { printf ("stress: unknown mode %s\n", m);  fails++; }
-  printf ("stress: %s done, %lld rounds, %d failed\n", m, iterations, fails);
+  printf ("stress: %s done, %lld rounds, %d failed\n", mode, iterations, fails);
   fflush (stdout);
 }
 
@@ -465,7 +468,7 @@ int main (int argc, char **argv) {
     return fails ? 1 : 0;
   }
   static const char *modes[][2] = { { "fork", 0 }, { "pipe", 0 }, { "futex", 0 }, { "signal", 0 }, { "mmap", 0 }, { "timer", 0 }, { "sock", 0 },
-                                    { "fs", "/tmp" }, { "fs", "/mnt" }, { "fs", "/" }, { "mmap", 0 } };
+                                    { "fs", "/tmp" }, { "fs", "/mnt" }, { "fs", "/" }, { "mmap", "2" } };
   pid_t pids[16];
   int n = 0, failed = 0;
   setvbuf (stdout, 0, _IOLBF, 0);
