@@ -858,7 +858,7 @@ Sections 23 and 24 say what to do when the board arrives; section 44 is the last
 | step | on the console | check |
 |---|---|---|
 | boot | `Device tree: ... MByte RAM at 0x0, 4 CPU(s), GICv2` | RAM size equals the model; the firmware passed the device tree |
-| SD card | the disk messages, then the kernel tests are not run (the shell image has none) | the root disk mounts |
+| SD card | the disk messages of the boot | the root disk mounts and `login` appears |
 | cores | `SMP: CPU 1 online` to `CPU 3` (not `did not start`) | section 44 |
 | network | `genet: link up`, then the DHCP answer (address from the router) | `ifconfig` in the shell, `ping` of the router |
 | login | prompt on the serial console; log in, then `top`: four CPU bars, memory line | `fork2` plus Ctrl-C ends the job |
@@ -886,7 +886,7 @@ Write the model, the firmware date, the commit, the SHA-256 of the image and the
 | `https` | 110 KByte code, 192 KByte data (128 KByte of it the CA list), 20 KByte of buffers | `third_party/README.md`, BearSSL |
 | SSH, telnet servers | a program each; the same order as the shell | sections 24, 30 |
 
-So an idle system with login, shell, telnet and ssh fits in about 10 MByte; Python and a web server in about 25 MByte. 1 GByte is a very generous budget for the work of this system. The limit that matters is therefore not RAM size but the **tables with a fixed size** (see below).
+Adding these up (an estimate, not a measurement) gives about 10 MByte for an idle system with login, shell, telnet and ssh and about 25 MByte with the Python web server. 1 GByte is a very generous budget for the work of this system. The limit that matters is therefore not RAM size but the **tables with a fixed size** (see below).
 
 **Rules for new code** (so that the budget stays true):
 
