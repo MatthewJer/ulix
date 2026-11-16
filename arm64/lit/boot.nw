@@ -669,7 +669,7 @@ static void mmu_selftest (void) {
 }
 
 static u32 file_sum (const char *path, u32 *size_out) {
-  static u8 buf[65536] __attribute__ ((aligned (16)));
+  static u8 buf[262144] __attribute__ ((aligned (16)));     // (/bin/vi is linked with musl: 140 KByte)
   u32 ino = minix_lookup (path), sum = 0;
   if (!ino) { *size_out = 0; return 0; }
   long n = minix_read (ino, 0, buf, sizeof buf);

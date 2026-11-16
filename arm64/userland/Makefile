@@ -185,11 +185,12 @@ clean:
 # ---- programs linked with musl instead of ulixlib (issue #35, section 51 of ../ARM64-PORT.md) ----
 # The program text is the book's. Its #include "../ulixlib.h" finds musl/ulixlib.h (copied to build/musl), which includes musl's headers and adds what
 # the book has more (see "The programs of the book on musl" in lit/userland.nw). Every name in MUSLTOOLS is linked with musl; the others keep ulixlib.
-MUSLTOOLS = echo cat wc grep diff mkdir rmdir rm touch stat cp ls hexdump bindump ascii print args exit42 trunc chmod chown chgrp df sync kill fault-div0 fault-mem testcp stdio inode keys clear free ps pw swapper top ping ping6 host ifconfig route dhclient shutdown poweroff reboot sntp rand daemon service heartbeat echod fork1 fork2 fork3 fbomb filecomm ptree vi paging tp su
+MUSLTOOLS = echo cat wc grep diff mkdir rmdir rm touch stat cp ls hexdump bindump ascii print args exit42 trunc chmod chown chgrp df sync kill fault-div0 fault-mem testcp stdio inode keys clear free ps pw swapper top ping ping6 host ifconfig route dhclient shutdown poweroff reboot sntp rand daemon service heartbeat echod fork1 fork2 fork3 fbomb filecomm ptree vi paging tp su sh init2 telnetd login xlogin init
 SYSROOT   = $(abspath ../libc/build/sysroot)
 MCFLAGS   = -O0 -fno-pic -mno-outline-atomics -fsanitize=integer-divide-by-zero -fsanitize-undefined-trap-on-error -std=gnu99 -w \
             -nostdinc -isystem $(SYSROOT)/include -isystem $(shell $(CC) -print-file-name=include)
 MUSLPROGS = $(addprefix $(BUILD)/bin/,$(addsuffix .elf,$(MUSLTOOLS)))
+# (the book's programs define O_CREAT = 0x200, O_APPEND, S_IF... themselves; musl's open would read 0x200 as Linux's O_TRUNC: those lines are dropped)
 # programs that define a library function themselves (a teaching version of strchr, memcmp, ...): their copy gets another name
 RENAME_wc   = strchr
 RENAME_grep = strchr memmove
@@ -208,7 +209,7 @@ $(BUILD)/musl/arm64-extra.h: arm64-extra.h
 
 $(BUILD)/musl/tools/%.c: $(BUILD)/tools/%.c $(BUILD)/musl/arm64-extra.h
 	mkdir -p $(BUILD)/musl/tools
-	perl -pe '$(foreach f,$(RENAME_$*),s/\b$(f)\b/$*_$(f)/g;)' $< > $@
+	perl -pe '$$_ = "" if /^#define (O_\w+|S_\w+|SEEK_\w+)\s/; $(foreach f,$(RENAME_$*),s/\b$(f)\b/$*_$(f)/g;)' $< > $@
 
 $(BUILD)/musl/tools/%.o: $(BUILD)/musl/tools/%.c $(BUILD)/musl/ulixlib.h $(SYSROOT)/lib/libc.a
 	$(CC) $(MCFLAGS) -c -o $@ $<
@@ -222,3 +223,8 @@ $(MUSLPROGS): $(BUILD)/bin/%.elf: $(BUILD)/musl/tools/%.o $(BUILD)/musl/ulixcomp
 	$(CC) -static -nostdlib -nostartfiles -mno-outline-atomics -z max-page-size=4096 -z noexecstack -T ../libc/musl.ld -o $@ \
 	  $(SYSROOT)/lib/crt1.o $(SYSROOT)/lib/crti.o $(BUILD)/musl/tools/$*.o $(BUILD)/musl/ulixcompat.o $(SYSROOT)/lib/libc.a -lgcc $(SYSROOT)/lib/crtn.o
 	python3 ../tools/mark_musl.py $@
+
+# init: the book defines umain(); the same program text, linked with musl (crt1 calls main)
+$(BUILD)/musl/tools/init.c: $(BUILD)/init.c
+	mkdir -p $(BUILD)/musl/tools
+	( echo '#define umain main'; sed 's|#include "ulixlib.h"|#include "../ulixlib.h"|' $< ) > $@
