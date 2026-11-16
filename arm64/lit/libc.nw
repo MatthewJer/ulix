@@ -2715,3 +2715,59 @@ int main (void) {
   return fails;
 }
 @
+\section{C++ without a C++ library: \texttt{cxxtest}}
+\label{src:libc/cxxtest.cc}
+
+Issue \#43 asks for the C++ standard library (LLVM's libc++, libc++abi and libunwind). Their sources are not part of this repository yet, and
+\texttt{aarch64-elf-g++} comes without a C++ library at all (no headers, no \texttt{libstdc++}, no \texttt{libsupc++}; see the section on C++ at the end of
+\texttt{ARM64-PORT.md}). What can be done now is the part that does not depend on the library: what the \emph{system} (kernel, linker script, start
+files) must provide for any C++ program. This program uses no C++ header, only musl's C headers, and checks:
+
+\begin{itemize}
+\item \textbf{static constructors and destructors}: the compiler puts a call of the constructor of every global object into
+  \texttt{.init\_array}; musl's start code runs them before \texttt{main}, and the destructors are registered with \texttt{\_\_cxa\_atexit}
+  (musl has it) and run by \texttt{exit};
+\item \textbf{\texttt{new} and \texttt{delete}} on top of \texttt{malloc}, virtual functions, templates.
+\end{itemize}
+
+\paragraph{Open: the call-frame tables.} C++ exceptions need the unwinder, which reads \texttt{.eh\_frame}. The old script \texttt{musl.ld}
+\emph{discarded} that section; it is kept now, with \texttt{.eh\_frame\_hdr} and a \texttt{PT\_GNU\_EH\_FRAME} header, and the program is linked with the
+compiler's \texttt{crtbegin.o}/\texttt{crtend.o} (they register the tables with \texttt{libgcc}, and define \texttt{\_\_dso\_handle}). Still,
+\texttt{\_Unwind\_Find\_FDE} finds nothing at run time (\texttt{\_Unwind\_Backtrace} returns after one frame), so there is no test for it yet: it is the first thing to find
+out when the C++ library arrives (see \texttt{ARM64-PORT.md}).
+
+<<libc/cxxtest.cc>>=
+#include <stdio.h>
+#include <stdlib.h>
+
+extern "C" void __cxa_pure_virtual () { abort (); }     // what the compiler calls for a pure virtual function (libc++abi has it later)
+
+void *operator new (size_t n) { return malloc (n); }
+void operator delete (void *p) noexcept { free (p); }
+void operator delete (void *p, size_t) noexcept { free (p); }
+
+static int fails = 0;
+#define CHECK(c, msg) do { if (c) printf ("  user ok:   %s\n", msg); \
+                           else { printf ("  user FAIL: %s\n", msg); fails++; } } while (0)
+
+static int order = 0;
+struct Global {
+  int at;
+  Global () { at = ++order; }
+  ~Global () { printf ("  user ok:   the destructor of a global object ran at exit\n"); }
+};
+Global first, second;                                   // constructed before main, in this order
+
+struct Shape { virtual int sides () const = 0; virtual ~Shape () {} };
+struct Triangle : Shape { int sides () const { return 3; } };
+template <class T> T twice (T x) { return x + x; }
+
+int main () {
+  CHECK (first.at == 1 && second.at == 2 && order == 2, "the constructors of the global objects ran before main, in order");
+  Shape *s = new Triangle;
+  CHECK (s->sides () == 3, "new, a virtual call, delete");
+  delete s;
+  CHECK (twice (21) == 42 && twice (1.5) == 3.0, "function templates");
+  return fails;                                         // two more "user ok" lines follow at exit: the destructors
+}
+@

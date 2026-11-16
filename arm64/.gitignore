@@ -141,4 +141,5 @@ sockets.c
 libc/sockettest.c
 libc/localetest.c
 libc/sockext.c
+libc/cxxtest.cc
 dbg_http.c

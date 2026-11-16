@@ -13,7 +13,7 @@ SYSROOT = $(abspath $(B)/sysroot)
 # the flags of the kernel's user space: no PIC, no outlined atomics (they need a run-time check of the CPU features)
 CFLAGS = -O1 -g0 -fno-pic -mno-outline-atomics -std=gnu11 -Wall
 
-PROGS = hello cat ls filetest readtest threadtest sockettest localetest sockext
+PROGS = hello cat ls filetest readtest threadtest sockettest localetest sockext cxxtest
 ARCHIVE ?= 1
 ifeq ($(ARCHIVE),1)
 PROGS += bsdtar bsdunzip
@@ -42,6 +42,19 @@ $(SYSROOT)/lib/libc.a:
 $(B)/%.o: %.c $(SYSROOT)/lib/libc.a
 	mkdir -p $(B)
 	$(CC) $(CFLAGS) -nostdinc -isystem $(SYSROOT)/include -isystem $(shell $(CC) -print-file-name=include) -c -o $@ $<
+
+# C++ (issue #43, section "C++ without a C++ library" of lit/libc.nw): no exceptions and no RTTI, because there is no C++ ABI library yet. The
+# program is linked with the compiler's crtbegin.o/crtend.o, which register the call-frame tables (.eh_frame) with the unwinder of libgcc.
+CRTBEGIN = $(shell $(CC) -print-file-name=crtbegin.o)
+CRTEND   = $(shell $(CC) -print-file-name=crtend.o)
+CXXFLAGS = -O1 -g0 -fno-pic -mno-outline-atomics -fno-exceptions -fno-rtti -fno-threadsafe-statics -Wall
+$(B)/%.o: %.cc $(SYSROOT)/lib/libc.a
+	mkdir -p $(B)
+	$(CROSS)g++ $(CXXFLAGS) -nostdinc -isystem $(SYSROOT)/include -isystem $(shell $(CC) -print-file-name=include) -c -o $@ $<
+$(B)/cxxtest.elf: $(B)/cxxtest.o musl.ld ../tools/mark_musl.py
+	$(CROSS)g++ -static -nostdlib -nostartfiles -mno-outline-atomics -z max-page-size=4096 -z noexecstack -Wl,--eh-frame-hdr -T musl.ld -o $@ \
+	  $(SYSROOT)/lib/crt1.o $(SYSROOT)/lib/crti.o $(CRTBEGIN) $< $(SYSROOT)/lib/libc.a -lgcc $(CRTEND) $(SYSROOT)/lib/crtn.o
+	python3 ../tools/mark_musl.py $@
 
 $(B)/%.elf: $(B)/%.o musl.ld ../tools/mark_musl.py
 	$(CC) -static -nostdlib -nostartfiles -mno-outline-atomics -z max-page-size=4096 -z noexecstack -T musl.ld -o $@ \

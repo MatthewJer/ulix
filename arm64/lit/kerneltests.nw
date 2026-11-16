@@ -879,6 +879,13 @@ int proc_test (void) {
   arch_threads_reap ();
   CHECK (pid > 0 && thread_table[pid].exitcode == 0, "/musl/localetest finished with exit status 0 (no failed checks)");
   CHECK (count_in (out, "user FAIL") == 0 && count_in (out, "user ok:") == 15, "all 15 locale, wide character and regular expression checks passed");
+  char *cxx_argv[] = { "cxxtest", 0 };                      // C++ without a C++ library: static constructors, new/delete, virtual functions, templates
+  capture_start ();
+  pid = run ("/musl/cxxtest", 1, cxx_argv);
+  capture_stop (&out);
+  arch_threads_reap ();
+  CHECK (pid > 0 && thread_table[pid].exitcode == 0, "/musl/cxxtest finished with exit status 0 (no failed checks)");
+  CHECK (count_in (out, "user FAIL") == 0 && count_in (out, "user ok:") == 5, "all 5 C++ checks passed: constructors before main, destructors at exit, new/delete/virtual/templates");
   char *mcat_argv[] = { "cat", "/etc/rc.conf", 0 };
   capture_start ();
   pid = run ("/musl/cat", 2, mcat_argv);
