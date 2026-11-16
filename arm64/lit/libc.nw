@@ -1747,9 +1747,8 @@ static long poll_wait (long (*count) (void *), void *arg, struct ts *timeout) {
     if (n != 0) return n;
     if (timeout && mono_ns () >= deadline) return 0;
     if (thread_table[current_task].sig_pending) return -LE_EINTR;
-    net_poll_once ();
-    arch_resign ();
-    arch_poll_pause ();
+    if (!net_poll_once ())                                     // a frame came: look at once; otherwise sleep one tick (no CPU time, the wake-up may be 10 ms late)
+      if (futex_nap () == -LE_EINTR) return -LE_EINTR;
   }
 }
 
