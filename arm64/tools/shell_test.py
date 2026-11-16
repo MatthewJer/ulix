@@ -14,7 +14,7 @@ if os.environ.get('QEMU_BOARD') == 'rpi4':               # the Raspberry Pi 4B i
     cmd = ['qemu-system-aarch64', '-M', 'raspi4b', '-dtb', 'rpi4-qemu.dtb', '-display', 'none', '-monitor', 'none', '-kernel', kernel, '-snapshot',
            '-drive', 'file=%s,if=sd,format=raw' % disk, '-serial', 'tcp:127.0.0.1:%d,server=on,wait=on' % PORT]
 else:
-    cmd = ['qemu-system-aarch64', '-M', os.environ.get('QEMU_M', 'virt'), '-cpu', 'cortex-a72', '-m', os.environ.get('QEMU_MEM', '128'), '-display', 'none',
+    cmd = ['qemu-system-aarch64', '-M', os.environ.get('QEMU_M', 'virt'), *(['-accel', 'hvf', '-cpu', 'host'] if os.environ.get('QEMU_FAST') == '1' else ['-cpu', 'cortex-a72']), '-m', os.environ.get('QEMU_MEM', '128'), '-display', 'none',
            '-monitor', 'none', '-kernel', kernel, '-snapshot',
            '-drive', 'file=%s,format=raw,if=none,id=hd0' % disk, '-device', 'virtio-blk-device,drive=hd0',
            '-serial', 'tcp:127.0.0.1:%d,server=on,wait=on' % PORT]
