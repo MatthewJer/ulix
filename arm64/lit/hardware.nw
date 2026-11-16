@@ -717,7 +717,13 @@ static void exc_handler_locked (struct frame *f, int kind) {
 Every exception is handled with the big kernel lock (see [[smp.c]])
 
 <<irq.c: exc_handler>>=
+volatile int irq_in_locked_code = 0;                  // checked by the kernel tests (must stay 0)
+
 void exc_handler (struct frame *f, int kind) {
+  // Kernel code runs with interrupts masked while it holds the lock; an interrupt that arrives in it was let in by mistake (the thread that boots
+  // the system used to do that) and the scheduler would run inside an update of shared data. Counted, and reported once.
+  if (kind == 1 && (f->spsr & 0xf) != 0 && bkl_depth () > 0 && book_scheduler_on && !irq_in_locked_code++)
+    printf ("[kernel] CPU %d: interrupt in kernel code that holds the lock, ELR 0x%lx\n", smp_cpu (), f->elr);
   bkl_lock ();
   exc_handler_locked (f, kind);
   if ((f->spsr & 0xf) == 0 && book_scheduler_on) smp_before_return (f);     // returning to user mode
