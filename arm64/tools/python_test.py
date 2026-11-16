@@ -90,7 +90,9 @@ try:
     if 'musl python ulix 14' not in out: print(out[-1500:])
     # the standard library on the disk (issue #133): modtest.py imports about 150 modules, runs small programs with them (json, re, hashlib,
     # socket, threading, subprocess, unittest, xml, decimal, ...) and checks that the modules that cannot work do fail to import
+    t0 = time.time()
     out = s.run('/musl/python -B /musl/modtest.py', r'modtest: \d+ ok, \d+ failed|Fatal Python|Killed', 'modtest.py: the module test ends', timeout=300)
+    print('  info: modtest.py took %.0f seconds (wall clock of the host)' % (time.time() - t0))
     m = re.search(r'modtest: (\d+) ok, (\d+) failed', out)
     check(m is not None and int(m.group(2)) == 0, 'modtest.py: no check failed')
     check(m is not None and int(m.group(1)) >= 180, 'modtest.py: at least 180 checks passed (%s)' % (m.group(1) if m else 'none'))

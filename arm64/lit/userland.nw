@@ -986,6 +986,12 @@ int main (int argc, char **argv) {
 \label{src:userland:arm64-extra.h}
 
 (Only the programs that need it include this file; see the rule for [[free.c]] in the Makefile.)
+The same file gives [[swapper.c]] the size of the RAM. The book's swapper starts to page out when fewer than [[init_frames - 500]] frames are
+free, that is, as soon as more than 500 frames (2 MByte) are in use, a number that fits the 64 MByte of the PC but not a machine with
+128 MByte to 4 GByte: every program that is larger than that made the swapper page out one frame in every tenth of a second, also
+when almost all of the RAM was free, and the pages that it took out had to be read back (Python's start uses about 8 MByte).
+\texttt{ARM64-PORT.md} (section on the descriptor table and the swapper threshold) has the measurement. Here the rule in the Makefile makes the
+threshold a sixteenth of the RAM: the swapper keeps about 6 \% of the frames free and does nothing before that.
 
 @
 

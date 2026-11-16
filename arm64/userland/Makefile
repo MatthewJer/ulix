@@ -16,6 +16,13 @@ TOOLSRC  = ../../lib-build/tools
 BUILD    = build
 
 SKIP     =
+# swapper.c starts to page out when only 500 frames (2 MByte) are in use ("init_frames - 500"): right for the 64 MByte PC, but on a machine with
+# 128 MByte to 4 GByte it swapped from the first program on. Here the threshold is a fraction of the RAM: 1/16 of the frames must stay free
+$(BUILD)/tools/swapper.c: $(TOOLSRC)/swapper.c $(BUILD)/ulixlib.h $(BUILD)/arm64-extra.h
+	mkdir -p $(BUILD)/tools
+	sed -e 's|#include "../ulixlib.h"|&\n#include "../arm64-extra.h"|' -e 's|init_frames - 500|(total_frames () / 16)|g' $< > $@
+	grep -q 'total_frames () / 16' $@
+
 # new programs of the AArch64 port (the network is not part of the original Ulix; the rule for them is further down)
 NEWTOOLS = ping ping6 host ifconfig route dhclient shutdown poweroff reboot top sntp rand https daemon service heartbeat echod ptytest telnetd sshd
 TOOLS    = $(filter-out $(SKIP),$(patsubst $(TOOLSRC)/%.c,%,$(wildcard $(TOOLSRC)/*.c))) $(NEWTOOLS)
