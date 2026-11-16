@@ -185,7 +185,7 @@ clean:
 # ---- programs linked with musl instead of ulixlib (issue #35, section 51 of ../ARM64-PORT.md) ----
 # The program text is the book's. Its #include "../ulixlib.h" finds musl/ulixlib.h (copied to build/musl), which includes musl's headers and adds what
 # the book has more (see "The programs of the book on musl" in lit/userland.nw). Every name in MUSLTOOLS is linked with musl; the others keep ulixlib.
-MUSLTOOLS = echo cat wc grep diff mkdir rmdir rm touch stat cp ls hexdump bindump ascii print args exit42 trunc chmod chown chgrp df sync kill fault-div0 fault-mem testcp stdio inode keys
+MUSLTOOLS = echo cat wc grep diff mkdir rmdir rm touch stat cp ls hexdump bindump ascii print args exit42 trunc chmod chown chgrp df sync kill fault-div0 fault-mem testcp stdio inode keys clear free ps pw swapper top ping ping6 host ifconfig route dhclient shutdown poweroff reboot sntp rand daemon service heartbeat echod fork1 fork2 fork3 fbomb filecomm ptree vi paging tp su
 SYSROOT   = $(abspath ../libc/build/sysroot)
 MCFLAGS   = -O0 -fno-pic -mno-outline-atomics -fsanitize=integer-divide-by-zero -fsanitize-undefined-trap-on-error -std=gnu99 -w \
             -nostdinc -isystem $(SYSROOT)/include -isystem $(shell $(CC) -print-file-name=include)
@@ -202,7 +202,11 @@ $(BUILD)/musl/ulixlib.h: musl/ulixlib.h
 	mkdir -p $(BUILD)/musl
 	cp $< $@
 
-$(BUILD)/musl/tools/%.c: $(TOOLSRC)/%.c
+$(BUILD)/musl/arm64-extra.h: arm64-extra.h
+	mkdir -p $(BUILD)/musl
+	cp $< $@
+
+$(BUILD)/musl/tools/%.c: $(BUILD)/tools/%.c $(BUILD)/musl/arm64-extra.h
 	mkdir -p $(BUILD)/musl/tools
 	perl -pe '$(foreach f,$(RENAME_$*),s/\b$(f)\b/$*_$(f)/g;)' $< > $@
 

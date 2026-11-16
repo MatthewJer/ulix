@@ -2048,6 +2048,142 @@ struct diskfree_query {
   char fstype[10];         // file system name, e.g. "minix"
 };
 void diskfree (struct diskfree_query *query);
+
+// types of the book that the process list and the screen need (copied from the book's ulixlib.h, AArch64 form)
+// Thread states
+#define TSTATE_READY     1   // process is ready
+#define TSTATE_FORK      3   // fork() has not completed
+#define TSTATE_EXIT      4   // process has called exit()
+#define TSTATE_WAITFOR   5   // process has called waitpid()
+#define TSTATE_ZOMBIE    6   // wait for parent to retrieve exit value
+#define TSTATE_WAITKEY   7   // wait for key press event
+#define TSTATE_WAITFLP   8   // wait for floppy
+#define TSTATE_LOCKED    9   // wait for lock
+#define TSTATE_STOPPED  10   // stopped by SIGSTOP signal
+#define TSTATE_WAITHD   11   // wait for hard disk
+
+#define KEY_ESC     27
+#define KEY_UP     191
+#define KEY_DOWN   192
+#define KEY_LEFT   193
+#define KEY_RIGHT  194
+
+#define VT_NORMAL_BACKGROUND (0x0F << 8)
+#define VT_BLUE_BACKGROUND   (0x1F << 8)
+#define VT_RED_BACKGROUND    (0x4F << 8)
+#define QUERY_UID  0
+#define QUERY_EUID 1
+#define QUERY_GID  2
+#define QUERY_EGID 3
+typedef unsigned int addr_space_id;
+typedef unsigned int thread_id;
+typedef struct {
+  union { unsigned long x0; unsigned long eax; };
+  union { unsigned long x1; unsigned long ebx; };
+  union { unsigned long x2; unsigned long ecx; };
+  union { unsigned long x3; unsigned long edx; };
+  union { unsigned long x4; unsigned long esi; };
+  union { unsigned long x5; unsigned long edi; };
+  unsigned long x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18;
+  unsigned long x19, x20, x21, x22, x23, x24, x25, x26, x27, x28;
+  union { unsigned long x29; unsigned long ebp; };
+  unsigned long x30;
+  union { unsigned long elr; unsigned long eip; };
+  union { unsigned long spsr; unsigned long eflags; };
+  union { unsigned long sp_el0; unsigned long useresp; unsigned long esp; };
+  unsigned long pad[2];                 // keeps the frame size a multiple of 16 bytes
+} context_t;
+
+typedef struct {
+  thread_id  pid;         // process id
+  thread_id  tid;         // thread id
+  thread_id  ppid;        // parent process
+  int        state;       // state of the process
+  context_t  regs;        // context
+  memaddress esp0;        // kernel stack pointer
+  memaddress eip;         // program counter
+  memaddress ebp;         // base pointer
+  
+
+addr_space_id addr_space;
+
+thread_id next;       // id of the ``next'' thread
+thread_id prev;       // id of the ``previous'' thread
+
+boolean used;
+
+int error;
+
+int exitcode;
+int waitfor;    // pid of the child that this process waits for
+
+char cmdline[CMDLINE_LENGTH];
+
+boolean   new;                    // is this thread new?
+void      *top_of_thread_kstack;  // extra kernel stack for this thread
+
+int terminal;
+
+int files[MAX_PFD];
+
+char cwd[256];
+
+  sighandler_t sighandlers[32];
+  unsigned long sig_pending;
+  unsigned long sig_blocked;
+
+word uid;   // user ID
+word gid;   // group ID
+word euid;  // effective user ID
+word egid;  // effective group ID
+word ruid;  // real user ID
+word rgid;  // real group ID
+
+} TCB;
+struct passwd {
+  char pw_name[32];    // user name
+  char pw_passwd[32];  // password
+  word pw_uid;         // user ID
+  word pw_gid;         // group ID
+  char *pw_gecos;      // long name        (ULIX: unused)
+  char pw_dir[32];     // home directory
+  char *pw_shell;      // shell            (ULIX: unused)
+};
+
+unsigned getpsinfo (int pid, TCB *tcb);                     // a copy of the entry of a process in the process table
+unsigned setpsname (char *psname);
+int  get_free_frames (void);
+void free_a_frame (void);
+int  lib_page_out (int pageno);
+void setterm (int vt);
+void clrscr (void);
+void get_xy (char *x, char *y);
+void set_xy (char x, char y);
+void read_screen (char *buf);
+void write_screen (char *buf);
+void scroll_up (void);
+void scroll_down (void);
+void resign (void);
+#define __NR_resign 66                                       // (ping and ping6 wait with it between two polls)
+void idle (void);
+word *memsetw (word *dest, word val, size_t count);
+
+// users: the kernel of the book keeps the ids (musl's getuid and friends are fixed at 0); the password file is read by the program
+#define getuid ulix_getuid
+#define geteuid ulix_geteuid
+#define getgid ulix_getgid
+#define getegid ulix_getegid
+#define setuid ulix_setuid
+#define setgid ulix_setgid
+#define seteuid ulix_seteuid
+#define setegid ulix_setegid
+#define getpwnam_r ulix_getpwnam_r
+#define getpwuid_r ulix_getpwuid_r
+word getuid (void), geteuid (void), getgid (void), getegid (void);
+int setuid (word uid), setgid (word gid), seteuid (word uid), setegid (word gid);
+int login (word uid, char *pass);
+int getpwnam_r (const char *name, struct passwd *pwd, char *buffer, int bufsize, struct passwd **result);
+int getpwuid_r (word uid, struct passwd *pwd, char *buffer, int bufsize, struct passwd **result);
 #endif
 @
 The functions behind it. [[ureadline]] is the book's function (the line editor of the shell, of \texttt{login} and of the
@@ -2110,6 +2246,99 @@ int ureadline (char *s, int maxlength, boolean echo) {
     }
   }
 }
+
+#define NR_getpsinfo    503
+#define NR_setpsname    504
+#define NR_idle         505
+#define NR_page_out     508
+#define NR_free_frames  509
+#define NR_free_a_frame 510
+#define NR_setterm      511
+#define NR_clrscr       512
+#define NR_get_xy       513
+#define NR_set_xy       514
+#define NR_read_screen  515
+#define NR_write_screen 516
+#define NR_resign        66
+#define NR_login        523
+#define NR_query_ids    524
+#define NR_setreuid     203
+#define NR_setregid     204
+#define NR_setuid       213
+#define NR_setgid       214
+
+unsigned getpsinfo (int pid, TCB *tcb) { return ulix_call (NR_getpsinfo, pid, (long) tcb, 0, 0, 0); }
+unsigned setpsname (char *psname)      { return ulix_call (NR_setpsname, (long) psname, 0, 0, 0, 0); }
+int  get_free_frames (void)            { return ulix_call (NR_free_frames, 0, 0, 0, 0, 0); }
+void free_a_frame (void)               { ulix_call (NR_free_a_frame, 0, 0, 0, 0, 0); }
+int  lib_page_out (int pageno)         { return ulix_call (NR_page_out, pageno, 0, 0, 0, 0); }
+void setterm (int vt)                  { ulix_call (NR_setterm, vt, 0, 0, 0, 0); }
+void clrscr (void)                     { ulix_call (NR_clrscr, 0, 0, 0, 0, 0); }
+void get_xy (char *x, char *y)         { ulix_call (NR_get_xy, (long) x, (long) y, 0, 0, 0); }
+void set_xy (char x, char y)           { ulix_call (NR_set_xy, x, y, 0, 0, 0); }
+void read_screen (char *buf)           { ulix_call (NR_read_screen, (long) buf, 0, 0, 0, 0); }
+void write_screen (char *buf)          { ulix_call (NR_write_screen, (long) buf, 0, 0, 0, 0); }
+void resign (void)                     { ulix_call (NR_resign, 0, 0, 0, 0, 0); }
+void idle (void)                       { ulix_call (NR_idle, 0, 0, 0, 0, 0); }
+
+word *memsetw (word *dest, word val, size_t count) {
+  while (count--) *dest++ = val;
+  return dest;
+}
+
+// the screen is 80 x 25 characters with an attribute byte each; scrolling reads it, moves it by one line and writes it back
+void scroll_up (void) {
+  char buffer[80 * 25 * 2];
+  word blank = 0x20 | VT_NORMAL_BACKGROUND;
+  read_screen (buffer);
+  memsetw ((word *) (buffer + 80 * 24 * 2), blank, 80);
+  write_screen (buffer + 160);
+}
+
+void scroll_down (void) {
+  char buffer[80 * 25 * 2];
+  word blank = 0x20 | VT_NORMAL_BACKGROUND;
+  read_screen (buffer + 160);
+  memsetw ((word *) buffer, blank, 80);
+  write_screen (buffer);
+}
+
+
+word ulix_getuid (void)  { return ulix_call (NR_query_ids, QUERY_UID, 0, 0, 0, 0); }
+word ulix_geteuid (void) { return ulix_call (NR_query_ids, QUERY_EUID, 0, 0, 0, 0); }
+word ulix_getgid (void)  { return ulix_call (NR_query_ids, QUERY_GID, 0, 0, 0, 0); }
+word ulix_getegid (void) { return ulix_call (NR_query_ids, QUERY_EGID, 0, 0, 0, 0); }
+int ulix_setuid (word uid)  { return ulix_call (NR_setuid, uid, 0, 0, 0, 0); }
+int ulix_setgid (word gid)  { return ulix_call (NR_setgid, gid, 0, 0, 0, 0); }
+int ulix_seteuid (word uid) { return ulix_call (NR_setreuid, uid, 0, 0, 0, 0); }
+int ulix_setegid (word gid) { return ulix_call (NR_setregid, gid, 0, 0, 0, 0); }
+int login (word uid, char *pass) { return ulix_call (NR_login, uid, (long) pass, 0, 0, 0); }
+
+// /etc/passwd has the lines name:password:uid:gid:home (five fields, the file of the book). The record is filled in for the first line
+// whose name (by_name) or user id matches; 0 when found, -1 otherwise.
+static int passwd_lookup (const char *name, int uid, struct passwd *pwd) {
+  char line[256];
+  FILE *f = fopen ("/etc/passwd", "r");
+  if (!f) { printf ("Cannot open /etc/passwd\n"); return -1; }
+  while (fgets (line, sizeof line, f)) {
+    char *field[5] = {0};
+    char *p = line;
+    for (int i = 0; i < 5 && p; i++) { field[i] = p; p = strpbrk (p, ":\n"); if (p) *p++ = 0; }
+    if (!field[4]) continue;
+    if (name ? strcmp (field[0], name) != 0 : atoi (field[2]) != uid) continue;
+    strncpy (pwd->pw_name, field[0], 32);
+    strncpy (pwd->pw_passwd, field[1], 32);
+    pwd->pw_uid = atoi (field[2]);
+    pwd->pw_gid = atoi (field[3]);
+    strncpy (pwd->pw_dir, field[4], 32);
+    fclose (f);
+    return 0;
+  }
+  fclose (f);
+  return -1;
+}
+int ulix_getpwnam_r (const char *name, struct passwd *pwd, char *buffer, int bufsize, struct passwd **result) { return passwd_lookup (name, 0, pwd); }
+int ulix_getpwuid_r (word uid, struct passwd *pwd, char *buffer, int bufsize, struct passwd **result)        { return passwd_lookup (0, uid, pwd); }
 
 static void unbuffered_output (void) __attribute__ ((constructor));
 static void unbuffered_output (void) { setvbuf (stdout, 0, _IONBF, 0); }
