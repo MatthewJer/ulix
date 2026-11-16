@@ -877,9 +877,17 @@ int smp_online_cpus (void) { return ncpus_online; }
 static volatile int bkl_word = 0;
 static volatile int bkl_owner = -1;
 
+// \emph{The lock is taken and given back with interrupts masked.} Most callers have them masked already (an exception entry does), but the
+// kernel main thread, and a new process that is started from it, run with interrupts unmasked. An interrupt that came between taking
+// the word and setting the owner (or between clearing the owner and releasing the word) called [[bkl_lock]] and spun for ever on a
+// lock that its own CPU held; the message ``waits for CPU -1'' was the only sign. So both windows are closed here.
+static inline u64 bkl_irq_off (void) { u64 d; __asm__ volatile ("mrs %0, daif; msr daifset, #2" : "=r" (d) :: "memory"); return d; }
+static inline void bkl_irq_back (u64 d) { __asm__ volatile ("msr daif, %0" :: "r" (d) : "memory"); }
+
 void bkl_lock (void) {
   int c = smp_cpu ();
-  if (bkl_owner == c) { pc[c].depth++; return; }                 // nested exception, or kernel code taking it again
+  u64 daif = bkl_irq_off ();
+  if (bkl_owner == c) { pc[c].depth++; bkl_irq_back (daif); return; }   // nested exception, or kernel code taking it again
   pc[c].in_kernel = 1;
   pc[c].entries++;
   while (__sync_lock_test_and_set (&bkl_word, 1)) {
@@ -894,16 +902,19 @@ void bkl_lock (void) {
   current_task = pc[c].cur_task;                                 // the book's view of "this CPU"
   current_as   = pc[c].cur_as;
   arch_sync_ttbr0 ();                                            // another CPU may have replaced the address space (exec)
+  bkl_irq_back (daif);
 }
 
 void bkl_unlock (void) {
   int c = smp_cpu ();
-  if (--pc[c].depth > 0) return;
+  u64 daif = bkl_irq_off ();
+  if (--pc[c].depth > 0) { bkl_irq_back (daif); return; }
   pc[c].cur_task = current_task;
   pc[c].cur_as   = current_as;
   bkl_owner = -1;
   pc[c].in_kernel = 0;
   __sync_lock_release (&bkl_word);
+  bkl_irq_back (daif);
 }
 
 int  bkl_depth (void) { return pc[smp_cpu ()].depth; }
