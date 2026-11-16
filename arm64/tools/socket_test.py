@@ -18,7 +18,8 @@ fails = 0
 
 class Session:
     def __init__(self, image):
-        cmd = ['qemu-system-aarch64', '-M', 'virt', '-cpu', 'cortex-a72', '-m', '128', '-display', 'none', '-monitor', 'none', '-kernel', kernel,
+        fast = ['-accel', 'hvf', '-cpu', 'host'] if os.environ.get('QEMU_FAST') else ['-cpu', 'cortex-a72']      # QEMU_FAST=1: hardware acceleration, for quick runs while debugging
+        cmd = ['qemu-system-aarch64', '-M', 'virt'] + fast + [ '-m', '128', '-display', 'none', '-monitor', 'none', '-kernel', kernel,
                '-snapshot', '-drive', 'file=%s,format=raw,if=none,id=hd0' % image, '-device', 'virtio-blk-device,drive=hd0',
                '-device', 'virtio-rng-device', '-smp', '2', '-netdev', 'user,id=n0,host=10.0.2.4', '-device', 'virtio-net-device,netdev=n0', '-serial', 'tcp:127.0.0.1:%d,server=on,wait=on' % PORT]
         self.qemu = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -106,6 +107,7 @@ try:
     s.expect(r'ulix login: esser', 'init started login, which logs in "esser" automatically')
     s.expect(PROMPT, 'shell prompt')
     s.pump(3)
+    if os.environ.get('SHOW_NET'): print(s.run('ifconfig', r'vioif0', 'ifconfig')[-600:])
     out = s.run('/musl/sockettest 10.0.2.2 %d %d' % (tcp.getsockname()[1], udp.getsockname()[1]), r'(?s)user (ok|FAIL):.*getaddrinfo \("gateway.ulix"\)|Killed', 'sockettest runs', timeout=120)
     print(out[-3000:])
     check(out.count('user ok:') == 24 and 'user FAIL' not in out, 'all 24 socket checks of the program passed')
