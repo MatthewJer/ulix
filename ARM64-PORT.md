@@ -893,7 +893,7 @@ Adding these up (an estimate, not a measurement) gives about 10 MByte for an idl
 1. **Everything that grows is bounded by a constant that is written down** (`CONNS`, `MAX_THREADS`, `MAX_SWAP_FRAMES`), and the table in `third_party/README.md` ("what it costs") gives the worst case in MByte for a library.
 2. **Nothing is sized for the largest model.** `frame_refs` is sized for 2 GByte at build time; a 4 GByte model would need a table of 2 MByte and the boot tables of section 23; that is the entry point of the label `hw:no-test-hardware`, not a reason to size everything for it.
 3. **When memory is short the system swaps** (book mechanism, `arch_swap.c`; the swap file grows on demand and keeps 300 KByte of the disk free) and only then says "out of memory". Test with `-m 64M` in qemu (the device tree says the size; the kernel tests run from 64 MByte up): a feature that needs more than that must say so in its section.
-4. **The GPU takes its part before the kernel starts.** The firmware reports to the kernel only the RAM that remains (`Device tree: ... MByte RAM`); read that number from the log of the run (section 45), not from the label on the board.
+4. **The GPU takes its part before the kernel starts.** The firmware reports to the kernel only the RAM that remains (`Device tree: ... MByte RAM`); read that number from the log of the run (section 46), not from the label on the board.
 5. **A new feature states its worst-case memory in its issue and section** in one line, like "needs N MByte at most", so that this table can be extended.
 
 **Open:** a measurement of the real free memory per model (1 and 2 GByte) in the log of section 46; `top` already shows it, nothing has been recorded.
