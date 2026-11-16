@@ -121,7 +121,7 @@ try:
     run('ps', r'(?s)PID\s+PPID.*login', 'the system is alive after the fork bomb (ps lists the login processes)')
     send('top\\r'); expect(r'(?s)top - up .*processes.*CPU0 \[.*\] \d+%.*Mem  \[.*MByte.*PID\s+PPID\s+UID S\s+CPU%\s+TIME\s+COMMAND.*/bin/sh', 'top shows the load of the CPU, the memory and the processes')
     send('q'); expect(PROMPT, 'q ends top, the shell is back')
-    run('readelf /bin/cat', r'e_entry:\s+400000\r?\n#pheaders: 3\r?\n', 'readelf reads the ELF64 header (entry 0x400000, 3 program headers)')
+    run('readelf /bin/thread', r'e_entry:\s+400000\r?\n#pheaders: 3\r?\n', 'readelf reads the ELF64 header (entry 0x400000, 3 program headers)')
     run('inode 2', r'i_nlinks: 1\r?\n.*i_size:\s+\d+', 'inode: the book\'s debug system call 777 prints an inode')
     send('su\\r'); expect(r'Enter root password: ', 'su asks for the root password')
     send('xyz\\r'); expect(r'root@ulix\[\d+\]:/root# ', 'su: the password is accepted, a root shell starts')
