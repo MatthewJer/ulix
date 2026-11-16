@@ -39,6 +39,7 @@ typedef unsigned short u16;
 typedef unsigned int   u32;
 typedef unsigned long  u64;
 typedef struct tcp_conn tcp_conn;
+extern int signal_interrupts (void);                 // linux_abi.c: a signal can be delivered to the calling thread now
 extern tcp_conn *tcp_connect (u32 ip, u16 port);       // the kernel's network stack (net.c, tcp.c)
 extern int  tcp_established (tcp_conn *c), tcp_closed (tcp_conn *c), tcp_readable (tcp_conn *c), tcp_writable (tcp_conn *c);
 extern int  tcp_read (tcp_conn *c, u8 *buf, int max), tcp_write (tcp_conn *c, const u8 *data, int len);
@@ -226,7 +227,7 @@ is pending (the call fails with \texttt{EINTR}) or when the time is up. \texttt{
 <<sockets.c>>=
 // 0: the time has not come, E_INTR: a signal is pending, E_TIMEDOUT: the time is up (timeout_ms < 0: for ever)
 static int wait_a_little (unsigned long long start, long timeout_ms) {
-  if (thread_table[current_task].sig_pending) return E_INTR;
+  if (signal_interrupts ()) return E_INTR;
   if (timeout_ms >= 0 && net_now_ms () - start >= (unsigned long long) timeout_ms) return E_TIMEDOUT;
   net_poll_once ();
   arch_resign ();
@@ -330,7 +331,7 @@ static int stream_check (struct sock *s) {                          // the conne
 // says so (release), and read after the counter was looked at (acquire).
 // waiting for the other end: no network is involved, so the network is not polled (two CPUs inside net_poll_once at the same time is not what it expects)
 static int local_wait (void) {
-  if (thread_table[current_task].sig_pending) return E_INTR;
+  if (signal_interrupts ()) return E_INTR;
   arch_resign ();
   arch_poll_pause ();
   return 0;

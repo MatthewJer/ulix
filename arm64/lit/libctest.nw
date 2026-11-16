@@ -662,7 +662,7 @@ static void test_process (void) {
   waitpid (pid, &st, 0);
   CHECK (WIFEXITED (st) && WEXITSTATUS (st) == 7, "execve: the new program ran and its exit status (7) arrives");
   CHECK (!strncmp (out, "child: argc=3 argv1=child argv2=arg two ", 40), "execve: the new program got argc and argv, its standard output went through dup2 into the pipe");
-  KNOWN (strstr (out, "CHILDVAR=yes") != 0, "execve: the new program got the environment of the call (the kernel's execv takes no envp)");
+  CHECK (strstr (out, "CHILDVAR=yes") != 0, "execve: the new program got the environment of the call (the kernel's execv takes no envp)");
   pid = fork ();
   if (pid == 0) { char *argv[] = { "x", 0 }; execv ("/no/such/program", argv); _exit (errno == ENOENT ? 42 : 43); }
   waitpid (pid, &st, 0);
@@ -782,7 +782,7 @@ static void test_signals (void) {
   nanosleep (&zzz, 0);
   CHECK (got == 0, "SIGCHLD is blocked: the handler has not run although the child has ended");
   sigprocmask (SIG_SETMASK, &old, 0);
-  KNOWN (got == SIGCHLD, "the signal that came from the child (SIGCHLD) is delivered at the unblock (sigsuspend, system call 133, is missing: not tested)");
+  CHECK (got == SIGCHLD, "the signal that came from the child (SIGCHLD) is delivered at the unblock (sigsuspend, system call 133, is missing: not tested)");
   waitpid (pid, 0, 0);
   signal (SIGCHLD, SIG_DFL);
   // the default action
@@ -792,23 +792,23 @@ static void test_signals (void) {
   nanosleep (&nap, 0);
   kill (pid, SIGTERM);
   int st = 0;
-  KNOWN (waitpid (pid, &st, 0) == pid && WIFSIGNALED (st) && WTERMSIG (st) == SIGTERM, "SIGTERM with the default action kills the child, waitpid reports WIFSIGNALED and WTERMSIG");
+  CHECK (waitpid (pid, &st, 0) == pid && WIFSIGNALED (st) && WTERMSIG (st) == SIGTERM, "SIGTERM with the default action kills the child, waitpid reports WIFSIGNALED and WTERMSIG");
   pid = fork ();
   if (pid == 0) { for (;;) pause (); }
   nanosleep (&nap, 0);
   kill (pid, SIGKILL);
-  KNOWN (waitpid (pid, &st, 0) == pid && WIFSIGNALED (st) && WTERMSIG (st) == SIGKILL, "SIGKILL ends a child that sleeps in pause ()");
+  CHECK (waitpid (pid, &st, 0) == pid && WIFSIGNALED (st) && WTERMSIG (st) == SIGKILL, "SIGKILL ends a child that sleeps in pause ()");
   pid = fork ();
   if (pid == 0) { sa.sa_handler = on_signal; sigaction (SIGUSR1, &sa, 0); got = 0; while (!got) pause (); _exit (got == SIGUSR1 ? 21 : 22); }
   nanosleep (&nap, 0);
   kill (pid, SIGUSR1);
-  KNOWN (waitpid (pid, &st, 0) == pid && WIFEXITED (st) && WEXITSTATUS (st) == 21, "a signal to a child with a handler: pause returns after the handler, the child exits normally");
+  CHECK (waitpid (pid, &st, 0) == pid && WIFEXITED (st) && WEXITSTATUS (st) == 21, "a signal to a child with a handler: pause returns after the handler, the child exits normally");
   pid = fork ();
   if (pid == 0) { signal (SIGSEGV, SIG_DFL); volatile int *bad = (int *) 0; *bad = 1; _exit (0); }
-  KNOWN (waitpid (pid, &st, 0) == pid && WIFSIGNALED (st) && WTERMSIG (st) == SIGSEGV, "a write through a null pointer ends the process with SIGSEGV (the fault becomes a signal)");
+  CHECK (waitpid (pid, &st, 0) == pid && WIFSIGNALED (st) && WTERMSIG (st) == SIGSEGV, "a write through a null pointer ends the process with SIGSEGV (the fault becomes a signal)");
   pid = fork ();
   if (pid == 0) { signal (SIGABRT, SIG_DFL); abort (); }
-  KNOWN (waitpid (pid, &st, 0) == pid && WIFSIGNALED (st) && WTERMSIG (st) == SIGABRT, "abort () ends the process with SIGABRT");
+  CHECK (waitpid (pid, &st, 0) == pid && WIFSIGNALED (st) && WTERMSIG (st) == SIGABRT, "abort () ends the process with SIGABRT");
 }
 @
 \section{The main program}
