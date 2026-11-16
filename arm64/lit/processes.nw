@@ -122,6 +122,7 @@ static void kctx_user_state_copy_live (struct kctx *c) {
                     :: "r" (v) : "memory");
 }
 
+extern int  u_share (int fd);                          // pipes.c: copy a descriptor, files share the position
 extern void cpu_switch (struct kctx *old, struct kctx *new);
 extern u64  alloc_frames_contig (int n);
 extern u64  kstack_alloc (void);
@@ -848,7 +849,7 @@ int u_fork (context_t *r) {
   t_new->ppid       = old_tid;
   for (int pfd = 0; pfd < MAX_PFD; pfd++) {
     int gfd = t_old->files[pfd];
-    t_new->files[pfd] = (gfd >= 0) ? u_reopen (gfd) : gfd;
+    t_new->files[pfd] = (gfd >= 0) ? u_share (gfd) : gfd;       // (shares the position of files, see pipes.c)
   }
 
   context_t child = *r;                   // the child continues exactly where the parent is ...

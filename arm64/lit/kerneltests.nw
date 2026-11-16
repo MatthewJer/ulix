@@ -864,6 +864,15 @@ int proc_test (void) {
   CHECK (pid > 0 && thread_table[pid].exitcode == 0, "/musl/filetest finished with exit status 0 (no failed checks)");
   CHECK (count_in (out, "user FAIL") == 0 && count_in (out, "user ok:") == 30 - !has_rng, "all file checks of the musl program passed (30, or 29 on a machine without random number generator)");
   CHECK (count_in (out, "not implemented") == 0, "the file test needed no Linux system call that the kernel does not have");
+  // descriptors (issue #138): dup, dup2 and fork share the position of the file, the table ends with EMFILE
+  char *fd_argv[] = { "fdtest", 0 };
+  capture_start ();
+  pid = run ("/musl/fdtest", 1, fd_argv);
+  capture_stop (&out);
+  arch_threads_reap ();
+  CHECK (pid > 0 && thread_table[pid].exitcode == 0, "/musl/fdtest finished with exit status 0 (no failed checks)");
+  CHECK (count_in (out, "user FAIL") == 0 && count_in (out, "user ok:") == 13, "all 13 descriptor checks passed: dup, dup2 and fork share the position of a file, EMFILE, nothing leaked");
+  CHECK (live_threads () == 0, "no process is left");
   char *mthr_argv[] = { "threadtest", 0 };                    // threads: clone, futex, thread-local variables, exit with threads (musl's pthreads)
   capture_start ();
   pid = run ("/musl/threadtest", 1, mthr_argv);

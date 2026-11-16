@@ -48,15 +48,29 @@ int u_write (int fd, void *buf, int nbyte) {
   if (k == -1 && (fd == DEV_STDOUT || fd == DEV_STDERR)) return nbyte;
   return k;
 }
+static int is_file (int gfd) { return gfd >= 0 && (gfd >> 8) == FS_MINIX; }
+static unsigned short file_users[MX_MAX_FILES];          // per entry of mx_status: how many descriptors more than one refer to it
 int u_close (int fd) {
   if (is_vdev (fd)) return 0;                       // nothing to give back
   if (is_sock (fd)) return sock_close (fd);         // (sockets.c: the socket goes away with its last user)
+  if (is_file (fd) && file_users[fd & 0xff] > 0) { file_users[fd & 0xff]--;  return 0; }   // not the last user of this open file (u_share)
   if (!is_pipe (fd)) return book_u_close (fd);
   pipe_close (fd);
   return 0;
 }
 
-// fork () copies a file descriptor with u_reopen: for a file that is a new position in the file, for a pipe end it is one more
+// u_share (fork, dup, dup2, fcntl F_DUPFD) is the Unix way to copy a descriptor: both descriptors name the same open file, so they
+// share the read/write position. For a file of the root disk that is the same entry of mx_status (the book's u_reopen made a copy
+// with its own position); file_users counts the descriptors besides the first one, and only the last u_close closes the file. Everything
+// else (pipe ends, sockets, devices) is copied by u_reopen as before.
+int u_share (int fd) {
+  if (!is_file (fd)) return u_reopen (fd);
+  file_users[fd & 0xff]++;
+  return fd;
+}
+
+// u_reopen is the book's copy with its own position, kept for the mapping of files (mmap reads the file by itself and must not move
+// the position of the program). For a pipe end it is one more user of the same end: for a file that is a new position in the file, for a pipe end it is one more
 // user of the same end
 int u_reopen (int fd) {
   if (is_vdev (fd)) return fd;
@@ -311,8 +325,8 @@ void syscall_pipe (context_t *r) {
 \texttt{dup2 (old, new)} makes descriptor \texttt{new} another name for what \texttt{old} refers to; if \texttt{new} was open, it is
 closed first. This is how a program that starts another one decides what the new program finds as its standard input and output:
 the child calls \texttt{dup2 (fd, 1)} and then \texttt{exec}, and everything that the new program prints goes into the file or
-the pipe. (A file that is copied this way gets its own read/write position through \texttt{u\_reopen}, the same as after a
-\texttt{fork}. The standard input, output and error are the negative numbers \texttt{DEV\_STDIN} and so on, which need no
+the pipe. (A file that is copied this way shares the read/write position with the original, see below: \texttt{u\_share}.
+The standard input, output and error are the negative numbers \texttt{DEV\_STDIN} and so on, which need no
 reference count.)
 
 <<pipes.c: pipe and dup2>>=
@@ -323,7 +337,7 @@ void syscall_dup2 (context_t *r) {
   if (old == new) { eax_return (new); }
   int gfd = t->files[old];
   if (t->files[new] != -1) u_close (t->files[new]);
-  t->files[new] = gfd >= 0 ? u_reopen (gfd) : gfd;
+  t->files[new] = gfd >= 0 ? u_share (gfd) : gfd;
   eax_return (new);
 }
 @

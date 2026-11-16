@@ -473,7 +473,7 @@ static void unmap_range (u64 va, u64 len) {
 \end{itemize}
 
 <<linux_abi.c: memory>>=
-extern int u_lseek (int gfd, int offset, int whence), u_read (int gfd, void *buf, int n), u_write (int gfd, void *buf, int n), u_close (int gfd), u_reopen (int gfd);
+extern int u_lseek (int gfd, int offset, int whence), u_read (int gfd, void *buf, int n), u_write (int gfd, void *buf, int n), u_close (int gfd), u_reopen (int gfd), u_share (int gfd);
 extern int pfd2gfd (int pfd);
 #define MAP_SHARED_  0x01
 
@@ -937,8 +937,12 @@ static long linux_openat (context_t *r, int dirfd, const char *path, int flags) 
   if ((flags & LO_CREAT) && (flags & LO_EXCL) && exists) return -LE_EEXIST;
   if ((flags & LO_DIRECTORY) && exists && (st.st_mode & S_IFMT) != S_IFDIR) return -LE_ENOTDIR;
   if ((flags & 3) != 0 && exists && (st.st_mode & S_IFMT) == S_IFDIR) return -LE_EISDIR;
-  long fd = ulix_call (r, syscall_open, (long) path, uflags, 0, 0, 0);
-  if (fd < 0) return linux_error (LE_ENOENT);
+  // (syscall_open of the book turns the file into a descriptor of the process at once and leaves the open file behind when the table is full: ask for the
+  // file first, then for a place in the table, and give the file back if there is none)
+  int gfd0 = u_open ((char *) path, uflags, 0);
+  if (gfd0 < 0) return linux_error (LE_ENOENT);
+  long fd = gfd2pfd (gfd0);
+  if (fd < 0) { u_close (gfd0);  return -LE_EMFILE; }
   if ((flags & LO_TRUNC) && (flags & 3) != 0 && linux_ftruncate (fd, 0) < 0) {   // the book has no O_TRUNC: shorten the file now
     ulix_call (r, syscall_close, fd, 0, 0, 0, 0);
     return -LE_EACCES;
@@ -1162,9 +1166,10 @@ static long linux_getdents64 (int fd, char *buf, u64 size) {
 
 @
 \paragraph{Descriptors.} \texttt{dup}, \texttt{dup3} and \texttt{fcntl (F\_DUPFD)} copy an entry of the process's descriptor table with
-\texttt{u\_reopen}, the function that \texttt{fork} uses. For a file that gives the copy \emph{its own} read/write position, which
-is a difference from Unix (there both descriptors share the position); for a pipe end it is one more user of the same end. The
-table has 16 entries (\texttt{MAX\_PFD} of the book), so \texttt{EMFILE} comes early. \texttt{pipe2} and \texttt{dup3} use the
+\texttt{u\_share}, the function that \texttt{fork} uses (chapter~\ref{ch:pipes}). For a file that gives a second descriptor of the \emph{same} open file,
+so both share the read/write position as in Unix (the book's \texttt{u\_reopen} made a copy with its own position); for a pipe end it is one more user of
+the same end. The table has 16 entries (\texttt{MAX\_PFD} of the book; the Makefile variable \texttt{PORT\_PFD} can change it, see section~50 of \texttt{ARM64-PORT.md}
+for why it is not larger), so \texttt{EMFILE} comes early; \texttt{open} now gives the file back when there is no free entry. \texttt{pipe2} and \texttt{dup3} use the
 book's calls from \texttt{pipes.c}; the flags \texttt{O\_CLOEXEC} and \texttt{O\_NONBLOCK} are accepted and ignored (a descriptor
 is never closed by \texttt{exec} yet, and reads on pipes always block).
 
@@ -1177,7 +1182,7 @@ static long linux_dup_from (int old, int from) {
   if (old < 0 || old >= MAX_PFD || gfd == -1) return -LE_EBADF;
   if (from < 0 || from >= MAX_PFD) return -LE_EINVAL;
   for (int pfd = from; pfd < MAX_PFD; pfd++)
-    if (t->files[pfd] == -1) { t->files[pfd] = gfd >= 0 ? u_reopen (gfd) : gfd;  copy_fd_path (gfd, t->files[pfd]);  return pfd; }
+    if (t->files[pfd] == -1) { t->files[pfd] = gfd >= 0 ? u_share (gfd) : gfd;  copy_fd_path (gfd, t->files[pfd]);  return pfd; }
   return -LE_EMFILE;
 }
 
@@ -2402,6 +2407,72 @@ int main (int argc, char **argv) {
   long ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
   printf ("readtest: %s %ld bytes sum %u chunk %ld time %ld ms\n", argv[1], total, sum, chunk, ms);
   return 0;
+}
+@
+\section{Descriptors: \texttt{fdtest}}
+\label{src:libc/fdtest.c}
+
+A program for issue \#138. In Unix, \texttt{dup}, \texttt{dup2} and \texttt{fork} make a second descriptor for the \emph{same} open file, so both share the
+read/write position; the book's \texttt{u\_reopen} gave the copy its own position. The kernel's \texttt{u\_share} (chapter~\ref{ch:pipes})
+puts that right. The test reads \texttt{/test.txt} (1680 bytes) in small pieces and looks where the position is after each copy; it also opens the
+file again and again until the table is full, which must end with \texttt{EMFILE} and must not leave anything behind (the same number of
+descriptors is possible a second time).
+
+<<libc/fdtest.c>>=
+#include <stdio.h>
+#include <string.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/wait.h>
+
+static int fails = 0;
+#define CHECK(c, msg) do { if (c) printf ("  user ok:   %s\n", msg); \
+                           else { printf ("  user FAIL: %s\n", msg); fails++; } } while (0)
+
+static int fill_table (int *fds, int max) {                    // open /test.txt until it fails; returns how many were opened
+  int n = 0;
+  while (n < max && (fds[n] = open ("/test.txt", O_RDONLY)) >= 0) n++;
+  return n;
+}
+
+int main (void) {
+  char buf[64];
+  int fd = open ("/test.txt", O_RDONLY);
+  CHECK (fd >= 3 && read (fd, buf, 10) == 10, "open /test.txt, read 10 bytes");
+
+  int d = dup (fd);
+  CHECK (d > fd && lseek (d, 0, SEEK_CUR) == 10, "dup: the copy is at the position of the original (10)");
+  CHECK (read (d, buf, 5) == 5 && lseek (fd, 0, SEEK_CUR) == 15, "a read through the copy moves the position of the original (15)");
+  CHECK (lseek (fd, 100, SEEK_SET) == 100 && lseek (d, 0, SEEK_CUR) == 100, "lseek on the original moves the copy (100)");
+
+  int e = dup2 (fd, 12);
+  CHECK (e == 12 && read (e, buf, 4) == 4 && lseek (fd, 0, SEEK_CUR) == 104 && lseek (d, 0, SEEK_CUR) == 104, "dup2: three descriptors, one position (104)");
+
+  close (fd);
+  CHECK (read (d, buf, 6) == 6 && lseek (e, 0, SEEK_CUR) == 110, "close of one descriptor leaves the others open and in step (110)");
+  close (d);
+  CHECK (read (e, buf, 1) == 1 && lseek (e, 0, SEEK_CUR) == 111, "still open after the second close (111)");
+
+  pid_t pid = fork ();
+  if (pid == 0) { char c[8];  _exit (read (e, c, 7) == 7 ? 0 : 1); }
+  int st = 0;
+  CHECK (pid > 0 && waitpid (pid, &st, 0) == pid && WIFEXITED (st) && WEXITSTATUS (st) == 0, "fork: the child read 7 bytes through its copy");
+  CHECK (lseek (e, 0, SEEK_CUR) == 118, "fork: the parent's position moved with the child's read (118)");
+  CHECK (read (e, buf, 2) == 2, "the parent can still read after the child has exited (its exit closed only its copy)");
+  close (e);
+  errno = 0;
+  CHECK (read (e, buf, 1) == -1 && errno == EBADF, "after the last close the descriptor is gone");
+
+  int fds[1100];
+  int n = fill_table (fds, 1100), err = errno;
+  printf ("  info: %d descriptors of /test.txt opened before the table was full\n", n);
+  CHECK (n >= 10 && n < 1100 && err == EMFILE, "a full table ends with EMFILE (the limit is MAX_PFD minus the 3 standard descriptors)");
+  for (int i = 0; i < n; i++) close (fds[i]);
+  int m = fill_table (fds, 1100);
+  CHECK (m == n, "after closing them all, the same number can be opened again (nothing leaked)");
+  for (int i = 0; i < m; i++) close (fds[i]);
+  return fails;
 }
 @
 \section{Python: CPython on Ulix}

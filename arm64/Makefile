@@ -12,7 +12,7 @@ OBJCOPY = $(CROSS)objcopy
 CFLAGS = -I$(GENDIR) -mno-outline-atomics -O0 -g -ffreestanding -nostdlib -fno-builtin -fno-stack-protector -mgeneral-regs-only -std=c99 -Wall
 
 # the programs linked with musl besides /muslhello64: they live in the directory /musl of the disk (see lit/libc.nw)
-MUSL_NAMES = cat ls filetest readtest threadtest sockettest localetest sockext cxxtest cxxtest2
+MUSL_NAMES = cat ls filetest readtest fdtest threadtest sockettest localetest sockext cxxtest cxxtest2
 
 # the Python interpreter (third_party/cpython, chapter "Python" of lit/libc.nw, issue #59): make PYTHON=0 leaves it out. It is part of the
 # system when the submodule is checked out (git submodule update --init third_party/cpython) and a Python 3.12 is on the host.
@@ -165,13 +165,17 @@ ulix.elf: $(OBJS) ulix.ld
 # ---- kernel code taken from the book (ulix-book.nw) ----
 # notangle assembles declarations / globals / functions from the book's chunks; port.py
 # picks the functions listed in port.manifest.  The result is compiled unchanged.
+PORT_PFD ?= 16   # 64 hangs the kernel tests, see ARM64-PORT.md section 50
 GENFILES = $(GENDIR)/ulix-decl.h $(GENDIR)/ulix-globals.c $(GENDIR)/ulix-functions.c $(GENDIR)/ulix-init.c
 
-$(GENFILES): ../ulix-book.nw ulix-arm64.nw
+$(GENFILES): ../ulix-book.nw ulix-arm64.nw Makefile
 	mkdir -p $(GENDIR)
 	for r in ulix-decl.h ulix-globals.c ulix-functions.c ulix-init.c; do \
 	  notangle -L -R$$r ../ulix-book.nw ulix-arm64.nw 2>/dev/null | sed 's/^#line .*//' > $(GENDIR)/$$r; \
 	done
+	# the book's table of descriptors has 16 entries per process (MAX_PFD, x86 untouched): the port has $(PORT_PFD) (ARM64-PORT.md, descriptors)
+	sed -i.bak 's|^#define MAX_PFD 16 .*|#define MAX_PFD $(PORT_PFD)   // (the book has 16; changed for the ARM64 port by the Makefile)|' $(GENDIR)/ulix-decl.h && rm $(GENDIR)/ulix-decl.h.bak
+	grep -q '^#define MAX_PFD $(PORT_PFD)' $(GENDIR)/ulix-decl.h
 
 $(GENDIR)/ulix-port.c $(GENDIR)/ulix-api.h: $(GENFILES) port.manifest tools/port.py Makefile
 	python3 tools/port.py $(GENDIR) port.manifest $(GENDIR)/ulix-port.c

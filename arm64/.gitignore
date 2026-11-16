@@ -136,6 +136,7 @@ libc/cat.c
 libc/ls.c
 libc/filetest.c
 libc/readtest.c
+libc/fdtest.c
 libc/threadtest.c
 sockets.c
 libc/sockettest.c
