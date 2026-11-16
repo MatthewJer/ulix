@@ -2703,6 +2703,8 @@ The complete file is put together from these parts:
 
 <<netd.c: log>>
 
+<<netd.c: resolv>>
+
 <<netd.c: link>>
 
 <<netd.c: link6>>
@@ -2804,6 +2806,29 @@ static void netlog_flush (void) {
 }
 
 @
+The name server that DHCP names is also what the C library of the programs needs: musl's [[getaddrinfo]] reads the file \texttt{/etc/resolv.conf}
+(chapter \ref{ch:sockets}), the kernel's own resolver ([[dns.c]]) takes [[net_dns]] directly. So after every successful DHCP exchange
+[[netd_write_resolv]] writes the file, with the one line [[nameserver a.b.c.d]]; the thread does it after its own request, and the system call of [[dhclient]]
+does it after the request of the program. A server that names no name server leaves the file as it is. The book has no way to cut a file to length when
+it is opened, so the old file is removed first. (A line with a comment says where the file came from, so that nobody edits it and wonders why the change is gone.)
+
+<<netd.c: resolv>>=
+extern unsigned net_dns;
+extern int u_unlink (const char *path);
+
+void netd_write_resolv (void) {
+  if (!net_dns) return;
+  char text[96];
+  int n = sprintf (text, "# written by the kernel after DHCP\nnameserver %d.%d.%d.%d\n", net_dns >> 24, (net_dns >> 16) & 255, (net_dns >> 8) & 255, net_dns & 255);
+  u_unlink ("/etc/resolv.conf");
+  int fd = u_open ("/etc/resolv.conf", O_WRONLY | O_CREAT, FOLLOW_LINK);
+  if (fd < 0) return;                                              // (no /etc: the DNS of the kernel still works)
+  u_write (fd, text, n);
+  u_close (fd);
+  buffer_sync (1);
+}
+
+@
 A cable that is plugged in \emph{after} the boot, or an address that the DHCP server did not give at the boot because
 nobody answered: for a computer that is supposed to get its address from DHCP ([[ip=dhcp]]) that must not mean ``no address
 for ever''. The boot itself does not ask the server (that could take seconds, and the console would show nothing but
@@ -2833,6 +2858,7 @@ static void netd_link (void) {
   if (!told) NETLOG ("net: asking a DHCP server for an address");
   if (dhcp_run (5000, netd_sleep) == 0) {
     net_dhcp_done = 1;  told = 0;
+    netd_write_resolv ();
     NETLOG ("net: DHCP: address %d.%d.%d.%d, router %d.%d.%d.%d", net_my_ip >> 24, (net_my_ip >> 16) & 255, (net_my_ip >> 8) & 255, net_my_ip & 255,
             net_gateway >> 24, (net_gateway >> 16) & 255, (net_gateway >> 8) & 255, net_gateway & 255);
   } else {
@@ -3040,6 +3066,7 @@ extern const char *net_if_name;
 extern const unsigned char *net_dev_mac (void);
 extern int net_dev_link (void);
 extern int dhcp_run (int timeout_ms, void (*idle) (void));
+extern void netd_write_resolv (void);
 extern struct dhcp_result dhcp_last;
 
 static int alive (int tid) { return tid > 0 && tid < MAX_THREADS && thread_table[tid].used; }
@@ -3131,6 +3158,7 @@ void syscall_net_dhcp (context_t *r) {
   struct net_dhcp_args *d = (struct net_dhcp_args *)r->ebx;
   if (!is_root ()) eax_return (-2);
   int result = dhcp_run (d->timeout_ms, arch_resign);                  // (the program that waits gives the CPU to the others)
+  if (result == 0) netd_write_resolv ();                               // (/etc/resolv.conf: netd.c)
   d->server = dhcp_last.server;  d->address = dhcp_last.address;  d->netmask = dhcp_last.netmask;
   d->gateway = dhcp_last.gateway;  d->dns = dhcp_last.dns;  d->lease = dhcp_last.lease_seconds;
   eax_return (result);

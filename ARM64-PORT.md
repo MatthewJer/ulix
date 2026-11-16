@@ -897,3 +897,12 @@ Adding these up (an estimate, not a measurement) gives about 10 MByte for an idl
 5. **A new feature states its worst-case memory in its issue and section** in one line, like "needs N MByte at most", so that this table can be extended.
 
 **Open:** a measurement of the real free memory per model (1 and 2 GByte) in the log of section 46; `top` already shows it, nothing has been recorded.
+
+## 48. Sockets for programs, part 2: IPv6 datagrams, `sendmsg`, `MSG_PEEK`, `SO_ERROR`, `SO_RCVTIMEO`, `resolv.conf` from DHCP (branch `m2-sockets`, issue #137)
+
+- **Address type.** `struct saddr` (family flag, IPv4 or 16-byte IPv6 address, port) replaces `ip, port` in the `sock_*` functions; a socket keeps the family it was made with, an address of the other family is `EAFNOSUPPORT`. IPv6 has its own port table in the network stack, so `sockets.c` has 16 more handler functions (same macro) and `udp6_unbind` was added (`udp6` ports 4 -> 16).
+- **TCP over IPv6: not done, on purpose** (see section 26: the `u32` peer in about ten places of `tcp.c`). `socket (AF_INET6, SOCK_STREAM)` stays `EAFNOSUPPORT`, which musl's `getaddrinfo` handles.
+- **`sendmsg`/`recvmsg`** (211, 212) are translations in `linux_abi.c` over `sock_send`/`sock_recv` (a datagram is gathered in a 1472-byte buffer on the kernel stack; no ancillary data). **`MSG_PEEK`**: datagrams stay in the queue, a stream peeks into a 512-byte buffer of the socket. **`SO_ERROR`**: `connect_check` records a failed non-blocking connect (always `ECONNREFUSED`: tcp.c does not say why), `getsockopt` clears it, `poll` reports `POLLOUT|POLLERR|POLLHUP`. **`SO_RCVTIMEO`**: ms in the socket, receive waits end with `EAGAIN`.
+- **`/etc/resolv.conf` from DHCP**: `netd_write_resolv` (netd.c) after the network thread's DHCP and after `dhclient`'s system call. The book has no `O_TRUNC`, so the file is unlinked first.
+- **Tests.** `make socket-test` (new program `libc/sockext.c`, 32 checks, host UDP server on `[::1]` reached through `fec0::2`); `make dhcp-retry-test` (resolv.conf placeholder replaced by `nameserver 10.0.2.3`).
+- **Open:** a test of musl's resolver through a real (host-side) name server (plan: a Python DNS server on 0.0.0.0:53, which macOS lets unprivileged users bind; disk copy with `nameserver 10.0.2.2`; a program calling `getaddrinfo` for A, AAAA, CNAME, NXDOMAIN names); `SO_SNDTIMEO`; `MSG_TRUNC`; the kernel-boot (`ip=dhcp` without the netd thread) path is the same code.

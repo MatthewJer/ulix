@@ -14,9 +14,11 @@ log, mon = os.path.join(tmp, "console.log"), os.path.join(tmp, "monitor.sock")
 here = os.path.dirname(os.path.abspath(__file__))
 rc = os.path.join(tmp, "rc.conf")
 open(rc, "w").write('telnetd_enable="NO"\nnetlog_enable="YES"\n')
+rv = os.path.join(tmp, "resolv.conf")
+open(rv, "w").write("nameserver 192.0.2.1\n")                  # a name server that is not the one of DHCP: the kernel must replace it
 mydisk = os.path.join(tmp, "disk.img")                         # a copy that qemu may write to (no -snapshot): the log file ends up in it
 shutil.copy(disk, mydisk)
-subprocess.check_call([sys.executable, os.path.join(here, "minix_add.py"), mydisk, "/etc/rc.conf=" + rc], stdout=subprocess.DEVNULL)
+subprocess.check_call([sys.executable, os.path.join(here, "minix_add.py"), mydisk, "/etc/rc.conf=" + rc, "/etc/resolv.conf=" + rv], stdout=subprocess.DEVNULL)
 disk = mydisk
 def netlog():
     r = subprocess.run([sys.executable, os.path.join(here, "minix_check.py"), disk, "--cat", "/var/log/net.log"], capture_output=True, errors="replace")
@@ -60,6 +62,8 @@ try:
     text = netlog()
     check("DHCP: address 10.0.2.15" in text, "the network thread asks by itself and gets the address; /var/log/net.log says so")
     check("DHCP" not in console() and "net:" not in console().split("console ready")[-1], "the console stayed quiet")
+    r = subprocess.run([sys.executable, os.path.join(here, "minix_check.py"), disk, "--cat", "/etc/resolv.conf"], capture_output=True, errors="replace")
+    check("nameserver 10.0.2.3" in r.stdout and "192.0.2.1" not in r.stdout, "/etc/resolv.conf was rewritten from what DHCP gave (nameserver 10.0.2.3)")
 finally:
     qemu.kill(); qemu.wait()
 print("dhcp retry test: %s" % ("all passed" if fails == 0 else "%d FAILED" % fails))
