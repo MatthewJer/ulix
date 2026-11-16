@@ -875,6 +875,8 @@ void kmain (void) {
 
   extern void smp_print_stats (void);
   smp_print_stats ();
+  extern volatile int irq_in_locked_code;
+  if (irq_in_locked_code) { printf ("  FAIL: %d interrupt(s) arrived in kernel code that held the lock\n", irq_in_locked_code); fails++; }
   extern void buffer_sync (int);
   buffer_sync (1);                                // write what the tests changed (make verify looks at the image)
   printf (fails ? "RESULT: %d check(s) FAILED\n" : "RESULT: all checks passed\n", fails);
