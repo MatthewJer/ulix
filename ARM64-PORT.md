@@ -836,3 +836,64 @@ Causes: `mx_pathname_to_ino` read a directory entry by entry, and every entry co
 **Tests.** `make fs-host-test` (`tools/minix_v3_test.py`, 12 checks: 70000 inodes, a directory of 600 entries, 60-character names, `__pycache__/_collections_abc.cpython-312.pyc`, a 3 MByte file, inode numbers above 65535, v2 still consistent). Kernel (`bookfs_test`, root disk): 198 checks pass: the v3 superblock, `st_ino` above 65535, a 43-character `.pyc` name and a 60-character name created, read and removed, 61 characters refused, a directory of 150 entries (ten blocks, indirect zone), plus everything from before. The same kernel test on an old-format root disk (`make disk.img ROOT_MKFS_FLAGS=--v2 ROOT_INODES=464`: first data zone 34, 30-character names) fails exactly the 11 checks that are about the new format and none other. **Not done:** the x86 kernel and its disk image were not rebuilt (the layout of `struct stat` and `struct dir_entry` changed, see `arm64/README.md`); a mount on Linux; the Pi board; a name cache; Python `.pyc` files on the root disk (the names fit now; `make` still copies only `*.py`); `make verify` reports a few leaked zones next to `/tmp/swap` (the swap file is open and growing when qemu is stopped; not from the file system code).
 
 **Open:** #56 (book text: written for the code above; a longer chapter on the format is still to do).
+
+## 46. A reproducible test run on the Raspberry Pi (2026-11-16, branch `m1-docs-housekeeping`, issue #19)
+
+Sections 23 and 24 say what to do when the board arrives; section 44 is the last run on the board. This section puts the procedure in one place, so that anybody with the same hardware can repeat a run and compare the result. It writes down what the maintainer did; steps that were only planned are marked.
+
+**Hardware.** Raspberry Pi 4B with 1 GByte of RAM (the only model that has been run; see section 46), SD card, USB serial adapter with 3.3 V levels (never 5 V), Ethernet cable to a router that answers DHCP.
+
+**1. Build the card image** on the host (the card is the same image that `make run-rpi4-shell` uses in qemu, with the boot partition filled):
+
+1. Firmware files from `boot/` of github.com/raspberrypi/firmware into `arm64/firmware/` (ignored by git): `start4.elf`, `fixup4.dat`, `bcm2711-rpi-4-b.dtb`. They are not in the repository (Broadcom licence, see `THIRD-PARTY.md`); fetch them yourself and note the firmware commit in the log (step 4).
+2. `cd arm64; git submodule status` (every line without a leading `-`; see `make check-submodules`), then `make sd-pi.img`. This builds `kernel8-shell.img`, copies `rpi4-config.txt` to `config.txt` (`arm_64bit=1`, `enable_uart=1`, `dtoverlay=disable-bt`) and `rpi4-cmdline.txt` to `cmdline.txt` (`ip=dhcp`; add `debug=http` for the heartbeat of section 43, `maxcpus=N` to limit the cores) and writes the partition table with the three Minix disks (type `0x81`).
+3. Note the commit (`git rev-parse --short HEAD`) and the SHA-256 of `sd-pi.img` (`shasum -a 256 sd-pi.img`): the run is only comparable for the same image.
+
+**2. Write the card** (done by the maintainer, not by a script, because the wrong `diskN` destroys data): `diskutil list external`, `diskutil unmountDisk /dev/diskN`, `sudo dd if=sd-pi.img of=/dev/rdiskN bs=4m`, `diskutil eject /dev/diskN`. The image is 64 MByte of root disk plus the others; the card needs to be at least as large as `ls -l sd-pi.img`.
+
+**3. Console.** Serial adapter: TXD to pin 10 (GPIO 15), RXD to pin 8 (GPIO 14), GND to pin 6. On the Mac `screen /dev/cu.usbserial-XXXX 115200` (8N1, no flow control), started *before* the power is switched on, with logging switched on: `screen -L -Logfile ~/pi-run-YYYY-MM-DD.log /dev/cu.usbserial-XXXX 115200`. (The maintainer works in a terminal window with the serial console; the console texts quoted in sections 24, 41 to 44 were copied from there. A log file is the planned way to keep the whole run, so it can be attached to an issue.)
+
+**4. The run and what to expect** (the log should contain, in this order; a missing line is the first thing to look at):
+
+| step | on the console | check |
+|---|---|---|
+| boot | `Device tree: ... MByte RAM at 0x0, 4 CPU(s), GICv2` | RAM size equals the model; the firmware passed the device tree |
+| SD card | the disk messages, then the kernel tests are not run (the shell image has none) | the root disk mounts |
+| cores | `SMP: CPU 1 online` to `CPU 3` (not `did not start`) | section 44 |
+| network | `genet: link up`, then the DHCP answer (address from the router) | `ifconfig` in the shell, `ping` of the router |
+| login | prompt on the serial console; log in, then `top`: four CPU bars, memory line | `fork2` plus Ctrl-C ends the job |
+| servers | from the Mac: `telnet <address>` (port 23, terminal 5), `ssh -p 2222 <address>`, `curl http://<address>:8080/` if the Python server runs | the same shell over the network |
+
+Write the model, the firmware date, the commit, the SHA-256 of the image and the result of each row at the top of the log file; that is the whole record. Differences between the runs of two images show up in the log, not in memory.
+
+**5. Without a board** the same image runs in qemu (`make run-rpi4-shell`, Ctrl-A X leaves) and `make pcheck` runs the jobs `rpi4`, `rpi4shell`, `rpi4console` on the emulated board. What qemu cannot show, and a board run therefore has to: the Ethernet controller, the real timing of the SD card, the instruction cache after page-in (section 40), the firmware's spin table, and the real device tree (save it: `dtc -I dtb -O dts` of the `bcm2711-rpi-4-b.dtb` that is on the card, and compare with `rpi4-qemu.dts`).
+
+**Not automated (open):** a script that does steps 1 to 3 in one call and checks the log for the lines of step 4 (a `tools/pi_log_check.py` that takes the log file and prints a table is small enough to be a teaching exercise). Until it exists the check is done by reading.
+
+## 47. Memory budget (2026-11-16, issue #20)
+
+**Decision.** Ulix is designed for the Raspberry Pi 4B models **below 4 GByte** (1 GByte and 2 GByte). The 1 GByte model is the reference, because it is the only board that the maintainer owns and has run (section 23: "the 1 GByte model has peripherals in block 3 and RAM in block 0, which fits the boot tables"). A feature must work on 1 GByte, in the sense of "does not break the boot and the shell"; it may be slower there (swap). A feature that needs more memory than the 1 GByte model has, or that depends on a model that nobody here owns (4 and 8 GByte, because RAM and peripherals share one GByte of the boot tables, section 23 point 4), is not refused; its issue gets the label **`hw:no-test-hardware`** and the text says what is untested. The same label is used for other hardware that cannot be tested (Pi Zero, Pi 5, a display, WLAN).
+
+**What the system uses today** (measured on the images of 2026-11-15, rounded; the numbers go stale, the *method* does not: run `aarch64-elf-size ulix-rpi4-shell.elf` and `top`):
+
+| item | size | where it comes from |
+|---|---|---|
+| kernel code and data | 0.3 MByte | `text` and `data` of `ulix-rpi4-shell.elf` |
+| kernel static tables (`bss`) | 4.8 MByte | process and thread tables, buffer cache, TCP buffers (8 connections of 2 x 4 KByte), `frame_refs` (2 bytes per 4 KByte frame: 1 MByte for the 2 GByte that `MAX_RAM` covers) |
+| kernel stack per thread | 16 KByte (`KSTACK_FRAMES`, 4 frames) | `memory.nw`; a Python with a few threads costs a few dozen KByte |
+| a user process | its pages (code, data, stack) plus page tables; fork shares frames until written (copy on write) | `memory.nw` |
+| `python` | 7 MByte image (static) plus 3 to 4 MByte of heap for a start | section 31 |
+| `https` | 110 KByte code, 192 KByte data (128 KByte of it the CA list), 20 KByte of buffers | `third_party/README.md`, BearSSL |
+| SSH, telnet servers | a program each; the same order as the shell | sections 24, 30 |
+
+So an idle system with login, shell, telnet and ssh fits in about 10 MByte; Python and a web server in about 25 MByte. 1 GByte is a very generous budget for the work of this system. The limit that matters is therefore not RAM size but the **tables with a fixed size** (see below).
+
+**Rules for new code** (so that the budget stays true):
+
+1. **Everything that grows is bounded by a constant that is written down** (`CONNS`, `MAX_THREADS`, `MAX_SWAP_FRAMES`), and the table in `third_party/README.md` ("what it costs") gives the worst case in MByte for a library.
+2. **Nothing is sized for the largest model.** `frame_refs` is sized for 2 GByte at build time; a 4 GByte model would need a table of 2 MByte and the boot tables of section 23; that is the entry point of the label `hw:no-test-hardware`, not a reason to size everything for it.
+3. **When memory is short the system swaps** (book mechanism, `arch_swap.c`; the swap file grows on demand and keeps 300 KByte of the disk free) and only then says "out of memory". Test with `-m 64M` in qemu (the device tree says the size; the kernel tests run from 64 MByte up): a feature that needs more than that must say so in its section.
+4. **The GPU takes its part before the kernel starts.** The firmware reports to the kernel only the RAM that remains (`Device tree: ... MByte RAM`); read that number from the log of the run (section 45), not from the label on the board.
+5. **A new feature states its worst-case memory in its issue and section** in one line, like "needs N MByte at most", so that this table can be extended.
+
+**Open:** a measurement of the real free memory per model (1 and 2 GByte) in the log of section 45; `top` already shows it, nothing has been recorded.
