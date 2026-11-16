@@ -185,15 +185,15 @@ clean:
 # ---- programs linked with musl instead of ulixlib (issue #35, section 51 of ../ARM64-PORT.md) ----
 # The program text is the book's. Its #include "../ulixlib.h" finds musl/ulixlib.h (copied to build/musl), which includes musl's headers and adds what
 # the book has more (see "The programs of the book on musl" in lit/userland.nw). Every name in MUSLTOOLS is linked with musl; the others keep ulixlib.
-MUSLTOOLS = echo cat
+MUSLTOOLS = echo cat wc grep diff mkdir rmdir rm touch stat cp ls hexdump bindump ascii print args exit42 trunc chmod chown chgrp df sync kill fault-div0 fault-mem testcp stdio inode keys
 SYSROOT   = $(abspath ../libc/build/sysroot)
 MCFLAGS   = -O0 -fno-pic -mno-outline-atomics -fsanitize=integer-divide-by-zero -fsanitize-undefined-trap-on-error -std=gnu99 -w \
             -nostdinc -isystem $(SYSROOT)/include -isystem $(shell $(CC) -print-file-name=include)
 MUSLPROGS = $(addprefix $(BUILD)/bin/,$(addsuffix .elf,$(MUSLTOOLS)))
 # programs that define a library function themselves (a teaching version of strchr, memcmp, ...): their copy gets another name
-MCFLAGS_wc   = -Dstrchr=wc_strchr
-MCFLAGS_grep = -Dstrchr=grep_strchr -Dmemmove=grep_memmove
-MCFLAGS_diff = -Dmemcmp=diff_memcmp
+RENAME_wc   = strchr
+RENAME_grep = strchr memmove
+RENAME_diff = memcmp
 
 $(SYSROOT)/lib/libc.a:
 	$(MAKE) -C ../libc $@
@@ -204,10 +204,10 @@ $(BUILD)/musl/ulixlib.h: musl/ulixlib.h
 
 $(BUILD)/musl/tools/%.c: $(TOOLSRC)/%.c
 	mkdir -p $(BUILD)/musl/tools
-	cp $< $@
+	perl -pe '$(foreach f,$(RENAME_$*),s/\b$(f)\b/$*_$(f)/g;)' $< > $@
 
 $(BUILD)/musl/tools/%.o: $(BUILD)/musl/tools/%.c $(BUILD)/musl/ulixlib.h $(SYSROOT)/lib/libc.a
-	$(CC) $(MCFLAGS) $(MCFLAGS_$*) -c -o $@ $<
+	$(CC) $(MCFLAGS) -c -o $@ $<
 
 $(BUILD)/musl/ulixcompat.o: musl/ulixcompat.c musl/ulixlib.h $(SYSROOT)/lib/libc.a
 	mkdir -p $(BUILD)/musl
