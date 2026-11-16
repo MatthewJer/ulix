@@ -102,6 +102,7 @@ struct sock {
   int v6;                                            // AF_INET6 (only datagram sockets): the addresses are peer6 and the ip6 of the datagrams
   int nonblock;
   int error;                                         // SO_ERROR: why a connect () that did not wait has failed (a Linux error number), 0 = none
+  long sndtimeo;                                     // SO_SNDTIMEO in milliseconds, 0 = wait for ever
   long rcvtimeo;                                     // SO_RCVTIMEO in milliseconds, 0 = wait for ever
   u8 pk[PEEKMAX];  int npk;                             // stream: what MSG_PEEK has read from the connection and recv () has not yet delivered
   u8 peer6[16];
@@ -191,6 +192,8 @@ void sock_set_nonblock (int gfd, int on) { struct sock *s = sock_of (gfd); if (s
 int  sock_is_nonblock (int gfd) { struct sock *s = sock_of (gfd); return s && s->nonblock; }
 int  sock_type (int gfd) { struct sock *s = sock_of (gfd); return s ? s->type : 0; }
 void sock_set_rcvtimeo (int gfd, long ms) { struct sock *s = sock_of (gfd); if (s) s->rcvtimeo = ms; }
+void sock_set_sndtimeo (int gfd, long ms) { struct sock *s = sock_of (gfd); if (s) s->sndtimeo = ms; }
+long sock_get_sndtimeo (int gfd) { struct sock *s = sock_of (gfd); return s ? s->sndtimeo : 0; }
 long sock_get_rcvtimeo (int gfd) { struct sock *s = sock_of (gfd); return s ? s->rcvtimeo : 0; }
 
 @
@@ -387,7 +390,8 @@ static long stream_send (struct sock *s, const u8 *buf, u64 n) {
     sent += k;
     if (k == 0) {
       if (s->nonblock) return sent ? (long) sent : -E_AGAIN;
-      if (wait_a_little (start, -1)) return sent ? (long) sent : -E_INTR;
+      int e = wait_a_little (start, s->sndtimeo ? s->sndtimeo : -1);              // (SO_SNDTIMEO ends the wait: EAGAIN, as on Linux)
+      if (e) return sent ? (long) sent : -(e == E_TIMEDOUT ? E_AGAIN : e);
     }
   }
   return sent;
@@ -754,6 +758,55 @@ int main (int argc, char **argv) {
   CHECK (poll (&pf, 1, 5000) == 1 && (pf.revents & POLLOUT) && !(pf.revents & POLLERR) && getsockopt (s, SOL_SOCKET, SO_ERROR, &err, &el) == 0 && err == 0,
          "a non-blocking connect that works: POLLOUT, no POLLERR, SO_ERROR 0");
   close (s);
+  return fails;
+}
+@
+
+\subsection{The test program \texttt{resolvtest}: musl's resolver and a real name server}
+\label{src:libc/resolvtest.c}
+
+\texttt{getaddrinfo} and \texttt{gethostbyname} of musl read \texttt{/etc/resolv.conf} (which the kernel writes from what DHCP gave), open a UDP socket (IPv4, as the name server is IPv4), send the questions for
+\texttt{A} and \texttt{AAAA} records together and parse the answers. With \texttt{AF\_UNSPEC} they then sort the addresses with the help of more UDP sockets (an IPv6 one among them: this is
+what the \texttt{AF\_INET6} datagram sockets are for). The name server is the forwarder of qemu's user network (\texttt{10.0.2.3}), which asks the resolver of the host. The name is \texttt{localhost.}
+with a final dot, which no line of \texttt{/etc/hosts} matches, so the question really goes out; every host knows its answer without the Internet. (A name server of our own on the host would be
+better, since the test could choose the answers, but qemu answers every question for port 53 of \texttt{10.0.2.2} itself, with NXDOMAIN, and the packets never reach the host; musl cannot ask another port.)
+
+<<libc/resolvtest.c>>=
+#include <stdio.h>
+#include <string.h>
+#include <netdb.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+
+static int fails = 0;
+#define CHECK(c, msg) do { if (c) printf ("  user ok:   %s\n", msg); \
+                           else { printf ("  user FAIL: %s\n", msg); fails++; } } while (0)
+
+int main (void) {
+  struct addrinfo hints, *res = 0;
+  memset (&hints, 0, sizeof hints);
+  hints.ai_family = AF_INET;  hints.ai_socktype = SOCK_STREAM;
+  int g = getaddrinfo ("localhost.", "80", &hints, &res);
+  if (g) printf ("  (getaddrinfo said: %s)\n", gai_strerror (g));                // (what went wrong, if it did)
+  CHECK (g == 0 && res && res->ai_family == AF_INET && ((struct sockaddr_in *) res->ai_addr)->sin_addr.s_addr == htonl (INADDR_LOOPBACK),
+         "getaddrinfo (\"localhost.\", AF_INET): 127.0.0.1 from the name server of qemu and the host");
+  CHECK (res && ((struct sockaddr_in *) res->ai_addr)->sin_port == htons (80), "...with the port 80");
+  if (res) freeaddrinfo (res);
+
+  hints.ai_family = AF_UNSPEC;
+  g = getaddrinfo ("localhost.", 0, &hints, &res);
+  int v4 = 0;
+  for (struct addrinfo *a = res; g == 0 && a; a = a->ai_next) if (a->ai_family == AF_INET) v4 = 1;
+  CHECK (g == 0 && v4, "getaddrinfo (\"localhost.\", AF_UNSPEC): asks for A and AAAA, sorts the result with datagram sockets, 127.0.0.1 is in it");
+  if (res) freeaddrinfo (res);
+
+  struct hostent *h = gethostbyname ("localhost.");
+  CHECK (h && h->h_addrtype == AF_INET && !memcmp (h->h_addr_list[0], "\x7f\x00\x00\x01", 4), "gethostbyname (\"localhost.\"): 127.0.0.1");
+
+  hints.ai_family = AF_INET;
+  g = getaddrinfo ("no-such-host.invalid", 0, &hints, &res);
+  CHECK (g == EAI_NONAME || g == EAI_AGAIN, "a name that does not exist: an error (EAI_NONAME from the server, or EAI_AGAIN if the host cannot ask)");
   return fails;
 }
 @

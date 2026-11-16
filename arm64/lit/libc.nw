@@ -1561,7 +1561,8 @@ extern int  sock_name (int gfd, int peer, struct saddr *a), sock_type (int gfd),
 extern long sock_send (int gfd, const void *buf, u64 n, const struct saddr *to);
 extern long sock_recv (int gfd, void *buf, u64 n, struct saddr *from, int flags);
 extern void sock_set_nonblock (int gfd, int on), sock_set_rcvtimeo (int gfd, long ms);
-extern long sock_get_rcvtimeo (int gfd);
+extern long sock_get_rcvtimeo (int gfd), sock_get_sndtimeo (int gfd);
+extern void sock_set_sndtimeo (int gfd, long ms);
 extern int  pipe_ready (int gfd);
 extern int  net_poll_once (void);
 extern int  gfd2pfd (int gfd);
@@ -1703,6 +1704,7 @@ static long linux_getname (int fd, void *addr, unsigned *alen, int peer) {
 #define SOL_SOCKET  1
 #define SO_TYPE     3
 #define SO_ERROR    4
+#define SO_SNDTIMEO 21
 #define SO_RCVTIMEO 20                 // (the one with a 64-bit struct timeval, which is what musl uses on AArch64)
 
 struct timeval_ { long sec, usec; };
@@ -1713,8 +1715,8 @@ static long linux_getsockopt (int fd, int level, int opt, void *val, unsigned *l
   long e;  int gfd = sock_arg (fd, &e);
   if (gfd < 0) return e;
   if (!val || !len || !user_ok ((u64) len, 4, 1) || !user_ok ((u64) val, *len, 1)) return -LE_EFAULT;
-  if (level == SOL_SOCKET && opt == SO_RCVTIMEO) {
-    long ms = sock_get_rcvtimeo (gfd);
+  if (level == SOL_SOCKET && (opt == SO_RCVTIMEO || opt == SO_SNDTIMEO)) {
+    long ms = opt == SO_RCVTIMEO ? sock_get_rcvtimeo (gfd) : sock_get_sndtimeo (gfd);
     struct timeval_ tv = { ms / 1000, ms % 1000 * 1000 };
     if (*len < sizeof tv) return -LE_EINVAL;
     memcpy (val, &tv, sizeof tv);  *len = sizeof tv;
@@ -1731,11 +1733,12 @@ static long linux_getsockopt (int fd, int level, int opt, void *val, unsigned *l
 static long linux_setsockopt (int fd, int level, int opt, const void *val, unsigned len) {
   long e;  int gfd = sock_arg (fd, &e);
   if (gfd < 0) return e;
-  if (level == SOL_SOCKET && opt == SO_RCVTIMEO) {
+  if (level == SOL_SOCKET && (opt == SO_RCVTIMEO || opt == SO_SNDTIMEO)) {
     if (!val || len < sizeof (struct timeval_) || !user_ok ((u64) val, sizeof (struct timeval_), 0)) return -LE_EINVAL;
     const struct timeval_ *tv = val;
     if (tv->sec < 0 || tv->usec < 0 || tv->usec >= 1000000) return -LE_EINVAL;
-    sock_set_rcvtimeo (gfd, tv->sec * 1000 + (tv->usec + 999) / 1000);              // (a tiny time is rounded up: 0 would mean for ever)
+    long ms = tv->sec * 1000 + (tv->usec + 999) / 1000;
+    if (opt == SO_RCVTIMEO) sock_set_rcvtimeo (gfd, ms);  else sock_set_sndtimeo (gfd, ms);              // (a tiny time is rounded up: 0 would mean for ever)
   }
   return 0;
 }

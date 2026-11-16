@@ -114,3 +114,4 @@ libc/cxxtest2.cc
 libc/libctest.c
 userland/musl/ulixlib.h
 userland/musl/ulixcompat.c
+libc/resolvtest.c

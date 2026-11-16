@@ -143,6 +143,7 @@ libc/sockettest.c
 libc/localetest.c
 libc/sockext.c
 libc/cxxtest.cc
+libc/resolvtest.c
 dbg_http.c
 libc/cxxtest2.cc
 libc/chantest.c

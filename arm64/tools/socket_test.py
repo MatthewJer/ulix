@@ -20,7 +20,7 @@ class Session:
     def __init__(self, image):
         cmd = ['qemu-system-aarch64', '-M', 'virt', '-cpu', 'cortex-a72', '-m', '128', '-display', 'none', '-monitor', 'none', '-kernel', kernel,
                '-snapshot', '-drive', 'file=%s,format=raw,if=none,id=hd0' % image, '-device', 'virtio-blk-device,drive=hd0',
-               '-device', 'virtio-rng-device', '-smp', '2', '-netdev', 'user,id=n0', '-device', 'virtio-net-device,netdev=n0', '-serial', 'tcp:127.0.0.1:%d,server=on,wait=on' % PORT]
+               '-device', 'virtio-rng-device', '-smp', '2', '-netdev', 'user,id=n0,host=10.0.2.4', '-device', 'virtio-net-device,netdev=n0', '-serial', 'tcp:127.0.0.1:%d,server=on,wait=on' % PORT]
         self.qemu = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.sock = None
         for _ in range(100):
@@ -114,6 +114,11 @@ try:
     print(out[-4000:])
     check(out.count('user ok:') == 32 and 'user FAIL' not in out, 'all 32 checks of sockext passed (IPv6 UDP, sendmsg/recvmsg, MSG_PEEK, SO_RCVTIMEO, SO_ERROR)')
     check('not implemented' not in out, 'no Linux system call that the kernel does not have (sockext)')
+    # musl's resolver asks the name server of qemu (10.0.2.3, /etc/resolv.conf: put there by DHCP or by the disk), which asks the resolver of the host
+    out = s.run('/musl/resolvtest', r'(?s)user (ok|FAIL):.*gethostbyname[^\n]*\n|Killed', 'resolvtest runs', timeout=120)
+    print(out[-3000:])
+    check(out.count('user ok:') == 5 and 'user FAIL' not in out, 'all 5 checks of musl\'s resolver through qemu\'s name server passed')
+    check('not implemented' not in out, 'no Linux system call that the kernel does not have (resolvtest)')
     s.pump(0.5)
     if b'EXCEPTION' in s.log or b'killed:' in s.log:
         print('  FAIL: kernel exception or process killed by a fault'); fails += 1
