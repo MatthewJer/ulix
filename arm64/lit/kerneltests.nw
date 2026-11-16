@@ -75,6 +75,15 @@ static long verify_pattern (int mfd, unsigned n) {
   return done;
 }
 
+// the blocks that a file of n bytes needs on the disk: data zones, the single indirect zone behind the first 7, and behind the next
+// 256 the double indirect zone with one single indirect zone for every 256 more
+static int blocks_for (unsigned n) {
+  int data = (n + 1023) / 1024, need = data;
+  if (data > 7) need++;
+  if (data > 7 + 256) need += 1 + (data - 7 - 256 + 255) / 256;
+  return need;
+}
+
 static int free_blocks (void) {
   struct diskfree_query q;
   q.device = DEV;
@@ -168,6 +177,37 @@ int bookfs_test (void) {
   CHECK (verify_pattern (mfd, 300000) == 300000, "read back: 300000 bytes match");
   mx_close (mfd);
   CHECK (mx_unlink (DEV, "/big.bin") == 0, "delete the big file again");
+
+  // ---- ftruncate gives back data zones and indirect zones, and forgets their numbers (issue #139) ----
+  // The count of free blocks is the proof: it must follow the size of the file exactly (data zones plus the indirect zones that the size
+  // needs), through the double indirect, the single indirect and the direct range, and after the file is deleted it is back where it was.
+  {
+    int base = free_blocks ();
+    mfd = mx_open (DEV, "/trunc.bin", O_CREAT | O_RDWR);
+    int start = free_blocks ();                                  // (the new name may need a block in the directory)
+    CHECK (write_pattern (mfd, 300000, 4096) == 300000 && start - free_blocks () == blocks_for (300000),
+           "trunc: 300000 bytes use exactly the data zones plus 1 + 1 + 1 indirect zones");
+    CHECK (mx_ftruncate (mfd, 100000) == 0 && start - free_blocks () == blocks_for (100000),
+           "trunc: down to 100000 bytes: the double indirect zones are free again (one indirect zone is left)");
+    CHECK (mx_ftruncate (mfd, 7000) == 0 && start - free_blocks () == blocks_for (7000),
+           "trunc: down to 7000 bytes: the single indirect zone is free, too");
+    mx_lseek (mfd, 0, SEEK_SET);
+    CHECK (verify_pattern (mfd, 7000) == 7000, "trunc: the 7000 bytes that stay are intact");
+    CHECK (mx_ftruncate (mfd, 4500) == 0, "trunc: down to 4500 bytes, in the middle of a block");
+    mx_lseek (mfd, 4900, SEEK_SET);
+    CHECK (mx_write (mfd, (void *)"X", 1) == 1 && mx_lseek (mfd, 4500, SEEK_SET) == 4500 && mx_read (mfd, buf, 401) == 401,
+           "trunc: write one byte behind the new end, read the gap");
+    int gap_zero = 1;  for (int i = 0; i < 400; i++) if (buf[i] != 0) gap_zero = 0;
+    CHECK (gap_zero && buf[400] == 'X', "trunc: the gap reads as zeros, not as the old bytes of the cut part");
+    CHECK (mx_ftruncate (mfd, 0) == 0 && start - free_blocks () == 0, "trunc: down to 0 bytes: every data zone is free");
+    mx_lseek (mfd, 0, SEEK_SET);                                 // (ftruncate does not move the position)
+    CHECK (write_pattern (mfd, 280000, 4096) == 280000 && start - free_blocks () == blocks_for (280000),
+           "trunc: the file grows again (through the zones that were freed): the count is right");
+    mx_lseek (mfd, 0, SEEK_SET);
+    CHECK (verify_pattern (mfd, 280000) == 280000, "trunc: and all 280000 bytes read back (no stale zone numbers)");
+    mx_close (mfd);
+    CHECK (mx_unlink (DEV, "/trunc.bin") == 0 && free_blocks () == base, "trunc: after the unlink the free blocks are what they were");
+  }
 
   // ---- directories and links ----
   CHECK (mx_mkdir (DEV, "/d1", 0755) == 0 && mx_file_is_directory (DEV, "/d1"), "mx_mkdir /d1");

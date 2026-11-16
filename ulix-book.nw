@@ -23775,7 +23775,6 @@ int mx_unlink (int device, const char *path);
 
 <<minix filesystem implementation>>=
 int mx_unlink (int device, const char *path) {
-  char ind_block[BLOCK_SIZE], double_ind_block[BLOCK_SIZE];
   struct minix_dir_entry dentry;
 
   // check if path exists
@@ -23837,7 +23836,6 @@ struct int_minix2_inode *mx_find_open_inode (int device, int inodenr);
 
 <<minix filesystem implementation>>=
 void mx_free_inode (int device, int inodenr, struct minix2_inode *ext) {
-  char ind_block[BLOCK_SIZE], double_ind_block[BLOCK_SIZE];
   struct minix2_inode inode = *ext;
   <<free this inode>>
   *ext = inode;
@@ -23854,90 +23852,81 @@ struct int_minix2_inode *mx_find_open_inode (int device, int inodenr) {
 We must take care of the case when the last link has been
 removed---then we have an inode with a reference count of 0, and
 that means, the file is truly to be deleted: We need to mark its
-data blocks as free (including an indirection block, if it exists)
-and also mark the inode as free. We show this action in four 
-separate steps:
+data blocks as free (including the indirection blocks, if they exist)
+and also mark the inode as free:
 
 \index{indirection}%
 <<free this inode>>=
-<<free this inode: (1) direct blocks>>
-<<free this inode: (2) single indirect blocks>>
-<<free this inode: (3) double indirect blocks>>
-<<free this inode: (4) inode itself>>
+mx_free_zones (device, &inode, 0);     // all data blocks and indirection blocks
+mx_clear_imap_bit (device, inodenr);   // the inode itself
 @
 
-<<free this inode: (1) direct blocks>>=
-for (int i = 0;  i < 7;  i++) {
-  if (inode.i_zone[i] != 0) {
-    mx_clear_zmap_bit (device, mx_zone_bit (device, inode.i_zone[i]));  // mark data block as free
-    inode.i_zone[i] = 0;
-  }
+\noindent
+Giving back the blocks of a file is the same work for [[mx_unlink]] (all blocks) and for [[mx_ftruncate]] (all blocks from some logical block on), so one function does both. [[mx_free_zones]] frees the data blocks of the logical blocks [[first]], [[first+1]], \dots{} and sets their numbers in the inode (or in the indirection block) to 0; an indirection block is freed as well if none of its entries is left, i.\,e., if [[first]] is at or before the logical block where it begins. A zone number of 0 means ``no block'' (a hole in a file that was written sparsely), so such entries are skipped.
+
+Every zone is freed by the same two steps, clear the bit in the zone map and forget the number, which is a function of its own:
+
+%nouse
+<<function prototypes>>=
+void mx_free_zone (int device, unsigned int *zone);
+void mx_free_zones (int device, struct minix2_inode *inode, int first);
+@
+
+<<minix filesystem implementation>>=
+void mx_free_zone (int device, unsigned int *zone) {
+  if (*zone == 0)  return;
+  mx_clear_zmap_bit (device, mx_zone_bit (device, *zone));
+  *zone = 0;
 }
-@
+@ %def mx_free_zone
 
-\pagebreak
+The three cases (direct blocks, single and double indirection) follow the three cases of [[fileblocktozone]]. The first seven logical blocks are in the inode:
 
-\index{single indirection}%
-For single indirection, we clear both the zone map entries for the indirection block itself and all the blocks it points to.
+<<minix filesystem implementation>>=
+void mx_free_zones (int device, struct minix2_inode *inode, int first) {
+  unsigned int block[BLOCKADDRESSES_PER_BLOCK];       // an indirection block
+  unsigned int outer[BLOCKADDRESSES_PER_BLOCK];       // the double indirection block
+  int i, k;
 
-<<free this inode: (2) single indirect blocks>>=
-if (inode.i_zone[7] != 0) {
-  readblock (device, inode.i_zone[7], ind_block);
-  unsigned int *zoneno;
-  zoneno = (unsigned int*)ind_block;      // cast to uint*
-  int count = 0;
-  while (*zoneno != 0 && count < 256) {
-    mx_clear_zmap_bit (device, mx_zone_bit (device, *zoneno));        // mark data block as free
-    zoneno++;
-    count++;
-  }
-  mx_clear_zmap_bit (device, mx_zone_bit (device, inode.i_zone[7]));  // mark indir. block as free
-  inode.i_zone[7] = 0;
+  for (i = first;  i < 7;  i++)                       // direct blocks
+    mx_free_zone (device, &inode->i_zone[i]);
+  <<[[mx_free_zones]]: single indirect>>
+  <<[[mx_free_zones]]: double indirect>>
 }
+@ %def mx_free_zones
+
+For single indirection we load the indirection block and free the entries from the one that belongs to logical block [[first]] on (entry [[i]] is logical block [[7 + i]]). If [[first]] is 7 or less, the whole block goes, and then we free the indirection block itself, otherwise we write it back with the freed entries set to 0.
+
+<<[[mx_free_zones]]: single indirect>>=
+  if (inode->i_zone[7] != 0) {
+    readblock (device, inode->i_zone[7], (byte*) block);
+    for (i = MAX (first - 7, 0);  i < BLOCKADDRESSES_PER_BLOCK;  i++)
+      mx_free_zone (device, &block[i]);
+    if (first <= 7)  mx_free_zone (device, &inode->i_zone[7]);
+    else             writeblock (device, inode->i_zone[7], (byte*) block);
+  }
 @
 
-And in case of double indirection, there are even more blocks to mark as free:
+Double indirection is the same thing twice: the double indirection block holds the numbers of 256 single indirection blocks, and entry [[k]] of it covers the logical blocks from [[7 + 256 + 256*k]] on.
 
-\index{double indirection}%
-<<free this inode: (3) double indirect blocks>>=
-if (inode.i_zone[8] != 0) {
-  readblock (device, inode.i_zone[8], double_ind_block);
-
-  unsigned int *ind_zoneno;
-  ind_zoneno = (unsigned int*)double_ind_block;     // cast to uint*
-  
-  int count1 = 0;
-  int count2;
-  while (*ind_zoneno != 0 && count1 < 256) {
-    // printf ("re" "ad block %d\n", *ind_zoneno);   // REMOVE_DEBUGGING_CODE
-    readblock (device, *ind_zoneno, ind_block);
-    unsigned int *zoneno;
-    zoneno = (unsigned int*)ind_block;              // cast to uint*
-    count2 = 0;
-    while (*zoneno != 0 && count2 < 256) {
-      mx_clear_zmap_bit (device, mx_zone_bit (device, *zoneno));     // mark data block as free
-      zoneno++;
-      count2++;
+<<[[mx_free_zones]]: double indirect>>=
+  if (inode->i_zone[8] != 0) {
+    int start = 7 + BLOCKADDRESSES_PER_BLOCK;         // first logical block behind the single indirection
+    readblock (device, inode->i_zone[8], (byte*) outer);
+    for (k = 0;  k < BLOCKADDRESSES_PER_BLOCK;  k++) {
+      if (outer[k] == 0)  continue;                   // (no block there)
+      int firstentry = MAX (first - (start + k * BLOCKADDRESSES_PER_BLOCK), 0);
+      if (firstentry >= BLOCKADDRESSES_PER_BLOCK)  continue;   // all of it stays
+      readblock (device, outer[k], (byte*) block);
+      for (i = firstentry;  i < BLOCKADDRESSES_PER_BLOCK;  i++)
+        mx_free_zone (device, &block[i]);
+      if (firstentry == 0)  mx_free_zone (device, &outer[k]);
+      else                  writeblock (device, outer[k], (byte*) block);
     }
-    mx_clear_zmap_bit (device, mx_zone_bit (device, *ind_zoneno));   // mark indir. block as free
-    ind_zoneno++;
-    count1++;
+    if (first <= start)  mx_free_zone (device, &inode->i_zone[8]);
+    else                 writeblock (device, inode->i_zone[8], (byte*) outer);
   }
-
-  mx_clear_zmap_bit (device, mx_zone_bit (device, inode.i_zone[8])); // mark double ind. block free
-  inode.i_zone[8] = 0;
-}
 @
-
-\pagebreak
-
-Last, we free the inode:
-
-<<free this inode: (4) inode itself>>=
-// printf ("Freeing inode %d\n", inodenr);   // REMOVE_DEBUGGING_CODE
-mx_clear_imap_bit (device, inodenr);
-@
-
 
 \subsubsection{\texttt{mx\_symlink}}
 
@@ -24020,52 +24009,42 @@ int mx_ftruncate (int mfd, int length);
 
 <<minix filesystem implementation>>=
 int mx_ftruncate (int mfd, int length) {
-  // printf ("DEBUG: mx_ftruncate entered\n");            // REMOVE_DEBUGGING_CODE
   if (mfd < 0 || mfd >= MX_MAX_FILES)  return -1;    // wrong mfd number
   struct mx_filestat      *st    = &mx_status[mfd];
   struct int_minix2_inode *inode = st->int_inode;
   if (inode == NULL)  return -1;                    // no open_ file
   short device = inode->device;
   
-  if (inode->i_size <= length)  return -1;           // attempt to grow the file
+  if (length < 0 || inode->i_size <= length)  return -1;   // attempt to grow the file
 
-  // calculate blocks to delete
-  int last_kept_byte = length - 1;
-  int firstblock;
-  if (length == 0)  firstblock = 0;
-  else              firstblock = last_kept_byte / BLOCK_SIZE + 1;
-  int lastblock  = inode->i_size / BLOCK_SIZE - 1;
+  // the first logical block that holds no byte of the part that stays
+  int firstblock = (length + BLOCK_SIZE - 1) / BLOCK_SIZE;
+  mx_free_zones (device, (struct minix2_inode*) inode, firstblock);
   
-  if (lastblock >= firstblock) {    // any blocks to delete?
-    for (int i = firstblock;  i <= lastblock; i++) {
-      // delete block
-      int zone = fileblocktozone (device, i, inode);
-      printf ("DELETE ZONE %d\n", zone);               // REMOVE_DEBUGGING_CODE
-      mx_clear_zmap_bit (device, mx_zone_bit (device, zone));
-    }
-  }
-
-  // check indirection blocks
-  if (lastblock > 6   && inode->i_zone[7] != 0) { 
-    <<[[mx_ftruncate]]: free single indirection block>> 
-  }
-  if (lastblock > 262 && inode->i_zone[8] != 0) {
-    <<[[mx_ftruncate]]: free double indirection block>>
-  }  
+  if (length % BLOCK_SIZE != 0) {  <<[[mx_ftruncate]]: clear the end of the last block>>  }
   
-  // reset size and write_ changed inode
+  // reset size; the changed inode is written by [[mx_close]] or [[mx_sync]]
   inode->i_size = length;
   inode->clean  = false;    // inode was changed
-  // mx_write_inode (device, inode->ino, (struct minix2_inode*)inode); // REMOVE_DEBUGGING_CODE
-  // printf ("DEBUG: mx_ftruncate finished\n");                        // REMOVE_DEBUGGING_CODE
   return 0;
 }
 @ %def mx_ftruncate
 
-We do not implement the [[<<[[mx_ftruncate]]: free single indirection block>>]] and [[<<[[mx_ftruncate]]: free double indirection block>>]] code chunks since they are basically a rewrite of corresponding chunks in [[fileblocktozone]]. Instead of looking up a zone number, it must be set to 0. Thus, when we truncate a file, single and double indirection blocks remain in use (and linked by the inode); they will however be destroyed when the file is finally deleted, and they will also be reused when the file grows again.
+The work of giving the blocks back is done by [[mx_free_zones]], which [[mx_unlink]] needs as well (a file that is deleted loses \emph{all} its blocks, a file that is truncated loses the blocks from [[firstblock]] on). The first version of this function cleared the bits of the data blocks in the zone map, but left their numbers in the inode and in the indirect blocks, and it did not free the indirect blocks themselves; when the file grew again, [[mx_write]] found the old numbers, believed that the blocks existed and wrote into zones that the zone map called free (and that another file could get at any time). Also, the last block was not counted if the file size was not a multiple of the block size. Now the zone numbers are set to 0 together with the bits, an indirect block that is left empty is freed, and the loop does not depend on the file size at all.
+
+The part of the last block that is kept after the cut must not keep the old bytes: if the file grows again by writing behind the new end, the gap has to read as zeros.
+
+<<[[mx_ftruncate]]: clear the end of the last block>>=
+int zone = fileblocktozone (device, firstblock - 1, inode);
+if (zone > 0) {
+  byte block[BLOCK_SIZE];
+  readblock (device, zone, (byte*) block);
+  memset (block + length % BLOCK_SIZE, 0, BLOCK_SIZE - length % BLOCK_SIZE);
+  writeblock (device, zone, (byte*) block);
+}
+@
 
 \pagebreak
-
 
 \subsection{Making and Removing Directories}
 \index{directory}
