@@ -741,3 +741,85 @@ int minix_read_fast (int gfd, void *buf, int nbyte) {
   return got;
 }
 @
+\section{The file system: one format family, from the superblock to the directory entry (issues \#52, \#56, \#139, \#141, \#142)}
+\label{sec:fs-overview}
+
+This section ties together what the file system code of the book does and why it looks as it does on the ARM64 port. The code itself is in
+the chapter on the Minix file system of the book (\texttt{ulix-book.nw}), the kernel's reader is in \texttt{minixfs.c} (chapter on processes), the host
+tools are in \texttt{tools/}.
+
+\subsection*{Which file system, and why}
+
+The question (``which file system?'') had three candidate answers: a larger variant of Minix, an ext2-like file system of our own, or FAT32. The
+decision is: \emph{keep Minix and extend it}. The reasons are the ones of a teaching system. The book already explains Minix in detail, so
+the extension is a small change of code that the reader knows; an ext2-like system would be a second file system to explain, with the same
+ideas (inodes, bitmaps, indirect blocks) under other names; FAT32 has no inodes and no permissions, which Ulix's users and groups need. The
+firmware of the Raspberry Pi reads a FAT partition for the boot files, but Ulix does not need to read it.
+
+What Minix version~2 could not do were three things, and they are what the extension fixes:
+
+\begin{center}
+\begin{tabular}{|l|l|l|}
+\hline
+ & Minix v2 (the book) & Minix v3 (extended) \\
+\hline
+inode numbers & 16 bit (65\,535 files) & 32 bit \\
+directory entry & 32 bytes, name of 30 characters & 64 bytes, name of 60 characters \\
+entries per directory & 224 (7 direct zones) in the book's code & as many as the zones allow (indirect zones) \\
+file size & 7 + 256 + 65\,536 zones (64 MByte) & the same \\
+magic number, place & \texttt{0x2478} at byte 16 & \texttt{0x4D5A} at byte 24 \\
+\hline
+\end{tabular}
+\end{center}
+
+\noindent The old limit of 263~KByte per file was never in the kernel (it reads and writes double indirect zones), only in a host tool.
+The new format is the \emph{Minix version 3} of Linux, with 1~KByte zones: inodes, zones and the two bitmaps are as before, only the
+superblock and the directory entry look different. This keeps the host tools honest (a second implementation of an existing format
+cannot silently drift) and lets Linux mount the image.
+
+\subsection*{One piece of code for both}
+
+Which format a device has is decided once. \texttt{mx\_fs (device)} reads the superblock, looks at the magic number and stores in a table entry
+(\texttt{struct mx\_fsinfo}) the numbers the other functions need: the number of inodes and zones, where the bitmaps are, the size of a directory entry and the
+length of a name. Before this table existed, every function that needed one of these numbers read block~1 through the buffer cache; that was
+one of the reasons for the slow path lookup below.
+
+Everything that touches a directory goes through one pair of functions that convert between the disk and the memory form of an entry.
+The width of the inode number in the entry is the entry size minus the name length (2 or 4 bytes), so no function has to know the version. In memory an entry is
+a number and a name that \emph{always} ends with a zero byte: a name of the full length has no zero on the disk, and the old code that
+compared or copied such a name without care read beyond the entry (a bug of the book, see the README). The directory itself is an ordinary file; its blocks are found
+with the same function as the blocks of a file, which is why the limit of 224 entries disappears without any special code.
+
+\subsection*{Looking up a path (issue \#142)}
+
+Opening a file turns the path into an inode number, component by component. The first version asked for the directory inode again for every \emph{entry}
+(the superblock, the inode bitmap, the inode table) and then for the block that held the entry, six calls of \texttt{readblock} per entry, each of which searches the buffer
+cache. In a directory with 200 entries (the Python library) one \texttt{open} cost thousands of calls. The measurement under qemu (Python start in a login
+session) was: \texttt{python -c pass} 1.5~s, \texttt{-m json.tool -h} 5.2~s, the module test 36.5~s. Now a component is looked up by reading the inode of the directory
+once and every block of the directory once, comparing the names in memory (\texttt{mx\_find\_in\_directory}); the numbers are 0.5~s, 2.1~s and 12.5~s.
+No name cache was needed. Making the simple thing do the work once was enough, which is the order this book prefers.
+
+\subsection*{Giving blocks back (issue \#139)}
+
+Deleting a file and cutting it with \texttt{ftruncate} free blocks in the same way, so there is one function, \texttt{mx\_free\_zones (inode, first)}: free every block from
+logical block \texttt{first} on, set its number to zero in the inode or in the indirect block, and free an indirect block that has nothing left. The bit in the zone map for a zone number
+is the number minus (first data zone $-$ 1); the first data zone comes from the superblock, never from a constant: a floppy image has it at 34, the root disk of this port at a different place.
+An earlier version used 33 and freed the wrong zones on every other layout.
+
+\subsection*{The kernel's reader and the host tools}
+
+The kernel has a second, read-only reader (\texttt{minixfs.c}) that the program loader uses; it understands both formats by the same magic test and reads a directory one zone at a time.
+On the host, \texttt{minix\_mkfs.py} makes an empty file system (version~3 unless \texttt{--v2}), \texttt{minix\_add.py} puts files and directory trees into it,
+\texttt{minix\_copy.py} copies one image into another, and \texttt{minix\_check.py} walks the whole tree and compares it with the bitmaps and link counts. They are independent
+of the kernel code on purpose: when kernel and tool agree, that is evidence; when one program tested itself, it is not.
+
+\subsection*{What is tested}
+
+\begin{itemize}
+\item Kernel (\texttt{bookfs\_test}): 32-bit inode numbers (a file with a number above 65\,535 made by the host tool), names of 43 and 60 characters made, read and deleted, 61 characters refused,
+a directory of 150 entries (ten blocks, so it needs the indirect zone), \texttt{ftruncate} through the double indirect, single indirect and direct range with the count of free blocks checked after every step, lookups of
+missing names, of paths through a file and of paths with a slash at the end.
+\item Host (\texttt{make fs-host-test}): more than 65\,535 inodes, a directory of 600 entries, a name like \texttt{\_\_pycache\_\_/\_collections\_abc.cpython-312.pyc}, a file of 3~MByte, and the old format next to it.
+\item Old format: the same kernel test on a root disk in version~2 (\texttt{make disk.img ROOT\_MKFS\_FLAGS=--v2 ROOT\_INODES=464}, first data zone 34) fails only the checks about the new format.
+\end{itemize}
+@
