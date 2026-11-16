@@ -268,6 +268,8 @@ void linux_abi_fork (int old_as, int new_as) {
 #define L_usem_post     642
 #define L_usem_value    643
 #define L_usem_close    644
+#define L_ULIX         1024      // 1024 + n is the book's system call n, see "The book's own calls"
+extern void syscall_handler (context_t *r);
 #define L_usem_unlink   645
 #define L_uchan_open    646
 #define L_uchan_send    647
@@ -2266,6 +2268,12 @@ static void linux_syscall_inner (context_t *r) {
     case L_uname: ret = linux_uname ((char *) a0); break;
 
     default:
+      if (nr >= L_ULIX && nr < L_ULIX + 1024) {                // a call of the book that Linux does not have: see "The book's own calls"
+        r->eax = nr - L_ULIX;  r->ebx = a0;  r->ecx = a1;  r->edx = a2;  r->esi = a3;  r->edi = a4;
+        syscall_handler (r);
+        ret = (int) r->eax;                                    // (-1 and the error number in the process, as for a program of the book)
+        break;
+      }
       if (nr >= 0 && nr < 512 && !unknown_reported[nr]) {
         unknown_reported[nr] = 1;
         printf ("[kernel] process %d: Linux system call %ld is not implemented\n", thread_table[current_task].pid, nr);

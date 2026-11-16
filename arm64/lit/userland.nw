@@ -1965,3 +1965,152 @@ int main () {
   clrscr ();
   return 0;
 }
+@
+
+\section{The programs of the book on musl (issue \#35)}
+\label{src:userland:musl}
+
+The maintainer's wish: all programs use musl. The 59 tools of the book are written against the book's [[ulixlib]], and they include
+\texttt{"../ulixlib.h"}. The least invasive way to move a program is therefore \emph{not} to rewrite it, but to give it another
+[[ulixlib.h]]: this one includes the headers of musl and adds the few things of the book that musl does not have. The program text
+stays the one of the book, only the library under it changes. [[userland/Makefile]] builds a program this way when its name is in
+[[MUSLTOOLS]]; everything else stays on the book's library, with the reason in \texttt{ARM64-PORT.md} (section 51).
+
+Three kinds of things are needed:
+\begin{itemize}
+\item \emph{Types and small functions} that the book adds to C ([[byte]], [[boolean]], [[strequal]], [[atoi8]], [[ureadline]], [[ureadchar]]).
+\item \emph{The book's own system calls} (screen, process list, free frames, disk usage, [[readdir]], the AArch64 network calls of
+  [[arm64-extra.h]], and [[chmod]]/[[chown]], which Linux's calls of the same name do not replace: musl's [[chmod]] goes to [[fchmodat]], and
+  the kernel accepts that but changes nothing). They keep their numbers; \texttt{linux\_abi.c} passes number $1024 + n$ to the book's
+  dispatcher (see there). [[ulix_call]] is the one place in user space that does it, and it fetches the book's error number into
+  [[errno]], so that [[perror]] and the book's [[errno]] tests keep working. [[syscall1]] to [[syscall4]], with which \texttt{arm64-extra.h}
+  and a few programs call the kernel directly, are defined on top of it.
+\item \emph{No buffering of the output.} The book's [[printf]] writes at once. musl's does not when the output is not a terminal, and
+  every program that prints a prompt without a newline, writes in a child after [[fork]] or ends with [[_exit]] depends on that. A
+  constructor in the library switches [[stdout]] to unbuffered mode; one [[printf]] still makes one [[write]] (musl collects a single call in
+  a small buffer of its own).
+\end{itemize}
+
+<<userland/musl/ulixlib.h>>=
+// ulixlib.h of the programs that are linked with musl (instead of the book's ulixlib, see lit/userland.nw)
+#ifndef ULIXLIB_MUSL_H
+#define ULIXLIB_MUSL_H
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <signal.h>
+#include <stdbool.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+
+typedef unsigned char  byte;
+typedef unsigned char  boolean;
+typedef unsigned short word;
+typedef unsigned long  memaddress;
+#define strequal(s1,s2) (!strcmp((s1),(s2)))
+#define strdiff(s1,s2)  (strcmp((s1),(s2)))
+#define MAX_PFD 16
+#define CMDLINE_LENGTH 50
+
+// the book's own system calls
+long ulix_call (int nr, long a, long b, long c, long d, long e);
+static inline int syscall1 (int nr)                           { return ulix_call (nr, 0, 0, 0, 0, 0); }
+static inline int syscall2 (int nr, long a)                   { return ulix_call (nr, a, 0, 0, 0, 0); }
+static inline int syscall3 (int nr, long a, long b)           { return ulix_call (nr, a, b, 0, 0, 0); }
+static inline int syscall4 (int nr, long a, long b, long c)   { return ulix_call (nr, a, b, c, 0, 0); }
+
+// owner and mode: the book's calls (musl's would be ignored by the kernel)
+#define chmod ulix_chmod
+#define chown ulix_chown
+int ulix_chmod (const char *path, short mode);
+int ulix_chown (const char *path, short owner, short group);
+
+int  atoi8 (char *s);                                        // like atoi, for octal numbers
+int  ureadline (char *s, int maxlength, boolean echo);       // a line from the terminal with backspace, ^C and ^D
+byte ureadchar (void);
+
+struct dir_entry {
+  unsigned int inode;      // inode number (0: the entry is free)
+  byte filename[64];
+};
+int getdent (const char *path, int index, struct dir_entry *buf);      // entry number index of a directory, -1 at the end
+
+struct diskfree_query {
+  int device;              // device ID (is set before the call)
+  int size, used, free;    // in blocks
+  char name[10];           // name (such as "/dev/hda")
+  char mount[256];         // mount point
+  char fstype[10];         // file system name, e.g. "minix"
+};
+void diskfree (struct diskfree_query *query);
+#endif
+@
+The functions behind it. [[ureadline]] is the book's function (the line editor of the shell, of \texttt{login} and of the
+programs that ask a question) with the same keys; only the output goes through [[write]].
+
+<<userland/musl/ulixcompat.c>>=
+#include "ulixlib.h"
+#include <sys/syscall.h>
+
+#define ULIX_BASE      1024        // 1024 + n is the book's system call n (linux_abi.c)
+#define NR_get_errno    501
+#define NR_readdir       89
+#define NR_chown        182
+#define NR_chmod         15
+#define NR_diskfree     522
+
+long ulix_call (int nr, long a, long b, long c, long d, long e) {
+  long r = syscall (ULIX_BASE + nr, a, b, c, d, e);
+  if (r == -1 && nr != NR_get_errno) errno = syscall (ULIX_BASE + NR_get_errno);    // the book's error number, not the one that musl derived from -1
+  return r;
+}
+
+int ulix_chmod (const char *path, short mode)               { return ulix_call (NR_chmod, (long) path, mode, 0, 0, 0); }
+int ulix_chown (const char *path, short owner, short group) { return ulix_call (NR_chown, (long) path, owner, group, 0, 0); }
+int getdent (const char *path, int index, struct dir_entry *buf) { return ulix_call (NR_readdir, (long) path, index, (long) buf, 0, 0); }
+void diskfree (struct diskfree_query *query)                { ulix_call (NR_diskfree, (long) query, 0, 0, 0, 0); }
+
+int atoi8 (char *s) {
+  int res = 0;
+  while ('0' <= *s && *s <= '7') res = res * 8 + (*s++ - '0');
+  return res;
+}
+
+byte ureadchar (void) {
+  byte b = 0;
+  read (STDIN_FILENO, &b, 1);
+  return b;
+}
+
+// maxlength < 0: no newline is printed at the end. A line that is cancelled with ^C is empty; ^D in the first column gives "exit".
+int ureadline (char *s, int maxlength, boolean echo) {
+  int print_newline = 1, pos = 0;
+  if (maxlength < 0) { print_newline = 0; maxlength = -maxlength; }
+  for (;;) {
+    byte c = 0;
+    if (read (STDIN_FILENO, &c, 1) == 0) return -1;
+    if (c == 0 || c == 27 || c > 190) continue;                   // Esc, cursor and other keys
+    if (c == 3) { s[0] = 0; if (echo) write (STDOUT_FILENO, "\n", 1); return 0; }
+    if (c == 4 && pos == 0) { strcpy (s, "exit"); if (echo) write (STDOUT_FILENO, "exit\n", 5); return 0; }
+    if (c == 0x08 && pos > 0) {
+      pos--;
+      if (echo) write (STDOUT_FILENO, "\010 \010", 3);
+    } else if (c == '\n') {
+      if (print_newline && echo) write (STDOUT_FILENO, "\n", 1);
+      s[pos] = 0;
+      return 0;
+    } else if (c != 0x08 && pos < maxlength) {
+      if (echo) write (STDOUT_FILENO, &c, 1);
+      s[pos++] = c;
+    }
+  }
+}
+
+static void unbuffered_output (void) __attribute__ ((constructor));
+static void unbuffered_output (void) { setvbuf (stdout, 0, _IONBF, 0); }
+@

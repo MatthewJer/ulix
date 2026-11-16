@@ -181,3 +181,40 @@ clean:
 	rm -rf $(BUILD)
 
 .SECONDARY:
+
+# ---- programs linked with musl instead of ulixlib (issue #35, section 51 of ../ARM64-PORT.md) ----
+# The program text is the book's. Its #include "../ulixlib.h" finds musl/ulixlib.h (copied to build/musl), which includes musl's headers and adds what
+# the book has more (see "The programs of the book on musl" in lit/userland.nw). Every name in MUSLTOOLS is linked with musl; the others keep ulixlib.
+MUSLTOOLS = echo cat
+SYSROOT   = $(abspath ../libc/build/sysroot)
+MCFLAGS   = -O0 -fno-pic -mno-outline-atomics -fsanitize=integer-divide-by-zero -fsanitize-undefined-trap-on-error -std=gnu99 -w \
+            -nostdinc -isystem $(SYSROOT)/include -isystem $(shell $(CC) -print-file-name=include)
+MUSLPROGS = $(addprefix $(BUILD)/bin/,$(addsuffix .elf,$(MUSLTOOLS)))
+# programs that define a library function themselves (a teaching version of strchr, memcmp, ...): their copy gets another name
+MCFLAGS_wc   = -Dstrchr=wc_strchr
+MCFLAGS_grep = -Dstrchr=grep_strchr -Dmemmove=grep_memmove
+MCFLAGS_diff = -Dmemcmp=diff_memcmp
+
+$(SYSROOT)/lib/libc.a:
+	$(MAKE) -C ../libc $@
+
+$(BUILD)/musl/ulixlib.h: musl/ulixlib.h
+	mkdir -p $(BUILD)/musl
+	cp $< $@
+
+$(BUILD)/musl/tools/%.c: $(TOOLSRC)/%.c
+	mkdir -p $(BUILD)/musl/tools
+	cp $< $@
+
+$(BUILD)/musl/tools/%.o: $(BUILD)/musl/tools/%.c $(BUILD)/musl/ulixlib.h $(SYSROOT)/lib/libc.a
+	$(CC) $(MCFLAGS) $(MCFLAGS_$*) -c -o $@ $<
+
+$(BUILD)/musl/ulixcompat.o: musl/ulixcompat.c musl/ulixlib.h $(SYSROOT)/lib/libc.a
+	mkdir -p $(BUILD)/musl
+	$(CC) $(MCFLAGS) -Imusl -c -o $@ $<
+
+$(MUSLPROGS): $(BUILD)/bin/%.elf: $(BUILD)/musl/tools/%.o $(BUILD)/musl/ulixcompat.o ../libc/musl.ld ../tools/mark_musl.py
+	mkdir -p $(BUILD)/bin
+	$(CC) -static -nostdlib -nostartfiles -mno-outline-atomics -z max-page-size=4096 -z noexecstack -T ../libc/musl.ld -o $@ \
+	  $(SYSROOT)/lib/crt1.o $(SYSROOT)/lib/crti.o $(BUILD)/musl/tools/$*.o $(BUILD)/musl/ulixcompat.o $(SYSROOT)/lib/libc.a -lgcc $(SYSROOT)/lib/crtn.o
+	python3 ../tools/mark_musl.py $@
