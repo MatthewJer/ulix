@@ -275,6 +275,8 @@ void linux_abi_fork (int old_as, int new_as) {
 #define L_setsockopt    208
 #define L_getsockopt    209
 #define L_shutdown      210
+#define L_sendmsg       211
+#define L_recvmsg       212
 
 @
 \subsection{Errors, flags and signal numbers}
@@ -1327,19 +1329,21 @@ static long linux_getrandom (char *buf, u64 n, unsigned flags) {
 \label{sec:libc:sockets}
 
 The sockets themselves are chapter \ref{ch:sockets}; this is the translation. A socket address of Linux is a \texttt{struct sockaddr\_in}: the family
-(2 for IPv4) and then port and address in \emph{network} byte order, the network stack of the kernel keeps host order. Everything that is not IPv4 is
-refused with \texttt{EAFNOSUPPORT} (which is what the resolver of musl expects when it tries IPv6 first). \texttt{listen} and \texttt{accept} (\texttt{accept4}) are translated, too (chapter \ref{ch:sockets}: a server socket). \texttt{ppoll} and \texttt{pselect6} look at every descriptor in the list: a socket or a pipe knows whether it can be
+(2 for IPv4) and then port and address in \emph{network} byte order, the network stack of the kernel keeps host order. IPv6 addresses (\texttt{sockaddr\_in6}) are translated, too, but only datagram sockets can be IPv6 (the family of a socket decides which addresses it takes). Every other family is
+refused with \texttt{EAFNOSUPPORT} (which is what the resolver of musl expects when it tries IPv6 first). \texttt{sendmsg}/\texttt{recvmsg} (without ancillary data), \texttt{MSG\_PEEK}, and the socket options \texttt{SO\_ERROR} and \texttt{SO\_RCVTIMEO} are here and in chapter \ref{ch:sockets}. \texttt{listen} and \texttt{accept} (\texttt{accept4}) are translated, too (chapter \ref{ch:sockets}: a server socket). \texttt{ppoll} and \texttt{pselect6} look at every descriptor in the list: a socket or a pipe knows whether it can be
 read or written; a file or a device is always ready (a read on it may take time but does not wait for somebody else), and so is the terminal for input
 (a read waits, but there is no call that asks the terminal driver for a key without taking it). If nothing is ready the call waits in a loop like the others do,
 until the time is up or a signal arrives.
 
 <<linux_abi.c: sockets and poll>>=
-extern int  sock_new (int type, int nonblock), sock_close (int gfd), sock_bind (int gfd, unsigned ip, unsigned short port);
-extern int  sock_connect (int gfd, unsigned ip, unsigned short port), sock_shutdown (int gfd, int how), sock_ready (int gfd), is_sock (int gfd);
-extern int  sock_name (int gfd, int peer, unsigned *ip, unsigned short *port), sock_type (int gfd), sock_is_nonblock (int gfd);
-extern long sock_send (int gfd, const void *buf, u64 n, unsigned ip, unsigned short port, int has_addr);
-extern long sock_recv (int gfd, void *buf, u64 n, unsigned *ip, unsigned short *port);
-extern void sock_set_nonblock (int gfd, int on);
+struct saddr { int v6; unsigned ip; unsigned char ip6[16]; unsigned short port; };      // an address of a socket, host byte order (as in sockets.c)
+extern int  sock_new (int family, int type, int nonblock), sock_close (int gfd), sock_bind (int gfd, const struct saddr *a);
+extern int  sock_connect (int gfd, const struct saddr *a), sock_shutdown (int gfd, int how), sock_ready (int gfd), is_sock (int gfd);
+extern int  sock_name (int gfd, int peer, struct saddr *a), sock_type (int gfd), sock_is_nonblock (int gfd), sock_error (int gfd);
+extern long sock_send (int gfd, const void *buf, u64 n, const struct saddr *to);
+extern long sock_recv (int gfd, void *buf, u64 n, struct saddr *from, int flags);
+extern void sock_set_nonblock (int gfd, int on), sock_set_rcvtimeo (int gfd, long ms);
+extern long sock_get_rcvtimeo (int gfd);
 extern int  pipe_ready (int gfd);
 extern int  net_poll_once (void);
 extern int  gfd2pfd (int gfd);
@@ -1348,25 +1352,49 @@ extern int  gfd2pfd (int gfd);
 #define LE_ENOTSOCK     88
 #define SOCK_NONBLOCK_  04000
 #define MSG_DONTWAIT    0x40
+#define MSG_PEEK        0x02
+#define LE_EMSGSIZE     90
 
-struct sockaddr_in_ { unsigned short family; unsigned char port[2], addr[4], zero[8]; };
+struct sockaddr_in_  { unsigned short family; unsigned char port[2], addr[4], zero[8]; };
+struct sockaddr_in6_ { unsigned short family; unsigned char port[2]; unsigned flowinfo; unsigned char addr[16]; unsigned scope_id; };
 
-static int get_sockaddr (const void *p, u64 len, unsigned *ip, unsigned short *port) {
-  const struct sockaddr_in_ *a = p;
-  if (!p || len < sizeof *a || !user_ok ((u64) p, sizeof *a, 0)) return -LE_EFAULT;
-  if (a->family != 2) return -LE_EAFNOSUPPORT;
-  *port = (a->port[0] << 8) | a->port[1];
-  *ip = ((unsigned) a->addr[0] << 24) | (a->addr[1] << 16) | (a->addr[2] << 8) | a->addr[3];
-  return 0;
+// the address of a program (family 2 or 10) as a struct saddr; any other family is EAFNOSUPPORT
+static int get_sockaddr (const void *p, u64 len, struct saddr *a) {
+  if (!p || len < 2 || !user_ok ((u64) p, len < 28 ? len : 28, 0)) return -LE_EFAULT;
+  unsigned short family = *(const unsigned short *) p;
+  memset (a, 0, sizeof *a);
+  if (family == 2 && len >= sizeof (struct sockaddr_in_)) {
+    const struct sockaddr_in_ *in = p;
+    a->port = (in->port[0] << 8) | in->port[1];
+    a->ip = ((unsigned) in->addr[0] << 24) | (in->addr[1] << 16) | (in->addr[2] << 8) | in->addr[3];
+    return 0;
+  }
+  if (family == 10 && len >= sizeof (struct sockaddr_in6_)) {
+    const struct sockaddr_in6_ *in6 = p;
+    a->v6 = 1;  a->port = (in6->port[0] << 8) | in6->port[1];
+    memcpy (a->ip6, in6->addr, 16);
+    return 0;
+  }
+  return (family == 2 || family == 10) ? -LE_EINVAL : -LE_EAFNOSUPPORT;
 }
 
 // writes the address (and its length, if the program asked for it): the caller has checked that the pointers are good
-static void put_sockaddr (void *p, unsigned *len, unsigned ip, unsigned short port) {
-  struct sockaddr_in_ a = { 2, { port >> 8, port & 255 }, { ip >> 24, (ip >> 16) & 255, (ip >> 8) & 255, ip & 255 }, { 0 } };
+static void put_sockaddr (void *p, unsigned *len, const struct saddr *s) {
+  union { struct sockaddr_in_ in;  struct sockaddr_in6_ in6; } a;
+  unsigned size;
+  memset (&a, 0, sizeof a);
+  if (s->v6) {
+    a.in6.family = 10;  a.in6.port[0] = s->port >> 8;  a.in6.port[1] = s->port & 255;  memcpy (a.in6.addr, s->ip6, 16);
+    size = sizeof a.in6;
+  } else {
+    a.in.family = 2;  a.in.port[0] = s->port >> 8;  a.in.port[1] = s->port & 255;
+    a.in.addr[0] = s->ip >> 24;  a.in.addr[1] = s->ip >> 16;  a.in.addr[2] = s->ip >> 8;  a.in.addr[3] = s->ip;
+    size = sizeof a.in;
+  }
   if (!p) return;
-  unsigned room = len ? *len : sizeof a;
-  memcpy (p, &a, room < sizeof a ? room : sizeof a);
-  if (len) *len = sizeof a;
+  unsigned room = len ? *len : size;
+  memcpy (p, &a, room < size ? room : size);
+  if (len) *len = size;
 }
 
 static int sock_arg (int fd, long *err) {                 // the global descriptor of a socket, or -1 and the error
@@ -1377,8 +1405,8 @@ static int sock_arg (int fd, long *err) {                 // the global descript
 }
 
 static long linux_socket (int domain, int type, int protocol) {
-  if (domain != 2) return -LE_EAFNOSUPPORT;
-  int gfd = sock_new (type & 0xf, (type & SOCK_NONBLOCK_) != 0);
+  if (domain != 2 && domain != 10) return -LE_EAFNOSUPPORT;
+  int gfd = sock_new (domain, type & 0xf, (type & SOCK_NONBLOCK_) != 0);
   if (gfd < 0) return linux_error (LE_EMFILE);
   int pfd = gfd2pfd (gfd);
   if (pfd < 0) { sock_close (gfd);  return -LE_EMFILE; }
@@ -1400,31 +1428,28 @@ static long linux_socketpair (context_t *r, int domain, int type, int protocol, 
 
 static long linux_connect_or_bind (int fd, const void *addr, u64 len, int connect) {
   long e;  int gfd = sock_arg (fd, &e);
-  unsigned ip;  unsigned short port;
+  struct saddr a;
   if (gfd < 0) return e;
-  if ((e = get_sockaddr (addr, len, &ip, &port)) != 0) return e;
-  return connect ? sock_connect (gfd, ip, port) : sock_bind (gfd, ip, port);
+  if ((e = get_sockaddr (addr, len, &a)) != 0) return e;
+  return connect ? sock_connect (gfd, &a) : sock_bind (gfd, &a);
 }
 
 static long linux_sendto (int fd, const void *buf, u64 n, int flags, const void *addr, u64 alen) {
   long e;  int gfd = sock_arg (fd, &e);
-  unsigned ip = 0;  unsigned short port = 0;
+  struct saddr a;
   if (gfd < 0) return e;
   if (!user_ok ((u64) buf, n, 0)) return -LE_EFAULT;
-  if (addr && (e = get_sockaddr (addr, alen, &ip, &port)) != 0) return e;
-  return sock_send (gfd, buf, n, ip, port, addr != 0);
+  if (addr && (e = get_sockaddr (addr, alen, &a)) != 0) return e;
+  return sock_send (gfd, buf, n, addr ? &a : 0);
 }
 
 static long linux_recvfrom (int fd, void *buf, u64 n, int flags, void *addr, unsigned *alen) {
   long e;  int gfd = sock_arg (fd, &e);
-  unsigned ip = 0;  unsigned short port = 0;
+  struct saddr a;
   if (gfd < 0) return e;
   if (!user_ok ((u64) buf, n, 1) || (addr && (!alen || !user_ok ((u64) alen, 4, 1) || !user_ok ((u64) addr, *alen, 1)))) return -LE_EFAULT;
-  int was = sock_is_nonblock (gfd);
-  if (flags & MSG_DONTWAIT) sock_set_nonblock (gfd, 1);
-  long k = sock_recv (gfd, buf, n, &ip, &port);
-  if (flags & MSG_DONTWAIT) sock_set_nonblock (gfd, was);
-  if (k >= 0) put_sockaddr (addr, alen, ip, port);
+  long k = sock_recv (gfd, buf, n, &a, flags & (MSG_DONTWAIT | MSG_PEEK));
+  if (k >= 0) put_sockaddr (addr, alen, &a);
   return k;
 }
 
@@ -1442,35 +1467,121 @@ static long linux_accept (int fd, void *addr, unsigned *alen, int flags) {
   if ((e = sock_accept (gfd, &ng, &ip, &port, (flags & SOCK_NONBLOCK_) != 0)) != 0) return e;
   int pfd = gfd2pfd (ng);
   if (pfd < 0) { sock_close (ng);  return -LE_EMFILE; }
-  put_sockaddr (addr, alen, ip, port);
+  struct saddr a = { 0, ip, { 0 }, port };
+  put_sockaddr (addr, alen, &a);
   return pfd;
 }
 
 static long linux_getname (int fd, void *addr, unsigned *alen, int peer) {
   long e;  int gfd = sock_arg (fd, &e);
-  unsigned ip;  unsigned short port;
+  struct saddr a;
   if (gfd < 0) return e;
   if (!alen || !user_ok ((u64) alen, 4, 1) || !user_ok ((u64) addr, *alen, 1)) return -LE_EFAULT;
-  if ((e = sock_name (gfd, peer, &ip, &port)) != 0) return e;
-  put_sockaddr (addr, alen, ip, port);
+  if ((e = sock_name (gfd, peer, &a)) != 0) return e;
+  put_sockaddr (addr, alen, &a);
   return 0;
 }
 
-#define SOL_SOCKET 1
-#define SO_TYPE    3
-#define SO_ERROR   4
+#define SOL_SOCKET  1
+#define SO_TYPE     3
+#define SO_ERROR    4
+#define SO_RCVTIMEO 20                 // (the one with a 64-bit struct timeval, which is what musl uses on AArch64)
 
-// options are accepted and ignored; the two that a program reads back have an answer
-static long linux_getsockopt (int fd, int level, int opt, int *val, unsigned *len) {
+struct timeval_ { long sec, usec; };
+
+// options are accepted and ignored, except three: SO_TYPE, SO_ERROR (the failed connect of a non-blocking socket; reading it clears it) and
+// SO_RCVTIMEO (how long a receive call waits, as a struct timeval; 0 is for ever)
+static long linux_getsockopt (int fd, int level, int opt, void *val, unsigned *len) {
   long e;  int gfd = sock_arg (fd, &e);
   if (gfd < 0) return e;
-  if (!val || !len || !user_ok ((u64) val, 4, 1) || !user_ok ((u64) len, 4, 1)) return -LE_EFAULT;
-  *val = (level == SOL_SOCKET && opt == SO_TYPE) ? sock_type (gfd) : 0;                     // (SO_ERROR: no error is ever kept)
-  *len = 4;
+  if (!val || !len || !user_ok ((u64) len, 4, 1) || !user_ok ((u64) val, *len, 1)) return -LE_EFAULT;
+  if (level == SOL_SOCKET && opt == SO_RCVTIMEO) {
+    long ms = sock_get_rcvtimeo (gfd);
+    struct timeval_ tv = { ms / 1000, ms % 1000 * 1000 };
+    if (*len < sizeof tv) return -LE_EINVAL;
+    memcpy (val, &tv, sizeof tv);  *len = sizeof tv;
+    return 0;
+  }
+  if (*len < 4) return -LE_EINVAL;
+  int v = 0;
+  if (level == SOL_SOCKET && opt == SO_TYPE) v = sock_type (gfd);
+  if (level == SOL_SOCKET && opt == SO_ERROR) v = sock_error (gfd);
+  memcpy (val, &v, 4);  *len = 4;
   return 0;
 }
 
-static long linux_setsockopt (int fd) { long e;  return sock_arg (fd, &e) < 0 ? e : 0; }
+static long linux_setsockopt (int fd, int level, int opt, const void *val, unsigned len) {
+  long e;  int gfd = sock_arg (fd, &e);
+  if (gfd < 0) return e;
+  if (level == SOL_SOCKET && opt == SO_RCVTIMEO) {
+    if (!val || len < sizeof (struct timeval_) || !user_ok ((u64) val, sizeof (struct timeval_), 0)) return -LE_EINVAL;
+    const struct timeval_ *tv = val;
+    if (tv->sec < 0 || tv->usec < 0 || tv->usec >= 1000000) return -LE_EINVAL;
+    sock_set_rcvtimeo (gfd, tv->sec * 1000 + (tv->usec + 999) / 1000);              // (a tiny time is rounded up: 0 would mean for ever)
+  }
+  return 0;
+}
+
+// sendmsg and recvmsg: the same as sendto and recvfrom, with the data in several pieces (iov) and the address in a struct. A datagram is put together in
+// (or taken apart from) a buffer on the stack, as it is only one frame long. The ancillary data (msg_control) is not supported: none is ever received
+// and none is sent (it is ignored), msg_controllen is set to 0 and msg_flags to 0 (a datagram that is too long is cut without MSG_TRUNC).
+struct msghdr_ { void *name; unsigned namelen, pad1; struct iovec *iov; long iovlen; void *control; long controllen; int flags, pad2; };
+
+static long msg_check (struct msghdr_ *m, int write, u64 *total) {
+  if (!user_ok ((u64) m, sizeof *m, 1)) return -LE_EFAULT;
+  if (m->iovlen < 0 || m->iovlen > 1024 || !user_ok ((u64) m->iov, m->iovlen * sizeof (struct iovec), 0)) return -LE_EFAULT;
+  *total = 0;
+  for (long i = 0; i < m->iovlen; i++) {
+    if (!user_ok ((u64) m->iov[i].base, m->iov[i].len, write)) return -LE_EFAULT;
+    *total += m->iov[i].len;
+  }
+  return 0;
+}
+
+static long linux_sendmsg (int fd, struct msghdr_ *m, int flags) {
+  long e;  int gfd = sock_arg (fd, &e);
+  u64 total;
+  struct saddr a;
+  if (gfd < 0) return e;
+  if ((e = msg_check (m, 0, &total)) != 0) return e;
+  if (m->name && (e = get_sockaddr (m->name, m->namelen, &a)) != 0) return e;
+  if (sock_type (gfd) == 2) {                                          // a datagram: all pieces in one buffer
+    unsigned char buf[1472];
+    if (total > sizeof buf) return -LE_EMSGSIZE;
+    u64 at = 0;
+    for (long i = 0; i < m->iovlen; i++) { memcpy (buf + at, m->iov[i].base, m->iov[i].len);  at += m->iov[i].len; }
+    return sock_send (gfd, buf, total, m->name ? &a : 0);
+  }
+  long sent = 0;                                                       // a stream: one piece after the other
+  for (long i = 0; i < m->iovlen; i++) {
+    if (!m->iov[i].len) continue;
+    long k = sock_send (gfd, m->iov[i].base, m->iov[i].len, 0);
+    if (k < 0) return sent ? sent : k;
+    sent += k;
+    if ((u64) k < m->iov[i].len) break;
+  }
+  return sent;
+}
+
+static long linux_recvmsg (int fd, struct msghdr_ *m, int flags) {
+  long e;  int gfd = sock_arg (fd, &e);
+  u64 total;
+  struct saddr a;
+  if (gfd < 0) return e;
+  if ((e = msg_check (m, 1, &total)) != 0) return e;
+  if (m->name && !user_ok ((u64) m->name, m->namelen, 1)) return -LE_EFAULT;
+  unsigned char buf[1472];                                             // (a stream gives what fits here: a short read is allowed)
+  long k = sock_recv (gfd, buf, total < sizeof buf ? total : sizeof buf, &a, flags & (MSG_DONTWAIT | MSG_PEEK));
+  if (k < 0) return k;
+  u64 at = 0;
+  for (long i = 0; i < m->iovlen && at < (u64) k; i++) {
+    u64 part = m->iov[i].len < (u64) k - at ? m->iov[i].len : (u64) k - at;
+    memcpy (m->iov[i].base, buf + at, part);  at += part;
+  }
+  if (m->name) put_sockaddr (m->name, &m->namelen, &a);
+  m->controllen = 0;  m->flags = 0;
+  return k;
+}
 
 static long linux_shutdown (int fd, int how) { long e;  int gfd = sock_arg (fd, &e);  return gfd < 0 ? e : sock_shutdown (gfd, how); }
 
@@ -1739,8 +1850,10 @@ static void linux_syscall_inner (context_t *r) {
     case L_recvfrom:    ret = linux_recvfrom (a0, (void *) a1, a2, a3, (void *) a4, (unsigned *) a5); break;
     case L_getsockname: ret = linux_getname (a0, (void *) a1, (unsigned *) a2, 0); break;
     case L_getpeername: ret = linux_getname (a0, (void *) a1, (unsigned *) a2, 1); break;
-    case L_setsockopt:  ret = linux_setsockopt (a0); break;
-    case L_getsockopt:  ret = linux_getsockopt (a0, a1, a2, (int *) a3, (unsigned *) a4); break;
+    case L_setsockopt:  ret = linux_setsockopt (a0, a1, a2, (const void *) a3, a4); break;
+    case L_getsockopt:  ret = linux_getsockopt (a0, a1, a2, (void *) a3, (unsigned *) a4); break;
+    case L_sendmsg:     ret = linux_sendmsg (a0, (struct msghdr_ *) a1, a2); break;
+    case L_recvmsg:     ret = linux_recvmsg (a0, (struct msghdr_ *) a1, a2); break;
     case L_shutdown:    ret = linux_shutdown (a0, a1); break;
     case L_ppoll:       ret = linux_ppoll ((struct pollfd_ *) a0, a1, (struct ts *) a2); break;
     case L_pselect6:    ret = linux_pselect6 (a0, (unsigned long *) a1, (unsigned long *) a2, (unsigned long *) a3, (struct ts *) a4); break;

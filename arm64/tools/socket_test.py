@@ -97,6 +97,8 @@ tcp = socket.socket(); tcp.bind(('127.0.0.1', 0)); tcp.listen(5)
 udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); udp.bind(('127.0.0.1', 0))
 threading.Thread(target=tcp_server, args=(tcp,), daemon=True).start()
 threading.Thread(target=udp_server, args=(udp,), daemon=True).start()
+udp6 = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM); udp6.bind(('::1', 0))      # IPv6: the guest sends to qemu's router fec0::2, which passes it to ::1
+threading.Thread(target=udp_server, args=(udp6,), daemon=True).start()
 
 s = Session(disk)
 try:
@@ -108,6 +110,10 @@ try:
     print(out[-3000:])
     check(out.count('user ok:') == 24 and 'user FAIL' not in out, 'all 24 socket checks of the program passed')
     check('not implemented' not in out, 'no Linux system call that the kernel does not have')
+    out = s.run('/musl/sockext 10.0.2.2 %d %d %d' % (tcp.getsockname()[1], udp.getsockname()[1], udp6.getsockname()[1]), r'(?s)user (ok|FAIL):.*a non-blocking connect that works|Killed', 'sockext runs', timeout=120)
+    print(out[-4000:])
+    check(out.count('user ok:') == 32 and 'user FAIL' not in out, 'all 32 checks of sockext passed (IPv6 UDP, sendmsg/recvmsg, MSG_PEEK, SO_RCVTIMEO, SO_ERROR)')
+    check('not implemented' not in out, 'no Linux system call that the kernel does not have (sockext)')
     s.pump(0.5)
     if b'EXCEPTION' in s.log or b'killed:' in s.log:
         print('  FAIL: kernel exception or process killed by a fault'); fails += 1

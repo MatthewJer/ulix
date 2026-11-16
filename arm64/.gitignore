@@ -140,4 +140,5 @@ libc/threadtest.c
 sockets.c
 libc/sockettest.c
 libc/localetest.c
+libc/sockext.c
 dbg_http.c

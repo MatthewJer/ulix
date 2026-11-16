@@ -8,17 +8,17 @@ This chapter is the kernel side (issue \#37): a socket is one more kind of file,
 reuses the kernel's own network stack of chapter \ref{ch:network} (\texttt{tcp\_connect}, \texttt{tcp\_read}, \texttt{udp\_send}, \ldots), which was written for
 the kernel's own use and is polled: a program that waits for the network calls \texttt{net\_poll\_once} itself, as the private calls do.
 
-\paragraph{What is there.} IPv4 only. A \emph{stream socket} (\texttt{SOCK\_STREAM}) is a TCP connection that the program opens with
+\paragraph{What is there.} IPv4 and, for datagrams, IPv6. A \emph{stream socket} (\texttt{SOCK\_STREAM}) is a TCP connection that the program opens with
 \texttt{connect}; a \emph{datagram socket} (\texttt{SOCK\_DGRAM}) is a UDP port, \texttt{bind} chooses it (or the first \texttt{sendto} gets
 one) and it keeps the last four datagrams that arrive. \texttt{read} and \texttt{write} work on both (a stream, or a connected datagram socket), \texttt{send},
-\texttt{recv}, \texttt{sendto}, \texttt{recvfrom} too, \texttt{poll} and \texttt{select} ask which sockets (and pipes) can be read or written
+\texttt{recv}, \texttt{sendto}, \texttt{recvfrom}, \texttt{sendmsg} and \texttt{recvmsg} too (\texttt{MSG\_PEEK} and \texttt{MSG\_DONTWAIT} are understood), \texttt{poll} and \texttt{select} ask which sockets (and pipes) can be read or written
 without waiting, a socket can be non-blocking (\texttt{SOCK\_NONBLOCK}, \texttt{O\_NONBLOCK}), \texttt{shutdown}, \texttt{getsockname}, \texttt{getpeername},
-\texttt{setsockopt} and \texttt{getsockopt} exist (the options are accepted and ignored, \texttt{SO\_ERROR} and \texttt{SO\_TYPE} are answered).
+\texttt{setsockopt} and \texttt{getsockopt} exist (\texttt{SO\_ERROR}, \texttt{SO\_TYPE} and \texttt{SO\_RCVTIMEO} are real, the other options are accepted and ignored).
+Section \ref{sec:sockets:more} says how the later additions work.
 
-\paragraph{What is not there.} \texttt{listen} and \texttt{accept} (a server in a program, issue \#124, is another piece of work and has its own calls), the
-other families (\texttt{AF\_INET6}, \texttt{AF\_UNIX}: \texttt{EAFNOSUPPORT}, which is what a resolver and \texttt{socketpair} users expect to handle), raw sockets,
-out-of-band data, \texttt{MSG\_PEEK}, ancillary data, \texttt{sendmsg}/\texttt{recvmsg}. A \texttt{bind} of a stream socket is remembered (the local port of the
-later connection) and nothing else.
+\paragraph{What is not there.} \texttt{AF\_UNIX} other than \texttt{socketpair}, TCP over IPv6 (\texttt{EAFNOSUPPORT}), raw sockets,
+out-of-band data, ancillary data, \texttt{SO\_SNDTIMEO}. A \texttt{bind} of a stream socket is remembered (the local port of the
+later connection, or of \texttt{listen}) and nothing else.
 
 \section{Where it fits: one more kind of file}
 
@@ -51,6 +51,12 @@ typedef void (*udp_handler) (u32 src_ip, u16 src_port, const u8 *data, int len);
 extern int  udp_bind (u16 port, udp_handler handler);
 extern void udp_unbind (u16 port);
 extern int  udp_send (u32 dst_ip, u16 dst_port, u16 src_port, const u8 *data, int len);
+typedef void (*udp6_handler) (const u8 *src_ip, u16 src_port, const u8 *data, int len);
+extern int  udp6_bind (u16 port, udp6_handler handler);
+extern void udp6_unbind (u16 port);
+extern int  udp6_send (const u8 *dst_ip, u16 dst_port, u16 src_port, const u8 *data, int len);
+extern u8   ip6_link_local[16], ip6_global[16];
+extern int  ip6_have_global;
 extern int  net_poll_once (void);
 extern unsigned long long net_now_ms (void);
 extern u32  net_my_ip;
@@ -60,6 +66,9 @@ extern void arch_resign (void), arch_poll_pause (void);
 #define MAX_SOCKS 16
 #define SOCK_STREAM_ 1
 #define SOCK_DGRAM_  2
+#define PEEKMAX 512                                   // how much of a stream MSG_PEEK looks at
+#define MSG_PEEK_ 2
+#define MSG_DONTWAIT_ 0x40
 #define LBUF 4096                                  // the receive buffer of one end of a socketpair
 
 // errors: the numbers of Linux (the functions that linux_abi.c calls directly return them as minus numbers; sock_read and sock_write turn
@@ -74,6 +83,7 @@ extern void arch_resign (void), arch_poll_pause (void);
 #define E_OPNOTSUPP 95
 #define E_AFNOSUPPORT 97
 #define E_ADDRINUSE 98
+#define E_MSGSIZE 90
 #define E_NOBUFS 105
 #define E_ISCONN 106
 #define E_NOTCONN 107
@@ -82,11 +92,19 @@ extern void arch_resign (void), arch_poll_pause (void);
 #define E_INPROGRESS 115
 #define E_MFILE 24
 
-struct dgram { u32 ip; u16 port; int len; u8 data[1472]; };
+// an address of a socket: IPv4 (ip) or IPv6 (ip6, v6 is 1), the port in host byte order; linux_abi.c has the same declaration
+struct saddr { int v6; u32 ip; u8 ip6[16]; u16 port; };
+
+struct dgram { u32 ip; u8 ip6[16]; u16 port; int len; u8 data[1472]; };
 
 struct sock {
   int used, refs, type;
+  int v6;                                            // AF_INET6 (only datagram sockets): the addresses are peer6 and the ip6 of the datagrams
   int nonblock;
+  int error;                                         // SO_ERROR: why a connect () that did not wait has failed (a Linux error number), 0 = none
+  long rcvtimeo;                                     // SO_RCVTIMEO in milliseconds, 0 = wait for ever
+  u8 pk[PEEKMAX];  int npk;                             // stream: what MSG_PEEK has read from the connection and recv () has not yet delivered
+  u8 peer6[16];
   tcp_conn *c;  u32 id;                              // stream: the connection (and its number, see tcp_id: the slot may be used again)
   int connecting;                                    // stream: connect () has started and the handshake is not finished
   int shut_write;                                    // shutdown (SHUT_WR) was called
@@ -112,31 +130,37 @@ So there is one small function per socket (generated by a macro: \texttt{udp\_in
 A datagram that arrives when the queue is full is dropped, as UDP is allowed to do.
 
 <<sockets.c>>=
-static void udp_in (int i, u32 src, u16 sport, const u8 *data, int len) {
+static void udp_in (int i, u32 src, const u8 *src6, u16 sport, const u8 *data, int len) {
   struct sock *s = &socks[i];
   if (!s->used || s->qcount == 4 || len > 1472) return;
   struct dgram *d = &s->q[(s->qhead + s->qcount++) % 4];
   d->ip = src;  d->port = sport;  d->len = len;
+  if (src6) for (int k = 0; k < 16; k++) d->ip6[k] = src6[k];
   for (int k = 0; k < len; k++) d->data[k] = data[k];
 }
-#define UDP_IN(n) static void udp_in##n (u32 src, u16 sport, const u8 *data, int len) { udp_in (n, src, sport, data, len); }
+// (IPv6 has its own table of ports in the network stack, so it needs its own handlers: udp6_in0 to udp6_in15)
+#define UDP_IN(n) static void udp_in##n (u32 src, u16 sport, const u8 *data, int len) { udp_in (n, src, 0, sport, data, len); } \
+                  static void udp6_in##n (const u8 *src, u16 sport, const u8 *data, int len) { udp_in (n, 0, src, sport, data, len); }
 UDP_IN(0)  UDP_IN(1)  UDP_IN(2)  UDP_IN(3)  UDP_IN(4)  UDP_IN(5)  UDP_IN(6)  UDP_IN(7)
 UDP_IN(8)  UDP_IN(9)  UDP_IN(10) UDP_IN(11) UDP_IN(12) UDP_IN(13) UDP_IN(14) UDP_IN(15)
 static udp_handler udp_handlers[MAX_SOCKS] = { udp_in0, udp_in1, udp_in2, udp_in3, udp_in4, udp_in5, udp_in6, udp_in7,
                                                udp_in8, udp_in9, udp_in10, udp_in11, udp_in12, udp_in13, udp_in14, udp_in15 };
+static udp6_handler udp6_handlers[MAX_SOCKS] = { udp6_in0, udp6_in1, udp6_in2, udp6_in3, udp6_in4, udp6_in5, udp6_in6, udp6_in7,
+                                                 udp6_in8, udp6_in9, udp6_in10, udp6_in11, udp6_in12, udp6_in13, udp6_in14, udp6_in15 };
 
 @
 \subsection{Making, copying and closing a socket}
 
 <<sockets.c>>=
-// a new socket: the global descriptor, or -1 (errno says why)
-int sock_new (int type, int nonblock) {
+// a new socket: the global descriptor, or -1 (errno says why). family is 2 (AF_INET) or 10 (AF_INET6, datagrams only: TCP has no IPv6)
+int sock_new (int family, int type, int nonblock) {
   if (type != SOCK_STREAM_ && type != SOCK_DGRAM_) { set_errno (E_PROTONOSUPPORT);  return -1; }
+  if (family == 10 && type == SOCK_STREAM_) { set_errno (E_AFNOSUPPORT);  return -1; }
   for (int i = 0; i < MAX_SOCKS; i++)
     if (!socks[i].used) {
       u8 *p = (u8 *) &socks[i];
       for (unsigned k = 0; k < sizeof socks[i]; k++) p[k] = 0;
-      socks[i].used = 1;  socks[i].refs = 1;  socks[i].type = type;  socks[i].nonblock = nonblock;
+      socks[i].used = 1;  socks[i].refs = 1;  socks[i].type = type;  socks[i].nonblock = nonblock;  socks[i].v6 = family == 10;
       return (FS_SOCK << 8) | i;
     }
   set_errno (E_MFILE);
@@ -146,7 +170,7 @@ int sock_new (int type, int nonblock) {
 static void sock_release (struct sock *s) {
   if (s->local && !s->peer_gone) socks[s->peer].peer_gone = 1;      // the other end now sees the end of the stream (and EPIPE when it writes)
   if (s->type == SOCK_STREAM_ && s->c) { if (tcp_id (s->c) == s->id) tcp_close (s->c);  s->c = 0; }
-  if (s->type == SOCK_DGRAM_ && s->local_port) udp_unbind (s->local_port);
+  if (s->type == SOCK_DGRAM_ && s->local_port) { if (s->v6) udp6_unbind (s->local_port);  else udp_unbind (s->local_port); }
   s->used = 0;
 }
 
@@ -166,6 +190,8 @@ int sock_reopen (int gfd) {
 void sock_set_nonblock (int gfd, int on) { struct sock *s = sock_of (gfd); if (s) s->nonblock = on; }
 int  sock_is_nonblock (int gfd) { struct sock *s = sock_of (gfd); return s && s->nonblock; }
 int  sock_type (int gfd) { struct sock *s = sock_of (gfd); return s ? s->type : 0; }
+void sock_set_rcvtimeo (int gfd, long ms) { struct sock *s = sock_of (gfd); if (s) s->rcvtimeo = ms; }
+long sock_get_rcvtimeo (int gfd) { struct sock *s = sock_of (gfd); return s ? s->rcvtimeo : 0; }
 
 @
 \subsection{A pair of connected sockets (\texttt{socketpair})}
@@ -178,9 +204,9 @@ A socket has nothing but its slot number to name the other end; this is safe bec
 <<sockets.c>>=
 // two connected stream sockets: 0 and the two global descriptors, or -1 (errno says why)
 int sock_pair (int *g0, int *g1, int nonblock) {
-  *g0 = sock_new (SOCK_STREAM_, nonblock);
+  *g0 = sock_new (1, SOCK_STREAM_, nonblock);
   if (*g0 < 0) return -1;
-  *g1 = sock_new (SOCK_STREAM_, nonblock);
+  *g1 = sock_new (1, SOCK_STREAM_, nonblock);
   if (*g1 < 0) { sock_close (*g0);  return -1; }
   struct sock *a = sock_of (*g0), *b = sock_of (*g1);
   a->local = b->local = 1;
@@ -217,16 +243,17 @@ static int bind_udp (struct sock *s, u16 port) {
   if (s->local_port) return -E_INVAL;
   if (!port) port = next_port++;
   int i = s - socks;
-  if (udp_bind (port, udp_handlers[i]) != 0) return -E_NOBUFS;
+  if ((s->v6 ? udp6_bind (port, udp6_handlers[i]) : udp_bind (port, udp_handlers[i])) != 0) return -E_NOBUFS;
   s->local_port = port;
   return 0;
 }
 
-int sock_bind (int gfd, u32 ip, u16 port) {
+int sock_bind (int gfd, const struct saddr *a) {
   struct sock *s = sock_of (gfd);
   if (!s) return -E_NOTSOCK;
-  if (s->type == SOCK_STREAM_) { s->local_port = port;  return 0; }     // remembered; listen () is not part of this chapter
-  return bind_udp (s, port);
+  if (a->v6 != s->v6) return -E_AFNOSUPPORT;                              // (the address of the call has the family of the socket)
+  if (s->type == SOCK_STREAM_) { s->local_port = a->port;  return 0; }    // remembered until listen () or connect ()
+  return bind_udp (s, a->port);
 }
 
 // 0 when the connection is made, or minus an error number; a socket that was started earlier is waited for here
@@ -241,12 +268,15 @@ static int stream_connect_wait (struct sock *s) {
   return 0;
 }
 
-int sock_connect (int gfd, u32 ip, u16 port) {
+int sock_connect (int gfd, const struct saddr *a) {
   struct sock *s = sock_of (gfd);
   if (!s) return -E_NOTSOCK;
+  if (a->v6 != s->v6) return -E_AFNOSUPPORT;
+  u32 ip = a->ip;  u16 port = a->port;
   if (s->type == SOCK_DGRAM_) {
     if (!s->local_port) { int e = bind_udp (s, 0);  if (e) return e; }
     s->peer_ip = ip;  s->peer_port = port;  s->connected = 1;
+    for (int k = 0; k < 16; k++) s->peer6[k] = a->ip6[k];
     return 0;
   }
   if (s->c) return s->connecting ? -E_INPROGRESS : -E_ISCONN;
@@ -265,6 +295,26 @@ one returns what went in (or \texttt{EAGAIN} when nothing did). A write to a con
 where it can; for \texttt{write} the signal \texttt{SIGPIPE} is not sent here). A stream read gives what has arrived; at the end of the stream it returns 0.
 
 <<sockets.c>>=
+// A connection that was started without waiting (a non-blocking socket) ends some time later, and the program asks how it ended: with poll (the socket
+// can be written, or has an error) and then with getsockopt (SO_ERROR). This looks at the connection and writes down the result: the socket is
+// connected, or it has failed and the error stays in the socket until getsockopt has read it once. (The TCP code does not say why a connection failed,
+// a refused connection and a server that does not answer look alike, so both are ECONNREFUSED.)
+static void connect_check (struct sock *s) {
+  if (!s->connecting) return;
+  if (s->c && tcp_id (s->c) == s->id && tcp_established (s->c)) { s->connecting = 0;  return; }
+  if (!s->c || tcp_closed (s->c) || tcp_id (s->c) != s->id) { s->connecting = 0;  s->c = 0;  s->error = E_CONNREFUSED; }
+}
+
+// SO_ERROR: the error that is waiting (and gone after this call), or 0
+int sock_error (int gfd) {
+  struct sock *s = sock_of (gfd);
+  if (!s) return -E_NOTSOCK;
+  connect_check (s);
+  int e = s->error;
+  s->error = 0;
+  return e;
+}
+
 static int stream_check (struct sock *s) {                          // the connection exists and is not a stale slot
   if (!s->c) return -E_NOTCONN;
   if (s->connecting) { if (s->nonblock && !tcp_established (s->c)) return -E_AGAIN;  int e = stream_connect_wait (s);  if (e) return e; }
@@ -304,7 +354,7 @@ static long local_send (struct sock *s, const u8 *buf, u64 n) {
   return sent;
 }
 
-static long local_recv (struct sock *s, u8 *buf, u64 n) {
+static long local_recv (struct sock *s, u8 *buf, u64 n, int peek) {
   while (LCOUNT (s) == 0) {
     if (s->peer_gone || s->eof) { if (LCOUNT (s) == 0) return 0;  break; }
     if (s->nonblock) return -E_AGAIN;
@@ -313,8 +363,14 @@ static long local_recv (struct sock *s, u8 *buf, u64 n) {
   unsigned long avail = LCOUNT (s);
   u64 k = n < avail ? n : avail;
   for (u64 i = 0; i < k; i++) buf[i] = s->lbuf[(s->lread + i) % LBUF];
-  __atomic_store_n (&s->lread, s->lread + k, __ATOMIC_RELEASE);
+  if (!peek) __atomic_store_n (&s->lread, s->lread + k, __ATOMIC_RELEASE);
   return k;
+}
+
+// the wait of a receive call: the socket's own time (SO_RCVTIMEO) may end it, the call then fails with EAGAIN, as on Linux
+static int recv_wait (struct sock *s, unsigned long long start) {
+  int e = wait_a_little (start, s->rcvtimeo ? s->rcvtimeo : -1);
+  return e == E_TIMEDOUT ? -E_AGAIN : -e;
 }
 
 static long stream_send (struct sock *s, const u8 *buf, u64 n) {
@@ -337,17 +393,33 @@ static long stream_send (struct sock *s, const u8 *buf, u64 n) {
   return sent;
 }
 
-static long stream_recv (struct sock *s, u8 *buf, u64 n) {
-  if (s->local) return local_recv (s, buf, n);
+// MSG_PEEK: a TCP connection cannot take back what it has given out, so a peek reads into a small buffer of the socket (pk) and the bytes stay there
+// until a call without MSG_PEEK delivers them (first, before anything new from the connection). The look is at most PEEKMAX bytes.
+static long stream_recv (struct sock *s, u8 *buf, u64 n, int peek) {
+  if (s->local) return local_recv (s, buf, n, peek);
   int e = stream_check (s);
   if (e) return e;
+  if (s->npk || peek) {
+    unsigned long long start = net_now_ms ();
+    while (!s->npk) {
+      int k = tcp_read (s->c, s->pk, PEEKMAX);
+      if (k > 0) { s->npk = k;  break; }
+      if (k < 0) return 0;                                            // the end of the stream
+      if (s->nonblock) return -E_AGAIN;
+      if ((e = recv_wait (s, start))) return e;
+    }
+    u64 k = n < (u64) s->npk ? n : (u64) s->npk;
+    for (u64 i = 0; i < k; i++) buf[i] = s->pk[i];
+    if (!peek) { for (int i = k; i < s->npk; i++) s->pk[i - k] = s->pk[i];  s->npk -= k; }
+    return k;
+  }
   unsigned long long start = net_now_ms ();
   for (;;) {
     int k = tcp_read (s->c, buf, n > 4096 ? 4096 : n);
     if (k > 0) return k;
     if (k < 0) return 0;                                              // the other side has closed: end of the stream
     if (s->nonblock) return -E_AGAIN;
-    if (wait_a_little (start, -1)) return -E_INTR;
+    if ((e = recv_wait (s, start))) return e;
   }
 }
 
@@ -356,48 +428,66 @@ A datagram is sent to the address in the call, or to the one that \texttt{connec
 A datagram that is received is cut to the size of the buffer (the rest is lost, as with UDP), and the sender's address is given to the caller.
 
 <<sockets.c>>=
-static long dgram_send (struct sock *s, const u8 *buf, u64 n, u32 ip, u16 port, int has_addr) {
-  if (!has_addr) { if (!s->connected) return -E_DESTADDRREQ;  ip = s->peer_ip;  port = s->peer_port; }   // (an address in the call wins, as on Linux)
-  if (n > 1472) return -E_INVAL;
+static long dgram_send (struct sock *s, const u8 *buf, u64 n, const struct saddr *to) {
+  u32 ip;  const u8 *ip6;  u16 port;
+  if (to) {                                                           // (an address in the call wins, as on Linux)
+    if (to->v6 != s->v6) return -E_AFNOSUPPORT;
+    ip = to->ip;  ip6 = to->ip6;  port = to->port;
+  } else {
+    if (!s->connected) return -E_DESTADDRREQ;
+    ip = s->peer_ip;  ip6 = s->peer6;  port = s->peer_port;
+  }
+  if (n > (s->v6 ? 1452 : 1472)) return -E_MSGSIZE;                   // (what fits into one Ethernet frame)
   if (!s->local_port) { int e = bind_udp (s, 0);  if (e) return e; }
-  return udp_send (ip, port, s->local_port, buf, n) == 0 ? (long) n : -E_NOBUFS;
+  int r = s->v6 ? udp6_send (ip6, port, s->local_port, buf, n) : udp_send (ip, port, s->local_port, buf, n);
+  return r == 0 ? (long) n : -E_NOBUFS;
 }
 
-static long dgram_recv (struct sock *s, u8 *buf, u64 n, u32 *ip, u16 *port) {
+static long dgram_recv (struct sock *s, u8 *buf, u64 n, struct saddr *from, int peek) {
   unsigned long long start = net_now_ms ();
+  int e;
   while (s->qcount == 0) {
     if (s->nonblock) return -E_AGAIN;
-    if (wait_a_little (start, -1)) return -E_INTR;
+    if ((e = recv_wait (s, start))) return e;
   }
   struct dgram *d = &s->q[s->qhead];
   u64 k = (u64) d->len < n ? (u64) d->len : n;
   for (u64 i = 0; i < k; i++) buf[i] = d->data[i];
-  if (ip) *ip = d->ip;
-  if (port) *port = d->port;
-  s->qhead = (s->qhead + 1) % 4;  s->qcount--;
+  if (from) {
+    from->v6 = s->v6;  from->ip = d->ip;  from->port = d->port;
+    for (int i = 0; i < 16; i++) from->ip6[i] = d->ip6[i];
+  }
+  if (!peek) { s->qhead = (s->qhead + 1) % 4;  s->qcount--; }          // (MSG_PEEK: the datagram stays in the queue)
   return k;
 }
 
 // the calls of linux_abi.c: the result is a count, or minus an error number
-long sock_send (int gfd, const void *buf, u64 n, u32 ip, u16 port, int has_addr) {
+long sock_send (int gfd, const void *buf, u64 n, const struct saddr *to) {
   struct sock *s = sock_of (gfd);
   if (!s) return -E_NOTSOCK;
-  return s->type == SOCK_STREAM_ ? stream_send (s, buf, n) : dgram_send (s, buf, n, ip, port, has_addr);
+  return s->type == SOCK_STREAM_ ? stream_send (s, buf, n) : dgram_send (s, buf, n, to);
 }
 
-long sock_recv (int gfd, void *buf, u64 n, u32 *ip, u16 *port) {
+// flags: MSG_PEEK (look, do not take) and MSG_DONTWAIT (this call does not wait, whatever the socket is); from gets the address of the sender (or 0)
+long sock_recv (int gfd, void *buf, u64 n, struct saddr *from, int flags) {
   struct sock *s = sock_of (gfd);
   if (!s) return -E_NOTSOCK;
-  if (s->type == SOCK_DGRAM_) return dgram_recv (s, buf, n, ip, port);
-  if (ip) *ip = s->peer_ip;
-  if (port) *port = s->peer_port;
-  return stream_recv (s, buf, n);
+  int was = s->nonblock, peek = (flags & MSG_PEEK_) != 0;
+  if (flags & MSG_DONTWAIT_) s->nonblock = 1;
+  long k;
+  if (s->type == SOCK_DGRAM_) k = dgram_recv (s, buf, n, from, peek);
+  else {
+    if (from) { from->v6 = 0;  from->ip = s->peer_ip;  from->port = s->peer_port; }
+    k = stream_recv (s, buf, n, peek);
+  }
+  s->nonblock = was;
+  return k;
 }
 
 // read and write of the book's descriptor functions: the book's convention (-1 and the error number in the process)
 static int as_book (long k) { if (k >= 0) return k;  set_errno (k == -E_AGAIN ? 35 : -k);  return -1; }
 int sock_read (int gfd, void *buf, int n)  { return as_book (sock_recv (gfd, buf, n, 0, 0)); }
-int sock_write (int gfd, void *buf, int n) { return as_book (sock_send (gfd, buf, n, 0, 0, 0)); }
+int sock_write (int gfd, void *buf, int n) { return as_book (sock_send (gfd, buf, n, 0)); }
 
 int sock_shutdown (int gfd, int how) {
   struct sock *s = sock_of (gfd);
@@ -444,7 +534,7 @@ int sock_accept (int gfd, int *new_gfd, u32 *ip, u16 *port, int nonblock_new) {
   for (;;) {
     tcp_conn *c = tcp_accept (s->local_port);
     if (c) {
-      int g = sock_new (SOCK_STREAM_, nonblock_new);
+      int g = sock_new (2, SOCK_STREAM_, nonblock_new);
       if (g < 0) { tcp_close (c);  return -E_MFILE; }
       struct sock *n = sock_of (g);
       n->c = c;  n->id = tcp_id (c);  n->local_port = s->local_port;
@@ -463,15 +553,23 @@ the addresses of a socket (host byte order); 0, or minus an error number
 
 <<sockets.c>>=
 // the addresses of a socket (host byte order); 0, or minus an error number
-int sock_name (int gfd, int peer, u32 *ip, u16 *port) {
+int sock_name (int gfd, int peer, struct saddr *a) {
   struct sock *s = sock_of (gfd);
   if (!s) return -E_NOTSOCK;
-  if (s->local) { *ip = 0;  *port = 0;  return 0; }                    // a socketpair has no address (Python's ssl asks getpeername whether it is connected)
+  a->v6 = s->v6;  a->ip = 0;  a->port = 0;
+  for (int k = 0; k < 16; k++) a->ip6[k] = 0;
+  if (s->local) return 0;                                              // a socketpair has no address (Python's ssl asks getpeername whether it is connected)
   if (peer) {
     if (s->type == SOCK_STREAM_ ? !s->c : !s->connected) return -E_NOTCONN;
-    *ip = s->peer_ip;  *port = s->peer_port;
+    a->ip = s->peer_ip;  a->port = s->peer_port;
+    for (int k = 0; k < 16; k++) a->ip6[k] = s->peer6[k];
   } else {
-    *ip = net_my_ip;  *port = s->local_port;
+    a->port = s->local_port;
+    if (!s->v6) a->ip = net_my_ip;
+    else {                                                             // the address that the kernel would use: the global one, if a router has given a prefix
+      const u8 *mine = ip6_have_global ? ip6_global : ip6_link_local;
+      for (int k = 0; k < 16; k++) a->ip6[k] = mine[k];
+    }
   }
   return 0;
 }
@@ -490,9 +588,172 @@ int sock_ready (int gfd) {
   if (s->type == SOCK_DGRAM_) return (s->qcount ? 1 : 0) | 4;
   if (s->listening) return tcp_pending (s->local_port) ? 1 : 0;           // a connection is waiting
   if (s->local) return (LCOUNT (s) || s->eof ? 1 : 0) | (s->peer_gone ? 1 | 4 | 16 : (LCOUNT (&socks[s->peer]) < LBUF ? 4 : 0));
+  connect_check (s);
+  if (s->error) return 4 | 8 | 16;                                     // a connect () has failed and nobody has asked yet: POLLOUT | POLLERR | POLLHUP, like Linux
   if (!s->c) return 4 | 16;                                            // not connected (any more): POLLOUT | POLLHUP, like Linux
   if (tcp_id (s->c) != s->id) return 8 | 16;
-  if (s->connecting) { if (tcp_established (s->c)) { s->connecting = 0; return 4; }  return tcp_closed (s->c) ? 8 | 16 : 0; }
-  return (tcp_readable (s->c) ? 1 : 0) | (tcp_writable (s->c) ? 4 : 0) | (tcp_closed (s->c) ? 16 : 0);
+  if (s->connecting) { connect_check (s);  if (s->error) return 4 | 8 | 16;  return s->connecting ? 0 : 4; }
+  return (tcp_readable (s->c) || s->npk ? 1 : 0) | (tcp_writable (s->c) ? 4 : 0) | (tcp_closed (s->c) ? 16 : 0);
+}
+@
+\section{IPv6 datagrams, \texttt{sendmsg}, \texttt{MSG\_PEEK} and friends}
+\label{sec:sockets:more}
+
+The sockets of the first version were IPv4 only and had the calls that Python and \texttt{getaddrinfo} use. Programs that were not written for this system ask for more.
+This section lists what was added later, and why each piece is as small as it is.
+
+\paragraph{\texttt{AF\_INET6}.} The kernel has IPv6 UDP (chapter \ref{ch:network}), so a datagram socket can be an IPv6 socket: \texttt{socket (AF\_INET6, SOCK\_DGRAM, 0)}.
+An address of a socket is now the small structure \texttt{struct saddr} (a flag \texttt{v6}, the IPv4 address or the 16 bytes of the IPv6 address, and the port), and the system
+call code of chapter \ref{ch:libc} turns a \texttt{sockaddr\_in} or a \texttt{sockaddr\_in6} into it. The network stack keeps IPv4 and IPv6 ports in two tables, so the socket
+has a second set of 16 handler functions (\texttt{udp6\_in0} to \texttt{udp6\_in15}, made by the same macro) and a datagram in the queue has room for either kind of sender.
+A socket has the family it was made with: an address of the other family is \texttt{EAFNOSUPPORT}, as on Linux; there are no IPv4-mapped addresses and no
+\texttt{IPV6\_V6ONLY}. \textbf{TCP over IPv6 is not done}: \texttt{socket (AF\_INET6, SOCK\_STREAM, 0)} is \texttt{EAFNOSUPPORT}, which is what a program expects when it tries
+IPv6 first and falls back (musl's \texttt{getaddrinfo} does). The reason is in section 26 of \texttt{ARM64-PORT.md}: the peer address is a \texttt{u32} in about ten places of \texttt{tcp.c}.
+
+\paragraph{\texttt{sendmsg} and \texttt{recvmsg}.} They are \texttt{sendto} and \texttt{recvfrom} with the buffer in pieces (\texttt{iov}) and the address in a structure. The
+translation is in chapter \ref{ch:libc}; the sockets do not know about them. Ancillary data is not supported.
+
+\paragraph{\texttt{MSG\_PEEK}.} A datagram stays in the queue (the receive function does not move \texttt{qhead}). A TCP connection cannot take back what it has handed out, so
+a peek reads up to 512 bytes into a buffer of the socket (\texttt{pk}) and later calls deliver from there first. \texttt{poll} counts the bytes of the buffer as readable.
+
+\paragraph{\texttt{SO\_ERROR} and \texttt{SO\_RCVTIMEO}.} A non-blocking \texttt{connect} answers \texttt{EINPROGRESS}; later \texttt{poll} says the socket can be written (or
+has \texttt{POLLERR}), and the program asks how the connection ended with \texttt{getsockopt (SO\_ERROR)}. \texttt{connect\_check} looks at the connection, and writes a failure
+into the socket; reading it once clears it. (The TCP code does not say \emph{why} a connection ended, so a refused connection and a server that does not answer are both \texttt{ECONNREFUSED}.)
+\texttt{SO\_RCVTIMEO} is the time (in milliseconds) after which a receive call that waits gives up with \texttt{EAGAIN}; the wait loop already had a time limit, only the value was missing.
+
+\subsection{The test program \texttt{sockext}}
+\label{src:libc/sockext.c}
+
+It runs against the servers of \texttt{tools/socket\_test.py} (the TCP and UDP server of \texttt{sockettest}, and a UDP server on \texttt{[::1]} that is reached through qemu's IPv6 router
+\texttt{fec0::2}): \texttt{sockext 10.0.2.2 TCPPORT UDPPORT UDP6PORT}.
+
+<<libc/sockext.c>>=
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <time.h>
+#include <unistd.h>
+#include <poll.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <sys/uio.h>
+#include <sys/time.h>
+#include <netinet/in.h>
+
+static int fails = 0;
+#define CHECK(c, msg) do { if (c) printf ("  user ok:   %s\n", msg); \
+                           else { printf ("  user FAIL: %s\n", msg); fails++; } } while (0)
+
+static long now_ms (void) { struct timespec t;  clock_gettime (CLOCK_MONOTONIC, &t);  return t.tv_sec * 1000 + t.tv_nsec / 1000000; }
+
+static int readable (int fd, int ms) { struct pollfd p = { fd, POLLIN, 0 };  return poll (&p, 1, ms) == 1 && (p.revents & POLLIN); }
+
+int main (int argc, char **argv) {
+  if (argc != 5) { printf ("usage: sockext HOST TCPPORT UDPPORT UDP6PORT\n");  return 2; }
+  struct sockaddr_in tcp = { .sin_family = AF_INET, .sin_port = htons (atoi (argv[2])) };
+  struct sockaddr_in closed = { .sin_family = AF_INET, .sin_port = htons (1) };
+  struct sockaddr_in6 six = { .sin6_family = AF_INET6, .sin6_port = htons (atoi (argv[4])) };
+  inet_pton (AF_INET, argv[1], &tcp.sin_addr);  closed.sin_addr = tcp.sin_addr;
+  inet_pton (AF_INET6, "fec0::2", &six.sin6_addr);                    // qemu's IPv6 router, which is the host
+  char buf[200];
+  int n;
+
+  // IPv6 datagrams: sendto, recvfrom with a sockaddr_in6, connect, getsockname, an IPv4 address is refused
+  int u6 = socket (AF_INET6, SOCK_DGRAM, 0);
+  CHECK (u6 >= 0, "socket (AF_INET6, SOCK_DGRAM) works");
+  CHECK (sendto (u6, "ping", 4, 0, (struct sockaddr *) &six, sizeof six) == 4, "IPv6 UDP: sendto a datagram to the host server (fec0::2)");
+  CHECK (readable (u6, 5000), "poll: the answer makes the IPv6 socket readable");
+  struct sockaddr_in6 from;  socklen_t fl = sizeof from;
+  n = recvfrom (u6, buf, sizeof buf, 0, (struct sockaddr *) &from, &fl);
+  CHECK (n == 4 && !memcmp (buf, "PING", 4), "IPv6 UDP: recvfrom gives PING");
+  CHECK (fl == sizeof from && from.sin6_family == AF_INET6 && from.sin6_port == six.sin6_port && !memcmp (&from.sin6_addr, &six.sin6_addr, 16),
+         "recvfrom: the sender is a sockaddr_in6 with the address fec0::2 and the port of the server");
+  struct sockaddr_in6 me;  socklen_t ml = sizeof me;
+  CHECK (getsockname (u6, (struct sockaddr *) &me, &ml) == 0 && me.sin6_family == AF_INET6 && ntohs (me.sin6_port) >= 1024 && !IN6_IS_ADDR_UNSPECIFIED (&me.sin6_addr),
+         "getsockname: AF_INET6, a local port and one of our own addresses");
+  errno = 0;
+  CHECK (sendto (u6, "x", 1, 0, (struct sockaddr *) &tcp, sizeof tcp) == -1 && errno == EAFNOSUPPORT, "an IPv4 address on an IPv6 socket: EAFNOSUPPORT");
+  CHECK (connect (u6, (struct sockaddr *) &six, sizeof six) == 0 && send (u6, "pong", 4, 0) == 4 && readable (u6, 5000) && recv (u6, buf, sizeof buf, 0) == 4 && !memcmp (buf, "PONG", 4),
+         "IPv6 UDP: connect, send and recv");
+
+  // sendmsg and recvmsg with two pieces each
+  struct iovec out[2] = { { "pi", 2 }, { "ng", 2 } };
+  struct msghdr mo;  memset (&mo, 0, sizeof mo);
+  mo.msg_name = &six;  mo.msg_namelen = sizeof six;  mo.msg_iov = out;  mo.msg_iovlen = 2;
+  CHECK (sendmsg (u6, &mo, 0) == 4, "sendmsg: two pieces \"pi\" and \"ng\" are one datagram of 4 bytes");
+  CHECK (readable (u6, 5000), "poll: the answer is there");
+  char a[3], b[10];
+  struct iovec in[2] = { { a, 3 }, { b, 10 } };
+  struct sockaddr_in6 f;
+  struct msghdr mi;  memset (&mi, 0, sizeof mi);
+  mi.msg_name = &f;  mi.msg_namelen = sizeof f;  mi.msg_iov = in;  mi.msg_iovlen = 2;
+  n = recvmsg (u6, &mi, 0);
+  CHECK (n == 4 && !memcmp (a, "PIN", 3) && b[0] == 'G', "recvmsg: PING is spread over two pieces (3 and 1 bytes)");
+  CHECK (mi.msg_namelen == sizeof f && f.sin6_family == AF_INET6 && f.sin6_port == six.sin6_port, "recvmsg: msg_name has the sender");
+
+  // MSG_PEEK on a datagram: the datagram stays
+  CHECK (send (u6, "peek", 4, 0) == 4 && readable (u6, 5000), "a datagram for MSG_PEEK has arrived");
+  n = recv (u6, buf, sizeof buf, MSG_PEEK);
+  CHECK (n == 4 && !memcmp (buf, "PEEK", 4), "recv (MSG_PEEK) shows the datagram");
+  memset (buf, 0, sizeof buf);
+  n = recv (u6, buf, sizeof buf, MSG_PEEK);
+  CHECK (n == 4 && !memcmp (buf, "PEEK", 4), "...and shows it again: it was not taken");
+  n = recv (u6, buf, 2, 0);
+  CHECK (n == 2 && !memcmp (buf, "PE", 2), "recv without MSG_PEEK takes it (a buffer of 2 bytes cuts the datagram)");
+  errno = 0;
+  CHECK (recv (u6, buf, sizeof buf, MSG_DONTWAIT) == -1 && errno == EAGAIN, "now the queue is empty: EAGAIN");
+  close (u6);
+
+  // SO_RCVTIMEO: a receive call that waits gives up after the time
+  int u4 = socket (AF_INET, SOCK_DGRAM, 0);
+  struct timeval tv = { 0, 300000 }, got;  socklen_t gl = sizeof got;
+  CHECK (setsockopt (u4, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv) == 0 && getsockopt (u4, SOL_SOCKET, SO_RCVTIMEO, &got, &gl) == 0 && got.tv_sec == 0 && got.tv_usec == 300000,
+         "SO_RCVTIMEO: set 300 ms, read back 300 ms");
+  long t0 = now_ms ();
+  errno = 0;
+  n = recv (u4, buf, sizeof buf, 0);
+  long took = now_ms () - t0;
+  CHECK (n == -1 && errno == EAGAIN && took >= 250 && took < 3000, "recv with nothing to read: EAGAIN after about 300 ms (not at once, not for ever)");
+  close (u4);
+
+  // MSG_PEEK on a stream
+  int s = socket (AF_INET, SOCK_STREAM, 0);
+  CHECK (connect (s, (struct sockaddr *) &tcp, sizeof tcp) == 0 && write (s, "hello\n", 6) == 6 && readable (s, 3000), "TCP: connected, \"hello\" sent, the answer has arrived");
+  n = recv (s, buf, 3, MSG_PEEK);
+  CHECK (n == 3 && !memcmp (buf, "HEL", 3), "recv (MSG_PEEK, 3 bytes) shows HEL");
+  n = recv (s, buf, sizeof buf, MSG_PEEK);
+  CHECK (n == 6 && !memcmp (buf, "HELLO\n", 6), "recv (MSG_PEEK) again shows all 6 bytes");
+  CHECK (readable (s, 0), "poll: peeked bytes still count as readable");
+  n = recv (s, buf, 4, 0);
+  CHECK (n == 4 && !memcmp (buf, "HELL", 4), "recv takes 4 bytes from what was peeked");
+  n = read (s, buf, sizeof buf);
+  CHECK (n == 2 && !memcmp (buf, "O\n", 2), "read gives the 2 bytes that are left");
+  shutdown (s, SHUT_WR);
+  CHECK (read (s, buf, sizeof buf) == 0, "the end of the stream after the peek");
+  close (s);
+
+  // SO_ERROR: a fresh socket has none; a non-blocking connect that fails leaves ECONNREFUSED, read once
+  int err = -1;  socklen_t el = sizeof err;
+  s = socket (AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+  CHECK (getsockopt (s, SOL_SOCKET, SO_ERROR, &err, &el) == 0 && err == 0, "SO_ERROR of a new socket is 0");
+  errno = 0;
+  CHECK (connect (s, (struct sockaddr *) &closed, sizeof closed) == -1 && errno == EINPROGRESS, "non-blocking connect to a port where nobody listens: EINPROGRESS");
+  struct pollfd pf = { s, POLLOUT, 0 };
+  CHECK (poll (&pf, 1, 5000) == 1 && (pf.revents & POLLERR), "poll: the socket has POLLERR");
+  err = -1;  el = sizeof err;
+  CHECK (getsockopt (s, SOL_SOCKET, SO_ERROR, &err, &el) == 0 && err == ECONNREFUSED, "getsockopt (SO_ERROR): ECONNREFUSED");
+  err = -1;  el = sizeof err;
+  CHECK (getsockopt (s, SOL_SOCKET, SO_ERROR, &err, &el) == 0 && err == 0, "SO_ERROR again: 0 (reading it cleared it)");
+  close (s);
+  s = socket (AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+  connect (s, (struct sockaddr *) &tcp, sizeof tcp);
+  pf.fd = s;
+  err = -1;  el = sizeof err;
+  CHECK (poll (&pf, 1, 5000) == 1 && (pf.revents & POLLOUT) && !(pf.revents & POLLERR) && getsockopt (s, SOL_SOCKET, SO_ERROR, &err, &el) == 0 && err == 0,
+         "a non-blocking connect that works: POLLOUT, no POLLERR, SO_ERROR 0");
+  close (s);
+  return fails;
 }
 @

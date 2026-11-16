@@ -148,6 +148,7 @@ int  ip6_send (const u8 *dst, u8 next_header, u8 *data, int len);      // an IPv
 int  ip6_ping (const u8 *dst, int size, int timeout_ms, void (*idle) (void));        // round trip time in microseconds, or -1
 typedef void (*udp6_handler) (const u8 *src_ip, u16 src_port, const u8 *data, int len);
 int  udp6_bind (u16 port, udp6_handler handler);
+void udp6_unbind (u16 port);                      // the port is free again (sockets.c closes its IPv6 UDP sockets with it)
 int  udp6_send (const u8 *dst_ip, u16 dst_port, u16 src_port, const u8 *data, int len);
 
 // ---- numbers in the headers are big endian ("network byte order") ----
@@ -2546,13 +2547,18 @@ without one is dropped), and a computed checksum of 0 is sent as all ones (as in
 with [[udp6_bind]]; its handler is called with the address of the sender, which it may use as the destination of the answer.
 
 <<ip6.c: udp>>=
-#define UDP6_PORTS 4
+#define UDP6_PORTS 16                              // as many as the sockets of programs (sockets.c)
 static struct { u16 port; udp6_handler handler; } udp6_ports[UDP6_PORTS];
 
 int udp6_bind (u16 port, udp6_handler handler) {
   for (int i = 0; i < UDP6_PORTS; i++)
     if (!udp6_ports[i].handler) { udp6_ports[i].port = port; udp6_ports[i].handler = handler; return 0; }
   return -1;
+}
+
+void udp6_unbind (u16 port) {
+  for (int i = 0; i < UDP6_PORTS; i++)
+    if (udp6_ports[i].handler && udp6_ports[i].port == port) udp6_ports[i].handler = 0;
 }
 
 int udp6_send (const u8 *dst, u16 dst_port, u16 src_port, const u8 *data, int len) {
