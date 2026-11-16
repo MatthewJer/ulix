@@ -2771,3 +2771,77 @@ int main () {
   return fails;                                         // two more "user ok" lines follow at exit: the destructors
 }
 @
+
+\section{The C++ library: libc++, libc++abi and libunwind: \texttt{cxxtest2}}
+\label{src:libc/cxxtest2.cc}
+
+LLVM's C++ library (issue \#43, submodule \texttt{third\_party/llvm-project}, release \texttt{llvmorg-21.1.8}, Apache-2.0 with the LLVM exception, see
+\texttt{third\_party/LICENCE-CHECK-llvm.md}) has three parts: \emph{libc++} (strings, containers, streams), \emph{libc++abi} (\texttt{throw}, \texttt{catch},
+run-time type information, \texttt{new}) and \emph{libunwind} (walks up the stack for an exception). They are compiled unmodified by
+\texttt{libc/libcxx.mk}, without CMake: one rule per kind of source file and the lists of files that the CMake files of LLVM would use for
+\emph{threads off, file system off, static library}. The few switches that CMake would write into the header \texttt{\_\_config\_site} are in
+\texttt{libc/libcxx\_config\_site.h}, one line each with the reason. Two small points: g++ for \texttt{aarch64-elf} does not define \texttt{\_GNU\_SOURCE}, which libc++
+needs for musl's \texttt{locale\_t}, so the flag is given; and part of the number conversion (\texttt{from\_chars}) uses a header of LLVM's own C library,
+so \texttt{libc/} is part of the sparse checkout.
+
+\paragraph{How the unwinder finds the code's tables.} libunwind asks \texttt{dl\_iterate\_phdr} for the program headers and uses \texttt{PT\_GNU\_EH\_FRAME}
+(the sorted table \texttt{.eh\_frame\_hdr}, which \texttt{musl.ld} now keeps). musl's static \texttt{dl\_iterate\_phdr} reads the program headers from
+the auxiliary vector (\texttt{AT\_PHDR}), which the kernel passes (\texttt{build\_linux\_stack}); nothing else is needed from the kernel.
+The GCC unwinder in \texttt{libgcc.a} (compiled without \texttt{dl\_iterate\_phdr}) is not used for exceptions: the open problem of the previous
+section does not matter for this program, because libunwind is linked before \texttt{libgcc}. The link needs \texttt{-Wl,--eh-frame-hdr}: without it the header is empty and a \texttt{throw} ends in \texttt{terminate}.
+
+The test uses what a first C++ program uses and checks each part: static constructors, \texttt{std::string}, \texttt{std::vector} with
+\texttt{std::sort}, \texttt{std::map}, an exception that runs a destructor on its way, one that passes a handler for another type, one thrown by the library
+itself, and \texttt{std::cout}.
+
+<<libc/cxxtest2.cc>>=
+#include <iostream>
+#include <string>
+#include <vector>
+#include <map>
+#include <stdexcept>
+#include <algorithm>
+#include <cstdio>
+
+static int fails = 0;
+#define CHECK(c, msg) do { if (c) std::printf ("  user ok:   %s\n", msg); \
+                           else { std::printf ("  user FAIL: %s\n", msg); fails++; } } while (0)
+
+static int order = 0;
+struct Global { int at; Global () { at = ++order; } };
+Global first, second;                                   // constructed before main, in this order
+
+struct Guard { int *n; ~Guard () { ++*n; } };           // a destructor that runs while an exception passes
+static void thrower (int *cleaned) { Guard g { cleaned }; throw std::runtime_error ("boom"); }
+
+int main () {
+  CHECK (first.at == 1 && second.at == 2, "static constructors ran before main");
+
+  std::string s = "Hello, ";
+  s += "C++ on Ulix";
+  CHECK (s.size () == 18 && s.find ("Ulix") == 14 && s.substr (0, 5) == "Hello", "std::string: append, find, substr");
+
+  std::vector<int> v;
+  for (int i = 10; i > 0; i--) v.push_back (i * i);
+  std::sort (v.begin (), v.end ());
+  CHECK (v.size () == 10 && v.front () == 1 && v.back () == 100, "std::vector and std::sort");
+
+  std::map<std::string, int> m;
+  m["one"] = 1;  m["two"] = 2;  m["three"] = 3;
+  CHECK (m.size () == 3 && m["two"] == 2 && m.begin ()->first == "one", "std::map: insert, lookup, sorted order");
+
+  int cleaned = 0, caught = 0;
+  try { thrower (&cleaned); } catch (const std::exception &e) { caught = std::string (e.what ()) == "boom"; }
+  CHECK (caught && cleaned == 1, "throw and catch: the exception arrives, the destructor ran on the way (needs the unwinder)");
+
+  int which = 0;
+  try { try { throw 42; } catch (const std::string &) { which = 1; } } catch (int n) { which = n; }
+  CHECK (which == 42, "an int is thrown through a handler for another type and caught by the right one");
+
+  try { std::vector<int> ().at (3); } catch (const std::out_of_range &) { which = -1; }
+  CHECK (which == -1, "the library throws too: std::vector::at out of range");
+
+  std::cout << "  user ok:   std::cout works: " << 42 << ' ' << 1.5 << ' ' << s << std::endl;
+  return fails;
+}
+@

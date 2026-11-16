@@ -13,7 +13,7 @@ SYSROOT = $(abspath $(B)/sysroot)
 # the flags of the kernel's user space: no PIC, no outlined atomics (they need a run-time check of the CPU features)
 CFLAGS = -O1 -g0 -fno-pic -mno-outline-atomics -std=gnu11 -Wall
 
-PROGS = hello cat ls filetest readtest threadtest sockettest localetest sockext cxxtest
+PROGS = hello cat ls filetest readtest threadtest sockettest localetest sockext cxxtest cxxtest2
 ARCHIVE ?= 1
 ifeq ($(ARCHIVE),1)
 PROGS += bsdtar bsdunzip
@@ -54,6 +54,16 @@ $(B)/%.o: %.cc $(SYSROOT)/lib/libc.a
 $(B)/cxxtest.elf: $(B)/cxxtest.o musl.ld ../tools/mark_musl.py
 	$(CROSS)g++ -static -nostdlib -nostartfiles -mno-outline-atomics -z max-page-size=4096 -z noexecstack -Wl,--eh-frame-hdr -T musl.ld -o $@ \
 	  $(SYSROOT)/lib/crt1.o $(SYSROOT)/lib/crti.o $(CRTBEGIN) $< $(SYSROOT)/lib/libc.a -lgcc $(CRTEND) $(SYSROOT)/lib/crtn.o
+	python3 ../tools/mark_musl.py $@
+
+# with the C++ library (libcxx.mk): exceptions and RTTI on; libunwind finds the call-frame tables through dl_iterate_phdr (musl's static one, which reads the
+# program headers that the start code got from the kernel in AT_PHDR)
+include libcxx.mk
+$(B)/cxxtest2.o: cxxtest2.cc $(CXXINC)/__config_site
+	$(CROSS)g++ $(CXXCOMMON) -std=c++20 $(CXXHDRS) -c -o $@ $<
+$(B)/cxxtest2.elf: $(B)/cxxtest2.o musl.ld ../tools/mark_musl.py $(SYSROOT)/lib/libc++.a $(SYSROOT)/lib/libunwind.a
+	$(CROSS)g++ -static -nostdlib -nostartfiles -mno-outline-atomics -z max-page-size=4096 -z noexecstack -Wl,--eh-frame-hdr -T musl.ld -o $@ \
+	  $(SYSROOT)/lib/crt1.o $(SYSROOT)/lib/crti.o $(CRTBEGIN) $< $(SYSROOT)/lib/libc++.a $(SYSROOT)/lib/libunwind.a $(SYSROOT)/lib/libc.a -lgcc $(CRTEND) $(SYSROOT)/lib/crtn.o
 	python3 ../tools/mark_musl.py $@
 
 $(B)/%.elf: $(B)/%.o musl.ld ../tools/mark_musl.py

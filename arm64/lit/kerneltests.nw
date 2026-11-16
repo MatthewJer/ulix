@@ -886,6 +886,13 @@ int proc_test (void) {
   arch_threads_reap ();
   CHECK (pid > 0 && thread_table[pid].exitcode == 0, "/musl/cxxtest finished with exit status 0 (no failed checks)");
   CHECK (count_in (out, "user FAIL") == 0 && count_in (out, "user ok:") == 5, "all 5 C++ checks passed: constructors before main, destructors at exit, new/delete/virtual/templates");
+  char *cxx2_argv[] = { "cxxtest2", 0 };                    // the C++ library: std::string, vector, map, iostream, exceptions (libc++, libc++abi, libunwind)
+  capture_start ();
+  pid = run ("/musl/cxxtest2", 1, cxx2_argv);
+  capture_stop (&out);
+  arch_threads_reap ();
+  CHECK (pid > 0 && thread_table[pid].exitcode == 0, "/musl/cxxtest2 finished with exit status 0 (no failed checks)");
+  CHECK (count_in (out, "user FAIL") == 0 && count_in (out, "user ok:") == 8, "all 8 C++ library checks passed: string, vector, map, throw/catch through a destructor, library exceptions, cout");
   char *mcat_argv[] = { "cat", "/etc/rc.conf", 0 };
   capture_start ();
   pid = run ("/musl/cat", 2, mcat_argv);

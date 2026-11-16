@@ -4,7 +4,7 @@
                 directories and `cmake`, `runtimes`, `llvm/cmake`, `llvm/utils/llvm-lit` are needed; a sparse checkout)
 - Tag:          llvmorg-21.1.8 (commit 2078da43e25a4623cab2d0d60decddf709aaea28), shallow, unmodified. Sparse checkout
                 (about 130 MByte in the working tree, 38 MByte of git objects instead of several GByte):
-                `git -C third_party/llvm-project sparse-checkout set --no-cone /libcxx/ /libcxxabi/ /libunwind/ /cmake/ /runtimes/ /llvm/cmake/ /llvm/LICENSE.TXT /third-party/`
+                `git -C third_party/llvm-project sparse-checkout set --no-cone /libcxx/ /libcxxabi/ /libunwind/ /cmake/ /runtimes/ /llvm/cmake/ /llvm/LICENSE.TXT /third-party/ /libc/shared/ /libc/src/__support/ /libc/include/ /libc/hdr/`
 - Licence:      Apache-2.0 with LLVM exceptions (SPDX `Apache-2.0 WITH LLVM-exception`), see `libcxx/LICENSE.TXT`,
                 `libcxxabi/LICENSE.TXT`, `libunwind/LICENSE.TXT`; every source file carries that line in its header.
                 (Before LLVM 9 the licence was MIT plus UIUC; a release tag from LLVM 9 on is used.)
