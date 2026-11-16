@@ -875,6 +875,10 @@ void kmain (void) {
 
   extern void smp_print_stats (void);
   smp_print_stats ();
+  extern void smp_dump (const char *why);
+  extern u64 smp_heartbeat_of (int cpu);
+  smp_dump ("end of the tests");                  // (also a smoke test of the dump that a lock timeout and a kernel exception print)
+  if (smp_heartbeat_of (0) == 0) { printf ("  FAIL: the heartbeat of CPU 0 did not count\n"); fails++; }
   extern volatile int irq_in_locked_code;
   if (irq_in_locked_code) { printf ("  FAIL: %d interrupt(s) arrived in kernel code that held the lock\n", irq_in_locked_code); fails++; }
   extern void buffer_sync (int);
