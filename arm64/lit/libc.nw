@@ -632,6 +632,7 @@ static long linux_clock_gettime (int clk, struct ts *t) {
   switch (clk) {
     case CLOCK_REALTIME:  ns = real_ns (); break;
     case CLOCK_MONOTONIC: case 4: case 7: ns = mono_ns (); break;      // 4 = MONOTONIC_RAW, 7 = BOOTTIME
+    case 2: case 3: ns = mono_ns (); break;                             // PROCESS_/THREAD_CPUTIME_ID (clock () of libc): the kernel does not count CPU time, the time since boot stands in
     default: return -LE_EINVAL;
   }
   t->sec = ns / 1000000000ULL;
@@ -641,7 +642,7 @@ static long linux_clock_gettime (int clk, struct ts *t) {
 
 // the resolution of a clock: the counter of the CPU ticks many million times a second, so a nanosecond is what Linux says as well (asyncio asks)
 static long linux_clock_getres (int clk, struct ts *t) {
-  if (clk != CLOCK_REALTIME && clk != CLOCK_MONOTONIC && clk != 4 && clk != 7) return -LE_EINVAL;
+  if (clk != CLOCK_REALTIME && clk != CLOCK_MONOTONIC && clk != 4 && clk != 7 && clk != 2 && clk != 3) return -LE_EINVAL;
   if (t) {
     if (!user_ok ((u64) t, sizeof *t, 1)) return -LE_EFAULT;
     t->sec = 0;  t->nsec = 1;
@@ -1131,6 +1132,7 @@ static long linux_openat (context_t *r, int dirfd, const char *path, int flags) 
   if ((flags & LO_CREAT) && (flags & LO_EXCL) && exists) return -LE_EEXIST;
   if ((flags & LO_DIRECTORY) && exists && (st.st_mode & S_IFMT) != S_IFDIR) return -LE_ENOTDIR;
   if ((flags & 3) != 0 && exists && (st.st_mode & S_IFMT) == S_IFDIR) return -LE_EISDIR;
+  if (!exists && !(flags & LO_CREAT) && strncmp (path, "/dev/", 5) != 0) return -LE_ENOENT;   // (the book's open says only -1)
   // (syscall_open of the book turns the file into a descriptor of the process at once and leaves the open file behind when the table is full: ask for the
   // file first, then for a place in the table, and give the file back if there is none)
   int gfd0 = u_open ((char *) path, uflags, 0);
@@ -2194,13 +2196,23 @@ static void linux_syscall_inner (context_t *r) {
     case L_renameat: case L_renameat2: ret = linux_renameat (a0, (const char *) a1, a2, (const char *) a3); break;
     case L_getrandom: ret = linux_getrandom ((char *) a0, a1, a2); break;
     case L_getcwd: ret = linux_getcwd ((char *) a0, a1); break;
-    case L_chdir:  ret = ulix_call (r, syscall_chdir, a0, 0, 0, 0, 0) < 0 ? -LE_ENOENT : 0; break;
+    case L_chdir: {                                            // (the book's chdir only says -1: ask stat for the reason)
+      struct stat st;
+      if (!user_string_ok (a0)) { ret = -LE_EFAULT; break; }
+      if (u_stat ((const char *) a0, &st) != 0) ret = -LE_ENOENT;
+      else if ((st.st_mode & S_IFMT) != S_IFDIR) ret = -LE_ENOTDIR;
+      else ret = ulix_call (r, syscall_chdir, a0, 0, 0, 0, 0) < 0 ? -LE_ENOENT : 0;
+      break;
+    }
     case L_mkdirat: case L_unlinkat: case L_faccessat: {      // (the name may be relative to an open directory: at_name)
       char nbuf[FD_PATH];  long err = 0;
       if (!user_string_ok (a1)) { ret = -LE_EFAULT; break; }
       const char *name = at_name (a0, (const char *) a1, nbuf, &err);
       if (!name) { ret = err; break; }
-      if (nr == L_mkdirat) ret = ulix_call (r, syscall_mkdir, (long) name, a2, 0, 0, 0) < 0 ? linux_error (LE_EACCES) : 0;
+      struct stat have;
+      if (nr == L_mkdirat && u_stat (name, &have) == 0) ret = -LE_EEXIST;
+      else if (nr == L_mkdirat) ret = ulix_call (r, syscall_mkdir, (long) name, a2, 0, 0, 0) < 0 ? linux_error (LE_EACCES) : 0;
+      else if (nr == L_unlinkat && u_stat (name, &have) != 0) ret = -LE_ENOENT;
       else if (nr == L_unlinkat) ret = ulix_call (r, (a2 & 0x200) ? syscall_rmdir : syscall_unlink, (long) name, 0, 0, 0, 0) < 0 ? linux_error (LE_ENOENT) : 0;
       else { struct stat st; ret = u_stat (name, &st) == 0 ? 0 : -LE_ENOENT; }
       break;
