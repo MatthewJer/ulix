@@ -145,3 +145,4 @@ libc/sockext.c
 libc/cxxtest.cc
 dbg_http.c
 libc/cxxtest2.cc
+libc/chantest.c
