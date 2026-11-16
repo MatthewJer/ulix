@@ -591,9 +591,11 @@ void arch_clock_init (void) {
 }
 
 extern void key_timeouts (void);              // arch_console.c: wake processes whose waiting for a key has timed out
+extern void futex_timeouts (void);            // linux_abi.c
 
 void arch_clock_tick (void) {                 // called from the timer interrupt, 100 times a second
   system_ticks++;
   key_timeouts ();
+  futex_timeouts ();                          // linux_abi.c: wake the threads whose sleep (futex, nanosleep) has run out
   system_time = (uint)(system_ticks / 100) + system_start_time;
 }

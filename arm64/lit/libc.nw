@@ -646,18 +646,19 @@ static long linux_gettimeofday (long *tv, void *tz) {
   return 0;
 }
 
-// sleep until the clock has reached the time: 0, or -EINTR when a signal arrived (rem gets the time that is left)
+static long futex_sleep (u64 key, int as, unsigned long long deadline);       // (the futex section: a sleep with a time limit)
+
+// sleep until the clock has reached the time: 0, or -EINTR when a signal arrived (rem gets the time that is left). The thread sleeps in
+// the queue of the futexes with the time as its limit (nobody wakes it: key 0); the timer tick wakes it.
 static long sleep_until (unsigned long long deadline, int absolute_clock, struct ts *rem) {
-  for (;;) {
-    unsigned long long now = absolute_clock == CLOCK_REALTIME ? real_ns () : mono_ns ();
-    if (now >= deadline) return 0;
-    if (thread_table[current_task].sig_pending) {
-      if (rem && user_ok ((u64) rem, sizeof *rem, 1)) { rem->sec = (deadline - now) / 1000000000ULL; rem->nsec = (deadline - now) % 1000000000ULL; }
-      return -LE_EINTR;
-    }
-    arch_resign ();
-    arch_poll_pause ();                                           // (let the other CPUs into the kernel, see arch_thread.c)
+  unsigned long long now = absolute_clock == CLOCK_REALTIME ? real_ns () : mono_ns ();
+  if (now >= deadline) return 0;
+  if (futex_sleep (0, current_as, mono_ns () + (deadline - now)) == -LE_EINTR) {
+    now = absolute_clock == CLOCK_REALTIME ? real_ns () : mono_ns ();
+    if (now < deadline && rem && user_ok ((u64) rem, sizeof *rem, 1)) { rem->sec = (deadline - now) / 1000000000ULL; rem->nsec = (deadline - now) % 1000000000ULL; }
+    return -LE_EINTR;
   }
+  return 0;
 }
 
 static long linux_nanosleep (struct ts *req, struct ts *rem) {
@@ -684,71 +685,202 @@ if the word at \texttt{address} still has the \texttt{value} (so a wake-up that 
 \texttt{FUTEX\_WAKE (address, n)} wakes up to $n$ sleepers on that address. musl's mutexes, condition variables, \texttt{pthread\_join}
 and the lock around its own thread list are built from these two calls; the kernel never sees a mutex.
 
-\paragraph{Simple version first.} The table of sleepers has 64 entries (address space, address, a flag \texttt{woken}). A sleeper does not leave the
-ready queue: it checks the flag and calls \texttt{arch\_resign} in a loop, like \texttt{nanosleep} does with the clock. It costs CPU time
-while it waits, and it needs no new thread state and no change of the scheduler. (The better version, a blocked queue per address like the one
-for pipes, is a replacement for the loop and for the flag; the table stays.) Wake-ups cannot get lost because all of this runs under the
-kernel lock: the value is compared and the entry made without a thread switch in between. A signal or the end of the process
-(\texttt{exit\_group} in another thread) ends the wait with \texttt{EINTR}; the timeout of a timed wait is relative (\texttt{FUTEX\_WAIT}) or
-absolute on the real-time clock (\texttt{FUTEX\_WAIT\_BITSET} with \texttt{FUTEX\_CLOCK\_REALTIME}, which is what \texttt{pthread\_cond\_timedwait} uses). The calls
-that move waiters from one address to another (\texttt{FUTEX\_REQUEUE}) and the priority-inheritance locks are not implemented: musl does not need them.
+\paragraph{A blocked queue, like the pipes.} A thread that waits does not stay in the ready queue. It goes into one queue for all futexes
+(\texttt{futex\_queue}, state \texttt{TSTATE\_WAITFUTEX}), exactly as a reader goes into \texttt{pipe\_queue}, and it costs no CPU time until somebody
+wakes it. (The first version of this chapter kept the sleeper in the ready queue and called \texttt{arch\_resign} in a loop; a waiting thread then used a whole
+CPU, which \texttt{threadtest} now shows as a number.) Four things end the sleep, and the same function \texttt{futex\_sleep} serves all of them:
+\begin{itemize}
+\item \texttt{FUTEX\_WAKE} finds the sleepers on the address in the order in which they went to sleep, marks them \texttt{woken} and makes them ready with \texttt{deblock}.
+\item The \emph{time limit} (timed waits, \texttt{nanosleep}): every sleeper has a deadline, and the timer tick asks \texttt{futex\_timeouts} (like \texttt{key\_timeouts} for the
+  keyboard) to wake those whose time has come. A timed sleep is therefore accurate to one tick (10 ms).
+\item A \emph{signal} that is not blocked: \texttt{u\_kill} calls \texttt{futex\_before\_kill} first (the book knows only its own queues, as with pipes), and the
+  sleeper sees the pending signal and returns \texttt{EINTR}.
+\item \texttt{exit\_group} in another thread: \texttt{futex\_wake\_process} wakes every sleeper of the address space, and the same test ends the sleep with \texttt{EINTR}.
+\end{itemize}
+A sleeper that is woken for no reason just goes to sleep again. Wake-ups cannot get lost because all of this runs under the
+kernel lock: the value is compared and the thread put in the queue without a thread switch in between.
+
+\paragraph{Which futex is it?} A \emph{private} futex (the flag \texttt{FUTEX\_PRIVATE\_FLAG}, which musl sets for the locks inside a process) is named by the address space
+and the address. A \emph{shared} futex (no flag: a lock in memory that was mapped with \texttt{MAP\_SHARED}, see the section on shared mappings) is named by the
+\emph{physical address} of the word, so that two processes that map the same frame find each other. Sleepers have a \texttt{key} (the address) and \texttt{as}
+(the address space, or $-1$ for a shared one). \texttt{FUTEX\_REQUEUE} and \texttt{FUTEX\_CMP\_REQUEUE} wake some of the sleepers and move the others to another
+address by changing their key. (musl does not use them; a condition variable in the style of glibc does: the woken thread would find the mutex locked and
+sleep again at once, so the others are moved to the mutex instead of being woken.)
+
+\paragraph{Robust mutexes.} \texttt{set\_robust\_list} tells the kernel where the thread keeps a list of the robust mutexes it holds. When the thread ends,
+\texttt{futex\_exit\_robust} walks the list: every mutex whose owner field names the dying thread gets the bit \texttt{FUTEX\_OWNER\_DIED} and one sleeper is woken, so
+that \texttt{pthread\_mutex\_lock} returns \texttt{EOWNERDEAD} to the next thread instead of waiting for ever. The walk is limited to 2048 entries and checks every address.
 
 <<linux_abi.c: futex>>=
 #define FUTEX_WAIT          0
 #define FUTEX_WAKE          1
+#define FUTEX_REQUEUE       3
+#define FUTEX_CMP_REQUEUE   4
 #define FUTEX_WAIT_BITSET   9
 #define FUTEX_WAKE_BITSET  10
+#define FUTEX_PRIVATE_FLAG 128
 #define FUTEX_CLOCK_REALTIME 256
+#define FUTEX_OWNER_DIED   0x40000000
 #define LE_ETIMEDOUT 110
-
-struct futex_waiter { int used, as, woken; u64 addr; };
-static struct futex_waiter futex_waiters[64];
-
-// wake up to n sleepers on this address of the current address space; returns how many
-static int futex_wake (u64 addr, int n) {
-  int woken = 0;
-  for (int i = 0; i < 64 && woken < n; i++)
-    if (futex_waiters[i].used && futex_waiters[i].as == current_as && futex_waiters[i].addr == addr && !futex_waiters[i].woken) {
-      futex_waiters[i].woken = 1;
-      woken++;
-    }
-  return woken;
-}
-
-void futex_wake_address (u64 addr, int n) { futex_wake (addr, n); }       // (the end of a thread: arch_thread.c)
+#define TSTATE_WAITFUTEX 15                   // a thread sleeps in futex_queue (12 serial disk, 13 pipe, 14 network)
 
 extern int arch_as_dying (void);
 
-static long futex_wait (int *addr, int val, struct ts *timeout, int absolute, int realtime) {
+static blocked_queue futex_queue;             // everybody who waits: futex, nanosleep, semaphores
+struct futex_waiter { u64 key;  int as, woken;  unsigned long long deadline; };    // one per thread: what it waits for (key 0: nothing)
+static struct futex_waiter futex_waiters[MAX_THREADS];
+
+// the name of the futex at this address: private to the address space, or (shared) named by the physical address of the word
+static void futex_name (u64 addr, int shared, u64 *key, int *as) {
+  if (shared) { *key = user_to_phys (addr, 0);  *as = -1; }
+  else        { *key = addr;                    *as = current_as; }
+}
+
+// a signal that can be delivered (a blocked one does not end a wait), or the end of the process
+static int futex_must_leave (void) {
+  TCB *t = &thread_table[current_task];
+  return (t->sig_pending & ~t->sig_blocked) != 0 || arch_as_dying ();
+}
+
+// sleep until woken (0), until the deadline (mono_ns, 0: none; -ETIMEDOUT), or until a signal or exit_group (-EINTR)
+static long futex_sleep (u64 key, int as, unsigned long long deadline) {
+  struct futex_waiter *w = &futex_waiters[current_task];
+  w->key = key;  w->as = as;  w->woken = 0;  w->deadline = deadline;
+  long result;
+  for (;;) {
+    if (futex_must_leave ()) { result = -LE_EINTR; break; }
+    if (deadline && mono_ns () >= deadline) { result = -LE_ETIMEDOUT; break; }
+    block (&futex_queue, TSTATE_WAITFUTEX);
+    arch_resign ();                                              // here the thread sleeps
+    if (w->woken) { result = 0; break; }
+  }
+  w->key = 0;  w->deadline = 0;
+  return result;
+}
+
+// wake up to n sleepers on this futex, oldest first; returns how many
+static int futex_wake_key (u64 key, int as, int n) {
+  int woken = 0;
+  thread_id t = futex_queue.next;
+  while (t != 0 && woken < n) {
+    thread_id next = thread_table[t].next;                       // (deblock changes the links)
+    if (futex_waiters[t].key == key && futex_waiters[t].as == as) { futex_waiters[t].woken = 1;  deblock (t, &futex_queue);  woken++; }
+    t = next;
+  }
+  return woken;
+}
+
+static int futex_wake (u64 addr, int shared, int n) {
+  u64 key;  int as;
+  futex_name (addr, shared, &key, &as);
+  return key ? futex_wake_key (key, as, n) : 0;
+}
+
+void futex_wake_address (u64 addr, int n) { futex_wake (addr, 0, n);  futex_wake (addr, 1, n); }     // (the end of a thread: arch_thread.c; private and shared waiters)
+
+// from the timer tick: wake the sleepers whose time has come (they find out why when they run)
+void futex_timeouts (void) {
+  unsigned long long now = 0;
+  thread_id t = futex_queue.next;
+  while (t != 0) {
+    thread_id next = thread_table[t].next;
+    if (futex_waiters[t].deadline) {
+      if (!now) now = mono_ns ();
+      if (now >= futex_waiters[t].deadline) deblock (t, &futex_queue);
+    }
+    t = next;
+  }
+}
+
+// a thread that is killed or signalled leaves the queue first (it looks at its signals when it runs again)
+void futex_before_kill (int pid) {
+  if (pid > 1 && pid < MAX_THREADS && thread_table[pid].used && thread_table[pid].state == TSTATE_WAITFUTEX) deblock (pid, &futex_queue);
+}
+
+// exit_group: every sleeper of the address space leaves, sees the mark and ends (arch_thread.c)
+void futex_wake_process (int as) {
+  thread_id t = futex_queue.next;
+  while (t != 0) {
+    thread_id next = thread_table[t].next;
+    if (thread_table[t].addr_space == as) deblock (t, &futex_queue);
+    t = next;
+  }
+}
+
+// one tick (10 ms) of sleep, for the loops that still look again and again (wait4 for any child): no CPU time between two looks
+static long futex_nap (void) { return futex_sleep (0, current_as, mono_ns () + 10000000ULL); }
+
+static long futex_wait (int *addr, int val, struct ts *timeout, int absolute, int realtime, int shared) {
   if (!user_ok ((u64) addr, 4, 0) || ((u64) addr & 3)) return -LE_EFAULT;
   if (*addr != val) return -LE_EAGAIN;                           // the value changed: do not sleep
   unsigned long long deadline = 0;
   if (timeout) {
     if (!user_ok ((u64) timeout, sizeof *timeout, 0)) return -LE_EFAULT;
     unsigned long long t = timeout->sec * 1000000000ULL + timeout->nsec;
-    deadline = absolute ? t : (realtime ? real_ns () : mono_ns ()) + t;
+    if (absolute) deadline = t + mono_ns () - (realtime ? real_ns () : mono_ns ());      // (an absolute time of the clock that the program named, on the monotonic clock)
+    else          deadline = mono_ns () + t;
+    if (!deadline) deadline = 1;
   }
-  int slot = 0;
-  while (slot < 64 && futex_waiters[slot].used) slot++;
-  if (slot == 64) return -LE_ENOMEM;
-  futex_waiters[slot].used = 1;  futex_waiters[slot].as = current_as;  futex_waiters[slot].addr = (u64) addr;  futex_waiters[slot].woken = 0;
-  long result = 0;
-  for (;;) {
-    if (futex_waiters[slot].woken) break;
-    if (thread_table[current_task].sig_pending || arch_as_dying ()) { result = -LE_EINTR; break; }
-    if (deadline && (realtime || absolute ? real_ns () : mono_ns ()) >= deadline) { result = -LE_ETIMEDOUT; break; }
-    arch_resign ();
-    arch_poll_pause ();
-  }
-  futex_waiters[slot].used = 0;
-  return result;
+  u64 key;  int as;
+  futex_name ((u64) addr, shared, &key, &as);
+  if (!key) return -LE_EFAULT;
+  return futex_sleep (key, as, deadline);
 }
 
-static long linux_futex (int *addr, int op, int val, struct ts *timeout, int val3) {
-  switch (op & 127) {                                            // (bit 7 is FUTEX_PRIVATE_FLAG: every futex is private to its address space here)
-    case FUTEX_WAIT:        return futex_wait (addr, val, timeout, 0, 0);
-    case FUTEX_WAIT_BITSET: return futex_wait (addr, val, timeout, 1, (op & FUTEX_CLOCK_REALTIME) != 0);
-    case FUTEX_WAKE: case FUTEX_WAKE_BITSET: return futex_wake ((u64) addr, val < 0 ? 0 : val);
+// wake n sleepers on addr and move up to n2 of the others to addr2: a wake of addr2 will find them
+static long futex_requeue (int *addr, int n, int n2, int *addr2, int shared) {
+  if (!user_ok ((u64) addr, 4, 0) || ((u64) addr & 3) || !user_ok ((u64) addr2, 4, 0) || ((u64) addr2 & 3)) return -LE_EFAULT;
+  u64 key, key2;  int as, as2;
+  futex_name ((u64) addr, shared, &key, &as);
+  futex_name ((u64) addr2, shared, &key2, &as2);
+  long done = futex_wake_key (key, as, n);
+  thread_id t = futex_queue.next;
+  for (int moved = 0; t != 0 && moved < n2; t = thread_table[t].next)
+    if (futex_waiters[t].key == key && futex_waiters[t].as == as) { futex_waiters[t].key = key2;  futex_waiters[t].as = as2;  moved++;  done++; }
+  return done;
+}
+
+// the robust list of a thread (set_robust_list): the head is {next, futex_offset, list_op_pending}; the entries are linked through their first word
+static u64 robust_head[MAX_THREADS];
+
+static long linux_set_robust_list (u64 head, u64 len) {
+  if (len != 24) return -LE_EINVAL;
+  robust_head[current_task] = head;
+  return 0;
+}
+
+// the thread ends: the mutexes of its list that it still holds are marked "owner died" and one sleeper on each is woken
+void futex_exit_robust (int tid) {
+  u64 head = robust_head[tid];
+  robust_head[tid] = 0;
+  if (!head || !user_ok (head, 24, 0)) return;
+  long offset = ((long *) head)[1];
+  u64 entry = ((u64 *) head)[0];
+  for (int n = 0; entry != head && n < 2048; n++) {
+    if (!user_ok (entry, 8, 0)) return;
+    u64 word = entry + offset;
+    if (user_ok (word, 4, 1) && !(word & 3)) {
+      unsigned *w = (unsigned *) word;
+      if ((*w & 0x3fffffff) == (unsigned) tid) {
+        *w = (*w & 0x80000000) | FUTEX_OWNER_DIED;               // keep "there are waiters", the owner is gone
+        futex_wake_address (word, 1);
+      }
+    }
+    entry = *(u64 *) entry;
+  }
+}
+
+static long linux_futex (int *addr, int op, int val, struct ts *timeout, int *addr2, int val3) {
+  int shared = !(op & FUTEX_PRIVATE_FLAG);
+  switch (op & 127) {
+    case FUTEX_WAIT:        return futex_wait (addr, val, timeout, 0, 0, shared);
+    case FUTEX_WAIT_BITSET: return futex_wait (addr, val, timeout, 1, (op & FUTEX_CLOCK_REALTIME) != 0, shared);
+    case FUTEX_WAKE: case FUTEX_WAKE_BITSET: return futex_wake ((u64) addr, shared, val < 0 ? 0 : val);
+    case FUTEX_REQUEUE:     return futex_requeue (addr, val, (long) timeout, addr2, shared);
+    case FUTEX_CMP_REQUEUE:
+      if (!user_ok ((u64) addr, 4, 0) || ((u64) addr & 3)) return -LE_EFAULT;
+      if (*addr != val3) return -LE_EAGAIN;                      // the word changed since the caller looked: nothing is moved
+      return futex_requeue (addr, val, (long) timeout, addr2, shared);
   }
   return -LE_ENOSYS;
 }
@@ -1046,7 +1178,7 @@ static long linux_wait4 (context_t *r, int pid, int *status, int options) {
     if (!children) return -LE_ECHILD;
     if (zombie || !(options & LW_NOHANG)) {
       int c = zombie ? zombie : pid;                         // (a named child that still runs: the book waits for it)
-      if (c < 1) { if (thread_table[current_task].sig_pending) return -LE_EINTR;  arch_resign ();  arch_poll_pause ();  continue; }   // "any child": look again
+      if (c < 1) { if (futex_nap () == -LE_EINTR) return -LE_EINTR;  continue; }   // "any child": look again after a tick of sleep
       long k = ulix_call (r, syscall_waitpid, c, 0, options & ~LW_NOHANG, 0, 0);
       if (k < 0) return -LE_ECHILD;
       if (status) *status = (thread_table[c].exitcode & 0xff) @<< 8;   // (the table entry is free but still holds the value)
@@ -1682,8 +1814,7 @@ semaphores: a table of 32, each with a name, a value and a count of the processe
 640 to 645, outside the numbers of Linux), and \texttt{libc/semshim.c} turns \texttt{sem\_open}, \texttt{sem\_wait}, \texttt{sem\_post} and the others into
 calls to them. A semaphore is identified by its slot number, which stays valid in a child after \texttt{fork}.
 
-The value is changed with an atomic compare-and-swap, because two CPUs may wait for the same semaphore. Waiting does what every wait in this chapter does:
-look again, give the CPU away, and stop when a signal is pending or the time is up. \texttt{usem\_wait} takes a mode: 0 waits for ever, 1 only tries, 2 waits at most
+The value is changed with an atomic compare-and-swap, because two CPUs may wait for the same semaphore. Waiting sleeps in the queue of the futexes (key: the semaphore, \texttt{usem\_post} wakes one sleeper), with the time limit of mode 2, and stops when a signal is pending. \texttt{usem\_wait} takes a mode: 0 waits for ever, 1 only tries, 2 waits at most
 the given number of nanoseconds.
 
 <<linux_abi.c: semaphores>>=
@@ -1723,9 +1854,7 @@ static long linux_usem_wait (long id, int mode, long long timeout_ns) {
     if (v > 0) { if (__atomic_compare_exchange_n (&u->value, &v, v - 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return 0;  continue; }
     if (mode == 1) return -LE_EAGAIN;
     if (mode == 2 && mono_ns () >= deadline) return -LE_ETIMEDOUT;
-    if (thread_table[current_task].sig_pending) return -LE_EINTR;
-    arch_resign ();
-    arch_poll_pause ();
+    if (futex_sleep ((u64) u, -1, mode == 2 ? deadline : 0) == -LE_EINTR) return -LE_EINTR;   // (sleeps in the futex queue, the key is the semaphore: usem_post wakes it)
   }
 }
 
@@ -1733,6 +1862,7 @@ static long linux_usem_post (long id) {
   struct usem *u = usem_of (id);
   if (!u) return -LE_EINVAL;
   __atomic_fetch_add (&u->value, 1, __ATOMIC_ACQ_REL);
+  futex_wake_key ((u64) u, -1, 1);
   return 0;
 }
 
@@ -1910,8 +2040,8 @@ static void linux_syscall_inner (context_t *r) {
     case L_getpid:  ret = thread_table[current_task].pid; break;
     case L_gettid:  ret = current_task; break;
     case L_set_tid_address: arch_set_clear_tid (current_task, a0); ret = current_task; break;
-    case L_set_robust_list: ret = 0; break;                   // robust mutexes: a thread that dies holding one is not handled
-    case L_futex:   ret = linux_futex ((int *) a0, a1, a2, (struct ts *) a3, a5); break;
+    case L_set_robust_list: ret = linux_set_robust_list (a0, a1); break;    // robust mutexes: see the futex section
+    case L_futex:   ret = linux_futex ((int *) a0, a1, a2, (struct ts *) a3, (int *) a4, a5); break;
     case L_getppid: ret = thread_table[current_task].ppid; break;
     case L_getuid: case L_geteuid: case L_getgid: case L_getegid: ret = 0; break;
     case L_clone: ret = linux_clone (r, a0, a1, (int *) a2, a3, (int *) a4); break;

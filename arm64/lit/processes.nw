@@ -1114,7 +1114,10 @@ returns to user mode, so after that it is killed like a process), then it ends t
 <<arch_thread.c: linux threads>>=
 extern u64 user_to_phys (u64 va, int write);
 
+extern void futex_exit_robust (int tid), futex_wake_process (int as);        // linux_abi.c
+
 static void thread_clear_tid (void) {
+  futex_exit_robust (current_task);                                 // robust mutexes that the thread still holds: "owner died"
   u64 a = clear_tid[current_task];
   clear_tid[current_task] = 0;
   if (a && user_to_phys (a, 1)) { *(int *) a = 0; futex_wake_address (a, 0x7fffffff); }
@@ -1138,7 +1141,7 @@ static void main_thread_ends_process (context_t *r, int code) {
 void arch_linux_exit (context_t *r, int code, int group) {
   TCB *t = &thread_table[current_task];
   if (address_spaces[current_as].refcount <= 1) { r->ebx = code; syscall_exit (r); return; }
-  if (group || t->pid == current_task) { as_dying[current_as] = 1; as_exit_code[current_as] = code; }
+  if (group || t->pid == current_task) { as_dying[current_as] = 1; as_exit_code[current_as] = code;  futex_wake_process (current_as); }   // (sleepers in futex or nanosleep leave)
   if (t->pid == current_task) { main_thread_ends_process (r, code); return; }
   thread_clear_tid ();
   r->ebx = 0;
