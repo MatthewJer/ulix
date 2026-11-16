@@ -59,5 +59,5 @@ This is how the repository is used today, written down so that it stays the same
   and `rpi4` receives `develop` only when `make pcheck` is green and the maintainer has run the changes on the board.
 * **Releases** (a proposal; no such tag exists yet) are tags on `rpi4`: `ulix-arm64-MAJOR.MINOR` (one per finished milestone M1, M2, ...; the original release is tagged `v0.13`). A tag comes with
   the rebuilt `ulix-book.pdf` and the section of `ARM64-PORT.md` that describes the milestone. The SD card image is built from the tag
-  (see "Reproducible run on the Raspberry Pi", section 45 of `ARM64-PORT.md`).
+  (see "Reproducible run on the Raspberry Pi", section 46 of `ARM64-PORT.md`).
 * **Remotes:** `origin` is the original project and is never pushed to; `fork` is the GitHub repository of this fork (`MatthewJer/ulix`); `backup` is the private copy.

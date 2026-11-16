@@ -841,7 +841,7 @@ Causes: `mx_pathname_to_ino` read a directory entry by entry, and every entry co
 
 Sections 23 and 24 say what to do when the board arrives; section 44 is the last run on the board. This section puts the procedure in one place, so that anybody with the same hardware can repeat a run and compare the result. It writes down what the maintainer did; steps that were only planned are marked.
 
-**Hardware.** Raspberry Pi 4B with 1 GByte of RAM (the only model that has been run; see section 46), SD card, USB serial adapter with 3.3 V levels (never 5 V), Ethernet cable to a router that answers DHCP.
+**Hardware.** Raspberry Pi 4B with 1 GByte of RAM (the only model that has been run; see section 47), SD card, USB serial adapter with 3.3 V levels (never 5 V), Ethernet cable to a router that answers DHCP.
 
 **1. Build the card image** on the host (the card is the same image that `make run-rpi4-shell` uses in qemu, with the boot partition filled):
 
@@ -896,4 +896,4 @@ Adding these up (an estimate, not a measurement) gives about 10 MByte for an idl
 4. **The GPU takes its part before the kernel starts.** The firmware reports to the kernel only the RAM that remains (`Device tree: ... MByte RAM`); read that number from the log of the run (section 45), not from the label on the board.
 5. **A new feature states its worst-case memory in its issue and section** in one line, like "needs N MByte at most", so that this table can be extended.
 
-**Open:** a measurement of the real free memory per model (1 and 2 GByte) in the log of section 45; `top` already shows it, nothing has been recorded.
+**Open:** a measurement of the real free memory per model (1 and 2 GByte) in the log of section 46; `top` already shows it, nothing has been recorded.

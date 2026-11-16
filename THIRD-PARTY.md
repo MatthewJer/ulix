@@ -35,7 +35,7 @@ Source of the tags: `third_party/LICENCE-CHECK-musl.md`, `LICENCE-CHECK-cpython.
 | original Ulix, `ulix-book.nw` and `lib-build/`, `bin-build/` | <https://github.com/hgesser/ulix> | release `v0.13` and later upstream commits | GPLv3 | the kernel logic that the ARM64 port reuses (`arm64/port.manifest`) |
 
 Not imported: Linux code (none anywhere); the Raspberry Pi firmware files (`start4.elf`, `fixup4.dat`, `bcm2711-rpi-4-b.dtb`) are downloaded by
-the person who builds the SD card and are not part of the repository (licence: Broadcom, redistributable but not free; see section 45 of
+the person who builds the SD card and are not part of the repository (licence: Broadcom, redistributable but not free; see section 46 of
 [`ARM64-PORT.md`](ARM64-PORT.md)).
 
 ## Adding a package
