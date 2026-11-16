@@ -510,7 +510,8 @@ static long linux_mprotect (u64 addr, u64 len, int prot);
 
 static long linux_mmap (u64 addr, u64 len, int prot, int flags, int fd, long off) {
   u64 l0 = arch_as_l0 (current_as), flagbits = prot_flags (prot);
-  if (!len || len > MMAP_HI - MMAP_LO) return -LE_EINVAL;
+  if (!len) return -LE_EINVAL;
+  if (len > MMAP_HI - MMAP_LO) return -LE_ENOMEM;                 // more than the whole range: Linux says ENOMEM (malloc of a huge size relies on it)
   len = (len + 4095) & ~4095UL;
   if (!flagbits) return -LE_EACCES;
   int gfd = -1;
@@ -2129,7 +2130,8 @@ static void linux_syscall_inner (context_t *r) {
       syscall_execv (r);                                      // on success it has set the new program counter and stack
       if (r->eip != saved.eip) return;                        // the new program starts
       *r = saved;
-      r->x0 = -LE_ENOENT;
+      { struct stat st;                                       // (the book's execv only fails: a file that is there but no program is ENOEXEC)
+        r->x0 = u_stat ((const char *) a0, &st) == 0 && (st.st_mode & S_IFMT) == S_IFREG ? -8 : -LE_ENOENT; }
       return;
 
     // files
