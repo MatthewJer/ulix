@@ -13,7 +13,7 @@ SYSROOT = $(abspath $(B)/sysroot)
 # the flags of the kernel's user space: no PIC, no outlined atomics (they need a run-time check of the CPU features)
 CFLAGS = -O1 -g0 -fno-pic -mno-outline-atomics -std=gnu11 -Wall
 
-PROGS = hello cat ls filetest readtest fdtest threadtest sockettest localetest sockext chantest cxxtest cxxtest2
+PROGS = hello cat ls filetest readtest fdtest threadtest sockettest localetest sockext chantest cxxtest cxxtest2 libctest
 ARCHIVE ?= 1
 ifeq ($(ARCHIVE),1)
 PROGS += bsdtar bsdunzip

@@ -12,7 +12,7 @@ OBJCOPY = $(CROSS)objcopy
 CFLAGS = -I$(GENDIR) -mno-outline-atomics -O0 -g -ffreestanding -nostdlib -fno-builtin -fno-stack-protector -mgeneral-regs-only -std=c99 -Wall
 
 # the programs linked with musl besides /muslhello64: they live in the directory /musl of the disk (see lit/libc.nw)
-MUSL_NAMES = cat ls filetest readtest fdtest threadtest sockettest localetest sockext chantest cxxtest cxxtest2
+MUSL_NAMES = cat ls filetest readtest fdtest threadtest sockettest localetest sockext chantest cxxtest cxxtest2 libctest
 
 # the Python interpreter (third_party/cpython, chapter "Python" of lit/libc.nw, issue #59): make PYTHON=0 leaves it out. It is part of the
 # system when the submodule is checked out (git submodule update --init third_party/cpython) and a Python 3.12 is on the host.
@@ -381,6 +381,10 @@ ssh-test: ulix-shell.bin $(DISK)
 # a cable that is plugged in after the boot: the network thread asks DHCP by itself
 dhcp-retry-test: ulix-console.bin $(DISK)
 	python3 tools/dhcp_retry_test.py ulix-console.bin $(DISK)
+
+# conformance tests of the C library (chapter "Conformance Tests for the C Library"): libctest, filetest, localetest, threadtest in a login session
+libc-test: ulix-shell.bin $(DISK)
+	python3 tools/libc_test.py ulix-shell.bin $(DISK)
 
 # the telnet server: a client of the host logs in on terminal 5, runs programs, hangs up; the server can be switched off in /etc/rc.conf
 telnet-test: ulix-shell.bin $(DISK)
