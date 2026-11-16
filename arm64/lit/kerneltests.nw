@@ -274,6 +274,33 @@ int bookfs_test (void) {
            !mx_file_exists (DEV, "/dl1"), "the three directories are removed again");
   }
 
+  // ---- path lookup (issue #142): a directory with many blocks, odd paths ----
+  {
+    char name[40];
+    CHECK (mx_mkdir (DEV, "/many", 0755) == 0, "lookup: directory /many");
+    int made = 0;
+    for (int i = 0; i < 150; i++) {                        // 150 entries + . and .. = five blocks of 32 entries
+      name[0] = '/'; name[1] = 'm'; name[2] = 'a'; name[3] = 'n'; name[4] = 'y'; name[5] = '/';
+      name[6] = 'f'; name[7] = '0' + i / 100; name[8] = '0' + (i / 10) % 10; name[9] = '0' + i % 10; name[10] = 0;
+      int f = mx_open (DEV, name, O_CREAT | O_WRONLY);
+      if (f >= 0) { made++; mx_close (f); }
+    }
+    CHECK (made == 150, "lookup: 150 files created in /many");
+    CHECK (mx_file_exists (DEV, "/many/f000") && mx_file_exists (DEV, "/many/f149") && mx_file_exists (DEV, "/many/f077"),
+           "lookup: first, middle and last entry are found");
+    CHECK (!mx_file_exists (DEV, "/many/f150") && !mx_file_exists (DEV, "/many/f14"), "lookup: names that are not there are not found");
+    CHECK (mx_pathname_to_ino (DEV, "/many/") == mx_pathname_to_ino (DEV, "/many") && mx_pathname_to_ino (DEV, "/") == 1,
+           "lookup: a slash at the end and the root directory");
+    CHECK (mx_pathname_to_ino (DEV, "/hello.c/x") == -1, "lookup: a file is not a directory");
+    CHECK (mx_pathname_to_ino (DEV, "/bin/../hello.c") == mx_pathname_to_ino (DEV, "/hello.c"), "lookup: .. works");
+    for (int i = 0; i < 150; i++) {
+      name[0] = '/'; name[1] = 'm'; name[2] = 'a'; name[3] = 'n'; name[4] = 'y'; name[5] = '/';
+      name[6] = 'f'; name[7] = '0' + i / 100; name[8] = '0' + (i / 10) % 10; name[9] = '0' + i % 10; name[10] = 0;
+      mx_unlink (DEV, name);
+    }
+    CHECK (mx_rmdir (DEV, "/many", "/many") == 0 && !mx_file_exists (DEV, "/many"), "lookup: the files and the directory are removed again");
+  }
+
   // ---- rmdir: the removed directory goes away, the one that contained it keeps . and .. ----
   {
     int before = count_entries ("/");

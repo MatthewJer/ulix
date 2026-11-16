@@ -821,4 +821,14 @@ Until now the Pi ran on one core: `cmdline.txt` said `maxcpus=1`, because the fi
 
 **Done, #139:** `mx_ftruncate` was still wrong after section 33 (zone numbers stayed in the inode and in the indirect blocks, indirect blocks never freed, last partial block not counted). New `mx_free_zones (device, inode, first)` frees from a logical block on and zeroes the pointers; `mx_unlink` uses it for all blocks, so holes and big files are handled (the old open point about double indirect zones is closed: the kernel test "trunc" and `make verify` agree). Test: count of free blocks through the double indirect, single indirect and direct range, regrow, gap reads as zeros (11 checks in `bookfs_test`). Not built for x86.
 
-**Open:** #142 (baseline measured: `python -c pass` 1.5 s, `-m json.tool -h` 5.2 s, `modtest.py` 36.5 s in a login session, qemu virt, 2 CPUs), #141 (the format), #56 (book text).
+**Done, #142 (faster path lookup).** Measured first, with `/musl/python` in a login session (qemu virt, 2 CPUs, wall clock from the host, one run each; the "before" run shared the machine with builds of other agents):
+
+| command | before | after |
+|---|---|---|
+| `python -c pass` | 1.5 s | 0.5 s |
+| `python -B -m json.tool -h` | 5.2 s | 2.1 s |
+| `python -B /musl/modtest.py` (193 checks) | 36.5 s | 12.5 s |
+
+Causes: `mx_pathname_to_ino` read a directory entry by entry, and every entry cost `mx_read_inode` (superblock read three times, inode bitmap, inode table) plus the directory block, each `readblock` searching the 512 entries of the buffer cache. Now (a) the superblock of a device is read once and kept (`mx_fs`, `struct mx_fsinfo`), (b) `mx_lookup_in_directory` reads the directory inode once and each directory block once and compares the names in memory. No name cache: the measurement did not call for one (simple first). The lookup also refuses a path through a file now. Test: 8 "lookup:" checks in `bookfs_test` (150 files in a five-block directory, first/middle/last entry, missing names, trailing slash, `..`, a file as directory).
+
+**Open:** #141 (the format), #56 (book text).

@@ -8,6 +8,7 @@ function count_zeros
 # globals used by the file system code
 global mx_inodes
 global mx_status
+global mx_fs_table
 global count_open_files
 global count_int_inodes
 global system_time

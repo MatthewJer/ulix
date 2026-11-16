@@ -22037,6 +22037,45 @@ This leads to the layout shown in Table~\ref{table:minix-floppy}.
 
 From calculating the sizes of the bitmaps and the inode table we know that the first data block is block 34, but this information is also stored (redundantly) in the superblock's [[s_firstdatazone]] field.
 
+The superblock never changes while the system runs, but almost every function below asks for a value from it (the zone bitmap starts behind the inode bitmap, whose size is in the superblock, and so on). Reading block 1 for every such question went through the whole buffer cache each time and was one of the reasons why looking up a path was slow (issue \#142). So the superblock of each device is read once, when it is first needed, and kept in a small table; [[mx_fs]] returns the entry of a device. Later sections also store values that follow from the superblock (the size of a directory entry, the length of a name) in the same entry.
+
+<<constants>>=
+#define MX_MAX_FS 4              // devices whose superblock is kept in memory
+@ %def MX_MAX_FS
+
+<<type definitions>>=
+struct mx_fsinfo {
+  int device;                    // 0: this entry is free
+  struct minix_superblock sb;    // copy of block 1
+};
+@ %def mx_fsinfo
+
+<<global variables>>=
+struct mx_fsinfo mx_fs_table[MX_MAX_FS] = {{ 0 }};
+@ %def mx_fs_table
+
+%nouse
+<<function prototypes>>=
+struct mx_fsinfo *mx_fs (int device);
+@
+
+<<minix filesystem implementation>>=
+struct mx_fsinfo *mx_fs (int device) {
+  static int next = 0;                                   // which entry to replace when all are used
+  int i;
+  for (i = 0;  i < MX_MAX_FS;  i++)
+    if (mx_fs_table[i].device == device)  return &mx_fs_table[i];
+  for (i = 0;  i < MX_MAX_FS;  i++)
+    if (mx_fs_table[i].device == 0)  break;
+  if (i == MX_MAX_FS)  { i = next;  next = (next + 1) % MX_MAX_FS; }
+  byte block[BLOCK_SIZE];
+  readblock (device, 1, (byte*) block);                  // superblock = block 1
+  mx_fs_table[i].sb = *(struct minix_superblock*) block;
+  mx_fs_table[i].device = device;
+  return &mx_fs_table[i];
+}
+@ %def mx_fs
+
 We provide a function which extracts specific values from
 the superblock, e.\,g, the number of inodes. Since we do not want
 to write several similar functions we combine this in one function called
@@ -22050,10 +22089,7 @@ int mx_query_superblock (int device, char index);
 
 <<minix filesystem implementation>>=
 int mx_query_superblock (int device, char index) {
-  byte block[1024];
-  struct minix_superblock *sblock;
-  readblock (device, 1, (byte*)block);                    // superblock = block 1
-  sblock = (struct minix_superblock*) &block;
+  struct minix_superblock *sblock = &mx_fs (device)->sb;
   switch (index) {
     case MX_SB_NINODES:       return sblock->s_ninodes;
     case MX_SB_NZONES:        return sblock->s_nzones;
@@ -22273,9 +22309,7 @@ The implementations of [[mx_request_inode]] and [[mx_request_block]] that we act
 <<minix filesystem implementation>>=
 int mx_request_inode (int device) {
   byte block[1024];
-  struct minix_superblock *sblock;
-  readblock (device, 1, (byte*)block);               // superblock = block 1
-  sblock = (struct minix_superblock*) &block;
+  struct minix_superblock *sblock = &mx_fs (device)->sb;
 
   int no_inodes  = sblock->s_ninodes;                // floppy: 480  
   int imap_start = 2;
@@ -22294,9 +22328,7 @@ int mx_request_inode (int device) {
 
 int mx_request_block (int device) {
   byte block[1024];
-  struct minix_superblock *sblock;
-  readblock (device, 1, (byte*)block);               // superblock = block 1
-  sblock = (struct minix_superblock*) &block;
+  struct minix_superblock *sblock = &mx_fs (device)->sb;
 
   int no_zones    = sblock->s_zones;                 // floppy: 1440
   int zmap_start  = 2 + sblock->s_imap_blocks;
@@ -22845,74 +22877,52 @@ int mx_pathname_to_ino (int device, const char *path);
 
 <<minix filesystem implementation>>=
 int mx_pathname_to_ino (int device, const char *path) {
-  debug_printf ("mx_pathname_to_ino: entered\n");    // REMOVE_DEBUGGING_CODE
-  struct minix2_inode dirinode, inode;
-  struct minix_dir_entry dentry;
-  char subpath[31];                         // maximum name length: 30
-  char searchbuf[256];
-  char *search = (char*)searchbuf;
-  strncpy (search, path, 256);              // do not modify original path
-  int dirinode_no = 1;                      // inode number of / directory
-  int next_dirinode_no;
-  short final = 0;                          // final = 1 if looking at final part
-  
-  search++;
-  if (*search == '\0') { return 1; }        // searching for / : inode 1
-  while (*search != '\0') {                 // work until end of path reached
-    <<[[mx_pathname_to_ino]]: search loop>>
-  } 
-  debug_printf ("DEBUG: returning inode no %d\n",   // REMOVE_DEBUGGING_CODE
-                next_dirinode_no);                  // REMOVE_DEBUGGING_CODE
-  return next_dirinode_no;
+  char name[31];                            // one component of the path (maximum name length: 30)
+  const char *p = path;
+  int dirinode_no = 1;                      // inode number of the / directory
+  while (*p == '/')  p++;
+  while (*p != '\0') {                      // work until end of path reached
+    int i = 0;
+    while (*p != '\0' && *p != '/') {
+      if (i == 30)  return -1;              // longer than any name on the disk
+      name[i++] = *p++;
+    }
+    name[i] = '\0';
+    dirinode_no = mx_lookup_in_directory (device, dirinode_no, name);
+    if (dirinode_no == -1)  return -1;      // not found!
+    while (*p == '/')  p++;                 // (also takes care of a slash at the end)
+  }
+  return dirinode_no;                       // the path "/" gives inode 1
 };
 @ %def mx_pathname_to_ino
 
-\pagebreak
+The path is cut into its components, and each of them is looked up in the directory that the previous one gave us. The first version of this function read the directory entry by entry with [[mx_read_dir_entry]], and every entry cost reading the directory inode again (the superblock, the inode bitmap and the inode table), plus the block with the entry: up to six calls of [[readblock]] for each of the 32 entries of a block, and each call searches the buffer cache. For a directory with 200 entries (the Python library) that was thousands of calls for each [[open]]. [[mx_lookup_in_directory]] reads the inode of the directory once and then each block of the directory once, and compares the names in memory. A name that is not in the directory costs one pass over the blocks of the directory and nothing more.
 
-Inside the loop we pick the next sub-path and perform the inode lookup. We know that we're done when [[search]] points to the [['\0']] character (the end of the pathname):
+%nouse
+<<function prototypes>>=
+int mx_lookup_in_directory (int device, int dirinode_no, const char *name);
+@
 
-<<[[mx_pathname_to_ino]]: search loop>>=
-int i = 0;
-while (*search != '\0' && *search != '/') {
-  if (i == 30) { return -1; }        // longer than any name on the disk (and subpath is full)
-  subpath[i] = *search;
-  search++; i++;
-}
-subpath[i] = '\0';                      // terminate subpath string
-
-if (*search == '\0') final = 1;         // looking at final part of path
-
-debug_printf ("DEBUG: searching for subpath "    // REMOVE_DEBUGGING_CODE
-              "%s in inode %d\n", subpath,       // REMOVE_DEBUGGING_CODE
-              dirinode_no);                      // REMOVE_DEBUGGING_CODE
-next_dirinode_no = -1;                  // look up subpath
-for (i = 0;  i < 32*7;  i++) {          // max. 32 * 7 entries
-  if (dirinode_no == -1)                         // REMOVE_DEBUGGING_CODE
-    printf ("FAIL: calling mx_read_dir_entry"    // REMOVE_DEBUGGING_CODE
-            " (%d); i = %d, subpath = %s\n",     // REMOVE_DEBUGGING_CODE
-            dirinode_no, i, subpath);            // REMOVE_DEBUGGING_CODE
-                                                 // REMOVE_DEBUGGING_CODE
-  mx_read_dir_entry (device, dirinode_no, i, &dentry);
-  debug_printf ("mx_pathname_to_ino: "           // REMOVE_DEBUGGING_CODE
-                "after mx_read_dir_entry()\n");  // REMOVE_DEBUGGING_CODE
-  if (dentry.inode != 0) {
-    if (strncmp (dentry.name, subpath, 30) == 0) {      // (a name of 30 characters has no 0 at its end: strequal would read on)
-      next_dirinode_no = dentry.inode;  // found it!
-      break;                            // leave for loop
+<<minix filesystem implementation>>=
+int mx_lookup_in_directory (int device, int dirinode_no, const char *name) {
+  struct int_minix2_inode dir;              // (only the fields of the disk inode are used)
+  if (!mx_read_inode (device, dirinode_no, (struct minix2_inode*) &dir))  return -1;
+  if ((dir.i_mode & S_IFMT) != S_IFDIR)  return -1;       // a file has no entries
+  int nblocks = (dir.i_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
+  byte block[BLOCK_SIZE];
+  for (int b = 0;  b < nblocks;  b++) {
+    int zone = fileblocktozone (device, b, &dir);
+    if (zone <= 0)  continue;                             // (no block there)
+    readblock (device, zone, block);
+    struct minix_dir_entry *entry = (struct minix_dir_entry*) block;
+    for (int i = 0;  i < BLOCK_SIZE / 32;  i++, entry++) {
+      if (entry->inode != 0 && strncmp (entry->name, name, 30) == 0)   // (a name of 30 characters has no 0 at its end)
+        return entry->inode;
     }
   }
+  return -1;
 }
-    
-// now next_dirinode_no is either -1 (not found) or points to next step
-if (next_dirinode_no == -1) { return -1; }   // not found!
-    
-dirinode_no = next_dirinode_no;
-debug_printf ("DEBUG: subpath = %s, "           // REMOVE_DEBUGGING_CODE
-              "inode = %d\n",                   // REMOVE_DEBUGGING_CODE
-              subpath, dirinode_no);            // REMOVE_DEBUGGING_CODE
-if (*search != '\0')  search++;
-else                  break;            // finished, leave while loop
-@
+@ %def mx_lookup_in_directory
 
 We also need two helper functions that give us the index of a free [[mx_inodes[]]] and a free [[mx_status[]]] entry. The code is similar: We loop over the respective array and check whether an entry is free. [[mx_inodes[i]]] is free if its [[refcount]] element is 0; the file status entry [[mx_status[i]]] is free if its [[int_inode]] element is a [[NULL]] pointer.
 
