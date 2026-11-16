@@ -115,3 +115,4 @@ libc/libctest.c
 userland/musl/ulixlib.h
 userland/musl/ulixcompat.c
 libc/resolvtest.c
+libc/stress.c

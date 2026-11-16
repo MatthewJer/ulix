@@ -1,0 +1,481 @@
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <pthread.h>
+#include <signal.h>
+#include <time.h>
+#include <unistd.h>
+#include <dirent.h>
+#include <arpa/inet.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+
+#define FUTEX_WAIT_PRIVATE 128
+#define FUTEX_WAKE_PRIVATE 129
+#define FUTEX_REQUEUE_PRIVATE 131
+#define FUTEX_CMP_REQUEUE_PRIVATE 132
+static const char *mode;
+static long long deadline, next_report, iterations;
+static int fails, seed_arg, mb = 8;
+static unsigned long long rng_state = 88172645463325252ULL;
+
+static long long now_ms (void) { struct timespec t; clock_gettime (CLOCK_MONOTONIC, &t); return t.tv_sec * 1000LL + t.tv_nsec / 1000000; }
+static void nap (int ms) { struct timespec t = { ms / 1000, (ms % 1000) * 1000000L }; nanosleep (&t, 0); }
+static unsigned rnd (unsigned n) { rng_state = rng_state * 6364136223846793005ULL + 1442695040888963407ULL;  return (unsigned) ((rng_state / 65536 / 65536) % n); }
+static void FAIL (const char *what) { printf ("  user FAIL: %s: %s (errno %d)\n", mode, what, errno);  fails++; }
+#define CHECK(c, what) do { if (!(c)) FAIL (what); } while (0)
+
+// every mode counts its rounds; a line every five seconds shows that the mode is alive
+static int running (void) {
+  long long t = now_ms ();
+  iterations++;
+  if (t >= next_report) { printf ("stress: %s %lld\n", mode, iterations);  fflush (stdout);  next_report = t + 5000; }
+  return t < deadline;
+}
+
+static unsigned char pat (unsigned s, long i) { return (unsigned char) (s * 31 + i * 7 + (i >> 8)); }
+static void fill (unsigned char *p, unsigned s, long n) { for (long i = 0; i < n; i++) p[i] = pat (s, i); }
+static int same_at (const unsigned char *p, unsigned s, long off, long n) { for (long i = 0; i < n; i++) if (p[i] != pat (s, off + i)) return 0;  return 1; }
+static int same (const unsigned char *p, unsigned s, long n) { for (long i = 0; i < n; i++) if (p[i] != pat (s, i)) return 0;  return 1; }
+
+// wait for a child that must end soon (a hang here is a kernel bug, which the host sees as silence; but a late child is also reported)
+static int reap (pid_t pid, int *status, int seconds) {
+  long long t = now_ms ();
+  for (;;) {
+    pid_t r = waitpid (pid, status, WNOHANG);
+    if (r == pid) return 1;
+    if (r < 0 && errno != EINTR) return 0;
+    if (now_ms () - t > seconds * 1000LL) { FAIL ("child does not end");  kill (pid, SIGKILL);  waitpid (pid, status, 0);  return 0; }
+    nap (2);
+  }
+}
+static void mode_fork (void) {
+  while (running ()) {
+    int n = 1 + rnd (4);
+    pid_t pids[4];
+    int kind[4];
+    for (int i = 0; i < n; i++) {
+      kind[i] = rnd (4);
+      pids[i] = fork ();
+      if (pids[i] < 0) { FAIL ("fork");  kind[i] = -1;  continue; }
+      if (pids[i] == 0) {
+        if (kind[i] == 0) _exit (10 + i);
+        if (kind[i] == 1) { nap (1 + rnd (20));  _exit (20 + i); }
+        if (kind[i] == 2) { char *av[] = { "/musl/stress", "child", 0 };  execv (av[0], av);  _exit (99); }
+        pause ();  _exit (0);                                       // kind 3: waits to be killed
+      }
+    }
+    nap (rnd (5));
+    for (int i = 0; i < n; i++) if (kind[i] == 3 && pids[i] > 0) kill (pids[i], SIGKILL);
+    for (int i = 0; i < n; i++) {
+      int st = 0;
+      if (pids[i] < 0) continue;
+      if (!reap (pids[i], &st, 20)) continue;
+      if (kind[i] == 0) CHECK (WIFEXITED (st) && WEXITSTATUS (st) == 10 + i, "exit status of a quick child");
+      if (kind[i] == 1) CHECK (WIFEXITED (st) && WEXITSTATUS (st) == 20 + i, "exit status of a sleeping child");
+      if (kind[i] == 2) CHECK (WIFEXITED (st) && WEXITSTATUS (st) == 7, "exit status of an exec'ed child");
+      if (kind[i] == 3) CHECK (WIFSIGNALED (st) && WTERMSIG (st) == SIGKILL, "killed child");
+    }
+    int st;
+    CHECK (waitpid (-1, &st, WNOHANG) == -1 && errno == ECHILD, "no child is left after wait");
+  }
+}
+
+static void mode_pipe (void) {
+  while (running ()) {
+    int variant = rnd (4), fd[2];
+    long total = 1000 + rnd (60000), got = 0;
+    unsigned s = rnd (1000);
+    if (pipe (fd) < 0) { FAIL ("pipe");  continue; }
+    pid_t w = fork ();
+    if (w < 0) { FAIL ("fork");  close (fd[0]);  close (fd[1]);  continue; }
+    if (w == 0) {
+      unsigned char buf[9000];
+      close (fd[0]);
+      for (long off = 0; off < total; ) {
+        long n = 1 + rnd (9000);
+        if (n > total - off) n = total - off;
+        for (long i = 0; i < n; i++) buf[i] = pat (s, off + i);
+        long r = write (fd[1], buf, n);
+        if (r < 0) _exit (errno == EPIPE ? 3 : 4);
+        off += r;
+        if (variant == 1 && off > total / 2) pause ();          // killed by the reader's side
+      }
+      _exit (0);
+    }
+    close (fd[1]);
+    unsigned char buf[9000];
+    long limit = variant == 2 ? total / 3 : total + 1;
+    int bad = 0;
+    while (got < limit) {
+      if (variant == 3) { struct pollfd p = { fd[0], POLLIN, 0 };  int r = poll (&p, 1, 1000);  if (r < 0) break; }
+      long r = read (fd[0], buf, 1 + rnd (9000));
+      if (r < 0) { if (errno == EINTR) continue;  FAIL ("read from pipe");  break; }
+      if (r == 0) break;
+      if (!same_at (buf, s, got, r)) bad = 1;
+      got += r;
+      if (variant == 1 && got >= total / 2) {                    // the writer pauses: kill it, the pipe must report the end after the data
+        kill (w, SIGKILL);
+      }
+    }
+    CHECK (!bad, "pipe data is intact");
+    if (variant == 0 || variant == 3) CHECK (got == total, "all data arrives");
+    if (variant == 1) CHECK (got >= total / 2 && got <= total, "data of a killed writer ends with end of file");
+    close (fd[0]);
+    int st = 0;
+    if (reap (w, &st, 20)) {
+      if (variant == 0 || variant == 3) CHECK (WIFEXITED (st) && WEXITSTATUS (st) == 0, "writer ends normally");
+      if (variant == 1) CHECK (WIFSIGNALED (st) && WTERMSIG (st) == SIGKILL, "writer was killed");
+      if (variant == 2) CHECK ((WIFSIGNALED (st) && WTERMSIG (st) == SIGPIPE) || (WIFEXITED (st) && WEXITSTATUS (st) == 3) || (WIFEXITED (st) && WEXITSTATUS (st) == 0), "writer meets a closed pipe");
+    }
+  }
+}
+
+static pthread_mutex_t mx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t cv = PTHREAD_COND_INITIALIZER;
+static long counter, tokens;
+static volatile int stop_threads;
+static int fa, fb;
+static volatile long woken, timedout;
+
+static void *count_body (void *arg) {
+  for (int i = 0; i < 2000; i++) { pthread_mutex_lock (&mx);  counter++;  pthread_mutex_unlock (&mx);  if (i % 500 == 0) sched_yield (); }
+  return 0;
+}
+static void *cond_body (void *arg) {                          // takes tokens that the main thread hands out
+  pthread_mutex_lock (&mx);
+  while (!stop_threads) {
+    if (tokens > 0) { tokens--;  woken++; }
+    else pthread_cond_wait (&cv, &mx);
+  }
+  pthread_mutex_unlock (&mx);
+  return 0;
+}
+static void *futex_body (void *arg) {                         // waits on fa with a time-out of 1 to 4 ms, or on the requeue target fb
+  unsigned me = (unsigned) (long) arg * 7919 + seed_arg;
+  while (!stop_threads) {
+    struct timespec to = { 0, (1 + me % 4) * 1000000L };
+    int *w = (me & 1) ? &fb : &fa;
+    long r = syscall (SYS_futex, w, FUTEX_WAIT_PRIVATE, *w, &to, 0, 0);
+    if (r < 0 && errno == ETIMEDOUT) __atomic_add_fetch (&timedout, 1, __ATOMIC_SEQ_CST);
+    else __atomic_add_fetch (&woken, 1, __ATOMIC_SEQ_CST);
+    me = me * 1103515245 + 12345;
+  }
+  return 0;
+}
+static void *short_body (void *arg) { return arg; }
+
+static void mode_futex (void) {
+  while (running ()) {
+    pthread_t t[8];
+    int n = 2 + rnd (3), kind = rnd (4);
+    stop_threads = 0;
+    if (kind == 0) {                                          // contended mutex: the sum must be exact
+      counter = 0;
+      for (int i = 0; i < n; i++) CHECK (pthread_create (&t[i], 0, count_body, 0) == 0, "pthread_create");
+      for (int i = 0; i < n; i++) pthread_join (t[i], 0);
+      CHECK (counter == 2000L * n, "mutex counter is exact");
+    } else if (kind == 1) {                                   // condition variable: every token is taken exactly once
+      long given = 0;
+      tokens = 0;  woken = 0;
+      for (int i = 0; i < n; i++) pthread_create (&t[i], 0, cond_body, 0);
+      for (int i = 0; i < 100; i++) {
+        pthread_mutex_lock (&mx);  tokens++;  given++;
+        if (rnd (2)) pthread_cond_signal (&cv); else pthread_cond_broadcast (&cv);
+        pthread_mutex_unlock (&mx);
+        if (i % 10 == 0) nap (1);
+      }
+      for (int tries = 0; tries < 2000; tries++) { pthread_mutex_lock (&mx);  long left = tokens;  pthread_mutex_unlock (&mx);  if (!left) break;  nap (2); }
+      pthread_mutex_lock (&mx);  stop_threads = 1;  pthread_cond_broadcast (&cv);  pthread_mutex_unlock (&mx);
+      for (int i = 0; i < n; i++) pthread_join (t[i], 0);
+      CHECK (woken == given && tokens == 0, "every token is taken once");
+    } else if (kind == 2) {                                   // raw futex: wake, requeue and time-outs, nobody may stay asleep
+      woken = timedout = 0;
+      for (int i = 0; i < n; i++) pthread_create (&t[i], 0, futex_body, (void *) (long) i);
+      for (int i = 0; i < 30; i++) {
+        nap (1 + rnd (3));
+        int op = rnd (3);
+        if (op == 0) syscall (SYS_futex, &fa, FUTEX_WAKE_PRIVATE, 1 + rnd (3), 0, 0, 0);
+        else if (op == 1) syscall (SYS_futex, &fa, FUTEX_REQUEUE_PRIVATE, 0, 8, &fb, 0);
+        else { int cur = fa;  syscall (SYS_futex, &fa, FUTEX_CMP_REQUEUE_PRIVATE, 1, 8, &fb, cur); }
+        syscall (SYS_futex, &fb, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0);
+      }
+      stop_threads = 1;
+      for (int tries = 0; tries < 50; tries++) { syscall (SYS_futex, &fa, FUTEX_WAKE_PRIVATE, 8, 0, 0, 0);  syscall (SYS_futex, &fb, FUTEX_WAKE_PRIVATE, 8, 0, 0, 0);  nap (1); }
+      for (int i = 0; i < n; i++) pthread_join (t[i], 0);
+    } else {                                                  // threads that start and end at once, joined and detached
+      for (int i = 0; i < 8; i++) CHECK (pthread_create (&t[i], 0, short_body, (void *) (long) i) == 0, "pthread_create");
+      for (int i = 0; i < 8; i++) { void *r;  pthread_join (t[i], &r);  CHECK (r == (void *) (long) i, "thread result"); }
+      pthread_attr_t a;  pthread_attr_init (&a);  pthread_attr_setdetachstate (&a, PTHREAD_CREATE_DETACHED);
+      for (int i = 0; i < 4; i++) pthread_create (&t[i], &a, short_body, 0);
+    }
+  }
+}
+
+static volatile int got_usr1;
+static void on_usr1 (int sig) { got_usr1++; }
+
+static void signal_target (int rfd) {
+  struct sigaction sa;
+  memset (&sa, 0, sizeof sa);
+  sa.sa_handler = on_usr1;
+  sa.sa_flags = rnd (2) ? SA_RESTART : 0;
+  sigaction (SIGUSR1, &sa, 0);
+  int word = 0;
+  for (;;) {
+    char c;
+    switch (rnd (4)) {
+      case 0: for (volatile int i = 0; i < 20000; i++) ;  break;
+      case 1: nap (1 + rnd (5));  break;
+      case 2: { struct pollfd p = { rfd, POLLIN, 0 };  poll (&p, 1, 3);  break; }
+      case 3: { struct timespec to = { 0, 2000000 };  syscall (SYS_futex, &word, FUTEX_WAIT_PRIVATE, 0, &to, 0, 0);  break; }
+    }
+    if (rnd (50) == 0) { fcntl (rfd, F_SETFL, O_NONBLOCK);  read (rfd, &c, 1);  fcntl (rfd, F_SETFL, 0); }
+  }
+}
+
+static void mode_signal (void) {
+  while (running ()) {
+    int fd[2];
+    if (pipe (fd) < 0) { FAIL ("pipe");  continue; }
+    pid_t p = fork ();
+    if (p < 0) { FAIL ("fork");  close (fd[0]);  close (fd[1]);  continue; }
+    if (p == 0) { close (fd[1]);  signal_target (fd[0]);  _exit (0); }
+    close (fd[0]);
+    int n = 20 + rnd (60), term = rnd (3) == 0;
+    for (int i = 0; i < n; i++) { if (kill (p, SIGUSR1) < 0) { FAIL ("kill SIGUSR1");  break; }  if (rnd (3)) nap (rnd (3)); }
+    kill (p, term ? SIGTERM : SIGKILL);
+    int st = 0;
+    if (reap (p, &st, 20)) CHECK (WIFSIGNALED (st) && WTERMSIG (st) == (term ? SIGTERM : SIGKILL), "target ends with the signal it was sent");
+    close (fd[1]);
+  }
+}
+
+static void mode_mmap (void) {
+  long size = (long) mb << 20, page = 4096, pages = size / page;
+  unsigned char *m = mmap (0, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (m == MAP_FAILED) { FAIL ("mmap");  return; }
+  unsigned base = getpid ();
+  for (long i = 0; i < pages; i++) { m[i * page] = pat (base, i);  m[i * page + page - 1] = pat (base, i + 1); }
+  while (running ()) {
+    int op = rnd (5);
+    if (op == 0) {                                            // the pages are still what was written
+      for (int k = 0; k < 64; k++) { long i = rnd (pages);  CHECK (m[i * page] == pat (base, i) && m[i * page + page - 1] == pat (base, i + 1), "page content after swapping"); }
+    } else if (op == 1) {                                     // give back a piece and map it again: it is zero
+      long i = rnd (pages - 8), n = 1 + rnd (8);
+      CHECK (munmap (m + i * page, n * page) == 0, "munmap");
+      void *r = mmap (m + i * page, n * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+      CHECK (r == m + i * page, "mmap at a fixed address");
+      for (long j = i; j < i + n; j++) { CHECK (m[j * page] == 0, "a new page is zero");  m[j * page] = pat (base, j);  m[j * page + page - 1] = pat (base, j + 1); }
+    } else if (op == 2) {                                     // copy on write
+      pid_t p = fork ();
+      if (p == 0) {
+        int bad = 0;
+        for (int k = 0; k < 64; k++) { long i = rnd (pages);  if (m[i * page] != pat (base, i)) bad = 1;  m[i * page] ^= 0xff; }
+        _exit (bad ? 1 : 0);
+      }
+      if (p < 0) { FAIL ("fork");  continue; }
+      int st = 0;
+      if (reap (p, &st, 120)) CHECK (WIFEXITED (st) && WEXITSTATUS (st) == 0, "child sees the parent's pages");
+      for (int k = 0; k < 64; k++) { long i = rnd (pages);  CHECK (m[i * page] == pat (base, i), "parent's page is unchanged by the child"); }
+    } else if (op == 3) {                                     // write-protect and back
+      long i = rnd (pages);
+      CHECK (mprotect (m + i * page, page, PROT_READ) == 0 && mprotect (m + i * page, page, PROT_READ | PROT_WRITE) == 0, "mprotect");
+      m[i * page] = pat (base, i);
+    } else {                                                  // touch all pages, in order
+      for (long i = 0; i < pages; i++) m[i * page] = pat (base, i);
+    }
+  }
+  munmap (m, size);
+}
+
+#define NFILES 12
+static void mode_fs (const char *dir) {
+  char path[200], path2[200];
+  long size[NFILES];
+  unsigned pseed[NFILES];
+  int live[NFILES] = { 0 };
+  char sub[128];
+  snprintf (sub, sizeof sub, "%s/s%d", dir, (int) getpid ());
+  mkdir (sub, 0777);
+  static unsigned char buf[20000];
+  while (running ()) {
+    int i = rnd (NFILES);
+    snprintf (path, sizeof path, "%s/f%d", sub, i);
+    int op = rnd (6);
+    if (!live[i] || op == 0) {                                // create (or replace) and write
+      size[i] = 1 + rnd (14000);  pseed[i] = rnd (1000);
+      fill (buf, pseed[i], size[i]);
+      int fd = open (path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+      if (fd < 0) { if (errno == ENOSPC) goto full;  FAIL ("create");  continue; }
+      long done = 0;
+      while (done < size[i]) { long r = write (fd, buf + done, size[i] - done < 3000 ? size[i] - done : 3000);  if (r <= 0) break;  done += r; }
+      int e = errno;
+      close (fd);
+      if (done < size[i]) { errno = e;  if (e == ENOSPC) { live[i] = 0;  unlink (path);  goto full; }  FAIL ("write");  }
+      live[i] = 1;
+    } else if (op == 1) {                                     // read back and compare
+      int fd = open (path, O_RDONLY);
+      if (fd < 0) { FAIL ("open");  continue; }
+      long r = read (fd, buf, sizeof buf);
+      CHECK (r == size[i], "file size is what was written");
+      CHECK (r == size[i] && same (buf, pseed[i], r), "file content is what was written");
+      lseek (fd, size[i] / 2, SEEK_SET);
+      CHECK (read (fd, buf, 1) == (size[i] > size[i] / 2 ? 1 : 0), "read after lseek");
+      close (fd);
+    } else if (op == 2) {                                     // remove
+      CHECK (unlink (path) == 0, "unlink");
+      CHECK (open (path, O_RDONLY) < 0 && errno == ENOENT, "a removed file is gone");
+      live[i] = 0;
+    } else if (op == 3) {                                     // rename
+      int j = rnd (NFILES);
+      if (j == i) continue;
+      snprintf (path2, sizeof path2, "%s/f%d", sub, j);
+      CHECK (rename (path, path2) == 0, "rename");
+      live[j] = 1;  size[j] = size[i];  pseed[j] = pseed[i];  live[i] = 0;
+    } else if (op == 4) {                                     // truncate, then the first part is unchanged
+      long n = rnd (size[i] + 1);
+      int fd = open (path, O_RDWR);
+      if (fd < 0) { FAIL ("open for truncate");  continue; }
+      CHECK (ftruncate (fd, n) == 0, "ftruncate");
+      close (fd);
+      size[i] = n;
+      fd = open (path, O_RDONLY);
+      long r = fd >= 0 ? read (fd, buf, sizeof buf) : -1;
+      CHECK (r == n && same (buf, pseed[i], n), "file after truncate");
+      if (fd >= 0) close (fd);
+    } else {                                                  // directory: the live files are all there
+      DIR *d = opendir (sub);
+      int found = 0, want = 0;
+      struct dirent *e;
+      for (int k = 0; k < NFILES; k++) want += live[k];
+      while (d && (e = readdir (d))) if (e->d_name[0] == 'f') found++;
+      if (d) closedir (d);
+      CHECK (d && found == want, "directory lists the live files");
+      snprintf (path2, sizeof path2, "%s/d", sub);
+      CHECK (mkdir (path2, 0777) == 0 || errno == EEXIST, "mkdir");
+      CHECK (rmdir (path2) == 0, "rmdir");
+    }
+    continue;
+  full:
+    for (int k = 0; k < NFILES; k++) { snprintf (path, sizeof path, "%s/f%d", sub, k);  unlink (path);  live[k] = 0; }
+  }
+  for (int k = 0; k < NFILES; k++) { snprintf (path, sizeof path, "%s/f%d", sub, k);  unlink (path); }
+  rmdir (sub);
+}
+
+static void mode_sock (const char *host, int tcpport, int udpport) {
+  while (running ()) {
+    int sv[2], kind = rnd (4);
+    if (kind <= 1) {                                          // socket pair: data both ways, a peer that leaves
+      if (socketpair (AF_UNIX, SOCK_STREAM, 0, sv) < 0) { FAIL ("socketpair");  continue; }
+      pid_t p = fork ();
+      if (p < 0) { FAIL ("fork");  close (sv[0]);  close (sv[1]);  continue; }
+      if (p == 0) {
+        unsigned char b[3000];
+        close (sv[0]);
+        for (;;) { long r = read (sv[1], b, sizeof b);  if (r <= 0) _exit (0);  for (long i = 0; i < r; i++) b[i] ^= 0x5a;  if (write (sv[1], b, r) != r) _exit (1); }
+      }
+      close (sv[1]);
+      unsigned char out[2000], in[2000];
+      int rounds = 1 + rnd (20);
+      for (int k = 0; k < rounds; k++) {
+        long n = 1 + rnd (2000), got = 0;
+        fill (out, k, n);
+        CHECK (write (sv[0], out, n) == n, "write to the socket pair");
+        while (got < n) { long r = read (sv[0], in + got, n - got);  if (r <= 0) break;  got += r; }
+        CHECK (got == n, "the peer answers");
+        for (long i = 0; i < got; i++) if ((unsigned char) (in[i] ^ 0x5a) != out[i]) { FAIL ("socket pair data");  break; }
+      }
+      if (kind == 1) kill (p, SIGKILL);
+      close (sv[0]);
+      int st;
+      reap (p, &st, 20);
+    } else if (host) {                                        // the host's echo servers
+      int udp = kind == 3, s = socket (AF_INET, udp ? SOCK_DGRAM : SOCK_STREAM, 0);
+      struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons (udp ? udpport : tcpport) };
+      struct timeval tv = { 5, 0 };
+      inet_pton (AF_INET, host, &a.sin_addr);
+      if (s < 0) { FAIL ("socket");  continue; }
+      setsockopt (s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+      if (connect (s, (struct sockaddr *) &a, sizeof a) < 0) { FAIL ("connect");  close (s);  continue; }
+      unsigned char out[600], in[600];
+      long n = 1 + rnd (600), got = 0;
+      fill (out, 5, n);
+      CHECK (send (s, out, n, 0) == n, "send to the host");
+      while (got < n) { long r = recv (s, in + got, n - got, 0);  if (r <= 0) break;  got += r;  if (udp) break; }
+      CHECK (got == n && same (in, 5, n), "the host echoes the data");
+      close (s);
+    }
+  }
+}
+
+static void mode_timer (void) {
+  long long last = now_ms ();
+  while (running ()) {
+    int ms = 1 + rnd (30), kind = rnd (3);
+    long long t0 = now_ms ();
+    if (kind == 0) nap (ms);
+    else if (kind == 1) { int fd[2];  pipe (fd);  struct pollfd p = { fd[0], POLLIN, 0 };  int r = poll (&p, 1, ms);  CHECK (r == 0, "poll times out");  close (fd[0]);  close (fd[1]); }
+    else { int w = 0;  struct timespec to = { 0, ms * 1000000L };  long r = syscall (SYS_futex, &w, FUTEX_WAIT_PRIVATE, 0, &to, 0, 0);  CHECK (r < 0 && errno == ETIMEDOUT, "futex wait times out"); }
+    long long dt = now_ms () - t0;
+    CHECK (dt >= ms - 1, "a sleep is not too short");
+    CHECK (dt < ms + 5000, "a sleep is not extremely long");
+    CHECK (now_ms () >= last, "the clock does not run backwards");
+    last = now_ms ();
+  }
+}
+
+static void run_mode (const char *m, const char *arg, char **argv) {
+  mode = m;
+  rng_state ^= (unsigned long long) (seed_arg + 1) * 2654435761ULL + (unsigned long long) getpid () * 40503ULL;
+  for (int i = 0; i < 8; i++) rnd (2);
+  if (!strcmp (m, "fork")) mode_fork ();
+  else if (!strcmp (m, "pipe")) mode_pipe ();
+  else if (!strcmp (m, "futex")) mode_futex ();
+  else if (!strcmp (m, "signal")) mode_signal ();
+  else if (!strcmp (m, "mmap")) mode_mmap ();
+  else if (!strcmp (m, "fs")) mode_fs (arg ? arg : "/tmp");
+  else if (!strcmp (m, "sock")) mode_sock (argv[5], argv[5] ? atoi (argv[6]) : 0, argv[5] ? atoi (argv[7]) : 0);
+  else if (!strcmp (m, "timer")) mode_timer ();
+  else { printf ("stress: unknown mode %s\n", m);  fails++; }
+  printf ("stress: %s done, %lld rounds, %d failed\n", m, iterations, fails);
+  fflush (stdout);
+}
+
+int main (int argc, char **argv) {
+  signal (SIGPIPE, SIG_DFL);
+  if (argc >= 2 && !strcmp (argv[1], "child")) return 7;       // the target of exec in mode fork
+  if (argc < 5) { printf ("usage: stress MODE SECONDS SEED MB [HOST TCPPORT UDPPORT]\n");  return 2; }
+  seed_arg = atoi (argv[3]);  mb = atoi (argv[4]);
+  deadline = now_ms () + 1000LL * atoi (argv[2]);
+  char *argv8[9] = { 0 };
+  for (int i = 0; i < argc && i < 8; i++) argv8[i] = argv[i];
+  if (strcmp (argv[1], "all")) {
+    char *colon = strchr (argv[1], ':');
+    if (colon) *colon++ = 0;
+    run_mode (argv[1], colon, argv8);
+    return fails ? 1 : 0;
+  }
+  static const char *modes[][2] = { { "fork", 0 }, { "pipe", 0 }, { "futex", 0 }, { "signal", 0 }, { "mmap", 0 }, { "timer", 0 }, { "sock", 0 },
+                                    { "fs", "/tmp" }, { "fs", "/mnt" }, { "fs", "/" }, { "mmap", 0 } };
+  pid_t pids[16];
+  int n = 0, failed = 0;
+  setvbuf (stdout, 0, _IOLBF, 0);
+  for (unsigned i = 0; i < sizeof modes / sizeof modes[0]; i++) {
+    pid_t p = fork ();
+    if (p < 0) { printf ("  user FAIL: all: fork of mode %s\n", modes[i][0]);  failed++;  continue; }
+    if (p == 0) { seed_arg += i * 17;  run_mode (modes[i][0], modes[i][1], argv8);  _exit (fails ? 1 : 0); }
+    pids[n++] = p;
+  }
+  for (int i = 0; i < n; i++) { int st = 0;  waitpid (pids[i], &st, 0);  if (!WIFEXITED (st) || WEXITSTATUS (st)) failed++; }
+  printf ("stress: all done, %d of %d modes failed\n", failed, n);
+  return failed ? 1 : 0;
+}

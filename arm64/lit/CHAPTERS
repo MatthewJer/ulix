@@ -16,3 +16,4 @@ userland
 libc
 servers
 libctest
+stress
