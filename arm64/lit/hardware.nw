@@ -656,7 +656,7 @@ static void exc_handler_locked (struct frame *f, int kind) {
     u32 irq = GIC_INTID (iar);
     if (irq < 1020) gic_eoi (iar);          // acknowledge first: nested interrupts must be possible
                                             // (the kernel shell waits for keys inside the UART handler)
-    if (irq == IRQ_TIMER) { stats_tick (); if (smp_cpu () == 0) { ticks++; arch_clock_tick (); if (book_scheduler_on) netd_tick (); } timer_reload (); }
+    if (irq == IRQ_TIMER) { smp_heartbeat (); stats_tick (); if (smp_cpu () == 0) { ticks++; arch_clock_tick (); if (book_scheduler_on) netd_tick (); } timer_reload (); }
     else if (irq == IRQ_UART) { if (book_scheduler_on) uart_rx_irq (); }
     else if (netd_irq && irq == (u32)netd_irq) { if (book_scheduler_on) { netd_interrupt (); disk_woke_someone = 1; } }      // the network card
     else if (plat.uart2 && irq == (u32)plat.uart2_irq) sdisk_irq ();          // the serial disk
@@ -709,6 +709,7 @@ static void exc_handler_locked (struct frame *f, int kind) {
   }
   printf ("\n*** KERNEL EXCEPTION kind=%d ESR=0x%lx (EC=0x%x) FAR=0x%lx ELR=0x%lx\n",
           kind, esr, ec, far, f->elr);
+  smp_dump ("kernel exception");
   if (!from_user) arch_kernel_fault_shell ();       // as on the x86: the kernel shell, no way back to user mode
   for (;;) __asm__ volatile ("wfe");
 }
@@ -725,6 +726,7 @@ void exc_handler (struct frame *f, int kind) {
   if (kind == 1 && (f->spsr & 0xf) != 0 && bkl_depth () > 0 && book_scheduler_on && !irq_in_locked_code++)
     printf ("[kernel] CPU %d: interrupt in kernel code that holds the lock, ELR 0x%lx\n", smp_cpu (), f->elr);
   bkl_lock ();
+  if (bkl_depth () == 1) smp_note_entry (f->elr, f->x[30], kind);
   exc_handler_locked (f, kind);
   if ((f->spsr & 0xf) == 0 && book_scheduler_on) smp_before_return (f);     // returning to user mode
   bkl_unlock ();
@@ -781,6 +783,12 @@ void bkl_lock (void);                      // the big kernel lock: the code of t
 void bkl_unlock (void);
 int  bkl_depth (void);
 void bkl_set_depth (int d);
+u64  smp_counter_freq (void);
+u64  smp_heartbeat_of (int cpu);
+void smp_heartbeat (void);                 // a timer interrupt of this CPU was handled
+void smp_note_entry (u64 elr, u64 lr, int kind);   // where the exception came from
+void smp_backtrace (void);
+void smp_dump (const char *why);           // every CPU: heartbeat, who holds the lock, where it came in
 void arch_idle (void);                     // give the lock away, wait for an interrupt, take it back
 #endif
 
@@ -857,6 +865,12 @@ struct percpu {
   volatile u32 switches;                   // context switches made on this CPU
   thread_id cur_task;  addr_space_id cur_as;
   int depth;                               // how often this CPU took the lock (nested exceptions)
+  // for the diagnosis of a hang (smp_dump): where a CPU came into the kernel, since when it holds the lock, whether it is alive
+  volatile u64 hb;                         // heartbeat: timer interrupts that this CPU has handled (stops when it is stuck with interrupts masked)
+  volatile u64 locked_at;                  // counter value (cntpct) when this CPU took the lock
+  volatile u64 entry_elr, entry_lr;        // where the exception that brought it into the kernel came from
+  volatile u32 entry_kind;
+  volatile int waiting;                    // it spins for the lock
 };
 static struct percpu pc[MAX_CPUS];
 static int ncpus_online = 1;
@@ -890,21 +904,39 @@ static volatile int bkl_owner = -1;
 static inline u64 bkl_irq_off (void) { u64 d; __asm__ volatile ("mrs %0, daif; msr daifset, #2" : "=r" (d) :: "memory"); return d; }
 static inline void bkl_irq_back (u64 d) { __asm__ volatile ("msr daif, %0" :: "r" (d) : "memory"); }
 
+static inline u64 cnt_now (void) { u64 v; __asm__ volatile ("mrs %0, cntpct_el0" : "=r" (v)); return v; }
+
+// A CPU that waits for the lock for more than two seconds says so once (the lock is held for microseconds): the other CPUs, their heartbeat, where
+// they came in and where the waiting CPU came from. Without it a frozen kernel on the real board says nothing. (Few reports, so the console is not flooded.)
+static int bkl_reports = 0;
+static void bkl_wait_report (int c, u64 waited) {
+  if (bkl_reports >= 4) return;
+  bkl_reports++;
+  printf ("BKL: CPU %d waits for the lock for %lu ms; owner CPU %d, depth %d\n", c, waited * 1000 / smp_counter_freq (), bkl_owner, bkl_owner >= 0 ? pc[bkl_owner].depth : -1);
+  smp_dump ("lock wait timeout");
+}
+
 void bkl_lock (void) {
   int c = smp_cpu ();
   u64 daif = bkl_irq_off ();
   if (bkl_owner == c) { pc[c].depth++; bkl_irq_back (daif); return; }   // nested exception, or kernel code taking it again
   pc[c].in_kernel = 1;
   pc[c].entries++;
-  while (__sync_lock_test_and_set (&bkl_word, 1)) {
-    for (u64 spin = 0; bkl_word; spin++) {
-      __asm__ volatile ("yield");
-      if (spin == 4000000000UL && scheduler_is_active) { u64 elr; __asm__ volatile ("mrs %0, elr_el1" : "=r" (elr));
-        printf ("BKL: CPU %d waits for CPU %d (elr 0x%lx, its task %d, depth %d)\n", c, bkl_owner, elr, pc[bkl_owner].cur_task, pc[bkl_owner].depth); }
-    }
+  if (__sync_lock_test_and_set (&bkl_word, 1)) {                 // taken by somebody: wait (the common case is not slower)
+    u64 t0 = cnt_now (), limit = 2 * smp_counter_freq ();
+    int reported = 0;
+    pc[c].waiting = 1;
+    do {
+      for (u64 spin = 0; bkl_word; spin++) {
+        __asm__ volatile ("yield");
+        if ((spin & 0xfffff) == 0 && !reported && cnt_now () - t0 > limit) { reported = 1;  bkl_wait_report (c, cnt_now () - t0); }
+      }
+    } while (__sync_lock_test_and_set (&bkl_word, 1));
+    pc[c].waiting = 0;
   }
   bkl_owner = c;
   pc[c].depth = 1;
+  pc[c].locked_at = cnt_now ();
   current_task = pc[c].cur_task;                                 // the book's view of "this CPU"
   current_as   = pc[c].cur_as;
   arch_sync_ttbr0 ();                                            // another CPU may have replaced the address space (exec)
@@ -925,6 +957,41 @@ void bkl_unlock (void) {
 
 int  bkl_depth (void) { return pc[smp_cpu ()].depth; }
 void bkl_set_depth (int d) { pc[smp_cpu ()].depth = d; }
+
+u64 smp_counter_freq (void) { static u64 f; if (!f) __asm__ volatile ("mrs %0, cntfrq_el0" : "=r" (f)); return f ? f : 1; }
+void smp_heartbeat (void) { pc[smp_cpu ()].hb++; }
+u64  smp_heartbeat_of (int cpu) { return pc[cpu].hb; }
+void smp_note_entry (u64 elr, u64 lr, int kind) { int c = smp_cpu (); pc[c].entry_elr = elr;  pc[c].entry_lr = lr;  pc[c].entry_kind = kind; }
+
+// the return addresses on the stack of the calling CPU (the kernel is compiled with frame pointers: x29 points to the saved x29 and x30)
+void smp_backtrace (void) {
+  u64 fp = (u64) __builtin_frame_address (0), prev = 0;
+  printf ("  backtrace:");
+  for (int i = 0; i < 12; i++) {
+    if (fp < 0xffff000000000000UL || (fp & 15) || (prev && (fp <= prev || fp - prev > 0x10000))) break;
+    printf (" 0x%lx", ((u64 *) fp)[1]);
+    prev = fp;  fp = ((u64 *) fp)[0];
+  }
+  printf ("\n");
+}
+
+// what every CPU was doing: for a lock timeout and for the dump of a kernel exception
+void smp_dump (const char *why) {
+  static volatile int dump_word;                      // (two CPUs that report together would mix their letters on the console)
+  int got = 0;
+  for (long spin = 0; spin < 20000000 && !got; spin++) got = !__sync_lock_test_and_set (&dump_word, 1);
+  u64 now = cnt_now (), f = smp_counter_freq ();
+  printf ("SMP dump (%s), CPU %d, lock word %d, owner %d\n", why, smp_cpu (), bkl_word, bkl_owner);
+  for (int c = 0; c < MAX_CPUS; c++) {
+    if (!pc[c].online) continue;
+    printf ("  CPU %d: heartbeat %lu, entries %u, depth %d, task %d%s%s, came in at ELR 0x%lx LR 0x%lx (kind %u)", c, pc[c].hb, pc[c].entries, pc[c].depth,
+            (int) pc[c].cur_task, pc[c].waiting ? ", WAITING" : "", bkl_owner == c ? ", HOLDS the lock" : "", pc[c].entry_elr, pc[c].entry_lr, pc[c].entry_kind);
+    if (bkl_owner == c) printf (" for %lu ms", (now - pc[c].locked_at) * 1000 / f);
+    printf ("\n");
+  }
+  smp_backtrace ();
+  if (got) __sync_lock_release (&dump_word);
+}
 
 void smp_boot_init (void) {
   u64 m;
