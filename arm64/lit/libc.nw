@@ -1030,6 +1030,8 @@ static long linux_kill (int pid, int sig) {
   signal_tables ();
   if (sig < 0 || sig > 31 || (sig && !to_ulix[sig])) return -LE_EINVAL;
   if (pid < 1 || pid >= MAX_THREADS || !thread_table[pid].used) return -LE_ESRCH;
+  if (thread_table[current_task].euid != 0 && thread_table[pid].euid != thread_table[current_task].euid)
+    return -LE_EPERM;                                         // the rule of the book's syscall_kill: root, or the same owner (the programs of the book run on musl now)
   if (sig == 0) return 0;                                     // only asks whether the process exists
   TCB *t = &thread_table[pid];
   int us = to_ulix[sig];

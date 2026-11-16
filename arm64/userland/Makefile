@@ -185,9 +185,9 @@ clean:
 # ---- programs linked with musl instead of ulixlib (issue #35, section 51 of ../ARM64-PORT.md) ----
 # The program text is the book's. Its #include "../ulixlib.h" finds musl/ulixlib.h (copied to build/musl), which includes musl's headers and adds what
 # the book has more (see "The programs of the book on musl" in lit/userland.nw). Every name in MUSLTOOLS is linked with musl; the others keep ulixlib.
-MUSLTOOLS = echo cat wc grep diff mkdir rmdir rm touch stat cp ls hexdump bindump ascii print args exit42 trunc chmod chown chgrp df sync kill fault-div0 fault-mem testcp stdio inode keys clear free ps pw swapper top ping ping6 host ifconfig route dhclient shutdown poweroff reboot sntp rand daemon service heartbeat echod fork1 fork2 fork3 fbomb filecomm ptree vi paging tp su sh init2 telnetd login xlogin init
+MUSLTOOLS = echo cat wc grep diff mkdir rmdir rm touch stat cp ls hexdump bindump ascii print args exit42 trunc chmod chown chgrp df sync kill fault-div0 fault-mem testcp stdio inode keys clear free ps pw swapper top ping ping6 host shutdown poweroff reboot sntp rand daemon service heartbeat echod fork1 fork2 fork3 fbomb filecomm ptree vi tp su sh init2 telnetd login xlogin init readelf memwrite recurse ifconfig route dhclient ptytest
 SYSROOT   = $(abspath ../libc/build/sysroot)
-MCFLAGS   = -O0 -fno-pic -mno-outline-atomics -fsanitize=integer-divide-by-zero -fsanitize-undefined-trap-on-error -std=gnu99 -w \
+MCFLAGS   = -O0 -fno-pic -mno-outline-atomics -fsanitize=integer-divide-by-zero -fsanitize-undefined-trap-on-error -std=gnu99 -w -Wno-error=return-mismatch -Wno-error=implicit-int -Wno-error=implicit-function-declaration -Wno-error=int-conversion -Wno-error=incompatible-pointer-types \
             -nostdinc -isystem $(SYSROOT)/include -isystem $(shell $(CC) -print-file-name=include)
 MUSLPROGS = $(addprefix $(BUILD)/bin/,$(addsuffix .elf,$(MUSLTOOLS)))
 # (the book's programs define O_CREAT = 0x200, O_APPEND, S_IF... themselves; musl's open would read 0x200 as Linux's O_TRUNC: those lines are dropped)

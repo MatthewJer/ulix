@@ -969,3 +969,43 @@ Adding these up (an estimate, not a measurement) gives about 10 MByte for an idl
 7. *A signal does not end a blocking `read` of a pipe* (no EINTR): a process that waits for a pipe cannot be interrupted by a handler. The test of this hung the program, so it is not in the suite.
 
 **Not tested, on purpose:** `popen`/`system` (the shell has no `-c`), real locales, `iconv`, `gettext` (not in musl).
+
+## 54. The programs of the book on musl (branch `m2-musl-programs`, issue #35, 2026-11-16)
+
+Wish of the maintainer: all user programs use musl, as far as possible. Chapter: "The programs of the book on musl" in `lit/userland.nw`.
+
+### Investigation (what stood in the way)
+
+- The 59 tools of `lib-build/tools`, `init` and the programs of `userland/` were linked with `ulixlib` (the book's own library, `-ffreestanding`, own `printf`, `open`, `read`, ...). Their source includes `"../ulixlib.h"`.
+- Calls only the Ulix kernel has: the process list (`getpsinfo`), screen functions (`clrscr`, `set_xy`, `read_screen`, ...), `get_free_frames`, `page_out`, `diskfree`, `readdir` (`getdent`), `login`/`getuid`..., `chmod`/`chown` (the Linux calls of the same name are accepted and ignored by the kernel), the AArch64 network calls (602 and up), book mutexes and threads (`pthread_create` 506 ...), book signal numbers.
+- What `linux_abi.c` lacked: a way to reach the book's calls at all (unknown numbers gave `ENOSYS`).
+- Traps that the first test run showed: (1) the tools define `O_CREAT 0x200`, `O_APPEND 8` themselves; musl's `open` reads `0x200` as Linux `O_TRUNC`, so `touch` and `cp` created nothing. (2) musl's `syscall ()` turns every result from -4095 to -1 into `-1` plus an error number; the book's calls answer with small negative numbers (`ifconfig` gets -2 for "not allowed", the pty calls -1/-3). (3) The book's `printf` writes at once, musl's buffers when stdout is not a terminal. (4) A few tools define `strchr`, `memmove`, `memcmp` themselves (teaching code). (5) `/bin/vi` grew from 33 to 145 KByte: the kernel test read at most 64 KByte (buffer enlarged).
+
+### Decision: change the library, not the programs
+
+The program text stays the book's. `userland/musl/ulixlib.h` replaces `ulixlib.h` for them (it includes musl's headers and adds `byte`, `boolean`, `strequal`, the book's TCB, `ureadline`, `getdent`, screen calls, ...); `userland/musl/ulixcompat.c` is the small library behind it. The Makefile copies a program into `build/musl/tools/`, drops its own `O_*`/`S_*`/`SEEK_*` defines, renames the library functions it defines itself, and links it with musl (names in `MUSLTOOLS`). Everything else in the repository, the book included, is unchanged.
+
+**The book's calls from a musl program:** `linux_abi.c` passes Linux number `1024 + n` to the book's dispatcher (`syscall_handler`) in a `default:` branch (about ten lines). `ulix_call` in `ulixcompat.c` makes the `svc` itself (not musl's `syscall ()`, see trap 2) and fetches the book's error number into `errno` when the result is -1. `syscall1` to `syscall4` of the book are defined on top of it, so `arm64-extra.h` works unchanged. Output is made unbuffered by a constructor (trap 3).
+
+**Small kernel fix:** `linux_kill` had no permission check (the book's `syscall_kill`: root or same owner); `service stop` as an ordinary user was no longer refused. Same rule now.
+
+### Which programs are on musl
+
+All of `lib-build/tools` and `userland/` except the list below; including `init`, `init2`, `login`, `xlogin`, `sh`, `su`, `vi`, `top`, `ps`, `ping`, `ping6`, `host`, `ifconfig`, `route`, `dhclient`, `telnetd`, `service`, `daemon`, `ptytest` and the fork tests (ptytest failed one check as long as `ulix_call` used musl's `syscall ()`, trap 2). The list is the variable `MUSLTOOLS` in `userland/Makefile`.
+
+### Which are not, and why
+
+| program | reason |
+|---|---|
+| `thread`, `tt`, `mutex`, `dumblock` | they test the book's own `pthread_create` and mutex calls (506, 517 ...), which musl's `pthread` does not use (it needs `clone` and `futex`, which exist). Moving them means writing new programs with POSIX threads; the book's versions are the point. |
+| `sigtest` | tests the book's signal numbers and `signal ()` semantics; musl numbers signals like Linux (the kernel translates). |
+| `sbrk`, `sbrk1`, `paging` | call `sbrk (1 MByte)` until memory is gone; musl's `sbrk` fails for every increment except 0 (musl removed it on purpose). |
+| `https`, `sshd` (and `sshcrypto`) | linked with BearSSL and its own tiny `tls/libc.c`; moving them is a separate task (BearSSL against musl, then the tiny libc can go). |
+
+### Tests
+
+`QEMU_FAST=1` kernel tests (198 checks), `make shell-test` with network and both extra disks, `console-test`, `telnet-test`, `daemon-test`, `listen-test`. Not run by me: the whole `make pcheck`, the Pi board, `ssh-test`, `scp-test`, `python-test` (submodules missing in the worktree).
+
+### Open
+
+The remaining table above; the musl programs are about three times as big as the ulixlib ones (`cat` 130 KByte instead of 4), which makes the disk image bigger and `vi` start a little slower.

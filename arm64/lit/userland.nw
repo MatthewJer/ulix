@@ -2200,9 +2200,14 @@ programs that ask a question) with the same keys; only the output goes through [
 #define NR_chmod         15
 #define NR_diskfree     522
 
+// The call is made here with its own [[svc]] and not with musl's [[syscall ()]]: that one turns every result between -4095 and -1 into -1 and an
+// error number, but the book's calls use small negative results as answers (ifconfig gets -2 for "not allowed", ping and sshd use others).
 long ulix_call (int nr, long a, long b, long c, long d, long e) {
-  long r = syscall (ULIX_BASE + nr, a, b, c, d, e);
-  if (r == -1 && nr != NR_get_errno) errno = syscall (ULIX_BASE + NR_get_errno);    // the book's error number, not the one that musl derived from -1
+  register long x8 __asm__ ("x8") = ULIX_BASE + nr;
+  register long x0 __asm__ ("x0") = a, x1 __asm__ ("x1") = b, x2 __asm__ ("x2") = c, x3 __asm__ ("x3") = d, x4 __asm__ ("x4") = e;
+  __asm__ volatile ("svc 0" : "+r" (x0) : "r" (x8), "r" (x1), "r" (x2), "r" (x3), "r" (x4) : "memory", "cc");
+  long r = x0;
+  if (r == -1 && nr != NR_get_errno) errno = ulix_call (NR_get_errno, 0, 0, 0, 0, 0);    // the book's error number
   return r;
 }
 
