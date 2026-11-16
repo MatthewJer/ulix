@@ -702,10 +702,10 @@ static void disk_test (void) {
   CHECK (blk_init () == 0, "virtio-blk device found and initialised");
   CHECK (blk_capacity () == 131072, "capacity is 131072 sectors (64 MByte: the x86 image copied into a bigger file system by tools/minix_copy.py; ROOT_ZONES in the Makefile)");
 
-  CHECK (blk_read (2, a, 2) == 0 && a[16] == 0x78 && a[17] == 0x24, "superblock read, Minix v2 magic 0x2478");
-  unsigned ninodes = a[0] | (a[1] << 8), firstdata = a[8] | (a[9] << 8);
+  CHECK (blk_read (2, a, 2) == 0 && a[24] == 0x5A && a[25] == 0x4D, "superblock read, Minix v3 magic 0x4D5A (the extended format; its magic is at byte 24)");
+  unsigned ninodes = a[0] | (a[1] << 8) | (a[2] << 16) | ((unsigned) a[3] << 24), firstdata = a[10] | (a[11] << 8);
   printf ("  info: root file system: %u inodes, first data zone %u\n", ninodes, firstdata);
-  CHECK (ninodes >= 2048 && firstdata > 34, "the root file system has at least 2048 inodes (the library of Python needs more than the 464 of the old image) and its data starts after zone 34: no code may assume 34");
+  CHECK (ninodes > 65535 && firstdata > 34, "the root file system has more than 65535 inodes (32-bit inode numbers; Python needs more than the 464 of the old image) and its data starts after zone 34: no code may assume 34");
   CHECK (blk_read (blk_capacity (), a, 1) == -1, "read beyond the end of the disk is rejected");
 
   for (int i = 0; i < 1024; i++) a[i] = (u8)(i * 7 + 3);
@@ -722,7 +722,7 @@ static void disk_test (void) {
   }
   if (blk_disks >= 2) {                                    // a second disk was given to qemu: /dev/hdb (see "make pcheck")
     CHECK (blk_capacity_of (1) == 65536, "second disk (hdb) found: 65536 sectors (32 MByte)");
-    CHECK (blk_read_n (1, 2, a, 2) == 0 && a[16] == 0x78 && a[17] == 0x24, "second disk: Minix v2 superblock read");
+    CHECK (blk_read_n (1, 2, a, 2) == 0 && a[24] == 0x5A && a[25] == 0x4D, "second disk: Minix v3 superblock read");
     CHECK (blk_read_n (1, blk_capacity_of (1), a, 1) == -1, "second disk: read beyond its end is rejected");
   }
   int n = 0;

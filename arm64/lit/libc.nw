@@ -1051,8 +1051,7 @@ static long linux_newfstatat (int dirfd, const char *path, struct kstat *k, int 
 
 @
 \paragraph{Directories.} A program reads a directory with \texttt{getdents64}: the descriptor is a directory that was opened with
-\texttt{open}, and the call fills a buffer with as many variable-length records as fit. The Minix directory is an array of 32-byte
-entries (a 2-byte inode number and a 30-byte name), and the position of the open file, in bytes, is the position in that array,
+\texttt{open}, and the call fills a buffer with as many variable-length records as fit. The Minix directory is an array of entries of 32 bytes (a 2-byte inode number and a 30-byte name; version 2) or 64 bytes (4 and 60; version 3), and the position of the open file, in bytes, is the position in that array,
 so that \texttt{lseek (fd, 0, SEEK\_SET)} (\texttt{rewinddir}) works without any new code. Free entries (inode 0) are skipped. The
 type of each entry is read from its inode (musl's \texttt{readdir} passes it on as \texttt{d\_type}).
 
@@ -1070,17 +1069,18 @@ static long linux_getdents64 (int fd, char *buf, u64 size) {
   u64 used = 0;
   while (f->pos < (int) dir->i_size) {
     struct minix_dir_entry d;
-    if (mx_read_dir_entry (dir->device, dir->ino, f->pos / 32, &d) == -1) break;
-    if (d.inode == 0) { f->pos += 32; continue; }                // a free slot
+    int esize = mx_dirent_size (dir->device);                   // 32 bytes (version 2) or 64 bytes (version 3)
+    if (mx_read_dir_entry (dir->device, dir->ino, f->pos / esize, &d) == -1) break;
+    if (d.inode == 0) { f->pos += esize; continue; }             // a free slot
     int n = 0;
-    while (n < 30 && d.name[n]) n++;
+    while (n < MX_MAX_NAME && d.name[n]) n++;
     u64 reclen = (19 + n + 1 + 7) & ~7UL;                        // d_ino, d_off, d_reclen, d_type, the name with its zero, padded to 8
     if (used + reclen > size) return used ? (long) used : -LE_EINVAL;   // the buffer is too small for even one entry
     struct minix2_inode ino;
     int type = 0;
     if (mx_read_inode (dir->device, d.inode, &ino)) type = (ino.i_mode & S_IFMT) == S_IFDIR ? DT_DIR_ : (ino.i_mode & S_IFMT) == S_IFREG ? DT_REG_ : 0;
     char *e = buf + used;
-    f->pos += 32;
+    f->pos += esize;
     *(u64 *) e = d.inode;                                        // d_ino
     *(long *) (e + 8) = f->pos;                                  // d_off: where the next call goes on
     *(unsigned short *) (e + 16) = reclen;

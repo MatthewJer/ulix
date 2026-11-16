@@ -177,6 +177,18 @@ Found while porting, present on the x86 as well, left as they are in the book:
 | `mx_mkdir` does not check whether the directory exists (`u_mkdir` does); a second `mx_mkdir` on an existing path would damage the file system. | [23942](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L23942) |
 | `u_kill` sets `used = false` at once, so a following `waitpid` of the parent reports -1. | [27781](https://github.com/hgesser/ulix/blob/32535a19a1a25bdd2b52e269de52bc1930c73fbb/ulix-book.nw#L27781) |
 
+## The file system (extended Minix, issues #141, #142)
+
+The root disk and `/dev/hdb` use **Minix v3** (magic `0x4D5A`, 1 KByte zones): 32-bit inode numbers, 64-byte directory entries with names of
+up to 60 characters, directories that grow through indirect zones (no limit of 224 entries). The book's code (`ulix-book.nw`, chunks
+`mx_fs`, `mx_dirent_*`, `mx_lookup_in_directory`) and the kernel reader (`minixfs.c`) pick the format from the superblock; Minix v2 with
+30-character names still works (the third disk keeps it, `make disk.img ROOT_MKFS_FLAGS=--v2 ROOT_INODES=464` builds an old-format root disk).
+Host tools: `tools/minix_mkfs.py IMAGE ZONES [--inodes=N] [--v2]`, `minix_add.py`, `minix_copy.py`, `minix_check.py` know both formats;
+`make fs-host-test` (`tools/minix_v3_test.py`) tests them. **Difference to the x86 build of the book:** `struct stat.st_ino` and
+`struct dir_entry.inode` are 32 bit now (they were 16 bit), so the layout of both structures changed; the x86 kernel and all x86 programs are built from the same
+book, so they stay consistent, but the prebuilt x86 disk image (`bin-build/minixdata.img`) contains old programs and has to be rebuilt
+with them. The x86 kernel was not rebuilt or started for this change. Details: `../ARM64-PORT.md`, section 45.
+
 ## Principles
 
 Ulix is a teaching system; what the port and the Raspberry Pi work follow from the original authors' idea is written down in

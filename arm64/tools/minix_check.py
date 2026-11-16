@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Read-only consistency check and dump for a Minix v2 image (independent of the kernel code).
+"""Read-only consistency check and dump for a Minix v2 or v3 image (independent of the kernel code).
+
+v2: 16-bit inode numbers, 32-byte directory entries with 30-character names (magic 0x2478, or 0x2468 with 14 characters).
+v3: 32-bit inode numbers, 64-byte entries with 60-character names (magic 0x4D5A, superblock layout of Linux); 1 KByte zones.
 
 usage: minix_check.py IMAGE [--files] [--cat PATH]
 
@@ -12,10 +15,17 @@ import struct, sys
 class Minix:
     def __init__(self, path):
         self.d = open(path, 'rb').read()
-        (self.ninodes, _, self.imap_b, self.zmap_b, self.first, self.logz, _,
-         self.magic, _, self.nzones) = struct.unpack('<HHHHHHIHHI', self.d[1024:1048])
-        assert self.magic in (0x2468, 0x2478) and self.logz == 0, 'unsupported file system'
-        self.dsize, self.nlen = (32, 30) if self.magic == 0x2478 else (16, 14)
+        if struct.unpack('<H', self.d[1024 + 24:1024 + 26])[0] == 0x4D5A:             # version 3
+            (self.ninodes, _, self.imap_b, self.zmap_b, self.first, self.logz, _, _, self.nzones,
+             self.magic) = struct.unpack('<IHHHHHHIIH', self.d[1024:1026 + 24])
+            assert self.logz == 0, 'unsupported file system'
+            self.dsize, self.nlen, self.version = 64, 60, 3
+        else:
+            (self.ninodes, _, self.imap_b, self.zmap_b, self.first, self.logz, _,
+             self.magic, _, self.nzones) = struct.unpack('<HHHHHHIHHI', self.d[1024:1048])
+            assert self.magic in (0x2468, 0x2478) and self.logz == 0, 'unsupported file system'
+            self.dsize, self.nlen = (32, 30) if self.magic == 0x2478 else (16, 14)
+            self.version = 2
         self.ist = (2 + self.imap_b + self.zmap_b) * 1024
     def blk(self, z): return self.d[z * 1024:(z + 1) * 1024]
     def inode(self, n):
@@ -42,8 +52,9 @@ class Minix:
     def readdir(self, n):
         raw, out = self.read(n), []
         for i in range(0, len(raw), self.dsize):
-            k, = struct.unpack('<H', raw[i:i + 2])
-            if k: out.append((k, raw[i + 2:i + self.dsize].split(b'\0')[0].decode()))
+            ib = self.dsize - self.nlen                      # bytes of the inode number: 2 or 4
+            k = int.from_bytes(raw[i:i + ib], 'little')
+            if k: out.append((k, raw[i + ib:i + self.dsize].split(b'\0')[0].decode()))
         return out
     def bit(self, base, n): return self.d[base + n // 8] >> (n % 8) & 1
     def lookup(self, path):

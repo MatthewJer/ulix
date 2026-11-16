@@ -2091,13 +2091,22 @@ The complete file is put together from these parts:
 
 #define MINIX2_14   0x2468
 #define MINIX2_30   0x2478
+#define MINIX3      0x4D5A     // extended format: 32-bit inode numbers, 64-byte entries with 60-character names
 #define ZONE_SIZE   1024
+#define MAX_NAME    60
 
 struct sb {
   unsigned short ninodes, nzones16, imap_blocks, zmap_blocks, firstdatazone, log_zone_size;
   u32 max_size;
   unsigned short magic, state;
   u32 zones;
+};
+
+struct sb3 {                                   // the superblock of version 3 (the book describes it)
+  u32 ninodes;
+  unsigned short pad0, imap_blocks, zmap_blocks, firstdatazone, log_zone_size, pad1;
+  u32 max_size, zones;
+  unsigned short magic, pad2, blocksize;
 };
 
 struct inode {
@@ -2109,6 +2118,7 @@ struct inode {
 static struct sb sb;
 static u64 inode_table_block;
 static int dirent_size, name_len;
+static u32 ninodes;
 
 // The buffers of this reader are local variables, on the stack of the caller. They used to be static, which is only safe as long as two
 // threads never read at the same time. But readblock sleeps until the disk interrupt, and another thread that starts a program (every
@@ -2128,18 +2138,26 @@ static int read_zone (u32 zone, void *buf) {
 int minix_mount (void) {
   u8 b[ZONE_SIZE] __attribute__ ((aligned (16)));
   if (read_zone (1, b)) return -1;
-  sb = *(struct sb *)b;
-  if (sb.magic == MINIX2_30)      { dirent_size = 32; name_len = 30; }
-  else if (sb.magic == MINIX2_14) { dirent_size = 16; name_len = 14; }
-  else { printf ("minix: unknown magic 0x%x\n", sb.magic); return -1; }
+  struct sb3 *s3 = (struct sb3 *)b;
+  int version = 2;
+  if (s3->magic == MINIX3) {                   // version 3: the magic is at another place than in version 2
+    version = 3;  dirent_size = 64;  name_len = 60;
+    ninodes = s3->ninodes;  sb.zones = s3->zones;  sb.imap_blocks = s3->imap_blocks;  sb.zmap_blocks = s3->zmap_blocks;
+  } else {
+    sb = *(struct sb *)b;
+    if (sb.magic == MINIX2_30)      { dirent_size = 32; name_len = 30; }
+    else if (sb.magic == MINIX2_14) { dirent_size = 16; name_len = 14; }
+    else { printf ("minix: unknown magic 0x%x\n", sb.magic); return -1; }
+    ninodes = sb.ninodes;
+  }
   inode_table_block = 2 + sb.imap_blocks + sb.zmap_blocks;
-  printf ("minix: v2, %u inodes, %u zones, %d-character names\n", sb.ninodes, sb.zones, name_len);
+  printf ("minix: v%d, %u inodes, %u zones, %d-character names\n", version, ninodes, sb.zones, name_len);
   return 0;
 }
 
 static int get_inode (u32 n, struct inode *out) {
   u8 b[ZONE_SIZE] __attribute__ ((aligned (16)));
-  if (n == 0 || n > sb.ninodes) return -1;
+  if (n == 0 || n > ninodes) return -1;
   u32 idx = n - 1;                          // 16 inodes of 64 bytes per zone
   if (read_zone (inode_table_block + idx / 16, b)) return -1;
   u8 *p = b + (idx % 16) * 64;
@@ -2251,19 +2269,25 @@ iterate over a directory: call fn for every used entry
 
 <<minixfs.c: minix_readdir>>=
 int minix_readdir (u32 dir, void (*fn)(u32 ino, const char *name, void *arg), void *arg) {
-  u8 ent[64];
+  u8 chunk[ZONE_SIZE] __attribute__ ((aligned (16)));       // one zone of the directory: each zone is read once
   struct inode d;
   if (get_inode (dir, &d) || (d.mode & 0170000) != 0040000) return -1;
+  int ino_bytes = dirent_size - name_len;                   // 2 or 4: the width of an inode number
   int count = 0;
-  for (u32 off = 0; off + dirent_size <= d.size; off += dirent_size) {
-    if (minix_read (dir, off, ent, dirent_size) != dirent_size) return -1;
-    u32 nr = ent[0] | (ent[1] @<< 8);
-    if (!nr) continue;
-    char name[32]; int i;
-    for (i = 0; i < name_len && ent[2 + i]; i++) name[i] = ent[2 + i];
-    name[i] = 0;
-    if (fn) fn (nr, name, arg);
-    count++;
+  for (u32 base = 0; base < d.size; base += ZONE_SIZE) {
+    u32 n = d.size - base < ZONE_SIZE ? d.size - base : ZONE_SIZE;
+    if (minix_read (dir, base, chunk, n) != (long) n) return -1;
+    for (u32 off = 0; off + dirent_size <= n; off += dirent_size) {
+      u8 *ent = chunk + off;
+      u32 nr = 0;
+      for (int k = ino_bytes - 1; k >= 0; k--) nr = (nr @<< 8) | ent[k];
+      if (!nr) continue;
+      char name[MAX_NAME + 1]; int i;
+      for (i = 0; i < name_len && ent[ino_bytes + i]; i++) name[i] = ent[ino_bytes + i];
+      name[i] = 0;
+      if (fn) fn (nr, name, arg);
+      count++;
+    }
   }
   return count;
 }
@@ -2280,12 +2304,12 @@ resolve an absolute path (``/bin/vi'') to an inode number, 0 if not found
 <<minixfs.c: minix_lookup>>=
 u32 minix_lookup (const char *path) {
   u32 cur = 1;                              // root inode
-  char part[32];
+  char part[MAX_NAME + 1];
   while (*path) {
     while (*path == '/') path++;
     if (!*path) break;
     int n = 0;
-    while (*path && *path != '/' && n < 31) part[n++] = *path++;
+    while (*path && *path != '/' && n < MAX_NAME) part[n++] = *path++;
     part[n] = 0;
     struct lookup l = { part, 0 };
     if (minix_readdir (cur, lookup_cb, &l) < 0 || !l.found) return 0;

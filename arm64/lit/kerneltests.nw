@@ -274,6 +274,33 @@ int bookfs_test (void) {
            !mx_file_exists (DEV, "/dl1"), "the three directories are removed again");
   }
 
+  // ---- the extended format (issue #141): the root disk is Minix v3 ----
+  {
+    CHECK (mx_query_superblock (DEV, MX_SB_MAGIC) == 0x4D5A && mx_dirent_size (DEV) == 64, "extended format: the root disk is Minix v3 (64-byte directory entries)");
+    CHECK (mx_query_superblock (DEV, MX_SB_NINODES) > 65535, "extended format: more inodes than a 16-bit number can count");
+    CHECK (mx_stat (DEV, "/etc/hi-inode.txt", &st) == 0 && st.st_ino > 65535 && st.st_size > 0,
+           "extended format: /etc/hi-inode.txt has an inode number above 65535 (set by the host tool)");
+    mfd = mx_open (DEV, "/etc/hi-inode.txt", O_RDONLY);
+    CHECK (mfd >= 0 && mx_read (mfd, buf, 4096) == st.st_size, "extended format: and it reads");
+    mx_close (mfd);
+    static const char pyc[] = "/dl1/__pycache__/_collections_abc.cpython-312.pyc";                // 43 characters: CPython's name for a compiled module
+    static const char n60[] = "/dl1/123456789012345678901234567890123456789012345678901234567890";   // exactly 60 characters
+    static const char n61[] = "/dl1/1234567890123456789012345678901234567890123456789012345678901";  // one too many
+    CHECK (mx_mkdir (DEV, "/dl1", 0755) == 0 && mx_mkdir (DEV, "/dl1/__pycache__", 0755) == 0, "extended format: directories /dl1 and /dl1/__pycache__");
+    mfd = mx_open (DEV, pyc, O_CREAT | O_RDWR);
+    CHECK (mfd >= 0 && write_pattern (mfd, 5000, 1000) == 5000, "extended format: a file with the name of a .pyc file of CPython (43 characters)");
+    mx_close (mfd);
+    mfd = mx_open (DEV, n60, O_CREAT | O_RDWR);
+    CHECK (mfd >= 0 && write_pattern (mfd, 100, 100) == 100, "extended format: a file with a name of 60 characters");
+    mx_close (mfd);
+    CHECK (mx_open (DEV, n61, O_CREAT | O_RDWR) == -1 && !mx_file_exists (DEV, n61), "extended format: a name of 61 characters is refused");
+    mfd = mx_open (DEV, pyc, O_RDONLY);
+    CHECK (mfd >= 0 && verify_pattern (mfd, 5000) == 5000 && mx_stat (DEV, n60, &st) == 0 && st.st_size == 100, "extended format: both are found by name and read back");
+    mx_close (mfd);
+    CHECK (mx_unlink (DEV, pyc) == 0 && mx_unlink (DEV, n60) == 0 && mx_rmdir (DEV, "/dl1/__pycache__", "/dl1/__pycache__") == 0 &&
+           mx_rmdir (DEV, "/dl1", "/dl1") == 0 && !mx_file_exists (DEV, "/dl1"), "extended format: removed again");
+  }
+
   // ---- path lookup (issue #142): a directory with many blocks, odd paths ----
   {
     char name[40];

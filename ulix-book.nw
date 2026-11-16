@@ -21969,6 +21969,22 @@ As mentioned before, instead of blocks, Minix uses ``zones''\marginnote{zone}\in
 \]
 (With a default setting of [[s_log_zone_size = 0]] that formula reads: zone size = block size, since $2^0=1$.) In our implementation we only support the case where block size = zone size = 1024, and so we will often use the terms \emph{zone} and \emph{block} interchangeably. Some filesystems use the name \emph{cluster}\marginnote{cluster} to discuss smallest allocatable units, thus a zone is also a cluster.
 
+\paragraph{The extended format (Minix v3).} The version~2 format has three limits that matter on a system that runs real programs: inode numbers have 16 bits (at most 65\,535 files), a name has 30 characters, and a directory of the book's first code could hold only 224 entries. A Python installation shows all three: [[__pycache__/_collections_abc.cpython-312.pyc]] needs 35 characters, and the library has directories of 200 entries. The ARM64 port therefore also understands the \emph{Minix version 3} layout (magic [[0x4D5A]], listed above): 32-bit inode numbers, directory entries of 64 bytes (a 4-byte inode number and a name of 60 characters), and the same inodes, zones and bitmaps as version 2 with 1024-byte blocks. Only the superblock looks different:
+
+<<type definitions>>=
+struct minix3_superblock {
+  uint32_t s_ninodes;
+  uint16_t s_pad0;           uint16_t s_imap_blocks;
+  uint16_t s_zmap_blocks;    uint16_t s_firstdatazone;
+  uint16_t s_log_zone_size;  uint16_t s_pad1;
+  uint32_t s_max_size;       uint32_t s_zones;
+  uint16_t s_magic;          uint16_t s_pad2;
+  uint16_t s_blocksize;      uint8_t  s_disk_version;
+};
+@ %def minix3_superblock
+
+(the magic number is at byte 24 instead of byte 16, and [[s_ninodes]] has 32 bits). Which format a device has is decided once, when its superblock is read (see [[mx_fs]] below); all functions of this chapter ask for the size of a directory entry and for the length of a name instead of using the numbers 32 and 30, so they work with both. Directories are files like any other: their blocks are found with [[fileblocktozone]], so a directory may use indirect and double indirect blocks and has no limit of 224 entries. The format was chosen over a file system of our own because the book already names it, because Linux can mount it (the host tools of this port write the same layout), and because the code that has to change is small. The disks of the ARM64 port use it, except the small serial disk that keeps the old format on purpose; the x86 system is built from the same book and understands both, but its disk images stay version~2.
+
 The [[s_imap_blocks]] and [[s_zmap_blocks]] fields note how many blocks are reserved for the inode bitmap and the zone bitmap. Those bitmaps store a single bit for each inode or data block, respectively, and the bits show whether an inode/a data block is free (0) or occupied (1). [[s_ninodes]] is the number of inodes from which we can calculate the size of the inode table.
 
 The inode bitmap\index{bitmap!inode bitmap}\index{inode bitmap} and the zone bitmap\index{bitmap!zone bitmap}\index{zone bitmap} follow directly after the superblock (see Figure~\ref{fig:minix-fs-structure}). After that the filesystem contains the inode table\index{inode table} and finally the data blocks\index{data block}.
@@ -22041,12 +22057,16 @@ The superblock never changes while the system runs, but almost every function be
 
 <<constants>>=
 #define MX_MAX_FS 4              // devices whose superblock is kept in memory
+#define MX_MAGIC_V3 0x4D5A       // Minix version 3 (the magic of version 2 is at another place, see [[mx_fs]])
 @ %def MX_MAX_FS
 
 <<type definitions>>=
 struct mx_fsinfo {
   int device;                    // 0: this entry is free
-  struct minix_superblock sb;    // copy of block 1
+  int version;                   // 2 or 3
+  int ninodes, zones, imap_blocks, zmap_blocks, firstdatazone;
+  int log_zone_size, max_size, magic, state;
+  int dirent_size, name_len;     // 32 and 30 (version 2), 64 and 60 (version 3)
 };
 @ %def mx_fsinfo
 
@@ -22070,9 +22090,22 @@ struct mx_fsinfo *mx_fs (int device) {
   if (i == MX_MAX_FS)  { i = next;  next = (next + 1) % MX_MAX_FS; }
   byte block[BLOCK_SIZE];
   readblock (device, 1, (byte*) block);                  // superblock = block 1
-  mx_fs_table[i].sb = *(struct minix_superblock*) block;
-  mx_fs_table[i].device = device;
-  return &mx_fs_table[i];
+  struct mx_fsinfo *fs = &mx_fs_table[i];
+  struct minix3_superblock *s3 = (struct minix3_superblock*) block;
+  struct minix_superblock  *s2 = (struct minix_superblock*)  block;
+  if (s3->s_magic == MX_MAGIC_V3) {
+    fs->version = 3;  fs->dirent_size = 64;  fs->name_len = 60;
+    fs->ninodes = s3->s_ninodes;  fs->zones = s3->s_zones;  fs->imap_blocks = s3->s_imap_blocks;
+    fs->zmap_blocks = s3->s_zmap_blocks;  fs->firstdatazone = s3->s_firstdatazone;
+    fs->log_zone_size = s3->s_log_zone_size;  fs->max_size = s3->s_max_size;  fs->magic = s3->s_magic;  fs->state = 0;
+  } else {                                               // version 2 with names of 30 characters (also for anything else, as before)
+    fs->version = 2;  fs->dirent_size = 32;  fs->name_len = 30;
+    fs->ninodes = s2->s_ninodes;  fs->zones = s2->s_zones;  fs->imap_blocks = s2->s_imap_blocks;
+    fs->zmap_blocks = s2->s_zmap_blocks;  fs->firstdatazone = s2->s_firstdatazone;
+    fs->log_zone_size = s2->s_log_zone_size;  fs->max_size = s2->s_max_size;  fs->magic = s2->s_magic;  fs->state = s2->s_state;
+  }
+  fs->device = device;
+  return fs;
 }
 @ %def mx_fs
 
@@ -22089,18 +22122,18 @@ int mx_query_superblock (int device, char index);
 
 <<minix filesystem implementation>>=
 int mx_query_superblock (int device, char index) {
-  struct minix_superblock *sblock = &mx_fs (device)->sb;
+  struct mx_fsinfo *fs = mx_fs (device);
   switch (index) {
-    case MX_SB_NINODES:       return sblock->s_ninodes;
-    case MX_SB_NZONES:        return sblock->s_nzones;
-    case MX_SB_IMAP_BLOCKS:   return sblock->s_imap_blocks;
-    case MX_SB_ZMAP_BLOCKS:   return sblock->s_zmap_blocks;
-    case MX_SB_FIRSTDATAZONE: return sblock->s_firstdatazone;
-    case MX_SB_LOG_ZONE_SIZE: return sblock->s_log_zone_size;
-    case MX_SB_MAX_SIZE:      return sblock->s_max_size;
-    case MX_SB_MAGIC:         return sblock->s_magic;
-    case MX_SB_STATE:         return sblock->s_state;
-    case MX_SB_ZONES:         return sblock->s_zones;
+    case MX_SB_NINODES:       return fs->ninodes;
+    case MX_SB_NZONES:        return 0;                          // (the 16-bit zone count of version 1 is unused)
+    case MX_SB_IMAP_BLOCKS:   return fs->imap_blocks;
+    case MX_SB_ZMAP_BLOCKS:   return fs->zmap_blocks;
+    case MX_SB_FIRSTDATAZONE: return fs->firstdatazone;
+    case MX_SB_LOG_ZONE_SIZE: return fs->log_zone_size;
+    case MX_SB_MAX_SIZE:      return fs->max_size;
+    case MX_SB_MAGIC:         return fs->magic;
+    case MX_SB_STATE:         return fs->state;
+    case MX_SB_ZONES:         return fs->zones;
     default:                  return -1;  // error
   }
 }
@@ -22309,13 +22342,13 @@ The implementations of [[mx_request_inode]] and [[mx_request_block]] that we act
 <<minix filesystem implementation>>=
 int mx_request_inode (int device) {
   byte block[1024];
-  struct minix_superblock *sblock = &mx_fs (device)->sb;
+  struct mx_fsinfo *sblock = mx_fs (device);
 
-  int no_inodes  = sblock->s_ninodes;                // floppy: 480  
+  int no_inodes  = sblock->ninodes;                // floppy: 480  
   int imap_start = 2;
 
   int i, index;
-  for (i = 0;  i < sblock->s_imap_blocks;  i++) {    // all IMAP blocks
+  for (i = 0;  i < sblock->imap_blocks;  i++) {    // all IMAP blocks
     readblock (device, imap_start + i, (byte*)&block);
     index = findZeroBitAndSet ((byte*)&block, no_inodes);
     if (index != -1) {                               // found one!
@@ -22328,12 +22361,12 @@ int mx_request_inode (int device) {
 
 int mx_request_block (int device) {
   byte block[1024];
-  struct minix_superblock *sblock = &mx_fs (device)->sb;
+  struct mx_fsinfo *sblock = mx_fs (device);
 
-  int no_zones    = sblock->s_zones;                 // floppy: 1440
-  int zmap_start  = 2 + sblock->s_imap_blocks;
-  int zmap_blocks = sblock->s_zmap_blocks;
-  int data_start  = sblock->s_firstdatazone;
+  int no_zones    = sblock->zones;                 // floppy: 1440
+  int zmap_start  = 2 + sblock->imap_blocks;
+  int zmap_blocks = sblock->zmap_blocks;
+  int data_start  = sblock->firstdatazone;
   int i, index;
   for (i = 0;  i < zmap_blocks;  i++) {              // all ZMAP blocks
     readblock (device, zmap_start + i, (byte*)&block);
@@ -22501,18 +22534,53 @@ Let's look at the task step by step. In order to read the root directory of a vo
 
 Looking at the root directory's inode brings up a special case of file access (before reading the first regular file): Directories are a special kind of file which map filenames to inode numbers. We can read a directory block by block, and the first zone number is stored in [[i_zone[0]]]. We just need to know how to interpret the data: A directory file is an array of structures of type [[minix_dir_entry]]:
 
+A directory file is an array of directory entries. On disk, an entry of version 2 is 32 bytes (a 16-bit inode number and a name of 30 characters) and an entry of version 3 is 64 bytes (a 32-bit inode number and a name of 60 characters). The code of this chapter works with one structure in memory that is large enough for both:
+
+<<constants>>=
+#define MX_MAX_NAME 60       // the longest name of any version
+@ %def MX_MAX_NAME
+
 <<type definitions>>=
 struct minix_dir_entry {
-  uint16_t inode;
-  char name[30];
+  uint32_t inode;                  // 0: unused entry
+  char     name[MX_MAX_NAME + 1];  // always ends with a 0
 };
 @ %def minix_dir_entry
 
-Each such entry has a size of $2+30 = 32$ bytes und starts with the 16-bit inode number, followed by the filename. Such filenames are normally null-terminated (as is standard for all strings on Unix systems), but when a filename uses the maximum allowed size of 30 characters, there is no space for the terminating [[\0]] character. Thus, simply copying an entry with [[strncpy]] will fail on filenames with maximum length. When dealing with Minix filenames internally, they should be stored in a [[char[31]]] string whose last byte is manually set to [[\0]].
+Names on disk are normally null-terminated (as is standard for all strings on Unix systems), but a name of the maximum length has no space for the terminating [[\0]] character. Simply copying such an entry with [[strncpy]] would fail, and comparing two names with [[strequal]] would read on beyond the entry. This is why the in-memory entry has one more byte and two small functions convert between the disk and the memory format. The number of bytes of the inode number is the size of the entry minus the length of the name (2 and 4), so one piece of code serves both versions (the processor is little endian, like the disk format):
 
-A block can hold $1024 / 32 = 32$ such directory entries. If there are more than 32 entries in a directory, an additional block is used (whose block number can be found in the next entry, [[i_zone[1]]]. The total size of the directory is found by inspecting the inode entry [[i_size]].
+%nouse
+<<function prototypes>>=
+void mx_dirent_from_disk (struct mx_fsinfo *fs, const byte *raw, struct minix_dir_entry *e);
+void mx_dirent_to_disk   (struct mx_fsinfo *fs, const struct minix_dir_entry *e, byte *raw);
+int  mx_dirent_size (int device);
+@
 
-Now we start the work on the function [[mx_write_link()]] that can add a (filename $\mapsto$ inode number) mapping to a directory. As already mentioned, directories are special files and the root directory has the inode number 1. Each of the associated data blocks contains 32 directory entries of type [[struct minix_dir_entry]] (since $32 \cdot 32 = 1024$). An unused entry has the [[inode]] field set to 0. We provide two functions
+<<minix filesystem implementation>>=
+void mx_dirent_from_disk (struct mx_fsinfo *fs, const byte *raw, struct minix_dir_entry *e) {
+  int ino_bytes = fs->dirent_size - fs->name_len;      // 2 or 4
+  e->inode = 0;
+  memcpy (&e->inode, raw, ino_bytes);
+  memcpy (e->name, raw + ino_bytes, fs->name_len);
+  e->name[fs->name_len] = 0;
+}
+
+void mx_dirent_to_disk (struct mx_fsinfo *fs, const struct minix_dir_entry *e, byte *raw) {
+  int ino_bytes = fs->dirent_size - fs->name_len;
+  int len = strlen (e->name);
+  if (len > fs->name_len)  len = fs->name_len;
+  memset (raw, 0, fs->dirent_size);
+  memcpy (raw, &e->inode, ino_bytes);
+  memcpy (raw + ino_bytes, e->name, len);
+}
+
+// the size of a directory entry on this device (the position in a directory file is a multiple of it)
+int mx_dirent_size (int device) { return mx_fs (device)->dirent_size; }
+@ %def mx_dirent_from_disk mx_dirent_to_disk mx_dirent_size
+
+A block holds [[BLOCK_SIZE / dirent_size]] entries (32 or 16). The directory's data blocks are found like those of any file; the first seven blocks are in the inode, further blocks through the indirection blocks, so a directory can have thousands of entries. The total size of the directory is found by inspecting the inode entry [[i_size]].
+
+Now we start the work on the function [[mx_write_link()]] that can add a (filename $\mapsto$ inode number) mapping to a directory. As already mentioned, directories are special files and the root directory has the inode number 1. Each of the associated data blocks contains 32 (version 2) or 16 (version 3) directory entries. An unused entry has the [[inode]] field set to 0. We provide two functions
 
 %nouse
 <<function prototypes>>=
@@ -22524,41 +22592,33 @@ int mx_write_dir_entry (int device, int inodenr, int entrynr,
 
 We will use the same trick that we applied to reading and writing inodes by providing a common function [[mx_read_write_dir_entry]] that can do both and decides via an extra flag [[wr_flag]] whether it shall read or write. The other arguments are the device, the inode number of the directory (file) and a pointer to a [[struct minix_dir_entry]] variable.
 
-Since only 32 entries fit in one block, we might have to reserve a new block and enter its location in the directory's inode; then we can go on writing entries in the new block. Similarly, when we later delete entries, we might want to remove additional blocks that are no longer needed. 
-
-In each inode's [[i_zone]] array only the first seven entries refer directly to data blocks, so using these we can work with up to $7 \cdot 32 = 224$ directory entries. After that an indirection block must be used, but we will restrict our Minix implementation to a maximum of 224 entries for a directory.
+Since only a few entries fit in one block, we might have to reserve a new block and enter its location in the directory's inode; then we can go on writing entries in the new block. Similarly, when we later delete entries, we might want to remove additional blocks that are no longer needed (we do not).
 
 <<minix filesystem implementation>>=
 int mx_read_write_dir_entry (int device, int inodenr, int entrynr, 
                              struct minix_dir_entry *entry, int wr_flag) {
-  debug_printf ("mx_read_write_dir_entry: entered\n");    // REMOVE_DEBUGGING_CODE
-                                                          // REMOVE_DEBUGGING_CODE
-  if (entrynr >= 32 * 7) {  // 7 direct blocks, 32 entries per block
-    debug_printf ("directory too big!\n");             // REMOVE_DEBUGGING_CODE
-    return false;
-  }
+  struct mx_fsinfo *fs = mx_fs (device);
+  int size = fs->dirent_size, per_block = BLOCK_SIZE / size;
+  struct int_minix2_inode inode;                      // (only the fields of the disk inode are used)
+  if (!mx_read_inode (device, inodenr, (struct minix2_inode*) &inode))  return false;
   
-  struct minix2_inode inode;
-  debug_printf ("mx_read_write_dir_entry: before mx_read_inode()\n"); // REMOVE_DEBUGGING_CODE
-  mx_read_inode (device, inodenr, &inode);            // read_ directory inode
-  debug_printf ("mx_read_write_dir_entry: after mx_read_inode()\n");  // REMOVE_DEBUGGING_CODE
-  int blockno;
-  blockno = inode.i_zone[entrynr/32];    // number of block that holds the entry
-  if (blockno == 0) {
+  int fileblock = entrynr / per_block;                // number of the block (of the directory) that holds the entry
+  int blockno = fileblocktozone (device, fileblock, &inode);
+  if (blockno <= 0) {                                 // no such block: 0 or -2
     if (wr_flag) { <<reserve a block and map it in the directory inode>> } 
     else         return false;
   }
   
-  char block[1024];
-  readblock (device, blockno, (byte*)&block);
+  byte block[BLOCK_SIZE];
+  readblock (device, blockno, block);
   
-  int offset = (32*entrynr) % BLOCK_SIZE;
+  int offset = (size * entrynr) % BLOCK_SIZE;
   if (!wr_flag) {
-    memcpy (entry, ((char*)&block)+offset, 32);       // reading
+    mx_dirent_from_disk (fs, block + offset, entry);  // reading
     return (entry->inode != 0);                       // true if entry non-empty
   } else {
-    memcpy (((byte*)&block)+offset, entry, 32);       // writing
-    writeblock (device, blockno, (byte*)&block);
+    mx_dirent_to_disk (fs, entry, block + offset);    // writing
+    writeblock (device, blockno, block);
     return true;
   };
 };
@@ -22574,22 +22634,14 @@ int mx_write_dir_entry (int device, int inodenr, int entrynr,
 };
 @ %def mx_read_write_dir_entry mx_read_dir_entry mx_write_dir_entry
 
-If the block which should hold the directory entry does not yet exist (and we're trying to write to it), we create it and enter it in the directory inode:
+If the block which should hold the directory entry does not yet exist (and we're trying to write to it), we create it, enter it in the directory inode (the function that adds a block to a file also takes care of the indirection blocks) and fill it with zeros, which means ``all entries unused'':
 
 <<reserve a block and map it in the directory inode>>=
-blockno = mx_request_block (device);
-char empty_block[1024] = { 0 };
-writeblock (device, blockno, (byte*)&empty_block);
-inode.i_zone[entrynr/32] = blockno;
-// printf ("DEBUG: entrynr = %d, entrynr/32 = %d, "          // REMOVE_DEBUGGING_CODE
-//         "blockno = %d\n", entrynr, entrynr/32, blockno);  // REMOVE_DEBUGGING_CODE
-// printf ("DEBUG: i_zone[] = [");                           // REMOVE_DEBUGGING_CODE
-// for (int i = 0; i < 7; i++)                               // REMOVE_DEBUGGING_CODE
-//   printf ("%d, ", inode.i_zone[i]);  printf ("]\n");      // REMOVE_DEBUGGING_CODE
-// int ret =                                                 // REMOVE_DEBUGGING_CODE
-mx_write_inode (device, inodenr, &inode);        // update directory inode
-// printf ("DEBUG: updating inode %d, mx_write_inode() "     // REMOVE_DEBUGGING_CODE
-//   "returns %d\n", inodenr, ret);                          // REMOVE_DEBUGGING_CODE
+blockno = mx_create_new_zone (device, fileblock, &inode);
+if (blockno <= 0)  return false;                      // disk full
+byte empty_block[BLOCK_SIZE] = { 0 };
+writeblock (device, blockno, empty_block);
+mx_write_inode (device, inodenr, (struct minix2_inode*) &inode);   // update directory inode
 @
 
 For dealing with pathnames we will sometimes need two helper functions:
@@ -22625,7 +22677,7 @@ void splitpath (const char *path, char *dirname, char *basename) {
   for (;;) {                                  // search for / (from back to front)
     pos--;
     if (pos == -1) {                          // no single slash found
-      strncpy (dirname, ".", 2);  strncpy (basename, p, 256);  return;
+      strncpy (dirname, ".", 2);  strncpy (basename, p, 60);  basename[60] = 0;  return;
     }
     if (p[pos] == '/') {                      // slash found
       if (pos==0)
@@ -22634,7 +22686,8 @@ void splitpath (const char *path, char *dirname, char *basename) {
         memcpy (dirname, p, pos);
         dirname[pos] = 0;                     // remove trailing '/'
       }
-      strncpy (basename, p + pos + 1, 30);
+      strncpy (basename, p + pos + 1, 60);   // (a name of the extended format has up to 60 characters)
+      basename[60] = 0;                      // [[basename]] must have room for 61 characters
       return;
     }
   }
@@ -22645,12 +22698,12 @@ In the implementations of [[basename]] and [[dirname]] we declare \verb#bname# a
 
 <<public function implementations>>=
 char *basename (char *path) {
-  static char bname[31];  static char dname[256];
+  static char bname[61];  static char dname[256];
   splitpath (path, dname, bname);  return (char *)bname;
 }
 
 char *dirname (char *path) {
-  static char bname[31];  static char dname[256];
+  static char bname[61];  static char dname[256];
   splitpath (path, dname, bname);  return (char *)dname;
 }
 @ %def basename dirname
@@ -22665,10 +22718,10 @@ void mx_write_link (int device, int inodenr, const char *filename);
 \item First, we check whether the directory already contains an entry for the filename---it is not possible to have the same filename twice in a directory.
 \item Then we split the path into the directory name and the base filename.
 \item We locate the inode that belongs to the directory file using [[mx_pathname_to_ino]] (a function  that we still have to implement; this follows a few pages later).
-\item Then we read all the directory entries (using [[mx_read_dir_entry]] from above) until we find a free entry. If we don't, we have to abort because the directory is full.
+\item Then we look for a free entry in the directory (a function of its own that reads every block of the directory once). If there is none, the new entry goes behind the last one, and the directory grows (by a new block, when the last block is full).
 \item Once we've found a free entry, we prepare a directory entry and write it to the free location.
 \item As a last thought, we must not forget to increase the link count of the inode: It counts how many links to the inode exist. For a freshly created file we could always set that value to 1, but we will also use this function when we create a hard link.
-\item Finally we update the size of the directory (it may have grown by 32 bytes unless we've found a free entry between other, used entries) and write back the modified directory inode.
+\item Finally we update the size of the directory (it may have grown by one entry unless we've found a free entry between other, used entries) and write back the modified directory inode.
 \end{itemize}
 
 <<minix filesystem implementation>>=
@@ -22676,36 +22729,64 @@ void mx_write_link (int device, int inodenr, const char *path) {
   if (mx_file_exists (device, path)) {   // check if filename already exists
       printf ("ERROR: filename %s exists!\n", path);  return;
   };
+  struct mx_fsinfo *fs = mx_fs (device);
   struct minix_dir_entry dentry;  struct minix2_inode inode;
-  char dirname[256];  char filename[31];
+  char dirname[256];  char filename[MX_MAX_NAME + 1];
   splitpath (path, dirname, filename);
   int dir_inode_no = mx_pathname_to_ino (device, dirname);
-  debug_printf ("DEBUG: dirname='%s' (ino: %d), "    // REMOVE_DEBUGGING_CODE
-                "filename='%s'\n", dirname,          // REMOVE_DEBUGGING_CODE
-                dir_inode_no, filename);             // REMOVE_DEBUGGING_CODE
-                                                     // REMOVE_DEBUGGING_CODE
+  if (dir_inode_no == -1 || mx_name_too_long (device, path)) {
+    printf ("ERROR: cannot create %s\n", path);  return;
+  }
+
   // find free location and enter it
-  mx_read_inode (device, dir_inode_no, &inode);   // read_ directory inode
-  for (int i = 0;  i < 32 * 7;  i++) {
-    mx_read_dir_entry (device, dir_inode_no, i, &dentry);
-    if (dentry.inode==0 || i * 32 >= inode.i_size) {
-      dentry.inode = inodenr;                     // found an empty entry
-      memcpy ((char*)dentry.name, filename, 30);
-      mx_write_dir_entry (device, dir_inode_no, i, &dentry);
-      mx_increase_link_count (device, inodenr);   // link count for file
-      if (inode.i_size < 32*(i+1)) {              // modify dir. inode size
-        mx_read_inode (device, dir_inode_no, &inode);   // must read again
-        inode.i_size = 32*(i+1);
-        mx_write_inode (device, dir_inode_no, &inode);
-      };
-      return;                                     // success
-    };
+  int entrynr = mx_find_free_dir_entry (device, dir_inode_no);   // (the number of entries if none is free)
+  dentry.inode = inodenr;
+  strncpy (dentry.name, filename, fs->name_len);  dentry.name[fs->name_len] = 0;
+  if (!mx_write_dir_entry (device, dir_inode_no, entrynr, &dentry)) {
+    printf ("ERROR: no free entry in directory\n");
+    return;
+  }
+  mx_increase_link_count (device, inodenr);       // link count for file
+  mx_read_inode (device, dir_inode_no, &inode);   // read directory inode (the write may have changed it)
+  if (inode.i_size < fs->dirent_size * (entrynr + 1)) {   // modify dir. inode size
+    inode.i_size = fs->dirent_size * (entrynr + 1);
+    mx_write_inode (device, dir_inode_no, &inode);
   };
-  printf ("ERROR: no free entry in directory\n"); // search failed
 };
 @ %def mx_write_link
 
-In the last few lines we need to read the directory inode from disk again (even though we did so just nine lines ago, but calling [[mx_write_dir_entry]] may have modified it if a new block was added to the directory---we must not overwrite this change.
+In the last few lines we need to read the directory inode from disk again, because writing the entry may have modified it if a new block was added to the directory---we must not overwrite this change.
+
+The search for a free entry reads each block of the directory only once and looks at all entries in it; an entry whose inode number is 0 is free:
+
+%nouse
+<<function prototypes>>=
+int mx_find_free_dir_entry (int device, int dirinode_no);
+@
+
+<<minix filesystem implementation>>=
+int mx_find_free_dir_entry (int device, int dirinode_no) {
+  struct mx_fsinfo *fs = mx_fs (device);
+  int size = fs->dirent_size;
+  struct int_minix2_inode dir;
+  if (!mx_read_inode (device, dirinode_no, (struct minix2_inode*) &dir))  return 0;
+  int nentries = dir.i_size / size;
+  byte block[BLOCK_SIZE];
+  for (int b = 0;  b * (BLOCK_SIZE / size) < nentries;  b++) {
+    int zone = fileblocktozone (device, b, &dir);
+    if (zone <= 0)  continue;
+    readblock (device, zone, block);
+    for (int i = 0;  i < BLOCK_SIZE / size;  i++) {
+      int n = b * (BLOCK_SIZE / size) + i;
+      if (n >= nentries)  break;
+      struct minix_dir_entry e;
+      mx_dirent_from_disk (fs, block + i * size, &e);
+      if (e.inode == 0)  return n;                        // free entry
+    }
+  }
+  return nentries;                                        // none: the next one is behind the last
+}
+@ %def mx_find_free_dir_entry
 
 This function uses [[mx_increase_link_count()]] which adds 1 to the
 number of links for a given inode:\index{link count}
@@ -22877,14 +22958,15 @@ int mx_pathname_to_ino (int device, const char *path);
 
 <<minix filesystem implementation>>=
 int mx_pathname_to_ino (int device, const char *path) {
-  char name[31];                            // one component of the path (maximum name length: 30)
+  char name[MX_MAX_NAME + 1];               // one component of the path
+  int name_len = mx_fs (device)->name_len;  // 30 or 60
   const char *p = path;
   int dirinode_no = 1;                      // inode number of the / directory
   while (*p == '/')  p++;
   while (*p != '\0') {                      // work until end of path reached
     int i = 0;
     while (*p != '\0' && *p != '/') {
-      if (i == 30)  return -1;              // longer than any name on the disk
+      if (i == name_len)  return -1;        // longer than any name on the disk
       name[i++] = *p++;
     }
     name[i] = '\0';
@@ -22901,10 +22983,19 @@ The path is cut into its components, and each of them is looked up in the direct
 %nouse
 <<function prototypes>>=
 int mx_lookup_in_directory (int device, int dirinode_no, const char *name);
+int mx_find_in_directory (int device, int dirinode_no, const char *name, int *entrynr);
 @
 
 <<minix filesystem implementation>>=
 int mx_lookup_in_directory (int device, int dirinode_no, const char *name) {
+  int entrynr;
+  return mx_find_in_directory (device, dirinode_no, name, &entrynr);
+}
+
+// the same, and the number of the entry too (it is the position in the directory file, [[mx_unlink]] needs it)
+int mx_find_in_directory (int device, int dirinode_no, const char *name, int *entrynr) {
+  struct mx_fsinfo *fs = mx_fs (device);
+  int size = fs->dirent_size, ino_bytes = size - fs->name_len;
   struct int_minix2_inode dir;              // (only the fields of the disk inode are used)
   if (!mx_read_inode (device, dirinode_no, (struct minix2_inode*) &dir))  return -1;
   if ((dir.i_mode & S_IFMT) != S_IFDIR)  return -1;       // a file has no entries
@@ -22914,10 +23005,14 @@ int mx_lookup_in_directory (int device, int dirinode_no, const char *name) {
     int zone = fileblocktozone (device, b, &dir);
     if (zone <= 0)  continue;                             // (no block there)
     readblock (device, zone, block);
-    struct minix_dir_entry *entry = (struct minix_dir_entry*) block;
-    for (int i = 0;  i < BLOCK_SIZE / 32;  i++, entry++) {
-      if (entry->inode != 0 && strncmp (entry->name, name, 30) == 0)   // (a name of 30 characters has no 0 at its end)
-        return entry->inode;
+    for (int i = 0;  i < BLOCK_SIZE / size;  i++) {
+      byte *raw = block + i * size;
+      uint32_t inode = 0;
+      memcpy (&inode, raw, ino_bytes);
+      if (inode != 0 && strncmp ((char*) raw + ino_bytes, name, fs->name_len) == 0) {   // (a name of the full length has no 0 at its end)
+        *entrynr = b * (BLOCK_SIZE / size) + i;
+        return inode;
+      }
     }
   }
   return -1;
@@ -23002,6 +23097,7 @@ if (ext_ino == -1) {
   if ((oflag & O_CREAT) != 0) {
     // REENABLE: printf ("DEBUG: mx_open calls mx_creat_empty_file\n");  // REMOVE_DEBUGGING_CODE
     ext_ino = mx_creat_empty_file (device, path, 0644);
+    if (ext_ino == -1)  return -1;   // cannot create (name too long, no free inode)
   }
   else {
     return (-1);  // file not found and no O_CREAT
@@ -23454,6 +23550,9 @@ readblock (device, double_indirect_zone, (byte *) indirect_block);
 zone_ptr = (int *) indirect_block;
 zone_ptr += (blockno - 7 - BLOCKADDRESSES_PER_BLOCK) / BLOCKADDRESSES_PER_BLOCK;
 int indirect_zone = *zone_ptr;
+if (indirect_zone == 0) {
+  return -2;  // no indirection block in this place
+}
 
 readblock (device, indirect_zone, (byte *) indirect_block);
 zone_ptr = (int *) indirect_block;
@@ -23673,6 +23772,22 @@ writeblock (device, indirect_zone, (byte *) indirect_block);
 debug_printf ("ADD DOUBLE INDIRECT: %d\n", zone);    // REMOVE_DEBUGGING_CODE
 @
 
+A name that is longer than a directory entry can hold must not be cut off silently (a file would be created under another name than the one that was asked for). [[splitpath]] cuts names at 60 characters, so the length of the last component is measured on the path itself:
+
+%nouse
+<<function prototypes>>=
+int mx_name_too_long (int device, const char *path);
+@
+
+<<minix filesystem implementation>>=
+int mx_name_too_long (int device, const char *path) {
+  int end = strlen (path), start;
+  while (end > 0 && path[end - 1] == '/')  end--;               // (a slash at the end does not belong to the name)
+  for (start = end;  start > 0 && path[start - 1] != '/';  start--)  ;
+  return end - start > mx_fs (device)->name_len;
+}
+@ %def mx_name_too_long
+
 What's still missing is a way to create a new (empty) file. The function
 
 %nouse
@@ -23684,7 +23799,9 @@ int mx_creat_empty_file (int device, const char *path, int mode);
 %BREAK BEFORE DEFINES
 <<minix filesystem implementation>>=
 int mx_creat_empty_file (int device, const char *path, int mode) {
+  if (mx_name_too_long (device, path))  return -1;                // the name does not fit into a directory entry
   int inodenr = mx_request_inode (device);
+  if (inodenr == -1)  return -1;                                  // no free inode
   struct minix2_inode inode = { 0 };
   inode.i_size = 0;
   inode.i_atime = inode.i_ctime = inode.i_mtime = system_time;
@@ -23797,24 +23914,18 @@ int mx_unlink (int device, const char *path) {
   int inodenr = mx_pathname_to_ino (device, path);
   struct minix2_inode inode;
   mx_read_inode (device, inodenr, &inode);
-  char dir[256], base[31];
+  char dir[256], base[MX_MAX_NAME + 1];
   splitpath (path, dir, base);            // split path into dir and base
   int dir_inodenr = mx_pathname_to_ino (device, dir);
-  // printf ("dir_inodenr is %d\n", dir_inodenr);   // REMOVE_DEBUGGING_CODE
 
   // delete entry in directory
-  boolean found = false;
-  for (int i = 0;  i < 32*7;  i++) {
-    mx_read_dir_entry (device, dir_inodenr, i, &dentry);
-    if ( dentry.inode==inodenr && strncmp (dentry.name, base, 30) == 0 ) {
-      dentry.inode = 0;
-      memset (dentry.name, 0, 30);
-      found = true;
-      mx_write_dir_entry (device, dir_inodenr, i, &dentry);
-      break;  // search finished
-    }
+  int entrynr;
+  if (mx_find_in_directory (device, dir_inodenr, base, &entrynr) != inodenr) {
+    return -1;                            // error: not found in directory
   }
-  if (found==false) { return -1; }  // error: not found in directory
+  dentry.inode = 0;
+  memset (dentry.name, 0, sizeof (dentry.name));
+  mx_write_dir_entry (device, dir_inodenr, entrynr, &dentry);
   
   inode.i_nlinks--;   // one name less
   if (inode.i_nlinks == 0) {
@@ -24127,6 +24238,8 @@ int mx_mkdir (int device, const char *path, int mode);
 <<minix filesystem implementation>>=
 int mx_mkdir (int device, const char *path, int mode) {
   struct minix_dir_entry entry = { 0 };
+  struct mx_fsinfo *fs = mx_fs (device);
+  byte raw[MX_MAX_NAME + 4];                       // an entry as it is on the disk
   char dir[256]; char base[256];
   int dir_inodenr, new_inodenr;
   struct minix2_inode inode;
@@ -24140,10 +24253,12 @@ int mx_mkdir (int device, const char *path, int mode) {
 
   // enter "." and ".." inode numbers
   fd = mx_open (device, path, O_WRONLY);
-  memset (&entry, 0, 32); memcpy (entry.name, ".", 2);  entry.inode = new_inodenr;
-  mx_write (fd, &entry, 32);
-  memset (&entry, 0, 32); memcpy (entry.name, "..", 3); entry.inode = dir_inodenr;
-  mx_write (fd, &entry, 32);
+  memset (&entry, 0, sizeof entry); memcpy (entry.name, ".", 2);  entry.inode = new_inodenr;
+  mx_dirent_to_disk (fs, &entry, raw);
+  mx_write (fd, raw, fs->dirent_size);
+  memset (&entry, 0, sizeof entry); memcpy (entry.name, "..", 3); entry.inode = dir_inodenr;
+  mx_dirent_to_disk (fs, &entry, raw);
+  mx_write (fd, raw, fs->dirent_size);
   mx_close (fd);
 
   // fix inode (make it type directory, set nlinks to 2)
@@ -24236,8 +24351,8 @@ files.
 boolean mx_directory_is_empty (int device, const char *path) {
   int count = 0;  // number of entries
   struct dir_entry d = { 0 };
-  for (int i = 0;  i < 32 * 7;  i++) {
-    if (mx_getdent (device, path, i, &d) == 0 && d.inode != 0) count++;
+  for (int i = 0;  mx_getdent (device, path, i, &d) == 0;  i++) {   // (until the index is behind the last entry)
+    if (d.inode != 0) count++;
   }
   return (count == 2);
 }
@@ -24259,7 +24374,7 @@ it is shown in the Linux\index{Linux!stat structure@\texttt{stat} structure} man
 <<public type definitions>>=
 struct stat {
   unsigned int   st_dev;     // ID of device containing file
-  unsigned short st_ino;     // inode number
+  unsigned int   st_ino;     // inode number (32 bit since the extended file system format)
   unsigned short st_mode;    // protection
   unsigned short st_nlink;   // number of hard links
   unsigned short st_uid;     // user ID of owner
@@ -24312,7 +24427,7 @@ filenames.
 
 <<public type definitions>>=
 struct dir_entry {
-  word inode;              // inode number
+  unsigned int inode;      // inode number (32 bit since the extended format; was [[word]])
   byte filename[64];       // filename
 };
 @ %def dir_entry
@@ -24336,7 +24451,7 @@ int mx_getdent (int device, const char *path, int index, struct dir_entry *buf) 
   int ret = mx_stat (device, path, &s);
   if (ret == -1) return -1;             // error does not exist
 
-  if (index*32 >= s.st_size) return -1; //  index out of bounds
+  if (index * mx_fs (device)->dirent_size >= s.st_size) return -1; //  index out of bounds
 
   int ino = mx_pathname_to_ino (device, path);
   if (ino == -1) return -1;             // error: not a directory
@@ -24344,8 +24459,8 @@ int mx_getdent (int device, const char *path, int index, struct dir_entry *buf) 
   ret = mx_read_dir_entry (device, ino, index, &d);
   if (ret == -1) return -1;             // error: no such entry in directory
   buf->inode = d.inode;
-  strncpy ((char*)(buf->filename), d.name, 30);
-  d.name[30] = 0;                       // terminate string
+  strncpy ((char*)(buf->filename), d.name, 63);
+  buf->filename[63] = 0;                // terminate string (the name has at most 60 characters)
   return 0;                             // success
 }
 @ %def mx_getdent

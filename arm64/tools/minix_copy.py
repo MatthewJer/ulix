@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Copy the files and directories of one Minix v2 image into another (empty) one.
+"""Copy the files and directories of one Minix image (v2 or v3) into another (empty) one of either version.
 
 usage: minix_copy.py SOURCE-IMAGE DEST-IMAGE
 
