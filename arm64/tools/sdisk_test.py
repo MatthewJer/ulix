@@ -24,7 +24,7 @@ def run():
     result["stats"] = serial_disk.serve(s, img)
 t = threading.Thread(target=run, daemon=True); t.start()
 text = ""
-for _ in range(int(os.environ.get('SDISK_WAIT', 240))):
+for _ in range(int(os.environ.get('SDISK_WAIT', 480))):
     time.sleep(1)
     text = open(log, errors="replace").read() if os.path.exists(log) else ""
     if "\nRESULT" in text: break
