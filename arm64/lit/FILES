@@ -103,6 +103,7 @@ libc/filetest.c
 libc/readtest.c
 libc/fdtest.c
 libc/threadtest.c
+libc/chantest.c
 sockets.c
 libc/sockettest.c
 libc/localetest.c

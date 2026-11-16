@@ -144,6 +144,8 @@ The complete file is put together from these parts:
 
 <<linux_abi.c: semaphores>>
 
+<<linux_abi.c: message channels>>
+
 <<linux_abi.c: linux_syscall>>
 @
 
@@ -213,6 +215,7 @@ void linux_abi_fork (int old_as, int new_as) {
 #define L_exit_group     94
 #define L_set_tid_address 96
 #define L_set_robust_list 99
+#define L_get_robust_list 100
 #define L_futex          98
 #define L_nanosleep     101
 #define L_clock_gettime 113
@@ -266,6 +269,11 @@ void linux_abi_fork (int old_as, int new_as) {
 #define L_usem_value    643
 #define L_usem_close    644
 #define L_usem_unlink   645
+#define L_uchan_open    646
+#define L_uchan_send    647
+#define L_uchan_recv    648
+#define L_uchan_close   649
+#define L_uchan_unlink  650
 #define L_socket        198
 #define L_socketpair    199
 #define L_listen        201
@@ -851,6 +859,14 @@ static u64 robust_head[MAX_THREADS];
 static long linux_set_robust_list (u64 head, u64 len) {
   if (len != 24) return -LE_EINVAL;
   robust_head[current_task] = head;
+  return 0;
+}
+
+// (musl asks in pthread_mutexattr_setrobust whether the kernel knows robust lists at all)
+static long linux_get_robust_list (int pid, u64 *head, u64 *len) {
+  if (pid != 0 && pid != current_task) return -LE_ESRCH;
+  if (!user_ok ((u64) head, 8, 1) || !user_ok ((u64) len, 8, 1)) return -LE_EFAULT;
+  *head = robust_head[current_task];  *len = 24;
   return 0;
 }
 
@@ -1945,6 +1961,127 @@ static long linux_usem_unlink (const char *name) {
 }
 
 @
+\subsection{Message channels between processes}
+\label{sec:libc:uchan}
+
+Threads share memory, processes do not (except in a \texttt{MAP\_SHARED} mapping, see below), and pipes are a stream of bytes between relatives. Two programs that
+want to exchange \emph{messages} --- a window server and its clients, a sound mixer and the programs that play --- need a channel that
+
+\begin{itemize}
+\item has a name, so that unrelated processes can find it (like the named semaphores above and like \texttt{mq\_open} of POSIX),
+\item keeps the boundaries of the messages (one \texttt{send} is one \texttt{recv}),
+\item makes the sender wait when it is full and the receiver wait when it is empty.
+\end{itemize}
+
+The kernel therefore keeps a small table of channels, each a ring of 16 messages of up to 256 bytes. The calls are Ulix's own (646 to 650, outside the numbers of Linux, like the
+semaphores): \texttt{uchan\_open (name, flags)}, \texttt{uchan\_send (id, buf, len, mode, timeout\_ns)}, \texttt{uchan\_recv (id, buf, size, mode, timeout\_ns)},
+\texttt{uchan\_close (id)} and \texttt{uchan\_unlink (name)}; \texttt{mode} is 0 (wait), 1 (do not wait: \texttt{EAGAIN}) or 2 (wait at most \texttt{timeout\_ns}).
+A message that is longer than the buffer of \texttt{recv} is not cut: the call fails with \texttt{EMSGSIZE} and the message stays.
+
+\paragraph{Waiting.} Both sides sleep in the queue of the futexes (see above), the key is the address of the channel for the receivers and the next byte for the senders. A
+\texttt{send} wakes one receiver, a \texttt{recv} wakes one sender. Nothing is copied twice: the kernel copies the message into the ring and out of it, under the kernel lock.
+
+\paragraph{Simple version first, and what it leaves out.} Eight channels, no priorities, no access rights (the name is the only protection; a window server would check who
+it talks to), no notification (the signal when a message arrives: a program that wants to wait for a channel \emph{and} a socket must make rounds with a time limit, as the servers
+of section 30 do). A channel stays in the table as long as it is open or its name exists, like a semaphore.
+
+<<linux_abi.c: message channels>>=
+#define MAX_UCHAN    8
+#define UCHAN_SLOTS 16
+#define UCHAN_SIZE 256
+#define LE_EMSGSIZE 90
+struct uchan {
+  char name[32];  int used, unlinked, refs;
+  int head, count;                                          // the oldest message is slot head, count of them
+  unsigned short len[UCHAN_SLOTS];
+  char data[UCHAN_SLOTS][UCHAN_SIZE];
+};
+static struct uchan uchans[MAX_UCHAN];
+
+static struct uchan *uchan_of (long id) { return (id >= 0 && id < MAX_UCHAN && uchans[id].used) ? &uchans[id] : 0; }
+
+static long linux_uchan_open (const char *name, int flags) {
+  if (!user_string_ok ((u64) name)) return -LE_EFAULT;
+  if (strlen (name) >= 32) return -LE_EINVAL;
+  for (int i = 0; i < MAX_UCHAN; i++)
+    if (uchans[i].used && !uchans[i].unlinked && strcmp (uchans[i].name, name) == 0) {
+      if ((flags & LO_CREAT) && (flags & LO_EXCL)) return -LE_EEXIST;
+      uchans[i].refs++;
+      return i;
+    }
+  if (!(flags & LO_CREAT)) return -LE_ENOENT;
+  for (int i = 0; i < MAX_UCHAN; i++)
+    if (!uchans[i].used) {
+      memset (&uchans[i], 0, sizeof uchans[i]);
+      strcpy (uchans[i].name, name);
+      uchans[i].used = 1;  uchans[i].refs = 1;
+      return i;
+    }
+  return -LE_ENOMEM;
+}
+
+// wait for the channel to have room (sender) or a message (receiver): 0, or minus an error; mode as described above
+static long uchan_wait (struct uchan *c, int sender, int mode, long long timeout_ns) {
+  int ready = sender ? c->count < UCHAN_SLOTS : c->count > 0;
+  if (ready) return 0;
+  if (mode == 1) return -LE_EAGAIN;
+  unsigned long long deadline = mode == 2 ? mono_ns () + (timeout_ns > 0 ? timeout_ns : 0) : 0;
+  while (!(sender ? c->count < UCHAN_SLOTS : c->count > 0)) {
+    if (mode == 2 && mono_ns () >= deadline) return -LE_ETIMEDOUT;
+    if (futex_sleep ((u64) c + sender, -1, deadline) == -LE_EINTR) return -LE_EINTR;
+  }
+  return 0;
+}
+
+static long linux_uchan_send (long id, const char *buf, u64 len, int mode, long long timeout_ns) {
+  struct uchan *c = uchan_of (id);
+  if (!c) return -LE_EINVAL;
+  if (len > UCHAN_SIZE) return -LE_EMSGSIZE;
+  if (len && !user_ok ((u64) buf, len, 0)) return -LE_EFAULT;
+  long r = uchan_wait (c, 1, mode, timeout_ns);
+  if (r < 0) return r;
+  int slot = (c->head + c->count) % UCHAN_SLOTS;
+  memcpy (c->data[slot], buf, len);
+  c->len[slot] = len;
+  c->count++;
+  futex_wake_key ((u64) c, -1, 1);                          // a receiver
+  return len;
+}
+
+static long linux_uchan_recv (long id, char *buf, u64 size, int mode, long long timeout_ns) {
+  struct uchan *c = uchan_of (id);
+  if (!c) return -LE_EINVAL;
+  if (!user_ok ((u64) buf, size, 1)) return -LE_EFAULT;
+  long r = uchan_wait (c, 0, mode, timeout_ns);
+  if (r < 0) return r;
+  int len = c->len[c->head];
+  if (len > size) return -LE_EMSGSIZE;                      // the message stays
+  memcpy (buf, c->data[c->head], len);
+  c->head = (c->head + 1) % UCHAN_SLOTS;
+  c->count--;
+  futex_wake_key ((u64) c + 1, -1, 1);                      // a sender
+  return len;
+}
+
+static long linux_uchan_close (long id) {
+  struct uchan *c = uchan_of (id);
+  if (!c) return -LE_EINVAL;
+  if (--c->refs <= 0 && c->unlinked) c->used = 0;
+  return 0;
+}
+
+static long linux_uchan_unlink (const char *name) {
+  if (!user_string_ok ((u64) name)) return -LE_EFAULT;
+  for (int i = 0; i < MAX_UCHAN; i++)
+    if (uchans[i].used && !uchans[i].unlinked && strcmp (uchans[i].name, name) == 0) {
+      uchans[i].unlinked = 1;
+      if (uchans[i].refs <= 0) uchans[i].used = 0;
+      return 0;
+    }
+  return -LE_ENOENT;
+}
+
+@
 \subsection{The translation: \texttt{linux\_syscall}}
 
 Called by \texttt{book\_syscall} instead of the book's dispatcher for a program that has \texttt{ELFOSABI\_LINUX}. A Linux program expects
@@ -2031,6 +2168,11 @@ static void linux_syscall_inner (context_t *r) {
     case L_usem_value:  ret = linux_usem_value (a0); break;
     case L_usem_close:  ret = linux_usem_close (a0); break;
     case L_usem_unlink: ret = linux_usem_unlink ((const char *) a0); break;
+    case L_uchan_open:   ret = linux_uchan_open ((const char *) a0, a1); break;
+    case L_uchan_send:   ret = linux_uchan_send (a0, (const char *) a1, a2, a3, a4); break;
+    case L_uchan_recv:   ret = linux_uchan_recv (a0, (char *) a1, a2, a3, a4); break;
+    case L_uchan_close:  ret = linux_uchan_close (a0); break;
+    case L_uchan_unlink: ret = linux_uchan_unlink ((const char *) a0); break;
     case L_socket:      ret = linux_socket (a0, a1, a2); break;
     case L_socketpair:  ret = linux_socketpair (r, a0, a1, a2, (int *) a3); break;
     case L_connect:     ret = linux_connect_or_bind (a0, (const void *) a1, a2, 1); break;
@@ -2100,6 +2242,7 @@ static void linux_syscall_inner (context_t *r) {
     case L_getpid:  ret = thread_table[current_task].pid; break;
     case L_gettid:  ret = current_task; break;
     case L_set_tid_address: arch_set_clear_tid (current_task, a0); ret = current_task; break;
+    case L_get_robust_list: ret = linux_get_robust_list (a0, (u64 *) a1, (u64 *) a2); break;
     case L_set_robust_list: ret = linux_set_robust_list (a0, a1); break;    // robust mutexes: see the futex section
     case L_futex:   ret = linux_futex ((int *) a0, a1, a2, (struct ts *) a3, (int *) a4, a5); break;
     case L_getppid: ret = thread_table[current_task].ppid; break;
@@ -2461,6 +2604,7 @@ a semaphore, a variable per thread (\texttt{\_Thread\_local}, which needs the \t
 of each thread, a timed wait, and the end of a process with threads that still run.
 
 <<libc/threadtest.c>>=
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -2470,6 +2614,9 @@ of each thread, a timed wait, and the end of a process with threads that still r
 #include <time.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <sys/syscall.h>
+#include <signal.h>
+#include <sched.h>
 
 static int fails = 0;
 #define CHECK(c, msg) do { if (c) printf ("  user ok:   %s\n", msg); \
@@ -2503,6 +2650,38 @@ static sem_t sem;
 static void *post_later (void *arg) { sem_post (&sem); return 0; }
 
 static void *forever (void *arg) { for (;;) ; }
+
+// ---- the futex without polling (issue 135), requeue, detached threads, pthread_kill, robust mutexes, the signal stack (issue 136)
+static long long now_ms (void) { struct timespec t; clock_gettime (CLOCK_MONOTONIC, &t); return t.tv_sec * 1000LL + t.tv_nsec / 1000000; }
+static void nap (int ms) { struct timespec t = { 0, ms * 1000000L }; nanosleep (&t, 0); }
+
+static volatile int sleeper_go;
+static void *sleeper (void *arg) { pthread_mutex_lock (&lock);  while (!sleeper_go) pthread_cond_wait (&cond, &lock);  pthread_mutex_unlock (&lock);  return 0; }
+static long busy_work (void) {                              // how much computing fits into 150 ms?
+  long long t0 = now_ms ();
+  volatile unsigned long x = 0;
+  long rounds = 0;
+  while (now_ms () - t0 < 150) { for (int i = 0; i < 1000; i++) x += i;  rounds++; }
+  return rounds;
+}
+
+static int futex_a, futex_b;
+static volatile int woke;
+static void *requeue_waiter (void *arg) { syscall (SYS_futex, &futex_a, 128, 0, 0, 0, 0);  __atomic_add_fetch (&woke, 1, __ATOMIC_SEQ_CST);  return 0; }   // FUTEX_WAIT | PRIVATE, once
+
+static volatile int detached_done;
+static void *detached_body (void *arg) { __atomic_add_fetch (&detached_done, 1, __ATOMIC_SEQ_CST);  return 0; }
+
+static volatile int got_usr1;
+static void on_usr1 (int sig) { got_usr1 = sig; }
+static volatile int usr1_ready;
+static void *wait_for_signal (void *arg) { usr1_ready = 1;  for (int i = 0; i < 300 && !got_usr1; i++) nap (10);  return 0; }
+
+static pthread_mutex_t robust_lock;
+static void *die_holding_lock (void *arg) { pthread_mutex_lock (&robust_lock);  return 0; }
+
+static char *handler_local;
+static void on_usr2 (int sig) { char here; handler_local = &here; }
 
 int main (void) {
   pthread_t t, ts[4];
@@ -2547,6 +2726,77 @@ int main (void) {
   CHECK (!pthread_equal (me, t), "pthread_self differs between the threads");
   pthread_join (t, 0);
 
+  // a thread that waits in the futex does not use the CPU: the same work takes about as long with a sleeper as without
+  long alone = busy_work ();
+  pthread_create (&t, 0, sleeper, 0);
+  nap (20);
+  long with_sleeper = busy_work ();
+  pthread_mutex_lock (&lock);  sleeper_go = 1;  pthread_cond_broadcast (&cond);  pthread_mutex_unlock (&lock);
+  pthread_join (t, 0);
+  printf ("  info: work done in 150 ms: %ld rounds alone, %ld rounds next to a sleeping thread\n", alone, with_sleeper);
+  CHECK (with_sleeper * 4 > alone * 3, "a thread blocked in pthread_cond_wait takes no CPU time: in the same 150 ms the work next to it gets at least 75 percent (a spinning waiter on one CPU would halve it)");
+
+  // FUTEX_CMP_REQUEUE: wake one of two sleepers, move the other to a second word
+  pthread_t rq[2];
+  pthread_create (&rq[0], 0, requeue_waiter, 0);  pthread_create (&rq[1], 0, requeue_waiter, 0);
+  nap (40);
+  long moved = syscall (SYS_futex, &futex_a, 4 | 128, 1, (void *) 1L, &futex_b, 0);     // wake 1, requeue 1, expected value 0
+  nap (30);
+  int first = woke;
+  long again = syscall (SYS_futex, &futex_a, 1 | 128, 1, 0, 0, 0);                      // nobody is left on the first word
+  long second = syscall (SYS_futex, &futex_b, 1 | 128, 1, 0, 0, 0);                     // the moved sleeper is here
+  pthread_join (rq[0], 0);  pthread_join (rq[1], 0);
+  CHECK (moved == 2 && first == 1 && again == 0 && second == 1 && woke == 2, "FUTEX_CMP_REQUEUE: one sleeper woken, one moved to the other word and woken there");
+  CHECK (syscall (SYS_futex, &futex_a, 4 | 128, 1, (void *) 1L, &futex_b, 5) == -1 && errno == EAGAIN, "FUTEX_CMP_REQUEUE with a wrong expected value: EAGAIN, nothing moved");
+
+  // detached threads: 100 of them, one after the other in two rounds (the resources of an ended thread must be given back)
+  pthread_attr_t attr;
+  pthread_attr_init (&attr);  pthread_attr_setdetachstate (&attr, PTHREAD_CREATE_DETACHED);
+  int created = 0;
+  for (int i = 0; i < 100; i++) {
+    int rc = pthread_create (&t, &attr, detached_body, 0);
+    if (rc == 0) created++;  else if (created == i) printf ("  info: pthread_create failed at thread %d: error %d\n", i, rc);
+    for (int w = 0; w < 200 && detached_done < created; w++) nap (2);
+  }
+  for (int w = 0; w < 200 && detached_done < created; w++) nap (5);
+  printf ("  info: detached threads: %d created, %d ran\n", created, detached_done);
+  CHECK (created == 100 && detached_done == 100, "100 detached threads, one after the other: all ran and went away (the thread unmaps its own stack)");
+
+  // pthread_kill: a signal for one thread
+  signal (SIGUSR1, on_usr1);
+  pthread_create (&t, 0, wait_for_signal, 0);
+  while (!usr1_ready) nap (5);
+  pthread_kill (t, SIGUSR1);
+  pthread_join (t, 0);
+  CHECK (got_usr1 == SIGUSR1, "pthread_kill: the handler of the other thread ran");
+
+  // a robust mutex whose owner ended
+  pthread_mutexattr_t ma;
+  pthread_mutexattr_init (&ma);  pthread_mutexattr_setrobust (&ma, PTHREAD_MUTEX_ROBUST);
+  pthread_mutex_init (&robust_lock, &ma);
+  pthread_create (&t, 0, die_holding_lock, 0);
+  pthread_join (t, 0);
+  int rl = pthread_mutex_lock (&robust_lock);
+  CHECK (rl == EOWNERDEAD, "robust mutex: the owner ended while holding it, the next lock says EOWNERDEAD");
+  if (rl == EOWNERDEAD) { pthread_mutex_consistent (&robust_lock);  pthread_mutex_unlock (&robust_lock); }
+
+  // the signal stack
+  static char altmem[16384];
+  stack_t ss = { altmem, 0, sizeof altmem };
+  struct sigaction sa;
+  memset (&sa, 0, sizeof sa);
+  sa.sa_handler = on_usr2;  sa.sa_flags = SA_ONSTACK;
+  sigaction (SIGUSR2, &sa, 0);
+  int ok_alt = sigaltstack (&ss, 0) == 0;
+  raise (SIGUSR2);
+  CHECK (ok_alt && handler_local >= altmem && handler_local < altmem + sizeof altmem, "sigaltstack: a handler with SA_ONSTACK runs on the alternate stack");
+
+  // the processors
+  cpu_set_t set;
+  CPU_ZERO (&set);
+  int n_aff = sched_getaffinity (0, sizeof set, &set) == 0 ? CPU_COUNT (&set) : 0;
+  CHECK (n_aff >= 1 && n_aff == sysconf (_SC_NPROCESSORS_ONLN), "sched_getaffinity: one bit per online CPU, the same number as sysconf");
+
   // exit () while another thread still runs: the process ends with the status, in a child so that this program goes on
   int pid = fork ();
   if (pid == 0) {
@@ -2557,6 +2807,111 @@ int main (void) {
   }
   int status = 0;
   CHECK (waitpid (pid, &status, 0) == pid && WIFEXITED (status) && WEXITSTATUS (status) == 7, "exit (7) while a second thread loops: the process ends, waitpid sees 7");
+  return fails;
+}
+@
+\section{Test of message channels and shared futexes: \texttt{chantest}}
+\label{src:libc/chantest.c}
+
+The test uses the channels of the section ``Message channels between processes'' the way two programs would: with a name, across \texttt{fork}, with waiting on both sides.
+The last two checks are about \emph{shared} futexes: the word is in memory that was mapped with \texttt{MAP\_SHARED}, the two processes wait and wake without the
+\texttt{PRIVATE} flag, and the sleeper must really sleep (the clock says how long) and wake up when the other process wakes it.
+
+<<libc/chantest.c>>=
+#include <stdio.h>
+#include <string.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <time.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+
+#define UCHAN_OPEN   646
+#define UCHAN_SEND   647
+#define UCHAN_RECV   648
+#define UCHAN_CLOSE  649
+#define UCHAN_UNLINK 650
+#define FUTEX_WAIT_ 0
+#define FUTEX_WAKE_ 1                                   // (no PRIVATE flag: shared futexes)
+
+static int fails = 0;
+#define CHECK(c, msg) do { if (c) printf ("  user ok:   %s\n", msg); \
+                           else { printf ("  user FAIL: %s\n", msg); fails++; } } while (0)
+
+static long long now_ms (void) { struct timespec t; clock_gettime (CLOCK_MONOTONIC, &t); return t.tv_sec * 1000LL + t.tv_nsec / 1000000; }
+static void nap (int ms) { struct timespec t = { 0, ms * 1000000L }; nanosleep (&t, 0); }
+
+static long copen (const char *name, int flags) { return syscall (UCHAN_OPEN, name, flags); }
+static long csend (long id, const char *s, int mode, long long ns) { return syscall (UCHAN_SEND, id, s, strlen (s), mode, ns); }
+static long crecv (long id, char *buf, int size, int mode, long long ns) { return syscall (UCHAN_RECV, id, buf, size, mode, ns); }
+
+int main (void) {
+  char buf[300];
+  long id = copen ("/chan/test", O_CREAT);
+  long reply_id = copen ("/chan/reply", O_CREAT);
+  CHECK (id >= 0, "uchan_open creates a channel");
+
+  CHECK (csend (id, "hello", 0, 0) == 5 && csend (id, "abc", 0, 0) == 3, "two messages are sent");
+  int a = crecv (id, buf, sizeof buf, 0, 0);  int a_ok = a == 5 && memcmp (buf, "hello", 5) == 0;
+  int b = crecv (id, buf, sizeof buf, 0, 0);
+  CHECK (a_ok && b == 3 && memcmp (buf, "abc", 3) == 0, "they come out in the same order and with the same boundaries (5 and 3 bytes)");
+
+  CHECK (crecv (id, buf, sizeof buf, 1, 0) == -1 && errno == EAGAIN, "recv on an empty channel without waiting: EAGAIN");
+  long long t0 = now_ms ();
+  long r = crecv (id, buf, sizeof buf, 2, 50 * 1000000LL);
+  long long waited = now_ms () - t0;
+  CHECK (r == -1 && errno == ETIMEDOUT && waited >= 40 && waited < 400, "recv with a time limit of 50 ms: ETIMEDOUT after about 50 ms");
+
+  csend (id, "0123456789", 0, 0);
+  CHECK (crecv (id, buf, 4, 0, 0) == -1 && errno == EMSGSIZE && crecv (id, buf, sizeof buf, 0, 0) == 10, "a message that does not fit is refused with EMSGSIZE and stays");
+
+  int pid = fork ();
+  if (pid == 0) {                                       // another process finds the channel by its name
+    long c = copen ("/chan/test", 0);
+    nap (30);
+    csend (c, "ping from the child", 0, 0);
+    char reply[300];
+    long r2 = copen ("/chan/reply", 0);                 // (the answer comes on a second channel: on the first one the child would find its own message)
+    int n = crecv (r2, reply, sizeof reply, 0, 0);      // and waits for the answer
+    _exit (n == 4 && memcmp (reply, "pong", 4) == 0 ? 0 : 1);
+  }
+  int n = crecv (id, buf, sizeof buf - 1, 0, 0);        // the parent sleeps until the child has sent
+  buf[n > 0 ? n : 0] = 0;
+  CHECK (n == 19 && strcmp (buf, "ping from the child") == 0, "a process that waits in recv gets the message of another process (sent 30 ms later)");
+  csend (reply_id, "pong", 0, 0);
+  int status = 0;
+  CHECK (waitpid (pid, &status, 0) == pid && WIFEXITED (status) && WEXITSTATUS (status) == 0, "the child received the answer");
+
+  int sent = 0;
+  while (csend (id, "x", 1, 0) == 1) sent++;
+  CHECK (sent == 16 && errno == EAGAIN, "a channel holds 16 messages, the 17th send without waiting: EAGAIN");
+  pid = fork ();
+  if (pid == 0) { nap (30); crecv (id, buf, sizeof buf, 0, 0); _exit (0); }
+  t0 = now_ms ();
+  r = csend (id, "last", 0, 0);                         // the sender sleeps until the child has made room
+  waited = now_ms () - t0;
+  CHECK (r == 4 && waited >= 20, "a sender that finds the channel full sleeps until the other process has read one message");
+  waitpid (pid, 0, 0);
+  while (crecv (id, buf, sizeof buf, 1, 0) >= 0) ;
+
+  CHECK (syscall (UCHAN_CLOSE, id) == 0 && syscall (UCHAN_UNLINK, "/chan/test") == 0 && copen ("/chan/test", 0) == -1 && errno == ENOENT, "close and unlink: the name is gone");
+
+  // shared futex: one word in shared memory, two processes
+  volatile int *word = mmap (0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+  *word = 0;
+  pid = fork ();
+  if (pid == 0) {
+    long long s = now_ms ();
+    while (*word == 0) syscall (SYS_futex, word, FUTEX_WAIT_, 0, 0, 0, 0);
+    _exit (now_ms () - s >= 20 ? 0 : 1);                // it must have slept until the parent woke it
+  }
+  nap (40);
+  *word = 1;
+  long woken = syscall (SYS_futex, word, FUTEX_WAKE_, 1, 0, 0, 0);
+  CHECK (waitpid (pid, &status, 0) == pid && WIFEXITED (status) && WEXITSTATUS (status) == 0, "shared futex: a process sleeps on a word in shared memory and the other process wakes it");
+  CHECK (woken == 1, "FUTEX_WAKE of a shared futex says that it woke one sleeper");
   return fails;
 }
 @

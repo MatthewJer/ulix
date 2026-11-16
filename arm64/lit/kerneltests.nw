@@ -879,8 +879,16 @@ int proc_test (void) {
   capture_stop (&out);
   arch_threads_reap ();
   CHECK (pid > 0 && thread_table[pid].exitcode == 0, "/musl/threadtest finished with exit status 0 (no failed checks)");
-  CHECK (count_in (out, "user FAIL") == 0 && count_in (out, "user ok:") == 9, "all 9 thread checks of the musl program passed");
+  CHECK (count_in (out, "user FAIL") == 0 && count_in (out, "user ok:") == 17, "all 17 thread checks of the musl program passed");
   CHECK (count_in (out, "not implemented") == 0, "the thread test needed no Linux system call that the kernel does not have");
+  char *chan_argv[] = { "chantest", 0 };                    // message channels between processes, shared futexes
+  capture_start ();
+  pid = run ("/musl/chantest", 1, chan_argv);
+  capture_stop (&out);
+  arch_threads_reap ();
+  CHECK (pid > 0 && thread_table[pid].exitcode == 0, "/musl/chantest finished with exit status 0 (no failed checks)");
+  CHECK (count_in (out, "user FAIL") == 0 && count_in (out, "user ok:") == 13, "all 13 checks of the channel test passed (messages between processes, shared futex)");
+  CHECK (count_in (out, "not implemented") == 0, "the channel test needed no Linux system call that the kernel does not have");
   char *loc_argv[] = { "localetest", 0 };                   // locale C.UTF-8, wide characters, regular expressions (all of it is musl's own code)
   capture_start ();
   pid = run ("/musl/localetest", 1, loc_argv);
