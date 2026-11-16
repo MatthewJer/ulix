@@ -21,7 +21,7 @@ class Session:
         fast = ['-accel', 'hvf', '-cpu', 'host'] if os.environ.get('QEMU_FAST') else ['-cpu', 'cortex-a72']      # QEMU_FAST=1: hardware acceleration, for quick runs while debugging
         cmd = ['qemu-system-aarch64', '-M', 'virt'] + fast + [ '-m', '128', '-display', 'none', '-monitor', 'none', '-kernel', kernel,
                '-snapshot', '-drive', 'file=%s,format=raw,if=none,id=hd0' % image, '-device', 'virtio-blk-device,drive=hd0',
-               '-device', 'virtio-rng-device', '-smp', '2', '-netdev', 'user,id=n0,host=10.0.2.4', '-device', 'virtio-net-device,netdev=n0', '-serial', 'tcp:127.0.0.1:%d,server=on,wait=on' % PORT]
+               '-device', 'virtio-rng-device', '-smp', '2', '-netdev', 'user,id=n0', '-device', 'virtio-net-device,netdev=n0', '-serial', 'tcp:127.0.0.1:%d,server=on,wait=on' % PORT]
         self.qemu = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.sock = None
         for _ in range(100):

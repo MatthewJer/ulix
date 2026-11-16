@@ -102,7 +102,6 @@ struct sock {
   int v6;                                            // AF_INET6 (only datagram sockets): the addresses are peer6 and the ip6 of the datagrams
   int nonblock;
   int error;                                         // SO_ERROR: why a connect () that did not wait has failed (a Linux error number), 0 = none
-  long sndtimeo;                                     // SO_SNDTIMEO in milliseconds, 0 = wait for ever
   long rcvtimeo;                                     // SO_RCVTIMEO in milliseconds, 0 = wait for ever
   u8 pk[PEEKMAX];  int npk;                             // stream: what MSG_PEEK has read from the connection and recv () has not yet delivered
   u8 peer6[16];
@@ -114,6 +113,7 @@ struct sock {
   struct dgram q[4];  int qhead, qcount;             // datagram: what has arrived and not been read
   int listening;                                     // stream: listen () was called, accept () takes the connections of local_port
   int local, peer, peer_gone, eof;                   // socketpair: this is one end, the slot of the other end, the other end is closed, it said SHUT_WR
+  long sndtimeo;                                     // SO_SNDTIMEO in milliseconds, 0 = wait for ever
   u8 lbuf[LBUF];  unsigned long lwritten, lread;      // socketpair: bytes the other end has written / this end has read (the difference is in the buffer)
 };
 
