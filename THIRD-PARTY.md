@@ -16,6 +16,7 @@ compatible with it. Never copy Linux code (GPL-2.0-only).
 | libffi | <https://github.com/libffi/libffi> | `v3.4.6` | MIT | Python `ctypes` |
 | libarchive | <https://github.com/libarchive/libarchive> | `v3.7.7` | New BSD (a few files public domain, BSD-2) | `/bin/tar` (bsdtar), `/bin/unzip` (bsdunzip); not with `make ARCHIVE=0` |
 | SQLite | <https://github.com/sqlite/sqlite> | `version-3.46.1` | public domain | Python `sqlite3` |
+| LLVM libc++, libc++abi, libunwind | <https://github.com/llvm/llvm-project> | `llvmorg-21.1.8` | Apache-2.0 with LLVM exception (`libcxx/LICENSE.TXT`) | the C++ standard library (issue #43), sparse checkout, see `third_party/LICENCE-CHECK-llvm.md` |
 | ncurses | <https://github.com/ThomasDickey/ncurses-snapshots> | `v6_5` | MIT-style | Python `curses` |
 | bzip2 | <https://sourceware.org/git/bzip2.git> | `bzip2-1.0.8` | BSD-style | Python `bz2`; libarchive (`tar -j`) |
 | xz (liblzma only) | <https://github.com/tukaani-project/xz> | `v5.4.7` (never 5.6.0 or 5.6.1) | 0BSD (liblzma) | Python `lzma`; libarchive (`tar -J`) |
