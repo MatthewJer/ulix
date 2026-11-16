@@ -1,4 +1,4 @@
-\chapter{Security: random numbers, the time of day and TLS (HTTPS)}
+\chapter{TLS and certificates: random numbers, the time of day and HTTPS}
 \label{ch:tls}
 
 A telnet session sends the password in clear text. A program that fetches a web page over the Internet has to know that the
@@ -32,6 +32,74 @@ clock, and the host name against the certificate.
 [[tls_enable="NO"]] the program [[https]] says ``TLS is disabled'' and stops. At build time, [[make TLS=0]] leaves the library and the
 glue out completely: [[https]] is then a tiny program that only says that this system was built without TLS, and BearSSL is
 not even compiled.
+
+\section{What a certificate is, and what the client checks}
+\label{sec:tls:certificates}
+
+The code of the next sections and of the chapter on the user programs only makes sense when one knows what the handshake is
+supposed to achieve. Here is the idea, without the mathematics.
+
+\paragraph{The problem.} Encryption alone is not enough. When the client has agreed on a key with ``the server'', it still does
+not know \emph{who} that is: a machine in the middle can agree on one key with the client and on another with the real server, and
+read everything. The client must be able to check that the other side is really the owner of the name it asked for (for example
+[[example.org]]). For that, the server has a \emph{key pair}: a secret key that never leaves the server, and a public key that
+everybody may know. Whoever can sign a message with the secret key proves that he holds it. But how does the client know that
+\emph{this} public key belongs to [[example.org]]?
+
+\paragraph{The certificate.} A \emph{certificate} (the format is X.509, in the DER encoding) is a small document that says: ``the
+public key K belongs to the name N, valid from date A to date B'', and it is \emph{signed} by a third party, the
+\emph{certificate authority} (CA) that looked into the matter. The client does not have to trust the server; it has to trust the
+authority, and it can check the signature with the authority's public key.
+
+\paragraph{The chain.} Authorities do not sign every server certificate with their most precious key. The server sends a
+\emph{chain}: its own certificate, signed by an intermediate authority, whose certificate is signed by the next one, and so on. The chain
+has to end in a certificate that the client already has. Such a certificate is a \emph{trust anchor}; the client gets the list from
+the system, not from the network. In Ulix it is the file [[/etc/ssl/cacert.pem]], which has the 118 authorities of Mozilla's list
+(source and date in [[third_party/README.md]], updated with [[tools/update_cacert.sh]]). \emph{Whoever is in that file can vouch for any
+name on the Internet.} The file is therefore as important as the code: an authority added to it by an attacker defeats the whole
+system, and Ulix protects the file only with the permissions of the file system (see the limits below).
+
+\paragraph{The handshake in TLS 1.2.} At the start of a connection the two sides exchange a few messages before any data is sent:
+
+\begin{enumerate}
+\item \textbf{ClientHello.} The client says which versions, key exchanges and ciphers it knows, sends a random number, and the \emph{name} of
+      the server it wants (so that a machine with many names can pick the right certificate).
+\item \textbf{ServerHello and certificate chain.} The server chooses one of the offered cipher suites, sends its random number and its chain.
+\item \textbf{Key exchange.} For the suites that are mostly chosen today (the ones with ``ECDHE'' in the name) the server sends the public half
+      of a temporary key and \emph{signs it with the key from its certificate}; this signature is how the server proves that it is the owner of
+      the certificate. Client and server compute the same secret from their halves. Because the temporary keys are thrown away, a
+      recording of the connection cannot be decrypted later even if the server's key is stolen (\emph{forward secrecy}).
+\item \textbf{Finished.} Both sides send a checksum of everything they have seen so far, already encrypted. If somebody changed a message on
+      the way, the checksums differ and the connection ends. From here on every record is encrypted and carries a message authentication code.
+\end{enumerate}
+
+\paragraph{What the client checks.} BearSSL does all of this; the program only gives it what it needs, and an error says which check
+failed (see [[tls_error_text]]):
+
+\begin{itemize}
+\item \textbf{The signatures of the chain.} Each certificate is signed by the next, and the last one by a trust anchor
+      (otherwise: \emph{not trusted}, \emph{bad signature}).
+\item \textbf{The dates.} Each certificate is valid from one day to another. This is why the chapter has a section on the time of day: a
+      machine without a battery clock does not know today's date, and with a date from 1970 every certificate is ``not valid yet''. The
+      program takes the time from the clock, or from [[sntp]] if the clock is only a guess (\emph{expired}, \emph{time unknown}).
+\item \textbf{The name.} The name in the certificate has to match the name that the user typed. Without this check, a valid certificate for
+      \emph{any} site would do for every site (\emph{bad server name}).
+\item \textbf{The proof of the key.} The signature in the key exchange is made with the key of the first certificate.
+\end{itemize}
+
+If one of the checks fails, the connection is closed before the program has sent a single byte of its request. (If the checks were
+only a warning, the password in the request would already be gone.)
+
+\paragraph{What is \emph{not} checked, and why that is acceptable here.} \textbf{Revocation}: a certificate whose key was stolen can be
+declared invalid before its date is over (lists of revoked certificates, OCSP); BearSSL's small certificate checker does not look
+at them, and Ulix has no way to fetch them. \textbf{Client certificates} (the server asking the client to prove who it is) are not
+supported; passwords and the SSH server do that job in this system. \textbf{TLS 1.3} is missing (see above). The consequence for a student
+is this: the chain of trust is only as good as the list of authorities, the clock, and the integrity of the
+disk they are kept on.
+
+\paragraph{Where in the book.} The authorities are loaded and the engine is configured in [[tlsglue.c]] (chapter on the user programs of
+TLS); the program that puts the steps in order is [[https]]; the SSH server (chapter~\ref{ch:ssh}) works with a much simpler trust model:
+the client remembers the key of the server the first time (\emph{trust on first use}) instead of asking an authority.
 
 @
 \section{Random numbers (see \texttt{random.c})}

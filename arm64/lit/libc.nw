@@ -9,6 +9,72 @@ enough to read, written without the history of glibc, and good for static linkin
 layer that connects musl to the kernel, the start-up information a program finds on its stack, and the memory, time and signal
 calls that musl needs.
 
+\section{Reading guide: what you need to know, and the path of one call}
+\label{sec:libc:guide}
+
+\paragraph{What a student needs.} The chapter assumes C, the idea of a system call (a controlled jump from user mode into the kernel,
+chapters \ref{ch:hardware} and \ref{ch:processes}), and a rough picture of an ELF file (a program is a file with a header, segments to
+load, and an entry address; the book's loader reads them, \texttt{elf.c}). It does \emph{not} assume that you know musl, Linux or the
+auxiliary vector; they are explained where they first appear. What a ``C library'' is: the part of every Unix program that is not the
+program's own code. It turns \texttt{printf} into a few bytes and one call to the kernel, \texttt{malloc} into \texttt{brk} or
+\texttt{mmap}, \texttt{fopen} into \texttt{open}; it also contains the code that runs before \texttt{main} and after it returns.
+The kernel and the library agree on one thing only, the \emph{system call interface}, and that is what this chapter is about.
+
+\paragraph{The layers.} From the top:
+
+\begin{quote}\begin{verbatim}
+  program (hello.c)         calls printf, malloc, fopen, ...
+     |
+  musl (third_party/musl)   unmodified; turns library calls into system calls
+     |   svc 0              Linux/AArch64 convention: number in x8, arguments in x0..x5
+  kernel entry (vectors.S)  saves the registers, calls book_syscall
+     |
+  linux_syscall (linux_abi.c)   OUR part: translates the call and its arguments
+     |
+  the kernel of the book    syscall_read, syscall_write, the file system, the scheduler
+\end{verbatim}\end{quote}
+
+Only the box in the middle is written for this chapter. The two ends already existed (the book's kernel) or are somebody else's
+(musl); the point of the design is that neither had to change.
+
+\paragraph{The path of one call.} What happens when a program says \texttt{printf ("hi\textbackslash n")} (the program was linked
+statically, so all library code is inside the file):
+
+\begin{enumerate}
+\item \texttt{printf} formats into the buffer of \texttt{stdout}; the line ends with a newline and the standard output is a terminal, so
+      musl flushes at once. The flush function of musl writes with \texttt{writev} (one call for a buffer and the pending bytes).
+\item The inline function \texttt{\_\_syscall3} puts 66 (the Linux/AArch64 number of \texttt{writev}) into \texttt{x8}, the
+      descriptor, the address of the vector and its length into \texttt{x0} to \texttt{x2}, and executes \texttt{svc 0}.
+\item The processor changes to kernel mode and jumps to the exception vector (\texttt{vectors.S}); the registers of the program are saved in a
+      frame on the kernel stack (the type \texttt{context\_t}).
+\item \texttt{book\_syscall} looks at the process: it was marked \texttt{ELFOSABI\_LINUX}, so the call goes to \texttt{linux\_syscall}.
+\item \texttt{linux\_syscall} has a \texttt{case} for \texttt{L\_writev}; the function \texttt{linux\_iov} checks that the vector lies in
+      memory of the program (``Checking pointers of the program'' below: the kernel never trusts an address it gets from a program), walks it, and calls the book's \texttt{syscall\_write}
+      for each piece.
+\item The book's code writes to the terminal and returns the number of bytes; the translation turns a failure into a negative Linux error
+      number, puts the result into \texttt{x0} of the saved frame, and returns from the exception. The program continues after the
+      \texttt{svc} with the result in \texttt{x0}.
+\end{enumerate}
+
+Every other call has the same form: a \texttt{case} in \texttt{linux\_syscall}, sometimes a single line that calls the book's function,
+sometimes (memory, signals, sockets) real code in this chapter.
+
+\paragraph{The path of the program before \texttt{main}.} \texttt{execve} loads the ELF file; the kernel builds the first stack
+(\texttt{build\_linux\_stack}, chapter \ref{ch:processes}): from the stack pointer upwards there are \texttt{argc}, the pointers of
+\texttt{argv}, a null pointer, the pointers of the environment, another null pointer, and the pairs of the \emph{auxiliary vector}
+(\texttt{AT\_PHDR}, \texttt{AT\_PHENT}, \texttt{AT\_PHNUM}, \texttt{AT\_PAGESZ}, \texttt{AT\_RANDOM}); after that the strings themselves.
+musl's start code (section ``Building musl and the first program'') reads exactly this layout. Where something in this chapter looks
+arbitrary (why sixteen random bytes? why the address of the program headers?), the reason is that musl reads it there.
+
+\paragraph{Reading order.} First this section and the next one (the decision to translate in the kernel). Then the start of the system
+call layer (numbers, errors, checking pointers), \texttt{linux\_syscall} at the end of the layer (it shows the whole list at a
+glance), and the build and the first program. The calls in between (memory, time, threads, signals, files, sockets) can be read
+as needed: each starts with the simplest version and says what it leaves out. The later sections (\texttt{cat}, \texttt{ls}, tests,
+Python) show the layer under load. To see it work, start the system with \texttt{debug=http} on the kernel command line: for the Python web server it prints
+every system call with its result and duration (\texttt{ARM64-PORT.md}, section 43); the kernel also prints the number of a call that is
+still missing (\texttt{ENOSYS}), once. The test programs of this chapter (\texttt{hello}, \texttt{threadtest}, \texttt{sockettest}, \ldots)
+are run by the kernel test, and their output says what each line proves.
+
 \section{How musl attaches to the kernel}
 
 musl talks to its kernel through one inline function per number of arguments (\texttt{\_\_syscall0} to \texttt{\_\_syscall6},
