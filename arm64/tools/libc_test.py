@@ -81,7 +81,7 @@ try:
     s.expect(PROMPT, 'shell prompt')
     s.pump(3)
     # (program, number of checks it must have run; None: the program says it on its last line)
-    for prog, count in (('/musl/libctest', None), ('/musl/filetest', 30), ('/musl/localetest', 15), ('/musl/threadtest', 9)):
+    for prog, count in (('/musl/libctest', None), ('/musl/filetest', 30), ('/musl/localetest', 15), ('/musl/threadtest', 17)):
         s.send(prog + '\r')
         out = s.expect(PROMPT, '%s ran and the prompt is back' % prog, int(os.environ.get('LIBC_TIMEOUT', 300)))
         print(out[-8000:])
