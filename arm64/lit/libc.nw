@@ -169,11 +169,13 @@ typedef unsigned char u8;
 
 unsigned char linux_abi_as[MAX_ADDR_SPACES];           // 1: the program of this address space uses the Linux system call interface
 u64 linux_sig_restorer[MAX_ADDR_SPACES];               // the function musl gave to sigaction: a handler returns to it
+static unsigned sa_onstack[MAX_ADDR_SPACES];           // bit n: the handler of signal n (book's number) runs on the alternate stack
 
 // fork: the child speaks the same interface and has the same signal restorer
 void linux_abi_fork (int old_as, int new_as) {
   linux_abi_as[new_as] = linux_abi_as[old_as];
   linux_sig_restorer[new_as] = linux_sig_restorer[old_as];
+  sa_onstack[new_as] = sa_onstack[old_as];
 }
 
 @
@@ -219,6 +221,9 @@ void linux_abi_fork (int old_as, int new_as) {
 #define L_prlimit64     261
 #define L_clock_nanosleep 115
 #define L_sched_yield   124
+#define L_sched_setaffinity 122
+#define L_sched_getaffinity 123
+#define L_sigaltstack   132
 #define L_kill          129
 #define L_tkill         130
 #define L_tgkill        131
@@ -901,11 +906,15 @@ The book's signals are the base (handlers per process, a pending set, a blocked 
   is sent (it does not stay pending); musl's \texttt{raise} blocks all signals around its \texttt{tkill} and needs the signal to be
   delivered when the mask is restored. So \texttt{linux\_kill} lets a signal that has a handler stay pending when it is blocked,
   and the delivery code skips blocked signals until they are unblocked. (A blocked signal without a handler is still discarded.)
-\item \texttt{SA\_RESTART}, \texttt{SA\_RESETHAND}, \texttt{SA\_NODEFER} and the signal stack are not supported; the flags are ignored.
+\item \texttt{SA\_ONSTACK} and \texttt{sigaltstack} are supported: a thread may name a stack for its handlers (\texttt{altstack}, one entry per thread, valid only in the
+  address space that made it, and not inherited by \texttt{fork} or \texttt{clone}); \texttt{arch\_signal\_check} asks \texttt{linux\_signal\_altstack} where to build
+  the frame. A handler that runs on the alternate stack and gets another signal goes on below its own stack pointer, as it should.
+\item \texttt{SA\_RESTART}, \texttt{SA\_RESETHAND} and \texttt{SA\_NODEFER} are not supported; the flags are ignored.
 \end{itemize}
 
 <<linux_abi.c: signals>>=
 extern sighandler_t u_signal (int sig, sighandler_t func);
+#define SA_ONSTACK_ 0x08000000
 
 struct k_sigaction { sighandler_t handler; unsigned long flags; void (*restorer) (void); unsigned mask[2]; };   // as musl passes it
 
@@ -918,14 +927,51 @@ static long linux_sigaction (int sig, struct k_sigaction *act, struct k_sigactio
   if (old) {
     if (!user_ok ((u64) old, sizeof *old, 1)) return -LE_EFAULT;
     old->handler = t->sighandlers[us];
-    old->flags = 0; old->restorer = (void (*) (void)) linux_sig_restorer[current_as]; old->mask[0] = old->mask[1] = 0;
+    old->flags = (sa_onstack[current_as] >> us) & 1 ? SA_ONSTACK_ : 0; old->restorer = (void (*) (void)) linux_sig_restorer[current_as]; old->mask[0] = old->mask[1] = 0;
   }
   if (act) {
     if (!user_ok ((u64) act, sizeof *act, 0)) return -LE_EFAULT;
     if (act->restorer) linux_sig_restorer[current_as] = (u64) act->restorer;
     t->sighandlers[us] = act->handler;
+    if (act->flags & SA_ONSTACK_) sa_onstack[current_as] |= 1U @<< us;  else sa_onstack[current_as] &= ~(1U @<< us);
   }
   return 0;
+}
+
+// the stack for signal handlers (sigaltstack): stack_t of Linux/AArch64 is {pointer, int flags, size}
+struct stack_t_ { u64 sp; int flags; u64 size; };
+#define SS_ONSTACK_ 1
+#define SS_DISABLE_ 2
+static struct { u64 sp, size; int as; } altstack[MAX_THREADS];
+
+static int on_altstack (u64 sp) {
+  int me = current_task;
+  return altstack[me].size && altstack[me].as == current_as && sp > altstack[me].sp && sp <= altstack[me].sp + altstack[me].size;
+}
+
+static long linux_sigaltstack (struct stack_t_ *ss, struct stack_t_ *old, u64 sp) {
+  int me = current_task;
+  int valid = altstack[me].size && altstack[me].as == current_as;
+  if (old) {
+    if (!user_ok ((u64) old, sizeof *old, 1)) return -LE_EFAULT;
+    old->sp = valid ? altstack[me].sp : 0;  old->size = valid ? altstack[me].size : 0;
+    old->flags = !valid ? SS_DISABLE_ : on_altstack (sp) ? SS_ONSTACK_ : 0;
+  }
+  if (ss) {
+    if (!user_ok ((u64) ss, sizeof *ss, 0)) return -LE_EFAULT;
+    if (on_altstack (sp)) return -LE_EPERM;                       // not while a handler runs on it
+    if (ss->flags & SS_DISABLE_) { altstack[me].size = 0;  return 0; }
+    if (ss->size < 2048) return -LE_ENOMEM;                       // MINSIGSTKSZ
+    altstack[me].sp = ss->sp;  altstack[me].size = ss->size;  altstack[me].as = current_as;
+  }
+  return 0;
+}
+
+// where arch_signal_check builds the frame: on the alternate stack if the handler asked for it (SA_ONSTACK) and the thread is not on it already
+u64 linux_signal_altstack (int signo, u64 sp) {
+  int me = current_task;
+  if (!(sa_onstack[current_as] & (1U @<< signo)) || !altstack[me].size || altstack[me].as != current_as || on_altstack (sp)) return sp;
+  return altstack[me].sp + altstack[me].size;
 }
 
 // the Linux mask (bit n-1 is signal n) from the book's mask (bit n is signal n), and back
@@ -1140,6 +1186,17 @@ extern void arch_set_clear_tid (thread_id t, u64 addr);
 extern void arch_linux_exit (context_t *r, int code, int group);
 
 // clone: either what musl's fork () asks for (only SIGCHLD in the flags: a copy of the process), or a thread (the flags of pthread_create)
+// sched_getaffinity: every CPU that is online may run the thread (bit n = CPU n). os.cpu_count () and musl's sysconf (_SC_NPROCESSORS_ONLN) count these bits.
+extern int smp_online_cpus (void);
+static long linux_sched_getaffinity (int pid, u64 size, u64 *mask) {
+  if (size < 8 || (size & 7)) return -LE_EINVAL;
+  if (!user_ok ((u64) mask, size, 1)) return -LE_EFAULT;
+  int n = smp_online_cpus ();
+  for (u64 i = 0; i < size / 8; i++) mask[i] = 0;
+  mask[0] = n >= 64 ? ~0UL : (1UL @<< n) - 1;
+  return 8;                                                         // (the number of bytes the kernel wrote)
+}
+
 static long linux_clone (context_t *r, u64 flags, u64 stack, int *ptid, u64 tls, int *ctid) {
   if ((flags & 0xff) == 17 && !(flags & ~0xffUL)) {
     int pid = u_fork (r);
@@ -1155,6 +1212,7 @@ static long linux_clone (context_t *r, u64 flags, u64 stack, int *ptid, u64 tls,
   if (flags & CLONE_PARENT_SETTID) *ptid = tid;
   if (flags & CLONE_CHILD_SETTID)  *ctid = tid;
   if (flags & CLONE_CHILD_CLEARTID) arch_set_clear_tid (tid, (u64) ctid);
+  altstack[tid].size = 0;                                           // (a new thread has no alternate signal stack)
   return tid;
 }
 
@@ -2036,6 +2094,9 @@ static void linux_syscall_inner (context_t *r) {
       arch_linux_exit (r, (int) a0, nr == L_exit_group);      // the end of a thread, or of the process (does not return)
       return;
     case L_sched_yield: syscall_resign (r); ret = 0; break;
+    case L_sched_getaffinity: ret = linux_sched_getaffinity (a0, a1, (u64 *) a2); break;
+    case L_sched_setaffinity: ret = 0; break;                  // (the threads run wherever the scheduler puts them)
+    case L_sigaltstack: ret = linux_sigaltstack ((struct stack_t_ *) a0, (struct stack_t_ *) a1, r->sp_el0); break;
     case L_getpid:  ret = thread_table[current_task].pid; break;
     case L_gettid:  ret = current_task; break;
     case L_set_tid_address: arch_set_clear_tid (current_task, a0); ret = current_task; break;

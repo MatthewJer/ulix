@@ -1380,6 +1380,7 @@ static void fp_load (struct sigframe *sf) {
 // linux_abi.c: the signal numbers, the mask and the restorer function of a program for musl
 extern int linux_signal_number (int signo);
 extern u64 linux_signal_restorer (void);
+extern u64 linux_signal_altstack (int signo, u64 sp);
 
 void arch_check_dying (context_t *f);
 // The kernel shell's [[ps]] prints the program counter, stack pointer and frame pointer of each thread from its [[regs]], which the x86 kernel fills at every
@@ -1401,7 +1402,7 @@ void arch_signal_check (context_t *f) {
     t->sig_pending &= ~(1UL @<< signo);
     sighandler_t h = t->sighandlers[signo];
     if (h == SIG_DFL || h == SIG_IGN) return;                       // cannot happen (u_kill filters them)
-    u64 sp = (f->sp_el0 - sizeof (struct sigframe)) & ~15UL;
+    u64 sp = ((linux_abi_as[current_as] ? linux_signal_altstack (signo, f->sp_el0) : f->sp_el0) - sizeof (struct sigframe)) & ~15UL;   // (sigaltstack)
     u64 ret = linux_abi_as[current_as] ? linux_signal_restorer () : SIGPAGE_VA;
     if (!ret || !user_to_phys (sp, 1) || !user_to_phys (sp + sizeof (struct sigframe) - 1, 1)) {
       printf ("[kernel] no room on the stack of process %d for signal %d\n", t->pid, signo);
