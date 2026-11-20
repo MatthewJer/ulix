@@ -143,6 +143,14 @@ try:
     c.send("cat /etc/rc.conf\n")
     check(c.expect(r"(?s)sshd_enable=\"YES\".*root@ulix\[\d+\]:/root# ", 30), "cat /etc/rc.conf: output of a program comes back (several packets, both directions)")
 
+    # the line editor: the keys arrive as ANSI sequences through the encrypted channel
+    c.send("cat /hello.c\n")
+    check(c.expect(r"(?s)Hello World.*root@ulix\[\d+\]:/root# ", 30), "cat /hello.c prints the file")
+    c.send("\x1b[A\n")
+    check(c.expect(r"(?s)Hello World.*root@ulix\[\d+\]:/root# ", 30), "Up-arrow recalls the last command through ssh, Enter runs it again")
+    c.send("caxt /hello.c" + "\x1b[D" * 10 + "\x7f\x1b[H\x1b[3~c\x1b[FZ\x7f\n")
+    check(c.expect(r"(?s)Hello World.*root@ulix\[\d+\]:/root# ", 30), "Left, Backspace, Home, Delete and End edit a line through ssh")
+
     c2 = Ssh(known)
     refused = not c2.expect(r"ulix login: ", 10)
     time.sleep(1); c2.close()
