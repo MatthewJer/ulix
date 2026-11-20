@@ -2230,26 +2230,117 @@ byte ureadchar (void) {
   return b;
 }
 
+// ---- line editor ----
+// The line is edited in [[s]]: [[len]] characters, the cursor stands before [[s[pos]]]. Every change is drawn with plain characters
+// (backspace moves the cursor to the left, a character moves it to the right, spaces erase), so it works on the UART, in telnet and SSH and on the
+// framebuffer console alike. Lines longer than a terminal line are not handled (the cursor cannot go back over the line break).
+#define HIST_LINES 32
+#define HIST_LEN   256
+#define K_UP 1000
+#define K_DOWN 1001
+#define K_RIGHT 1002
+#define K_LEFT 1003
+#define K_DEL 1004
+static char history[HIST_LINES][HIST_LEN];          // the last lines of this process; line n (n = 0, 1, ...) is in history[n % HIST_LINES]
+static int  hist_count = 0;                         // how many lines were stored since the start
+
+static void out_rep (char c, int n) { while (n-- > 0) write (STDOUT_FILENO, &c, 1); }
+
+// writes s[from..len), then [[extra]] erasing spaces, and puts the cursor back to [[pos]]
+static void redraw (const char *s, int from, int len, int pos, int extra) {
+  if (len > from) write (STDOUT_FILENO, s + from, len - from);
+  out_rep (' ', extra);
+  out_rep ('\010', len + extra - pos);
+}
+
+// replaces the whole line by [[text]] (a line of the history); the cursor ends behind it
+static void set_line (char *s, int maxlength, int *len, int *pos, const char *text) {
+  int n = strlen (text), old = *len;
+  if (n > maxlength) n = maxlength;
+  out_rep ('\010', *pos);
+  memcpy (s, text, n);
+  write (STDOUT_FILENO, s, n);
+  if (old > n) { out_rep (' ', old - n); out_rep ('\010', old - n); }
+  *len = *pos = n;
+}
+
 // maxlength < 0: no newline is printed at the end. A line that is cancelled with ^C is empty; ^D in the first column gives "exit".
+// With echo (the shell, not the password) the keys work as in other shells: Left/Right, Home/End (^A/^E), Backspace and Delete (^D) in the line,
+// Up/Down for the lines of the history, ^U clears the line. A cursor key arrives as an ANSI sequence: ESC [ A, ESC O A, ESC [ H, ESC [ 3 ~ ...
 int ureadline (char *s, int maxlength, boolean echo) {
-  int print_newline = 1, pos = 0;
+  int print_newline = 1, len = 0, pos = 0, hpos = 0;         // hpos: how many lines back in the history (0: the line that is being typed)
+  char saved[HIST_LEN];                                      // the line that was typed before the first Up
+  int pending = -1;                                          // a key that followed an Esc without belonging to a sequence
   if (maxlength < 0) { print_newline = 0; maxlength = -maxlength; }
+  saved[0] = 0;
   for (;;) {
-    byte c = 0;
-    if (read (STDIN_FILENO, &c, 1) == 0) return -1;
-    if (c == 0 || c == 27 || c > 190) continue;                   // Esc, cursor and other keys
+    byte b = 0;
+    int c;                                                   // the key: a character, or K_UP ... for a cursor key
+    if (pending >= 0) { b = pending; pending = -1; }
+    else if (read (STDIN_FILENO, &b, 1) == 0) return -1;
+    c = b;
+    if (c == 27) {                                           // Esc: the start of a sequence, or a single key
+      byte d = 0;
+      if (read (STDIN_FILENO, &d, 1) == 0) return -1;
+      if (d == '[' || d == 'O') {
+        int num = 0;
+        for (;;) {
+          if (read (STDIN_FILENO, &d, 1) == 0) return -1;
+          if (d >= '0' && d <= '9') num = num * 10 + d - '0';
+          else if (d >= '@' && d <= '~') break;              // the last byte of a sequence
+        }
+        if (d == '~') d = num == 1 || num == 7 ? 'H' : num == 4 || num == 8 ? 'F' : num == 3 ? 'x' : 0;   // ESC [ 3 ~ is Delete
+        c = d == 'A' ? K_UP : d == 'B' ? K_DOWN : d == 'C' ? K_RIGHT : d == 'D' ? K_LEFT : d == 'H' ? 1 : d == 'F' ? 5 : d == 'x' ? K_DEL : 0;
+      } else { pending = d; continue; }
+    }
+    if (c == 0 || (c >= 128 && c < 1000) || (c >= 1000 && !echo)) continue;
     if (c == 3) { s[0] = 0; if (echo) write (STDOUT_FILENO, "\n", 1); return 0; }
-    if (c == 4 && pos == 0) { strcpy (s, "exit"); if (echo) write (STDOUT_FILENO, "exit\n", 5); return 0; }
-    if (c == 0x08 && pos > 0) {
-      pos--;
-      if (echo) write (STDOUT_FILENO, "\010 \010", 3);
-    } else if (c == '\n') {
+    if (c == 4 && len == 0) { strcpy (s, "exit"); if (echo) write (STDOUT_FILENO, "exit\n", 5); return 0; }
+    if (c == '\n') {
       if (print_newline && echo) write (STDOUT_FILENO, "\n", 1);
-      s[pos] = 0;
+      s[len] = 0;
+      if (echo && len > 0 && (hist_count == 0 || strcmp (history[(hist_count - 1) % HIST_LINES], s) != 0)) {
+        strncpy (history[hist_count % HIST_LINES], s, HIST_LEN - 1);
+        history[hist_count % HIST_LINES][HIST_LEN - 1] = 0;
+        hist_count++;
+      }
       return 0;
-    } else if (c != 0x08 && pos < maxlength) {
-      if (echo) write (STDOUT_FILENO, &c, 1);
-      s[pos++] = c;
+    }
+    if (!echo) {                                             // no editing: only Backspace at the end
+      if (c == 0x08 && len > 0) len--;
+      else if (c >= 32 && len < maxlength) s[len++] = c;
+      continue;
+    }
+    if (c == 0x08) {                                         // Backspace
+      if (pos == 0) continue;
+      memmove (s + pos - 1, s + pos, len - pos);
+      pos--; len--;
+      write (STDOUT_FILENO, "\010", 1);
+      redraw (s, pos, len, pos, 1);
+    } else if (c == K_DEL || c == 4) {                     // Delete, ^D with text
+      if (pos == len) continue;
+      memmove (s + pos, s + pos + 1, len - pos - 1);
+      len--;
+      redraw (s, pos, len, pos, 1);
+    } else if (c == K_LEFT || c == 2) { if (pos > 0) { pos--; write (STDOUT_FILENO, "\010", 1); } }
+    else if (c == K_RIGHT || c == 6) { if (pos < len) { write (STDOUT_FILENO, s + pos, 1); pos++; } }
+    else if (c == 1) { out_rep ('\010', pos); pos = 0; }
+    else if (c == 5) { write (STDOUT_FILENO, s + pos, len - pos); pos = len; }
+    else if (c == 21) { set_line (s, maxlength, &len, &pos, ""); }
+    else if (c == K_UP || c == K_DOWN) {               // Up, Down: older or newer line
+      int avail = hist_count < HIST_LINES ? hist_count : HIST_LINES;
+      if (c == K_UP && hpos < avail) {
+        if (hpos == 0) { s[len] = 0; strncpy (saved, s, HIST_LEN - 1); saved[HIST_LEN - 1] = 0; }
+        hpos++;
+        set_line (s, maxlength, &len, &pos, history[(hist_count - hpos) % HIST_LINES]);
+      } else if (c == K_DOWN && hpos > 0) {
+        hpos--;
+        set_line (s, maxlength, &len, &pos, hpos == 0 ? saved : history[(hist_count - hpos) % HIST_LINES]);
+      }
+    } else if (c >= 32 && len < maxlength) {                 // insert at the cursor
+      memmove (s + pos + 1, s + pos, len - pos);
+      s[pos++] = c; len++;
+      redraw (s, pos - 1, len, pos, 0);
     }
   }
 }
