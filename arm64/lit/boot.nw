@@ -727,7 +727,7 @@ static void disk_test (void) {
   }
   int n = 0;
   minix_readdir (1, count_cb, &n);
-  CHECK (n == 34, "root directory has 34 entries (16 from x86 Ulix + 18 AArch64 files and directories)");
+  CHECK (n == 35, "root directory has 35 entries (16 from x86 Ulix + 19 AArch64 files and directories, among them /var)");
   n = 0;
   minix_readdir (minix_lookup ("/bin"), count_cb, &n);
   CHECK (n == 83 || n == 85, "/bin has 83 entries (85 with tar and unzip, ARCHIVE=1) (the programs of lib-build/tools, init, ping, ping6, host, ifconfig, route, dhclient, top, shutdown, poweroff, reboot, sntp, rand, https, daemon, service, heartbeat, echod, ptytest, telnetd and sshd)");
