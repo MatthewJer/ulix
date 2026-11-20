@@ -357,13 +357,13 @@ void arch_threads_init (void) {
   arch_buffer_init ();
   scheduler_is_active = true;
   arch_swap_init ();                           // the book opens /tmp/swap when the system starts
-  book_scheduler_on = 1;
-  smp_start ();                                // the other CPUs
   // Thread 1 holds the kernel lock from here on, like every other thread in the kernel, and so it runs with interrupts masked. Its
   // waits (arch_idle, arch_resign in a loop, arch_poll_pause) open the windows in which the lock is free and interrupts are let in.
   // With interrupts unmasked, a timer tick in the middle of its work on the shared data (frame allocator, thread table, buffer cache) ran
   // the scheduler inside that update and let other threads see it half done.
-  __asm__ volatile ("msr daifset, #2" ::: "memory");
+  __asm__ volatile ("msr daifset, #2" ::: "memory");   // (before smp_start: it waits for the other CPUs, and a tick in that wait was the one that got through)
+  book_scheduler_on = 1;
+  smp_start ();                                // the other CPUs
 }
 
 @
