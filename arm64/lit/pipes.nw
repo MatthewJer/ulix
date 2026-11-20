@@ -453,6 +453,8 @@ static void fs_enter (void) {
 int fs_busy_by_me (void) { return fs_owner == current_task; }      // swap.c: the thread is inside the file system code
 
 static void fs_leave (void) { if (--fs_depth <= 0) { fs_owner = -1;  fs_depth = 0; } }
+void swap_fs_enter (void) { fs_enter (); }            // memory.nw: the swap file is read inside the file system lock, too
+void swap_fs_leave (void) { fs_leave (); }
 
 int u_stat (const char *path, struct stat *buf)    { fs_enter ();  int r = book_u_stat (path, buf);  fs_leave ();  return r; }
 int u_unlink (const char *path)                    { fs_enter ();  int r = book_u_unlink (path);  fs_leave ();  return r; }
