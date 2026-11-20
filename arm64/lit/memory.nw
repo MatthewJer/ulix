@@ -242,6 +242,7 @@ give up one reference; the frame is free when nobody uses it any more
 
 <<mmu.c: free_frame>>=
 void free_frame (u64 pa) {
+  if (REFS (pa) == 0) { printf ("[kernel] BUG: free_frame (0x%lx) of a frame that is free already (caller 0x%lx)\n", pa, (u64) __builtin_return_address (0));  return; }
   if (--REFS (pa) > 0) return;
   *(u64 *)KVA (pa) = free_list;
   free_list = pa;
@@ -269,7 +270,9 @@ static u64 *walk (u64 *l0, u64 va, int create) {
       if (!create) return 0;
       u64 t = alloc_frame_try ();
       if (!t) return 0;                     // (map_page_in fails, the caller handles it)
-      *e = t | PTE_TABLE;
+      // alloc_frame_try can swap a page out and wait for the disk: another thread of the program may have made this table meanwhile
+      if (*e & PTE_VALID) free_frame (t);
+      else *e = t | PTE_TABLE;
     } else if ((*e & 3) == 1) {
       return 0;                             // 1 GB / 2 MB block: can't descend
     }
@@ -409,6 +412,11 @@ int cow_fault (u64 l0_pa, u64 va) {
   } else {
     u64 pa = alloc_frame_try ();
     if (!pa) return 0;                                      // no memory for the copy: the process cannot go on
+    // alloc_frame_try can wait for the disk (it swaps a page out): the entry may have changed meanwhile (another thread copied the page, the
+    // other process that shared it did, the program ended). Then the copy is not needed, or not for this frame: let the fault happen again.
+    e = walk (KVA (l0_pa), va & ~(PAGE_SIZE - 1), 0);
+    if (!e || (*e & PTE_ADDR) != old || !(*e & PTE_VALID) || !(*e & PTE_COW)) { free_frame (pa);  return 1; }
+    if (REFS (old) == 1) { *e = old | flags;  __asm__ volatile ("dsb ishst; tlbi vaae1is, %0; dsb ish; isb" :: "r" (va >> 12));  free_frame (pa);  return 1; }
     u64 *src = KVA (old), *dst = KVA (pa);
     for (int i = 0; i < (int)(PAGE_SIZE / 8); i++) dst[i] = src[i];
     REFS (old)--;                                          // we no longer use the shared frame
@@ -649,6 +657,7 @@ int page_out (int as, int pageno) {
     swap_free_est -= 5;                                    // a page is 4 blocks, plus a block for the file's indirect table now and then
   }
   int l = swap_io_enter ();
+  if (arch_as_l0 (as) != l0 || address_spaces[as].status != AS_USED) { swap_io_leave (l);  return -1; }   // (the program ended while we waited: its tables are gone)
   e = pte_of (l0, va);                                     // (the tables may have changed while we waited)
   if (!e || !(*e & PTE_VALID) || (*e & PTE_ADDR) != pa) { swap_io_leave (l); return -1; }
   u64 old = *e;
@@ -686,6 +695,7 @@ int page_in (int as, int pageno) {
   u64 pa = alloc_frame_try ();                             // reserve a frame
   if (!pa) return -1;
   int l = swap_io_enter ();
+  if (arch_as_l0 (as) != l0 || address_spaces[as].status != AS_USED) { swap_io_leave (l);  free_frame (pa);  return -1; }   // (the program ended while we waited)
   e = pte_of (l0, va);
   if (!e || (*e & PTE_VALID)) {                            // somebody else brought the page back while we waited
     swap_io_leave (l);  free_frame (pa);
