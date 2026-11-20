@@ -1011,7 +1011,6 @@ All of `lib-build/tools` and `userland/` except the list below; including `init`
 
 The remaining table above; the musl programs are about three times as big as the ulixlib ones (`cat` 130 KByte instead of 4), which makes the disk image bigger and `vi` start a little slower.
 
-<<<<<<< HEAD
 ## 58. Lock audit (branches `m3-lock-audit`, `m3-lock-audit2`)
 
 Static audit of the big kernel lock (BKL) and the places where interrupts are let in. Findings and fixes:
@@ -1021,7 +1020,7 @@ Static audit of the big kernel lock (BKL) and the places where interrupts are le
 - **User pointers.** `user_ok` accepted a length that wraps around the end of the address space (`va + len < va`): the loop did not run and the kernel wrote through an unchecked range. Fixed. No regression test yet (needs a musl program that calls a system call with length -1).
 - Checked and fine: wake-ups in pipes, futex, network are under the BKL with interrupts masked (no lost wake-up); DMA cache maintenance of virtio-blk, virtio-net and genet is symmetric (clean before, flush/invalidate after); the SD card is PIO (no ADMA2).
 - **Doubtful / not reviewed:** pipe/futex/net waits ignore a signal (loop again, no EINTR; topic of `m3-signals`); lock ordering fs/hd/paging/swapper/exec/run_lock only skimmed (all are sleeping book mutexes taken under the BKL, hd lock inside the fs lock); frame allocator, buffer cache, TLB shootdown, stack depth (BearSSL, printf), `uchan`/`usem` not reviewed.
-=======
+
 ## 60. The hang with a larger descriptor table: kernel threads had `files[]` = 0 (2026-11-20, branch `m3-fd-hang`, issue #138)
 
 **Cause (section 50 had left it open).** `arch_thread_create` (kernel threads, `lit/processes.nw`) makes the `TCB` with `memset (t, 0, sizeof (TCB))` and set no `files[]`. Zero is a valid global descriptor (file system 0, entry 0). `syscall_exit` closes every entry that is not -1, so a thread's exit called `u_close (0)` for each entry of the table: with 16 entries the damage was small (and apparently harmless in the tests), with 32 or 64 the same loop closed the global descriptor 0 up to 64 times, which now also counts down `file_users[]` and the book's `mx_close` of whatever file used entry 0. The process that the test started next could no longer run its exit (the parent's `waitpid` never returned): the kernel stood in the idle loop and the scheduler (the samples in `book_scheduler` of section 50 were the idle thread calling it all the time, not a loop inside it).
@@ -1029,4 +1028,3 @@ Static audit of the big kernel lock (BKL) and the places where interrupts are le
 **Fix.** Every entry of `files[]` of a kernel thread is -1 (the other ways to make a TCB, `tcb_init_process` and `fork`, already set all `MAX_PFD` entries). Then `PORT_PFD ?= 64`: the table has 64 entries, a program can open 61 files. `fdtest` opens until `EMFILE` and requires at least 60 (and the same number again after closing).
 
 **Tests.** `QEMU_FAST=1 tools/run_kernel_tests.sh ulix.bin disk.img LOG -smp N` for N = 1, 2, 4: 209 checks, all passed; one normal run with `-smp 2`: the same; `make python-test`: all passed (modtest 20 s). The global table `mx_status` (256 entries for all processes) is still a limit for many processes with many open files.
->>>>>>> 5dc5d41 (Kernel threads start with files[] = -1 (exit closed global descriptor 0 once per table entry: the hang with a larger table); MAX_PFD 64, fdtest opens 60 files (issue #138))
