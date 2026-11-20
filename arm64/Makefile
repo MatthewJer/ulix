@@ -165,10 +165,18 @@ ulix.elf: $(OBJS) ulix.ld
 # ---- kernel code taken from the book (ulix-book.nw) ----
 # notangle assembles declarations / globals / functions from the book's chunks; port.py
 # picks the functions listed in port.manifest.  The result is compiled unchanged.
-PORT_PFD ?= 64   # (ARM64-PORT.md section 60)
+# descriptors per process (ARM64-PORT.md section 60); no comment behind the value: it would become part of it
+PORT_PFD ?= 64
 GENFILES = $(GENDIR)/ulix-decl.h $(GENDIR)/ulix-globals.c $(GENDIR)/ulix-functions.c $(GENDIR)/ulix-init.c
 
-$(GENFILES): ../ulix-book.nw ulix-arm64.nw Makefile
+# The objects depend on the generated headers (struct TCB has MAX_PFD descriptors: an object compiled with another MAX_PFD reads the
+# fields behind files[] at the wrong offset, ARM64-PORT.md section 64). A stamp per value of PORT_PFD makes a change of it count.
+$(GENDIR)/pfd-$(PORT_PFD).stamp:
+	mkdir -p $(GENDIR)
+	rm -f $(GENDIR)/pfd-*.stamp
+	touch $@
+
+$(GENFILES): ../ulix-book.nw ulix-arm64.nw Makefile $(GENDIR)/pfd-$(PORT_PFD).stamp
 	mkdir -p $(GENDIR)
 	for r in ulix-decl.h ulix-globals.c ulix-functions.c ulix-init.c; do \
 	  notangle -L -R$$r ../ulix-book.nw ulix-arm64.nw 2>/dev/null | sed 's/^#line .*//' > $(GENDIR)/$$r; \
@@ -244,10 +252,10 @@ virtionet.o genet.o netdev.o net.o ip6.o tcp.o dhcp.o dns.o netconf.o echo.o net
 random.o: plat.h ulix.h cache.h
 sdcard.o: delay.h
 
-%.o: %.S
+%.o: %.S $(GENDIR)/ulix-decl.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-%.o: %.c
+%.o: %.c $(GENDIR)/ulix-decl.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # ---- Raspberry Pi 4B (see PRINCIPLES.md) ----

@@ -188,6 +188,12 @@ clean:
 MUSLTOOLS = echo cat wc grep diff mkdir rmdir rm touch stat cp ls hexdump bindump ascii print args exit42 trunc chmod chown chgrp df sync kill fault-div0 fault-mem testcp stdio inode keys clear free ps pw swapper top ping ping6 host shutdown poweroff reboot sntp rand daemon service heartbeat echod fork1 fork2 fork3 fbomb filecomm ptree vi tp su sh init2 telnetd login xlogin init readelf memwrite recurse ifconfig route dhclient ptytest
 SYSROOT   = $(abspath ../libc/build/sysroot)
 PORT_PFD ?= 64
+# (a change of PORT_PFD must rebuild the programs: the stamp is a prerequisite of their objects)
+$(BUILD)/pfd-$(PORT_PFD).stamp:
+	mkdir -p $(BUILD)
+	rm -f $(BUILD)/pfd-*.stamp
+	touch $@
+
 MCFLAGS   = -DMAX_PFD=$(PORT_PFD) -O0 -fno-pic -mno-outline-atomics -fsanitize=integer-divide-by-zero -fsanitize-undefined-trap-on-error -std=gnu99 -w -Wno-error=return-mismatch -Wno-error=implicit-int -Wno-error=implicit-function-declaration -Wno-error=int-conversion -Wno-error=incompatible-pointer-types \
             -nostdinc -isystem $(SYSROOT)/include -isystem $(shell $(CC) -print-file-name=include)
 MUSLPROGS = $(addprefix $(BUILD)/bin/,$(addsuffix .elf,$(MUSLTOOLS)))
@@ -212,10 +218,10 @@ $(BUILD)/musl/tools/%.c: $(BUILD)/tools/%.c $(BUILD)/musl/arm64-extra.h
 	mkdir -p $(BUILD)/musl/tools
 	perl -pe '$$_ = "" if /^#define (O_\w+|S_\w+|SEEK_\w+)\s/; $(foreach f,$(RENAME_$*),s/\b$(f)\b/$*_$(f)/g;)' $< > $@
 
-$(BUILD)/musl/tools/%.o: $(BUILD)/musl/tools/%.c $(BUILD)/musl/ulixlib.h $(SYSROOT)/lib/libc.a
+$(BUILD)/musl/tools/%.o: $(BUILD)/musl/tools/%.c $(BUILD)/musl/ulixlib.h $(SYSROOT)/lib/libc.a $(BUILD)/pfd-$(PORT_PFD).stamp
 	$(CC) $(MCFLAGS) -c -o $@ $<
 
-$(BUILD)/musl/ulixcompat.o: musl/ulixcompat.c musl/ulixlib.h $(SYSROOT)/lib/libc.a
+$(BUILD)/musl/ulixcompat.o: musl/ulixcompat.c musl/ulixlib.h $(SYSROOT)/lib/libc.a $(BUILD)/pfd-$(PORT_PFD).stamp
 	mkdir -p $(BUILD)/musl
 	$(CC) $(MCFLAGS) -Imusl -c -o $@ $<
 

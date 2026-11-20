@@ -1054,3 +1054,11 @@ Static audit of the big kernel lock (BKL) and the places where interrupts are le
 **Fix.** `ulixlib.h` takes `MAX_PFD` from the compiler flag `-DMAX_PFD=$(PORT_PFD)` (`userland/Makefile`, `MCFLAGS`; the top-level Makefile passes `PORT_PFD`), default 64. Kernel and user space now always agree. After changing `PORT_PFD` run `make -C userland clean`.
 
 **Test.** `QEMU_FAST=1 make shell-test`: all passed.
+
+## 64. Stale kernel objects after the change of MAX_PFD: the pseudo terminal failed (2026-11-20, branch `m3-pty-fix`)
+
+**Symptom.** On a tree that had been built before `MAX_PFD` became 64 (section 60), `ptytest`, telnetd and the other users of the pseudo terminal failed in `pcheck` (login prompt of terminal 5 never painted into the ring), although a clean build of the same commit passed every test, also with `make TLS=1`.
+
+**Cause.** The objects did not depend on the generated headers (`gen/ulix-decl.h` with `struct TCB`, whose `files[MAX_PFD]` sits before `terminal` and the fields behind it): `arch_vt.o` of 14 November was linked with `ulix-port.o` of 20 November and read `terminal` 192 bytes off. `PORT_PFD=16 make` did not even regenerate `gen/` (the generated files depend only on the books and the Makefile). Found by running the maintainer's `ulix-shell.bin` with a freshly built disk (fails) and a freshly built kernel with the maintainer's disk (passes). In addition `PORT_PFD ?= 64   # comment` made the value `64` followed by blanks.
+
+**Fix.** Every kernel object depends on `gen/ulix-decl.h`; a stamp file per value of `PORT_PFD` (`gen/pfd-N.stamp`, `userland/build/pfd-N.stamp`) is a prerequisite of the generated files and of the musl programs, so a changed `PORT_PFD` rebuilds kernel and programs. The comment behind `PORT_PFD ?= 64` is gone.
