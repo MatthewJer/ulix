@@ -388,6 +388,22 @@ static int user_ok (u64 va, u64 len, int write) {
 }
 
 @
+A [[read]] may ask for more bytes than the buffer holds (a program with a 32 byte buffer that calls [[read (fd, buf, 1023)]] on a small file: the
+file has only a few bytes and Linux copies just those). The kernel does not know how many bytes the file will give, so for [[read]] the count is shortened
+to the part of the buffer that is mapped; only a buffer that is not mapped at its very start is an error.
+
+<<linux_abi.c: user pointers>>=
+static u64 user_ok_prefix (u64 va, u64 len, int write) {      // how many bytes from va on are all right (at most len)
+  if (va + len < va) return 0;
+  u64 n = 0;
+  for (u64 p = va & ~4095UL; p < va + len; p += 4096) {
+    if (!user_to_phys (p < va ? va : p, write)) break;
+    n = p + 4096 - va;
+  }
+  return n < len ? n : len;
+}
+
+@
 A string (a file name) has no length that the kernel knows in advance, so it is checked as it is read: every page it touches
 must be readable, up to the largest name the book's file functions accept (255 bytes).
 
@@ -2407,7 +2423,9 @@ static void linux_syscall_inner (context_t *r) {
       return;
 
     // files
-    case L_read:   if (!user_ok (a1, a2, 1)) { ret = -LE_EFAULT; break; }
+    case L_read:   { u64 ok = user_ok_prefix (a1, a2, 1);                 // (a count that is too big for the buffer is shortened)
+                     if (ok == 0 && a2 != 0) { ret = -LE_EFAULT; break; }
+                     a2 = ok; }
                    ret = ulix_call (r, syscall_read,  a0, a1, a2, 0, 0); if (ret < 0) ret = linux_error (LE_EBADF); break;
     case L_write:  if (!user_ok (a1, a2, 0)) { ret = -LE_EFAULT; break; }
                    ret = ulix_call (r, syscall_write, a0, a1, a2, 0, 0); if (ret < 0) ret = linux_error (LE_EBADF); break;
