@@ -870,7 +870,7 @@ int proc_test (void) {
   capture_stop (&out);
   arch_threads_reap ();
   CHECK (pid > 0 && thread_table[pid].exitcode == 0, "/musl/fdtest finished with exit status 0 (no failed checks)");
-  CHECK (count_in (out, "user FAIL") == 0 && count_in (out, "user ok:") == 13, "all 13 descriptor checks passed: dup, dup2 and fork share the position of a file, EMFILE, nothing leaked");
+  CHECK (count_in (out, "user FAIL") == 0 && count_in (out, "user ok:") == 37, "all 37 checks passed: dup, dup2 and fork share the position of a file, EMFILE, nothing leaked, bad pointers give EFAULT");
   CHECK (live_threads () == 0, "no process is left");
   char *mthr_argv[] = { "threadtest", 0 };                    // threads: clone, futex, thread-local variables, exit with threads (musl's pthreads)
   capture_start ();

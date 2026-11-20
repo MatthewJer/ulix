@@ -382,12 +382,25 @@ A string (a file name) has no length that the kernel knows in advance, so it is 
 must be readable, up to the largest name the book's file functions accept (255 bytes).
 
 <<linux_abi.c: user pointers>>=
-static int user_string_ok (u64 va) {
-  for (int i = 0; i < 256; i++, va++) {
+static int user_cstr_ok (u64 va, u64 max) {                   // a string of at most max bytes (with the zero)
+  for (u64 i = 0; i < max; i++, va++) {
     if ((i == 0 || (va & 4095) == 0) && !user_to_phys (va, 0)) return 0;
     if (*(char *) va == 0) return 1;
   }
   return 0;                                                   // too long
+}
+
+static int user_string_ok (u64 va) { return user_cstr_ok (va, 256); }
+
+// the argument list of execve: the array and every string in it must be readable (the book's execv walks them without a check)
+static int user_argv_ok (u64 av) {
+  for (int i = 0; i < 4096; i++) {
+    if (!user_ok (av + 8 * (u64) i, 8, 0)) return 0;
+    u64 s = ((u64 *) av)[i];
+    if (!s) return 1;
+    if (!user_cstr_ok (s, 131072)) return 0;
+  }
+  return 0;
 }
 
 @
@@ -1064,6 +1077,8 @@ static long ulix_call (context_t *r, void (*handler) (context_t *), long a, long
 static long linux_iov (context_t *r, int write, int fd, struct iovec *iov, int n) {
   if (n < 0 || n > 1024 || !user_ok ((u64) iov, n * sizeof *iov, 0)) return -LE_EFAULT;
   long total = 0;
+  for (int i = 0; i < n; i++)                                   // (all buffers first: no transfer happens if one of them is bad)
+    if (!user_ok ((u64) iov[i].base, iov[i].len, !write)) return -LE_EFAULT;
   for (int i = 0; i < n; i++) {
     if (!iov[i].len) continue;
     long k = ulix_call (r, write ? syscall_write : syscall_read, fd, (long) iov[i].base, iov[i].len, 0, 0);
@@ -1852,7 +1867,8 @@ static long poll_count (void *p) {
 }
 
 static long linux_ppoll (struct pollfd_ *fds, unsigned n, struct ts *timeout) {
-  if (n > 64 || !user_ok ((u64) fds, n * sizeof *fds, 1)) return -LE_EINVAL;
+  if (n > 64) return -LE_EINVAL;
+  if (!user_ok ((u64) fds, n * sizeof *fds, 1) || (timeout && !user_ok ((u64) timeout, sizeof *timeout, 0))) return -LE_EFAULT;
   struct poll_args a = { fds, n };
   return poll_wait (poll_count, &a, timeout ? timeout : 0);
 }
@@ -2133,7 +2149,7 @@ static void linux_syscall_inner (context_t *r) {
   switch (nr) {
     case L_rt_sigreturn: syscall_sigreturn (r); return;
     case L_execve:
-      if (!user_ok (a0, 1, 0) || !a1 || !user_ok (a1, 8, 0)) { r->x0 = -LE_EFAULT; return; }
+      if (!user_string_ok (a0) || !a1 || !user_argv_ok (a1)) { r->x0 = -LE_EFAULT; return; }
       r->ebx = a0; r->ecx = a1;
       syscall_execv (r);                                      // on success it has set the new program counter and stack
       if (r->eip != saved.eip) return;                        // the new program starts
@@ -2143,8 +2159,10 @@ static void linux_syscall_inner (context_t *r) {
       return;
 
     // files
-    case L_read:   ret = ulix_call (r, syscall_read,  a0, a1, a2, 0, 0); if (ret < 0) ret = linux_error (LE_EBADF); break;
-    case L_write:  ret = ulix_call (r, syscall_write, a0, a1, a2, 0, 0); if (ret < 0) ret = linux_error (LE_EBADF); break;
+    case L_read:   if (!user_ok (a1, a2, 1)) { ret = -LE_EFAULT; break; }
+                   ret = ulix_call (r, syscall_read,  a0, a1, a2, 0, 0); if (ret < 0) ret = linux_error (LE_EBADF); break;
+    case L_write:  if (!user_ok (a1, a2, 0)) { ret = -LE_EFAULT; break; }
+                   ret = ulix_call (r, syscall_write, a0, a1, a2, 0, 0); if (ret < 0) ret = linux_error (LE_EBADF); break;
     case L_readv:  ret = linux_iov (r, 0, a0, (struct iovec *) a1, a2); break;
     case L_writev: ret = linux_iov (r, 1, a0, (struct iovec *) a1, a2); break;
     case L_openat: ret = linux_openat (r, a0, (const char *) a1, a2); break;
@@ -3009,6 +3027,48 @@ static int fill_table (int *fds, int max) {                    // open /test.txt
   return n;
 }
 
+// System calls with pointers that are not good (not mapped, a kernel address, a length that wraps around): -EFAULT, and the kernel goes on.
+#include <sys/syscall.h>
+#include <sys/uio.h>
+#include <sys/socket.h>
+static int is_efault (long r) { return r == -1 && errno == EFAULT; }
+#define BAD_KERNEL ((void *) 0xffff000040000000UL)
+static void badptr_checks (void) {
+  int fd = open ("/test.txt", O_RDONLY), dfd = open ("/", O_RDONLY);
+  char buf[16];
+  struct iovec bad_base = { (void *) 0, 8 }, bad_len = { buf, (size_t) -1 };
+  struct msghdr mh;
+  memset (&mh, 0, sizeof mh);
+  CHECK (is_efault (syscall (SYS_read, fd, (void *) 0, 10)), "read into the address 0: EFAULT");
+  CHECK (is_efault (syscall (SYS_read, fd, BAD_KERNEL, 10)), "read into a kernel address: EFAULT");
+  CHECK (is_efault (syscall (SYS_read, fd, buf, (size_t) -1)), "read with length -1 (wraps around): EFAULT");
+  CHECK (is_efault (syscall (SYS_write, 1, (void *) 0x10, 5)), "write from an unmapped address: EFAULT");
+  CHECK (is_efault (syscall (SYS_write, 1, BAD_KERNEL, 5)), "write from a kernel address: EFAULT");
+  CHECK (is_efault (syscall (SYS_readv, fd, &bad_base, 1)), "readv with an unmapped buffer: EFAULT");
+  CHECK (is_efault (syscall (SYS_writev, 1, &bad_len, 1)), "writev with length -1: EFAULT");
+  CHECK (is_efault (syscall (SYS_readv, fd, (void *) 0, 3)), "readv with the iovec array at 0: EFAULT");
+  CHECK (is_efault (syscall (SYS_getrandom, (void *) 0, 16, 0)), "getrandom into the address 0: EFAULT");
+  CHECK (is_efault (syscall (SYS_getrandom, buf, (size_t) -1, 0)), "getrandom with length -1: EFAULT");
+  CHECK (is_efault (syscall (SYS_clock_gettime, 0, (void *) 0x10)), "clock_gettime into an unmapped address: EFAULT");
+  CHECK (is_efault (syscall (SYS_uname, BAD_KERNEL)), "uname into a kernel address: EFAULT");
+  CHECK (is_efault (syscall (SYS_openat, AT_FDCWD, (void *) 0, O_RDONLY, 0)), "openat with the name at 0: EFAULT");
+  CHECK (is_efault (syscall (SYS_openat, AT_FDCWD, BAD_KERNEL, O_RDONLY, 0)), "openat with a name in the kernel: EFAULT");
+  CHECK (is_efault (syscall (SYS_newfstatat, AT_FDCWD, "/test.txt", (void *) 0x10, 0)), "stat into an unmapped address: EFAULT");
+  CHECK (is_efault (syscall (SYS_getdents64, dfd, (void *) 0, 100)), "getdents64 into the address 0: EFAULT");
+  CHECK (is_efault (syscall (SYS_getcwd, (void *) 0, 100)), "getcwd into the address 0: EFAULT");
+  char *argv_bad[] = { (char *) 0x10, 0 };
+  CHECK (is_efault (syscall (SYS_execve, "/musl/hello", (void *) 0x10, 0)), "execve with argv at an unmapped address: EFAULT");
+  CHECK (is_efault (syscall (SYS_execve, "/musl/hello", argv_bad, 0)), "execve with an argument string at an unmapped address: EFAULT");
+  CHECK (is_efault (syscall (SYS_ppoll, (void *) 0x10, 2, 0, 0, 0)), "ppoll with the array at an unmapped address: EFAULT");
+  int sv = socket (AF_INET, SOCK_DGRAM, 0);
+  mh.msg_iov = &bad_base;  mh.msg_iovlen = 1;
+  CHECK (sv < 0 || is_efault (syscall (SYS_sendmsg, sv, &mh, 0)), "sendmsg with an unmapped buffer: EFAULT");
+  CHECK (sv < 0 || is_efault (syscall (SYS_sendmsg, sv, (void *) 0x10, 0)), "sendmsg with the message header at an unmapped address: EFAULT");
+  CHECK (sv < 0 || is_efault (syscall (SYS_connect, sv, (void *) 0x10, 16)), "connect with the address at an unmapped address: EFAULT");
+  CHECK (sv < 0 || is_efault (syscall (SYS_recvfrom, sv, (void *) 0, 16, MSG_DONTWAIT, 0, 0)), "recvfrom into the address 0: EFAULT");
+  printf ("  user info: bad pointers survived\n");
+}
+
 int main (void) {
   char buf[64];
   int fd = open ("/test.txt", O_RDONLY);
@@ -3045,6 +3105,7 @@ int main (void) {
   int m = fill_table (fds, 1100);
   CHECK (m == n, "after closing them all, the same number can be opened again (nothing leaked)");
   for (int i = 0; i < m; i++) close (fds[i]);
+  badptr_checks ();
   return fails;
 }
 @
