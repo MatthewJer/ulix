@@ -216,7 +216,7 @@ $(BUILD)/musl/arm64-extra.h: arm64-extra.h
 
 $(BUILD)/musl/tools/%.c: $(BUILD)/tools/%.c $(BUILD)/musl/arm64-extra.h
 	mkdir -p $(BUILD)/musl/tools
-	perl -pe '$$_ = "" if /^#define (O_\w+|S_\w+|SEEK_\w+)\s/; $(foreach f,$(RENAME_$*),s/\b$(f)\b/$*_$(f)/g;)' $< > $@
+	perl -pe '$$_ = "" if /^#define (O_\w+|S_\w+|SEEK_\w+)\s/; s/\bprintf \((?="%s\@ulix)/ureadline_prompt (/; $(foreach f,$(RENAME_$*),s/\b$(f)\b/$*_$(f)/g;)' $< > $@
 
 $(BUILD)/musl/tools/%.o: $(BUILD)/musl/tools/%.c $(BUILD)/musl/ulixlib.h $(SYSROOT)/lib/libc.a $(BUILD)/pfd-$(PORT_PFD).stamp
 	$(CC) $(MCFLAGS) -c -o $@ $<

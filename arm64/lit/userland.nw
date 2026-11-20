@@ -2033,7 +2033,8 @@ int ulix_chmod (const char *path, short mode);
 int ulix_chown (const char *path, short owner, short group);
 
 int  atoi8 (char *s);                                        // like atoi, for octal numbers
-int  ureadline (char *s, int maxlength, boolean echo);       // a line from the terminal with backspace, ^C and ^D
+int  ureadline (char *s, int maxlength, boolean echo);       // a line from the terminal with editing, history and Tab completion, ^C and ^D
+int  ureadline_prompt (const char *format, ...);               // printf for the prompt: the line editor learns its width
 byte ureadchar (void);
 
 struct dir_entry {
@@ -2194,6 +2195,9 @@ programs that ask a question) with the same keys; only the output goes through [
 <<userland/musl/ulixcompat.c>>=
 #include "ulixlib.h"
 #include <sys/syscall.h>
+#include <sys/ioctl.h>
+#include <dirent.h>
+#include <stdarg.h>
 
 #define ULIX_BASE      1024        // 1024 + n is the book's system call n (linux_abi.c)
 #define NR_get_errno    501
@@ -2231,18 +2235,159 @@ byte ureadchar (void) {
 }
 
 // ---- line editor ----
-// The line is edited in [[s]]: [[len]] characters, the cursor stands before [[s[pos]]]. Every change is drawn with plain characters
-// (backspace moves the cursor to the left, a character moves it to the right, spaces erase), so it works on the UART, in telnet and SSH and on the
-// framebuffer console alike. Lines longer than a terminal line are not handled (the cursor cannot go back over the line break).
+// The line is edited in [[ed.s]]: [[ed.len]] characters, the cursor stands before [[ed.s[ed.pos]]]. The screen is drawn with plain
+// characters and a few ANSI sequences. The terminal is [[ed.w]] columns wide (the [[TIOCGWINSZ]] answer, 80 if there is none), the line starts
+// in column [[ed.c0]] (behind the prompt), so character number [[i]] of the line is in row ([[c0 + i]] / [[w]]) and column ([[c0 + i]] mod [[w]]);
+// [[move]] goes from one index to another with Up/Down and Left/Right. When a character fills the last column we write a space and a return
+// ("[[ \r]]"): the terminal wraps at once, and the cursor is where we think it is (xterm would wait with the wrap, the console would not).
 #define HIST_LINES 32
 #define HIST_LEN   256
-#define K_UP 1000
-#define K_DOWN 1001
+#define K_UP    1000
+#define K_DOWN  1001
 #define K_RIGHT 1002
-#define K_LEFT 1003
-#define K_DEL 1004
+#define K_LEFT  1003
+#define K_DEL   1004
+#define K_TAB   9
 static char history[HIST_LINES][HIST_LEN];          // the last lines of this process; line n (n = 0, 1, ...) is in history[n % HIST_LINES]
 static int  hist_count = 0;                         // how many lines were stored since the start
+static char prompt_text[128];                       // the prompt of the shell (set by ureadline_prompt), to draw it again after a list of names
+static struct { char *s; int max, len, pos, c0, w; } ed;
+
+static void out (const char *p, int n) { if (n > 0) write (STDOUT_FILENO, p, n); }
+static void out_rep (const char *p, int n, int times) { while (times-- > 0) out (p, n); }
+
+// A prompt: written at once (not through stdio) and remembered, because the editor needs its width and its text.
+int ureadline_prompt (const char *format, ...) {
+  va_list ap;
+  va_start (ap, format);
+  int n = vsnprintf (prompt_text, sizeof (prompt_text), format, ap);
+  va_end (ap);
+  if (n >= (int) sizeof (prompt_text)) n = sizeof (prompt_text) - 1;
+  fflush (stdout);
+  out (prompt_text, n);
+  return n;
+}
+
+// writes s[a..b) at the right place on the screen; the cursor is behind it
+static void emit (const char *s, int a, int b) {
+  for (int i = a; i < b; i++) {
+    out (s + i, 1);
+    if ((ed.c0 + i + 1) % ed.w == 0) out (" \r", 2);
+  }
+}
+
+// moves the cursor from character index [[from]] to [[to]]
+static void move (int from, int to) {
+  int rows = (ed.c0 + to) / ed.w - (ed.c0 + from) / ed.w, cols = (ed.c0 + to) % ed.w - (ed.c0 + from) % ed.w;
+  char seq[16];
+  if (rows > 0) out (seq, sprintf (seq, "\033[%dB", rows));
+  if (rows < 0) out (seq, sprintf (seq, "\033[%dA", -rows));
+  if (cols > 0) out (seq, sprintf (seq, "\033[%dC", cols));
+  if (cols < 0) out_rep ("\010", 1, -cols);
+}
+
+// writes [[extra]] spaces behind the end of the line, to erase what was there, and puts the cursor to index [[to]]
+static void erase_and_move (int extra, int to) {
+  for (int i = 0; i < extra; i++) {
+    out (" ", 1);
+    if ((ed.c0 + ed.len + i + 1) % ed.w == 0) out (" \r", 2);
+  }
+  move (ed.len + extra, to);
+}
+
+// replaces the whole line by [[text]] (a line of the history); the cursor ends behind it
+static void set_line (const char *text) {
+  int n = strlen (text), old = ed.len;
+  if (n > ed.max) n = ed.max;
+  move (ed.pos, 0);
+  memcpy (ed.s, text, n);
+  emit (ed.s, 0, n);
+  ed.len = ed.pos = n;
+  if (old > n) erase_and_move (old - n, n);
+}
+
+static void insert_char (int c) {
+  if (ed.len >= ed.max) return;
+  memmove (ed.s + ed.pos + 1, ed.s + ed.pos, ed.len - ed.pos);
+  ed.s[ed.pos++] = c;  ed.len++;
+  emit (ed.s, ed.pos - 1, ed.len);
+  move (ed.len, ed.pos);
+}
+
+static void delete_char (int at) {                    // removes the character at index [[at]]; the cursor goes to [[at]] if it was behind it
+  memmove (ed.s + at, ed.s + at + 1, ed.len - at - 1);
+  ed.len--;
+  if (at < ed.pos) { move (ed.pos, at); ed.pos = at; }
+  emit (ed.s, ed.pos, ed.len);
+  erase_and_move (1, ed.pos);
+}
+
+// ---- completion of names (Tab) ----
+// The word before the cursor is the start of a name. The first word of the line is a command: the names come from /bin. Another word is a
+// file name: its directory is the part before the last slash (the current directory if there is none).
+#define MAX_MATCH 64
+#define NAME_LEN  61
+static char matches[MAX_MATCH][NAME_LEN];
+
+static int find_matches (const char *dir, const char *prefix) {
+  int n = 0, pl = strlen (prefix);
+  DIR *d = opendir (dir);
+  if (d == 0) return 0;
+  struct dirent *e;
+  while ((e = readdir (d)) != 0 && n < MAX_MATCH) {
+    if (strncmp (e->d_name, prefix, pl) != 0) continue;
+    if (e->d_name[0] == '.' && prefix[0] != '.') continue;       // ".", ".." and hidden files only if asked for
+    strncpy (matches[n], e->d_name, NAME_LEN - 1);  matches[n][NAME_LEN - 1] = 0;  n++;
+  }
+  closedir (d);
+  return n;
+}
+
+static void redraw_line (void) {                      // prompt and line again (after the list of names)
+  out (prompt_text, strlen (prompt_text));
+  ed.c0 = strlen (prompt_text) % ed.w;
+  emit (ed.s, 0, ed.len);
+  move (ed.len, ed.pos);
+}
+
+static void complete (void) {
+  char word[128], dir[128];
+  int start = ed.pos, first = 1, n;
+  while (start > 0 && ed.s[start - 1] != ' ') start--;
+  for (int i = 0; i < start; i++) if (ed.s[i] != ' ') first = 0;
+  n = ed.pos - start;
+  if (n > 120) return;
+  memcpy (word, ed.s + start, n);  word[n] = 0;
+  char *slash = strrchr (word, '/');
+  const char *prefix = word;
+  if (slash) { prefix = slash + 1;  n = slash - word + 1;  memcpy (dir, word, n);  dir[n] = 0; }
+  else strcpy (dir, first ? "/bin" : ".");
+  int count = find_matches (dir, prefix), common = 0, plen = strlen (prefix);
+  if (count == 0) { out ("\007", 1); return; }
+  while (matches[0][common]) {                        // the longest start that all names have
+    int k = 1;
+    while (k < count && matches[k][common] == matches[0][common]) k++;
+    if (k < count) break;
+    common++;
+  }
+  for (int i = plen; i < common; i++) insert_char (matches[0][i]);
+  if (count == 1) {
+    struct stat st;
+    char path[200];
+    snprintf (path, sizeof (path), "%s%s%s", dir, slash || dir[strlen (dir) - 1] == '/' ? "" : "/", matches[0]);
+    insert_char (stat (path, &st) == 0 && S_ISDIR (st.st_mode) ? '/' : ' ');
+  } else if (common == plen) {                        // nothing to add: show the names, then the line again
+    move (ed.pos, ed.len);
+    out ("\n", 1);
+    for (int i = 0, col = 0; i < count; i++) {
+      int l = strlen (matches[i]) + 2;
+      if (col + l > ed.w) { out ("\n", 1);  col = 0; }
+      out (matches[i], l - 2);  out ("  ", 2);  col += l;
+    }
+    out ("\n", 1);
+    redraw_line ();
+  }
+}
 
 // The next key. The kernel's readchar returns 0 when a process was woken without a key having arrived, so zeros are skipped; -1 is end of file.
 static int getkey (void) {
@@ -2253,34 +2398,19 @@ static int getkey (void) {
   }
 }
 
-static void out_rep (char c, int n) { while (n-- > 0) write (STDOUT_FILENO, &c, 1); }
-
-// writes s[from..len), then [[extra]] erasing spaces, and puts the cursor back to [[pos]]
-static void redraw (const char *s, int from, int len, int pos, int extra) {
-  if (len > from) write (STDOUT_FILENO, s + from, len - from);
-  out_rep (' ', extra);
-  out_rep ('\010', len + extra - pos);
-}
-
-// replaces the whole line by [[text]] (a line of the history); the cursor ends behind it
-static void set_line (char *s, int maxlength, int *len, int *pos, const char *text) {
-  int n = strlen (text), old = *len;
-  if (n > maxlength) n = maxlength;
-  out_rep ('\010', *pos);
-  memcpy (s, text, n);
-  write (STDOUT_FILENO, s, n);
-  if (old > n) { out_rep (' ', old - n); out_rep ('\010', old - n); }
-  *len = *pos = n;
-}
-
 // maxlength < 0: no newline is printed at the end. A line that is cancelled with ^C is empty; ^D in the first column gives "exit".
 // With echo (the shell, not the password) the keys work as in other shells: Left/Right, Home/End (^A/^E), Backspace and Delete (^D) in the line,
-// Up/Down for the lines of the history, ^U clears the line. A cursor key arrives as an ANSI sequence: ESC [ A, ESC O A, ESC [ H, ESC [ 3 ~ ...
+// Up/Down for the lines of the history, ^U clears the line, Tab completes a name. A cursor key arrives as an ANSI sequence: ESC [ A, ESC O A,
+// ESC [ H, ESC [ 3 ~ ...
 int ureadline (char *s, int maxlength, boolean echo) {
-  int print_newline = 1, len = 0, pos = 0, hpos = 0;         // hpos: how many lines back in the history (0: the line that is being typed)
+  int print_newline = 1, hpos = 0;                           // hpos: how many lines back in the history (0: the line that is being typed)
   char saved[HIST_LEN];                                      // the line that was typed before the first Up
   int pending = -1;                                          // a key that followed an Esc without belonging to a sequence
+  struct winsize ws;
   if (maxlength < 0) { print_newline = 0; maxlength = -maxlength; }
+  ed.s = s;  ed.max = maxlength;  ed.len = ed.pos = 0;
+  ed.w = ioctl (STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col >= 20 ? ws.ws_col : 80;
+  ed.c0 = strlen (prompt_text) % ed.w;
   saved[0] = 0;
   for (;;) {
     int c;                                                   // the key: a character, or K_UP ... for a cursor key
@@ -2300,13 +2430,13 @@ int ureadline (char *s, int maxlength, boolean echo) {
         c = d == 'A' ? K_UP : d == 'B' ? K_DOWN : d == 'C' ? K_RIGHT : d == 'D' ? K_LEFT : d == 'H' ? 1 : d == 'F' ? 5 : d == 'x' ? K_DEL : 0;
       } else { pending = d; continue; }
     }
-    if (c == 0 || (c >= 128 && c < 1000) || (c >= 1000 && !echo)) continue;
-    if (c == 3) { s[0] = 0; if (echo) write (STDOUT_FILENO, "\n", 1); return 0; }
-    if (c == 4 && len == 0) { strcpy (s, "exit"); if (echo) write (STDOUT_FILENO, "exit\n", 5); return 0; }
+    if (c == 0 || (c > 190 && c < 1000) || (c >= 1000 && !echo)) continue;
+    if (c == 3) { s[0] = 0; if (echo) { move (ed.pos, ed.len); out ("\n", 1); } return 0; }
+    if (c == 4 && ed.len == 0) { strcpy (s, "exit"); if (echo) out ("exit\n", 5); return 0; }
     if (c == '\n') {
-      if (print_newline && echo) write (STDOUT_FILENO, "\n", 1);
-      s[len] = 0;
-      if (echo && len > 0 && (hist_count == 0 || strcmp (history[(hist_count - 1) % HIST_LINES], s) != 0)) {
+      if (print_newline && echo) { move (ed.pos, ed.len); out ("\n", 1); }
+      s[ed.len] = 0;
+      if (echo && ed.len > 0 && (hist_count == 0 || strcmp (history[(hist_count - 1) % HIST_LINES], s) != 0)) {
         strncpy (history[hist_count % HIST_LINES], s, HIST_LEN - 1);
         history[hist_count % HIST_LINES][HIST_LEN - 1] = 0;
         hist_count++;
@@ -2314,41 +2444,29 @@ int ureadline (char *s, int maxlength, boolean echo) {
       return 0;
     }
     if (!echo) {                                             // no editing: only Backspace at the end
-      if (c == 0x08 && len > 0) len--;
-      else if (c >= 32 && len < maxlength) s[len++] = c;
+      if (c == 0x08 && ed.len > 0) ed.len--;
+      else if (c >= 32 && ed.len < maxlength) s[ed.len++] = c;
       continue;
     }
-    if (c == 0x08) {                                         // Backspace
-      if (pos == 0) continue;
-      memmove (s + pos - 1, s + pos, len - pos);
-      pos--; len--;
-      write (STDOUT_FILENO, "\010", 1);
-      redraw (s, pos, len, pos, 1);
-    } else if (c == K_DEL || c == 4) {                     // Delete, ^D with text
-      if (pos == len) continue;
-      memmove (s + pos, s + pos + 1, len - pos - 1);
-      len--;
-      redraw (s, pos, len, pos, 1);
-    } else if (c == K_LEFT || c == 2) { if (pos > 0) { pos--; write (STDOUT_FILENO, "\010", 1); } }
-    else if (c == K_RIGHT || c == 6) { if (pos < len) { write (STDOUT_FILENO, s + pos, 1); pos++; } }
-    else if (c == 1) { out_rep ('\010', pos); pos = 0; }
-    else if (c == 5) { write (STDOUT_FILENO, s + pos, len - pos); pos = len; }
-    else if (c == 21) { set_line (s, maxlength, &len, &pos, ""); }
-    else if (c == K_UP || c == K_DOWN) {               // Up, Down: older or newer line
+    if (c == 0x08) { if (ed.pos > 0) delete_char (ed.pos - 1); }               // Backspace
+    else if (c == K_DEL || c == 4) { if (ed.pos < ed.len) delete_char (ed.pos); }   // Delete, ^D with text
+    else if (c == K_LEFT || c == 2) { if (ed.pos > 0) { move (ed.pos, ed.pos - 1); ed.pos--; } }
+    else if (c == K_RIGHT || c == 6) { if (ed.pos < ed.len) { move (ed.pos, ed.pos + 1); ed.pos++; } }
+    else if (c == 1) { move (ed.pos, 0); ed.pos = 0; }
+    else if (c == 5) { move (ed.pos, ed.len); ed.pos = ed.len; }
+    else if (c == 21) set_line ("");
+    else if (c == K_TAB) complete ();
+    else if (c == K_UP || c == K_DOWN) {                     // older or newer line
       int avail = hist_count < HIST_LINES ? hist_count : HIST_LINES;
       if (c == K_UP && hpos < avail) {
-        if (hpos == 0) { s[len] = 0; strncpy (saved, s, HIST_LEN - 1); saved[HIST_LEN - 1] = 0; }
+        if (hpos == 0) { s[ed.len] = 0; strncpy (saved, s, HIST_LEN - 1); saved[HIST_LEN - 1] = 0; }
         hpos++;
-        set_line (s, maxlength, &len, &pos, history[(hist_count - hpos) % HIST_LINES]);
+        set_line (history[(hist_count - hpos) % HIST_LINES]);
       } else if (c == K_DOWN && hpos > 0) {
         hpos--;
-        set_line (s, maxlength, &len, &pos, hpos == 0 ? saved : history[(hist_count - hpos) % HIST_LINES]);
+        set_line (hpos == 0 ? saved : history[(hist_count - hpos) % HIST_LINES]);
       }
-    } else if (c >= 32 && len < maxlength) {                 // insert at the cursor
-      memmove (s + pos + 1, s + pos, len - pos);
-      s[pos++] = c; len++;
-      redraw (s, pos - 1, len, pos, 0);
-    }
+    } else if (c >= 32) insert_char (c);                     // insert at the cursor
   }
 }
 
