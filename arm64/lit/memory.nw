@@ -604,6 +604,7 @@ void arch_swap_shrink (void) {
 
 // A checksum of every page in the swap file (debugging aid: a page that comes back with other content is reported at once, with the slot and the program)
 static unsigned swap_sum[MAX_SWAP_FRAMES];
+static unsigned long swap_who[MAX_SWAP_FRAMES];                 // (as << 32 | page) of the last page written to the slot
 static unsigned page_sum (u64 pa) {
   const unsigned *w = KVA (pa);
   unsigned h = 2166136261u;
@@ -713,6 +714,13 @@ int page_out (int as, int pageno) {
     return -1;
   }
   swap_sum[index] = sum;
+  if (page_sum (pa) != sum) printf ("[kernel] BUG: the frame of page %d of address space %d changed while it was written to swap slot %d (thread %d)\n", pageno, as, index, current_task);
+  swap_who[index] = ((unsigned long) as << 32) | (unsigned) pageno;
+  {                                                        // read the page back at once (into the frame, which is freed below anyway): is the file right?
+    static int back_reports;
+    read_swap_page (as, pageno, (int)(pa >> 12));
+    if (page_sum (pa) != sum && back_reports++ < 8) printf ("[kernel] BUG: page %d of address space %d is wrong in the swap file right after it was written (slot %d, thread %d)\n", pageno, as, index, current_task);
+  }
   swap_io_leave (l);
   swap_has_data = 1;
   if (index + 1 > swap_file_pages) swap_file_pages = index + 1;
@@ -755,7 +763,7 @@ static int page_in_inner (int as, int pageno) {
     static int reports;
     int again = 0;
     for (; again < 3; again++) { read_swap_page (as, pageno, (int)(pa >> 12));  if (page_sum (pa) == swap_sum[slot]) break; }
-    if (reports++ < 8) printf ("[kernel] BUG: page %d of address space %d (swap slot %d) came back from the swap file with the wrong content; %s after %d more reads\n", pageno, as, slot, again < 3 ? "right" : "still wrong", again + 1);
+    if (reports++ < 8) printf ("[kernel] BUG: page %d of address space %d (swap slot %d, last written for as %lu page %lu) came back from the swap file with the wrong content; %s after %d more reads\n", pageno, as, slot, swap_who[slot] >> 32, swap_who[slot] & 0xffffffffUL, again < 3 ? "right" : "still wrong", again + 1);
   }
   swap_io_leave (l);
   e = pte_of (l0, va);

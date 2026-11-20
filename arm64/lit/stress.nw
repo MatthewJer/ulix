@@ -463,9 +463,9 @@ static void mode_sock (const char *host, int tcpport, int udpport) {
       for (int k = 0; k < rounds; k++) {
         long n = 1 + rnd (2000), got = 0;
         fill (out, k, n);
-        CHECK (write (sv[0], out, n) == n, "write to the socket pair");
+        if (write (sv[0], out, n) != n) { if (errno != EPIPE) FAIL ("write to the socket pair");  break; }     /* (a peer that is gone: EPIPE, and SIGPIPE is ignored below) */
         while (got < n) { long r = read (sv[0], in + got, n - got);  if (r <= 0) break;  got += r; }
-        CHECK (got == n, "the peer answers");
+        if (got != n) break;                                  /* (the peer left) */
         for (long i = 0; i < got; i++) if ((unsigned char) (in[i] ^ 0x5a) != out[i]) { FAIL ("socket pair data");  break; }
       }
       if (kind == 1) kill (p, SIGKILL);
@@ -531,7 +531,7 @@ static void run_mode (const char *m, const char *arg, char **argv) {
 }
 
 int main (int argc, char **argv) {
-  signal (SIGPIPE, SIG_DFL);
+  signal (SIGPIPE, SIG_IGN);                                   // (EPIPE is an answer: a closed pipe or socket)
   if (argc >= 2 && !strcmp (argv[1], "child")) return 7;       // the target of exec in mode fork
   if (argc < 5) { printf ("usage: stress MODE SECONDS SEED MB [HOST TCPPORT UDPPORT]\n");  return 2; }
   seed_arg = atoi (argv[3]);  mb = atoi (argv[4]);
