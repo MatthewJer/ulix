@@ -1103,7 +1103,20 @@ static void before_kill (int pid, int signo) {
   pty_before_kill (pid, signo);              // pty.c: the holder of the pseudo terminal ends: hang up the session
 }
 
+// A thread that is in the middle of swapping (it holds the paging lock and the swap I/O lock, and a page of some program is marked "being
+// evicted") must not be killed there: the locks would stay taken for ever and every thread that needs a frame would wait for them
+// (found by tools/stress_test.py: "paging:" with six threads in its queue, and the owner a zombie). The signal waits in deferred_sig until the thread
+// leaves the kernel (smp_run_deferred).
+static volatile int kill_hold[MAX_THREADS];
+void kill_hold_inc (void) { if (current_task < MAX_THREADS) kill_hold[current_task]++; }
+void kill_hold_dec (void) { if (current_task < MAX_THREADS && kill_hold[current_task] > 0) kill_hold[current_task]--; }
+
 int u_kill (int pid, int signo) {            // the book's u_kill is book_u_kill
+  if (pid > 1 && pid < MAX_THREADS && kill_hold[pid] > 0 && pid != current_task && signo > 0 && signo <= 31 && thread_table[pid].used &&
+      (signo == SIGKILL || signo == SIGSTOP || thread_table[pid].sighandlers[signo] == SIG_DFL)) {
+    deferred_sig[pid] |= 1u @<< signo;
+    return 0;
+  }
   if (ncpus_online > 1 && pid > 1 && pid < MAX_THREADS && signo >= 0 && signo <= 31 && thread_table[pid].used) {
     int me = smp_cpu ();
     for (int c = 0; c < MAX_CPUS; c++) {

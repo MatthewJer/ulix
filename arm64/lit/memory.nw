@@ -612,6 +612,7 @@ transfer at a time.
 <<arch_swap.c: swap_io_lock>>=
 static lock swap_io_lock = NULL;
 extern int fs_busy_by_me (void);
+extern void kill_hold_inc (void), kill_hold_dec (void);        // irq.c: a thread that swaps is not killed until it is done
 static int swap_nested_reports, swap_evicting_now;
 static int swap_io_enter (void) {                  // 1: locked, 0: no lock needed, -1: busy (the caller must not use the swap file now)
   if (current_task > 1 && fs_busy_by_me ()) {      // swap I/O inside the file system code of this very thread would run the Minix code twice at once (its tables are global)
@@ -703,13 +704,21 @@ int page_out (int as, int pageno) {
   return 0;
 }
 
+static int page_in_inner (int as, int pageno);
 int page_in (int as, int pageno) {
+  kill_hold_inc ();
+  int r = page_in_inner (as, pageno);
+  kill_hold_dec ();
+  return r;
+}
+static int page_in_inner (int as, int pageno) {
   dbg_pageins++;  dbg_note ("page_in", as, pageno);                                         // DBG-HTTP
   u64 l0 = arch_as_l0 (as), va = (u64)pageno @<< 12;
   if (!l0 || swap_fd == -1) return -1;
   u64 *e = pte_of (l0, va);
   while (e && (*e & PTE_EVICTING) && arch_swap_evicting (as)) { arch_resign ();  arch_poll_pause ();  e = pte_of (l0, va); }   // page_out is writing it: wait
-  if (!e || (*e & PTE_VALID) || !(*e & PTE_SWAPPED)) return -1;      // fail: page was not paged out
+  if (e && (*e & PTE_VALID)) return 0;                                // the page is there (page_out failed and gave it back, or another thread was faster): repeat the access
+  if (!e || !(*e & PTE_SWAPPED)) return -1;                           // fail: page was not paged out
   if (swap_index (as, pageno) < 0) return -1;
   u64 pa = alloc_frame_try ();                             // reserve a frame
   if (!pa) return -1;
@@ -881,7 +890,15 @@ be chosen to [[make room]], the two would chase each other forever.  So the pare
 static addr_space_id evict_protected = 0;
 void arch_evict_protect (addr_space_id as) { evict_protected = as; }
 
+extern void kill_hold_inc (void), kill_hold_dec (void);        // irq.c: a thread that swaps is not killed until it is done
+static int arch_evict_one_inner (void);
 int arch_evict_one (void) {
+  kill_hold_inc ();
+  int r = arch_evict_one_inner ();
+  kill_hold_dec ();
+  return r;
+}
+static int arch_evict_one_inner (void) {
   static thread_id owner = 0;
   if (swap_fd == -1 || !paging_lock || owner == current_task) return -1;
   if (current_task > 1) mutex_lock (paging_lock);
