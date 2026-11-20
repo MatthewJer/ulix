@@ -538,7 +538,8 @@ int main (int argc, char **argv) {
   deadline = now_ms () + 1000LL * atoi (argv[2]);
   char *argv8[9] = { 0 };
   for (int i = 0; i < argc && i < 8; i++) argv8[i] = argv[i];
-  if (strcmp (argv[1], "all")) {
+  int skip_fs = !strcmp (argv[1], "all-nofs"), skip_tmp = !strcmp (argv[1], "all-notmp");     // (all without the file system workers, or without the one on /tmp, where the swap file is)
+  if (strncmp (argv[1], "all", 3)) {
     char *colon = strchr (argv[1], ':');
     if (colon) *colon++ = 0;
     run_mode (argv[1], colon, argv8);
@@ -550,6 +551,7 @@ int main (int argc, char **argv) {
   int n = 0, failed = 0;
   setvbuf (stdout, 0, _IOLBF, 0);
   for (unsigned i = 0; i < sizeof modes / sizeof modes[0]; i++) {
+    if (!strcmp (modes[i][0], "fs") && (skip_fs || (skip_tmp && !strcmp (modes[i][1], "/tmp")))) continue;
     pid_t p = fork ();
     if (p < 0) { printf ("  user FAIL: all: fork of mode %s\n", modes[i][0]);  failed++;  continue; }
     if (p == 0) { seed_arg += i * 17;  run_mode (modes[i][0], modes[i][1], argv8);  _exit (fails ? 1 : 0); }

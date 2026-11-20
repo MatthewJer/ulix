@@ -149,7 +149,7 @@ def run(smp, fast, mem, seed, index):
                 line = text[scanned + m.start():].split(b'\n')[0][:200]
                 print('  FAILURE: %s' % line.decode('latin1').strip()); result = 'failure'
             scanned = len(text)
-            endmark = b'stress: all done' if MODE == 'all' else b'stress: %s done' % MODE.encode()
+            endmark = b'stress: all done' if MODE.startswith('all') else b'stress: %s done' % MODE.encode()
             if endmark in text:
                 print('  ' + re.search(re.escape(endmark) + rb'[^\r\n]*', text).group().decode()); break
             if now - st['last'] > SILENT: hang('no output for %d s' % SILENT); result = 'hang'; break
@@ -157,7 +157,7 @@ def run(smp, fast, mem, seed, index):
             if stalled: hang('mode %s printed nothing for %d s' % (','.join(stalled), STALL)); result = 'hang'; break
             if now - start > SECONDS + 240: hang('run does not end'); result = 'hang'; break
         done = [m.group().decode() for m in re.finditer(rb'stress: \S+ done, \d+ rounds, \d+ failed', st['log'])]
-        if result == 'ok' and (MODE == 'all' and (not b'stress: all done, 0 of' in st['log'] or len(done) < 11) or MODE != 'all' and not re.search(rb'done, \d+ rounds, 0 failed', st['log'])): result = 'modes failed or missing'
+        if result == 'ok' and (MODE.startswith('all') and (not b'stress: all done, 0 of' in st['log'] or (MODE == 'all' and len(done) < 11)) or not MODE.startswith('all') and not re.search(rb'done, \d+ rounds, 0 failed', st['log'])): result = 'modes failed or missing'
         print('  %s: %d modes finished: %s' % (tag, len(done), '; '.join(d.replace('stress: ', '').replace(' rounds', '') for d in done)[:600]))
     finally:
         q.kill(); full.close()
