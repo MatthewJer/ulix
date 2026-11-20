@@ -68,13 +68,14 @@ static int same_at (const unsigned char *p, unsigned s, long off, long n) { for 
 static int same (const unsigned char *p, unsigned s, long n) { for (long i = 0; i < n; i++) if (p[i] != pat (s, i)) return 0;  return 1; }
 
 // wait for a child that must end soon (a hang here is a kernel bug, which the host sees as silence; but a late child is also reported)
+static int reap_kind = -1;
 static int reap (pid_t pid, int *status, int seconds) {
   long long t = now_ms ();
   for (;;) {
     pid_t r = waitpid (pid, status, WNOHANG);
     if (r == pid) return 1;
     if (r < 0 && errno != EINTR) return 0;
-    if (now_ms () - t > seconds * 1000LL) { FAIL ("child does not end");  kill (pid, SIGKILL);  waitpid (pid, status, 0);  return 0; }
+    if (now_ms () - t > seconds * 1000LL) { { printf ("  (child %d, kind %d)\n", (int) pid, reap_kind);  FAIL ("child does not end"); }  kill (pid, SIGKILL);  waitpid (pid, status, 0);  return 0; }
     nap (2);
   }
 }
@@ -104,6 +105,7 @@ static void mode_fork (void) {
     for (int i = 0; i < n; i++) {
       int st = 0;
       if (pids[i] < 0) continue;
+      reap_kind = kind[i];
       if (!reap (pids[i], &st, 20)) continue;
       if (kind[i] == 0) CHECK (WIFEXITED (st) && WEXITSTATUS (st) == 10 + i, "exit status of a quick child");
       if (kind[i] == 1) CHECK (WIFEXITED (st) && WEXITSTATUS (st) == 20 + i, "exit status of a sleeping child");
