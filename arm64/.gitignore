@@ -149,3 +149,5 @@ libc/cxxtest2.cc
 libc/chantest.c
 userland/musl/
 stress-logs/
+libc/libctest.c
+libc/stress.c
