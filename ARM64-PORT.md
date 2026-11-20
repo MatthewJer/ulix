@@ -1046,3 +1046,11 @@ Static audit of the big kernel lock (BKL) and the places where interrupts are le
 **Fix.** Every entry of `files[]` of a kernel thread is -1 (the other ways to make a TCB, `tcb_init_process` and `fork`, already set all `MAX_PFD` entries). Then `PORT_PFD ?= 64`: the table has 64 entries, a program can open 61 files. `fdtest` opens until `EMFILE` and requires at least 60 (and the same number again after closing).
 
 **Tests.** `QEMU_FAST=1 tools/run_kernel_tests.sh ulix.bin disk.img LOG -smp N` for N = 1, 2, 4: 209 checks, all passed; one normal run with `-smp 2`: the same; `make python-test`: all passed (modtest 20 s). The global table `mx_status` (256 entries for all processes) is still a limit for many processes with many open files.
+
+## 63. `ps` hung after `fbomb`: the user-space `TCB` had 16 descriptors, the kernel's 64 (2026-11-20, branch `m3-shell-fix`)
+
+**Cause.** Commit 460be84 raised the kernel's `MAX_PFD` to 64 (section 60), but `userland/musl/ulixlib.h` (lit/userland.nw) still had `#define MAX_PFD 16`, so the `TCB` of `ps`, `top` and `swapper` had `files[16]`. `getpsinfo` copies the whole kernel `TCB` into the buffer of the program (`sizeof (TCB)` with 64 entries): 192 bytes too many, written over the stack of `ps` (`top` and `swapper` fill an array of `TCB`s). Bisection: 61f6073 green, 460be84 (and f5be02d) red, 3f15135 with `make PORT_PFD=16` green.
+
+**Fix.** `ulixlib.h` takes `MAX_PFD` from the compiler flag `-DMAX_PFD=$(PORT_PFD)` (`userland/Makefile`, `MCFLAGS`; the top-level Makefile passes `PORT_PFD`), default 64. Kernel and user space now always agree. After changing `PORT_PFD` run `make -C userland clean`.
+
+**Test.** `QEMU_FAST=1 make shell-test`: all passed.

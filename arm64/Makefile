@@ -73,7 +73,7 @@ all: ulix.elf ulix-console.elf ulix-shell.elf ulix.bin ulix-console.bin ulix-she
 USERLAND_BIN = userland/build/bin
 
 userland/build/bin/init.elf: FORCE
-	$(MAKE) -C userland
+	$(MAKE) -C userland PORT_PFD=$(PORT_PFD)
 
 disk.img: $(wildcard userland/build/bin/*.elf) $(if $(filter 1,$(PYTHON)),libc/hello.py libc/hello_http.py libc/modtest.py libc/_sysconfigdata__linux_.py) ../bin-build/minixdata.img etc/rc.conf etc/hosts etc/resolv.conf etc/services user/hello.elf user/cat.elf user/crash.elf user/forktest.elf user/sigtest.elf user/contest.elf user/cowtest.elf user/thtest.elf user/badptr.elf user/swaptest.elf user/screentest.elf user/stacktest.elf user/memtest.elf user/pipetest.elf libc/build/hello.elf $(MUSL_PROGS) userland/build/bin/init.elf tools/minix_add.py tools/minix_copy.py tools/minix_mkfs.py etc/ssl/cacert.pem etc/rc.d/heartbeat etc/rc.d/echod etc/rc.d/telnetd $(if $(filter 1,$(TLS)),etc/ssh/ssh_host_ecdsa_key etc/rc.d/sshd)
 	# a root file system of ROOT_ZONES KByte: the image of the book is too small for big programs (tools/minix_copy.py)

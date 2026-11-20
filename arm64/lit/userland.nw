@@ -2014,7 +2014,9 @@ typedef unsigned short word;
 typedef unsigned long  memaddress;
 #define strequal(s1,s2) (!strcmp((s1),(s2)))
 #define strdiff(s1,s2)  (strcmp((s1),(s2)))
-#define MAX_PFD 16
+#ifndef MAX_PFD
+#define MAX_PFD 64        // must be the kernel's MAX_PFD (Makefile PORT_PFD): getpsinfo copies the whole TCB, files[] included
+#endif
 #define CMDLINE_LENGTH 50
 
 // the book's own system calls
