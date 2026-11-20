@@ -626,9 +626,6 @@ transfer at a time.
 <<arch_swap.c: swap_io_lock>>=
 static lock swap_io_lock = NULL;
 extern int fs_busy_by_me (void);
-extern void swap_fs_enter (void), swap_fs_leave (void);
-// the book's read changes the global state of the file system code, like its write; a read of the swap file in the middle of another thread's file system call read wrong blocks
-static void read_swap_page_locked (int as, int pageno, int frameno) { swap_fs_enter ();  read_swap_page (as, pageno, frameno);  swap_fs_leave (); }
 extern void kill_hold_inc (void), kill_hold_dec (void);        // irq.c: a thread that swaps is not killed until it is done
 static int swap_nested_reports, swap_evicting_now;
 static volatile int swap_io_owner = -1;             // the thread that holds the swap lock
@@ -721,7 +718,7 @@ int page_out (int as, int pageno) {
   swap_who[index] = ((unsigned long) as << 32) | (unsigned) pageno;
   {                                                        // read the page back at once (into the frame, which is freed below anyway): is the file right?
     static int back_reports;
-    read_swap_page_locked (as, pageno, (int)(pa >> 12));
+    read_swap_page (as, pageno, (int)(pa >> 12));
     if (page_sum (pa) != sum && back_reports++ < 8) printf ("[kernel] BUG: page %d of address space %d is wrong in the swap file right after it was written (slot %d, thread %d)\n", pageno, as, index, current_task);
   }
   swap_io_leave (l);
@@ -761,11 +758,11 @@ static int page_in_inner (int as, int pageno) {
     return (e && (*e & PTE_VALID)) ? 0 : -1;
   }
   int slot = swap_index (as, pageno);
-  read_swap_page_locked (as, pageno, (int)(pa >> 12));
+  read_swap_page (as, pageno, (int)(pa >> 12));
   if (slot >= 0 && page_sum (pa) != swap_sum[slot]) {
     static int reports;
     int again = 0;
-    for (; again < 3; again++) { read_swap_page_locked (as, pageno, (int)(pa >> 12));  if (page_sum (pa) == swap_sum[slot]) break; }
+    for (; again < 3; again++) { read_swap_page (as, pageno, (int)(pa >> 12));  if (page_sum (pa) == swap_sum[slot]) break; }
     if (reports++ < 8) printf ("[kernel] BUG: page %d of address space %d (swap slot %d, last written for as %lu page %lu) came back from the swap file with the wrong content; %s after %d more reads\n", pageno, as, slot, swap_who[slot] >> 32, swap_who[slot] & 0xffffffffUL, again < 3 ? "right" : "still wrong", again + 1);
   }
   swap_io_leave (l);
