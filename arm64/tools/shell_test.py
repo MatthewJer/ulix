@@ -73,7 +73,7 @@ def run(cmd, answer, what=None, prompt=PROMPT):
     return seen
 
 class Screen:
-    """A very small terminal (80 columns, the cursor keys of ANSI, the wrap of xterm that waits until the next character) to see
+    """A very small terminal (80 columns, the cursor sequences of ANSI, the wrap of xterm that waits until the next character) to see
     where the line editor of the shell leaves the characters and the cursor."""
     def __init__(s, w=80): s.w, s.rows, s.r, s.c, s.pend = w, [[' '] * w], 0, 0, False
     def row(s):
@@ -92,6 +92,8 @@ class Screen:
                 elif f == 'B': s.r += n
                 elif f == 'C': s.c = min(s.c + n, s.w - 1)
                 elif f == 'D': s.c = max(s.c - n, 0)
+                elif f == 'H':                                  # ESC [ line ; column H (the kernel moves the cursor for set_xy)
+                    ps = par.split(b';'); s.r = int(ps[0] or 1) - 1; s.c = int(ps[1] or 1) - 1 if len(ps) > 1 else 0; s.row()
             elif b == 13: s.c, s.pend = 0, False
             elif b == 10: s.r, s.c, s.pend = s.r + 1, 0, False
             elif b == 8: s.c, s.pend = max(s.c - 1, 0), False
@@ -116,8 +118,8 @@ try:
     send('\\x1b[A\\r'); expect(r'Hello World', 'Up recalls "cat /hello.c", Enter runs it again'); expect(PROMPT, 'prompt after the recalled line')
     send('caxt /hello.c' + '\\x1b[D' * 10 + '\\x7f\\x1b[H\\x1b[3~c\\x1b[FZ\\x7f\\r'); expect(r'Hello World', 'Left, Backspace, Home, Delete, insert, End edit "caxt /hello.c" into "cat /hello.c"')
     expect(PROMPT, 'prompt after the edited line')
-    # a line that is longer than the terminal: edit it across the line break, a small terminal checks the screen
-    send('\\r'); prompt_line = expect(PROMPT, 'an empty line gives a new prompt').split(b'\n')[-1].rstrip(b'\r').decode()
+    # a line that is longer than the terminal: edit it across the line break, a small terminal checks the screen (it starts with a cleared screen)
+    send('clear\\r'); seen = expect(PROMPT, 'clear: the cursor is at the top, the prompt follows there'); prompt_line = re.search(PROMPT.encode(), seen).group(0).decode()
     p, L = len(prompt_line), 'cat /hello.c ' + 'x' * 70
     scr = Screen(); scr.feed(prompt_line.encode())
     send(L + '\\x1b[D' * 60 + 'Q\\x1b[3~'); pump(1.5); scr.feed(log); log = b''
@@ -126,7 +128,8 @@ try:
     print('  %s a line of %d characters is edited across the line break (screen and cursor are right)' % ('ok:  ' if ok else 'FAIL:', len(E)))
     if not ok: fails += 1; print('        screen: %r, cursor %r' % (scr.text(0), (scr.r, scr.c)))
     send('\\x15\\r'); expect(PROMPT, 'Ctrl-U clears the long line, Enter')
-    send('cat /hel\\t\\r'); expect(r'Hello World', 'Tab completes the file name /hel to /hello.c'); expect(PROMPT, 'prompt after the completed line')
+    send('cat /hello.\\t\\r'); expect(r'Hello World', 'Tab completes the file name /hello. to /hello.c'); expect(PROMPT, 'prompt after the completed line')
+    send('cat /hell\\t\\t'); expect(r'hello  hello\.c|hello\.c  hello', 'Tab with two matches (hello, hello.c) lists them'); pump(0.5); send('\\x15\\r'); expect(PROMPT, 'the list is followed by the prompt and the line again; Ctrl-U, Enter')
     send('readel\\t /bin/thread\\r'); expect(r'e_entry', 'Tab completes the command readel to readelf (from /bin)'); expect(PROMPT, 'prompt after the completed command')
     if os.environ.get('HAVE_DISK2'):                     # qemu was given a second disk (make pcheck, job "shell2")
         run('df', r'/dev/hdb\s+32768 K .*/tmp/\r?\n', 'df: /dev/hdb (32 MByte) is mounted on /tmp/')

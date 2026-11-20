@@ -2034,7 +2034,6 @@ int ulix_chown (const char *path, short owner, short group);
 
 int  atoi8 (char *s);                                        // like atoi, for octal numbers
 int  ureadline (char *s, int maxlength, boolean echo);       // a line from the terminal with editing, history and Tab completion, ^C and ^D
-int  ureadline_prompt (const char *format, ...);               // printf for the prompt: the line editor learns its width
 byte ureadchar (void);
 
 struct dir_entry {
@@ -2195,9 +2194,7 @@ programs that ask a question) with the same keys; only the output goes through [
 <<userland/musl/ulixcompat.c>>=
 #include "ulixlib.h"
 #include <sys/syscall.h>
-#include <sys/ioctl.h>
 #include <dirent.h>
-#include <stdarg.h>
 
 #define ULIX_BASE      1024        // 1024 + n is the book's system call n (linux_abi.c)
 #define NR_get_errno    501
@@ -2235,11 +2232,12 @@ byte ureadchar (void) {
 }
 
 // ---- line editor ----
-// The line is edited in [[ed.s]]: [[ed.len]] characters, the cursor stands before [[ed.s[ed.pos]]]. The screen is drawn with plain
-// characters and a few ANSI sequences. The terminal is [[ed.w]] columns wide (the [[TIOCGWINSZ]] answer, 80 if there is none), the line starts
-// in column [[ed.c0]] (behind the prompt), so character number [[i]] of the line is in row ([[c0 + i]] / [[w]]) and column ([[c0 + i]] mod [[w]]);
-// [[move]] goes from one index to another with Up/Down and Left/Right. When a character fills the last column we write a space and a return
-// ("[[ \r]]"): the terminal wraps at once, and the cursor is where we think it is (xterm would wait with the wrap, the console would not).
+// The line is edited in [[ed.s]]: [[ed.len]] characters, the cursor stands before [[ed.s[ed.pos]]]. The kernel's terminal ([[kputch]]) knows the
+// cursor, wraps a line at column 80 by itself and takes only [[\b]], [[\n]] and text from [[write]] (an Esc or a return would be shown as
+// [[^[]] or [[^M]]). To move the cursor over a line break the editor does what [[top]] does: it asks for the position with [[get_xy]] and puts the cursor to
+// the new place with [[set_xy]]; the kernel then sends the ANSI sequence to the UART, telnet or SSH. A move from character [[from]] to [[to]]
+// is a move of the cursor by [[to - from]] places in the screen's 80 columns, which is right across line breaks, and scrolling does no harm.
+#define LINE_WIDTH 80
 #define HIST_LINES 32
 #define HIST_LEN   256
 #define K_UP    1000
@@ -2250,48 +2248,34 @@ byte ureadchar (void) {
 #define K_TAB   9
 static char history[HIST_LINES][HIST_LEN];          // the last lines of this process; line n (n = 0, 1, ...) is in history[n % HIST_LINES]
 static int  hist_count = 0;                         // how many lines were stored since the start
-static char prompt_text[128];                       // the prompt of the shell (set by ureadline_prompt), to draw it again after a list of names
-static struct { char *s; int max, len, pos, c0, w; } ed;
+static struct { char *s; int max, len, pos; char prompt[LINE_WIDTH + 1]; } ed;
 
 static void out (const char *p, int n) { if (n > 0) write (STDOUT_FILENO, p, n); }
-static void out_rep (const char *p, int n, int times) { while (times-- > 0) out (p, n); }
 
-// A prompt: written at once (not through stdio) and remembered, because the editor needs its width and its text.
-int ureadline_prompt (const char *format, ...) {
-  va_list ap;
-  va_start (ap, format);
-  int n = vsnprintf (prompt_text, sizeof (prompt_text), format, ap);
-  va_end (ap);
-  if (n >= (int) sizeof (prompt_text)) n = sizeof (prompt_text) - 1;
-  fflush (stdout);
-  out (prompt_text, n);
-  return n;
-}
-
-// writes s[a..b) at the right place on the screen; the cursor is behind it
-static void emit (const char *s, int a, int b) {
-  for (int i = a; i < b; i++) {
-    out (s + i, 1);
-    if ((ed.c0 + i + 1) % ed.w == 0) out (" \r", 2);
-  }
+// the text in front of the cursor on its screen line: the prompt (read from the screen buffer of the terminal)
+static void read_prompt (void) {
+  static char screen[80 * 25 * 2];
+  char x, y;
+  get_xy (&x, &y);
+  read_screen (screen);
+  if (x > LINE_WIDTH) x = LINE_WIDTH;
+  for (int i = 0; i < x; i++) ed.prompt[i] = screen[y * LINE_WIDTH * 2 + 2 * i];
+  ed.prompt[(int) x] = 0;
 }
 
 // moves the cursor from character index [[from]] to [[to]]
 static void move (int from, int to) {
-  int rows = (ed.c0 + to) / ed.w - (ed.c0 + from) / ed.w, cols = (ed.c0 + to) % ed.w - (ed.c0 + from) % ed.w;
-  char seq[16];
-  if (rows > 0) out (seq, sprintf (seq, "\033[%dB", rows));
-  if (rows < 0) out (seq, sprintf (seq, "\033[%dA", -rows));
-  if (cols > 0) out (seq, sprintf (seq, "\033[%dC", cols));
-  if (cols < 0) out_rep ("\010", 1, -cols);
+  char x, y;
+  if (from == to) return;
+  get_xy (&x, &y);
+  int place = y * LINE_WIDTH + x + (to - from);
+  if (to < from && place / LINE_WIDTH == y) { for (int i = from - to; i > 0; i--) out ("\010", 1);  return; }     // to the left in the same line
+  set_xy (place % LINE_WIDTH, place / LINE_WIDTH);
 }
 
 // writes [[extra]] spaces behind the end of the line, to erase what was there, and puts the cursor to index [[to]]
 static void erase_and_move (int extra, int to) {
-  for (int i = 0; i < extra; i++) {
-    out (" ", 1);
-    if ((ed.c0 + ed.len + i + 1) % ed.w == 0) out (" \r", 2);
-  }
+  for (int i = 0; i < extra; i++) out (" ", 1);
   move (ed.len + extra, to);
 }
 
@@ -2301,7 +2285,7 @@ static void set_line (const char *text) {
   if (n > ed.max) n = ed.max;
   move (ed.pos, 0);
   memcpy (ed.s, text, n);
-  emit (ed.s, 0, n);
+  out (ed.s, n);
   ed.len = ed.pos = n;
   if (old > n) erase_and_move (old - n, n);
 }
@@ -2310,7 +2294,7 @@ static void insert_char (int c) {
   if (ed.len >= ed.max) return;
   memmove (ed.s + ed.pos + 1, ed.s + ed.pos, ed.len - ed.pos);
   ed.s[ed.pos++] = c;  ed.len++;
-  emit (ed.s, ed.pos - 1, ed.len);
+  out (ed.s + ed.pos - 1, ed.len - ed.pos + 1);
   move (ed.len, ed.pos);
 }
 
@@ -2318,7 +2302,7 @@ static void delete_char (int at) {                    // removes the character a
   memmove (ed.s + at, ed.s + at + 1, ed.len - at - 1);
   ed.len--;
   if (at < ed.pos) { move (ed.pos, at); ed.pos = at; }
-  emit (ed.s, ed.pos, ed.len);
+  out (ed.s + ed.pos, ed.len - ed.pos);
   erase_and_move (1, ed.pos);
 }
 
@@ -2344,9 +2328,8 @@ static int find_matches (const char *dir, const char *prefix) {
 }
 
 static void redraw_line (void) {                      // prompt and line again (after the list of names)
-  out (prompt_text, strlen (prompt_text));
-  ed.c0 = strlen (prompt_text) % ed.w;
-  emit (ed.s, 0, ed.len);
+  out (ed.prompt, strlen (ed.prompt));
+  out (ed.s, ed.len);
   move (ed.len, ed.pos);
 }
 
@@ -2381,7 +2364,7 @@ static void complete (void) {
     out ("\n", 1);
     for (int i = 0, col = 0; i < count; i++) {
       int l = strlen (matches[i]) + 2;
-      if (col + l > ed.w) { out ("\n", 1);  col = 0; }
+      if (col + l > LINE_WIDTH) { out ("\n", 1);  col = 0; }
       out (matches[i], l - 2);  out ("  ", 2);  col += l;
     }
     out ("\n", 1);
@@ -2406,11 +2389,9 @@ int ureadline (char *s, int maxlength, boolean echo) {
   int print_newline = 1, hpos = 0;                           // hpos: how many lines back in the history (0: the line that is being typed)
   char saved[HIST_LEN];                                      // the line that was typed before the first Up
   int pending = -1;                                          // a key that followed an Esc without belonging to a sequence
-  struct winsize ws;
   if (maxlength < 0) { print_newline = 0; maxlength = -maxlength; }
   ed.s = s;  ed.max = maxlength;  ed.len = ed.pos = 0;
-  ed.w = ioctl (STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col >= 20 ? ws.ws_col : 80;
-  ed.c0 = strlen (prompt_text) % ed.w;
+  if (echo) { fflush (stdout);  read_prompt (); }
   saved[0] = 0;
   for (;;) {
     int c;                                                   // the key: a character, or K_UP ... for a cursor key
