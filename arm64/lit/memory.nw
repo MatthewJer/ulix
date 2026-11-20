@@ -622,7 +622,7 @@ static volatile int swap_io_owner = -1;             // the thread that holds the
 int swap_io_by_me (void) { return swap_io_owner == current_task; }
 static int swap_io_enter (void) {                  // 1: locked, 0: no lock needed, -1: busy (the caller must not use the swap file now)
   if (current_task > 1 && fs_busy_by_me ()) {      // swap I/O inside the file system code of this very thread would run the Minix code twice at once (its tables are global)
-    if (swap_nested_reports++ < 5) printf ("[kernel] BUG: swap I/O from inside the file system (thread %d, %s)\n", current_task, swap_evicting_now ? "eviction" : "page-in");
+    if (swap_nested_reports++ < 5) printf ("[kernel] BUG: swap I/O from inside the file system (thread %d, %s, caller 0x%lx, then 0x%lx)\n", current_task, swap_evicting_now ? "eviction" : "page-in", (unsigned long) __builtin_return_address (0), (unsigned long) __builtin_return_address (1));
     if (swap_evicting_now) return -1;                // (an eviction is not needed that badly: the caller finds another way)
   }
   if (current_task <= 1) {                         // thread 1 cannot wait; but it must not use the swap file (one file position!) while another thread is in the middle of a transfer
