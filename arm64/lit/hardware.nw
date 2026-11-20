@@ -384,7 +384,11 @@ static void dsb_isb (void) { __asm__ volatile ("dsb sy; isb" ::: "memory"); }
 #define ICC_IGRPEN1_EL1 "S3_0_C12_C12_7"
 #define ICC_SGI1R_EL1   "S3_0_C12_C11_5"
 
-static void d_wait_rwp (void) { while (R32 (gicd_va + D_CTLR) & (1u @<< 31)) ; }
+// (a register that never changes would freeze the boot without a word: give up after a while and say so)
+static void spin_giveup (const char *what) { printf ("[kernel] GIC: gave up waiting for %s\n", what); }
+static void d_wait_rwp (void) {
+  for (long n = 0; R32 (gicd_va + D_CTLR) & (1u @<< 31); n++) if (n > 100000000L) { spin_giveup ("RWP"); return; }
+}
 
 static u64 mpidr_affinity (u64 mpidr) { return (mpidr & 0xffffff) | ((mpidr >> 32 & 0xff) @<< 32); }
 
@@ -407,7 +411,7 @@ static void v3_cpu_init (void) {
   if (!rd) return;
   u32 waker = R32 (rd + R_WAKER);                        // wake the redistributor up
   W32 (rd + R_WAKER, waker & ~(1u @<< 1));
-  while (R32 (rd + R_WAKER) & (1u @<< 2)) ;
+  for (long n = 0; R32 (rd + R_WAKER) & (1u @<< 2); n++) if (n > 100000000L) { spin_giveup ("the redistributor (ChildrenAsleep)"); break; }
   u64 sgi = rd + S_BASE;
   W32 (sgi + D_IGROUPR (0), 0xffffffff);                 // group 1
   W32 (sgi + D_ICENABLER (0), 0xffffffff);
@@ -1008,6 +1012,10 @@ wait for an interrupt without holding the kernel lock
 
 <<smp.c: arch_idle>>=
 void arch_idle (void) {
+  if (bkl_depth () != 1) {                   // with another count the lock stays ours while we wait: no other CPU could enter the kernel
+    static int told;
+    if (!told++) { printf ("[kernel] arch_idle with lock depth %d (called from 0x%lx)\n", bkl_depth (), (u64) __builtin_return_address (0)); smp_dump ("arch_idle"); }
+  }
   bkl_unlock ();
   __asm__ volatile ("msr daifclr, #2; wfi; msr daifset, #2" ::: "memory");
   bkl_lock ();
@@ -1122,7 +1130,9 @@ void smp_stop_others (void) {
     if (c == me || !pc[c].online) continue;
     u32 e0 = pc[c].entries;
     gic_send_sgi (c, SGI_STOP);
-    for (long spin = 0; spin < 100000000 && !pc[c].in_kernel && pc[c].entries == e0; spin++) __asm__ volatile ("yield");
+    long spin;
+    for (spin = 0; spin < 100000000 && !pc[c].in_kernel && pc[c].entries == e0; spin++) __asm__ volatile ("yield");
+    if (spin >= 100000000) printf ("[kernel] CPU %d did not enter the kernel after the stop request\n", c);
   }
 }
 

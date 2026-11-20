@@ -279,7 +279,10 @@ void blk_irq_ack (void) {                   // in the interrupt handler: every d
 
 static int blk_request (int n, int type, u64 sector, void *buf, u32 nsectors) {
   if (blk_submit_n (n, type, sector, buf, nsectors) != 0) return -1;
-  while (!blk_done_n (n)) __asm__ volatile ("dmb ish" ::: "memory");              // polling
+  for (long polls = 0; !blk_done_n (n); polls++) {                               // polling
+    __asm__ volatile ("dmb ish" ::: "memory");
+    if (polls == 200000000L) printf ("[kernel] disk %d: request still not done after 200000000 polls\n", n);      // (once; a dead device otherwise hangs without a word)
+  }
   return blk_finish_n (n);
 }
 
