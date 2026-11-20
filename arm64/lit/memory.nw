@@ -602,6 +602,15 @@ void arch_swap_shrink (void) {
   swap_io_leave (l);
 }
 
+// A checksum of every page in the swap file (debugging aid: a page that comes back with other content is reported at once, with the slot and the program)
+static unsigned swap_sum[MAX_SWAP_FRAMES];
+static unsigned page_sum (u64 pa) {
+  const unsigned *w = KVA (pa);
+  unsigned h = 2166136261u;
+  for (int i = 0; i < (int) (PAGE / 4); i++) h = (h ^ w[i]) * 16777619u;
+  return h;
+}
+
 static int swap_index (int as, int pageno) {
   for (int i = 0; i < MAX_SWAP_FRAMES; i++)
     if (paging[i].used && paging[i].as == as && paging[i].pageno == pageno) return i;
@@ -692,6 +701,7 @@ int page_out (int as, int pageno) {
   *e = (old & ~PTE_VALID) | PTE_SWAPPED | PTE_EVICTING;    // take the page away: from now on every access faults and waits
   evicting_as = as;
   flush_page (as, va);                                     // (on all CPUs; the frame stays ours: pa is still in the entry)
+  unsigned sum = page_sum (pa);                            // (the page is not mapped any more: this is what goes to the file)
   if (write_swap_page (as, pageno, (int)(pa >> 12)) != 0) { *e = old;  swap_io_leave (l);  evict_over (as);  return -1; }
   int index = swap_index (as, pageno);
   if (index < 0 || u_lseek (swap_fd, 0, SEEK_END) < (index + 1) * (int)PAGE) {   // the disk is full
@@ -702,6 +712,7 @@ int page_out (int as, int pageno) {
     evict_over (as);
     return -1;
   }
+  swap_sum[index] = sum;
   swap_io_leave (l);
   swap_has_data = 1;
   if (index + 1 > swap_file_pages) swap_file_pages = index + 1;
@@ -738,7 +749,14 @@ static int page_in_inner (int as, int pageno) {
     swap_io_leave (l);  free_frame (pa);
     return (e && (*e & PTE_VALID)) ? 0 : -1;
   }
+  int slot = swap_index (as, pageno);
   read_swap_page (as, pageno, (int)(pa >> 12));
+  if (slot >= 0 && page_sum (pa) != swap_sum[slot]) {
+    static int reports;
+    int again = 0;
+    for (; again < 3; again++) { read_swap_page (as, pageno, (int)(pa >> 12));  if (page_sum (pa) == swap_sum[slot]) break; }
+    if (reports++ < 8) printf ("[kernel] BUG: page %d of address space %d (swap slot %d) came back from the swap file with the wrong content; %s after %d more reads\n", pageno, as, slot, again < 3 ? "right" : "still wrong", again + 1);
+  }
   swap_io_leave (l);
   e = pte_of (l0, va);
   if (!e || (*e & PTE_VALID)) { free_frame (pa); return (e && (*e & PTE_VALID)) ? 0 : -1; }

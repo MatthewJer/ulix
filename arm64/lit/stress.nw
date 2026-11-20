@@ -232,7 +232,8 @@ static void mode_futex (void) {
     } else if (kind == 1) {                                   // condition variable: every token is taken exactly once
       long given = 0;
       tokens = 0;  woken = 0;
-      for (int i = 0; i < n; i++) spawn (&t[i], cond_body, 0);
+      int made = 0;
+      for (int i = 0; i < n; i++) made += spawn (&t[i], cond_body, 0) == 0;
       for (int i = 0; i < 100; i++) {
         pthread_mutex_lock (&mx);  tokens++;  given++;
         if (rnd (2)) pthread_cond_signal (&cv); else pthread_cond_broadcast (&cv);
@@ -242,7 +243,7 @@ static void mode_futex (void) {
       for (int tries = 0; tries < 2000; tries++) { pthread_mutex_lock (&mx);  long left = tokens;  pthread_mutex_unlock (&mx);  if (!left) break;  nap (2); }
       pthread_mutex_lock (&mx);  stop_threads = 1;  pthread_cond_broadcast (&cv);  pthread_mutex_unlock (&mx);
       for (int i = 0; i < n; i++) if (t[i]) pthread_join (t[i], 0);
-      CHECK (tokens == 0 && (woken == given), "every token is taken once");
+      if (made) CHECK (tokens == 0 && (woken == given), "every token is taken once");
     } else if (kind == 2) {                                   // raw futex: wake, requeue and time-outs, nobody may stay asleep
       woken = timedout = 0;
       for (int i = 0; i < n; i++) spawn (&t[i], futex_body, (void *) (long) i);
