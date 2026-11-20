@@ -167,7 +167,9 @@ extern int arch_evict_one (void);           // arch_swap.c: page out the least u
 returns a zeroed frame (physical address), or 0 if there is none and no page can be swapped out
 
 <<mmu.c: alloc_frame_try>>=
+extern void arch_evict_wait (void);         // arch_swap.c: let the other threads run (not thread 1, which cannot wait)
 u64 alloc_frame_try (void) {
+  int evict_failures = 0;
   for (;;) {
     u64 pa;
     if (free_list) {
@@ -182,7 +184,12 @@ u64 alloc_frame_try (void) {
       REFS (pa) = 1;
       return pa;
     }
-    if (arch_evict_one () != 0) return 0;   // as in the book, a missing frame is made free by swapping a page out
+    // as in the book, a missing frame is made free by swapping a page out. One failed attempt is no reason to give up: another thread may be
+    // in the middle of a transfer (the swap file serves one at a time), or the page that was chosen changed meanwhile. Only a row of failures is "no memory".
+    if (arch_evict_one () != 0) {
+      if (++evict_failures > 30) { evict_failures = 0;  return 0; }
+      arch_evict_wait ();
+    } else evict_failures = 0;
   }
 }
 
@@ -902,6 +909,8 @@ int arch_evict_one (void) {
   mutex_unlock (paging_lock);
   return r;
 }
+
+void arch_evict_wait (void) { if (current_task > 1) arch_resign (); }
 
 void syscall_free_a_frame (context_t *r) {
   if (arch_evict_one () != 0) printf ("\nERROR: cannot pick a page to evict!\n");

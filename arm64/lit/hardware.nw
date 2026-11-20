@@ -1086,7 +1086,17 @@ static volatile u32 deferred_sig[MAX_THREADS];
 
 // what the kernel has to do for a process before the book's u_kill signals it: a process that sleeps in a pipe or in the network
 // code leaves its queue (the book knows only its own queues), and a process that ends closes its pipe ends
+// a thread that waits for a kernel lock (mutex_lock: state TSTATE_LOCKED) is in the queue of that lock, and the book's u_kill does not know the
+// lock ("probably failure!"): the dead thread stayed in the queue and was woken later, as a ready thread that does not exist (a jump to a wild
+// address; found by tools/stress_test.py when kills meet threads that wait for the swap lock)
+static void locks_before_kill (int pid) {
+  if (thread_table[pid].state != TSTATE_LOCKED) return;
+  for (int i = 0; i < MAX_LOCKS; i++)
+    if (kernel_locks[i].used) remove_from_blocked_queue (pid, &kernel_locks[i].bq);
+}
+
 static void before_kill (int pid, int signo) {
+  if (signo == SIGKILL || signo == SIGSTOP || (signo > 0 && signo != SIGCHLD && signo != SIGCONT && thread_table[pid].sighandlers[signo] == SIG_DFL)) locks_before_kill (pid);   // (a signal that ends or stops the thread)
   pipes_before_kill (pid, signo);            // pipes.c: leave the pipe queue, close the pipe ends of a process that ends
   net_before_kill (pid);                     // net_syscalls.c: leave the queue of the network waiters
   futex_before_kill (pid);                   // linux_abi.c: leave the queue of the futex waiters (a signal ends the wait)
