@@ -84,6 +84,18 @@ try:
     t.send("ps\r\n")
     check(t.expect(r"(?s)PID\s+PPID.*tty4.*/bin/sh.*root@ulix\[\d+\]:/root# ", 30), "ps shows the shell on tty4, the terminal of the session")
 
+    # the line editor: the client sends the ANSI sequences of the cursor keys as they are
+    t.text = ""
+    t.send("cat /hello.c\r\n")
+    check(t.expect(r"(?s)Hello World.*root@ulix\[\d+\]:/root# ", 30), "cat /hello.c prints the file")
+    t.text = ""
+    t.send("\x1b[A\r\n")
+    check(t.expect(r"(?s)Hello World.*root@ulix\[\d+\]:/root# ", 30), "Up-arrow recalls the last command through telnet, Enter runs it again")
+    t.text = ""
+    t.send("caxt /hello.c" + "\x1b[D" * 10 + "\x7f\x1b[H\x1b[3~c\x1b[FZ\x7f\r\n")
+    check(t.expect(r"(?s)Hello World.*root@ulix\[\d+\]:/root# ", 30), "Left, Backspace, Home, Delete and End edit a line through telnet")
+    t.text = ""
+
     t2 = Telnet()
     t2.pump(5)
     check("in use" in t2.text, "a second connection is told that the terminal is in use")
