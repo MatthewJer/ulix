@@ -1018,6 +1018,8 @@ Findings:
 - The kernel exception with the jump into `stack_top` after "cannot remove process N (state: 9) from blocked queue" was seen once (first run, before the signal work); it was not reproduced again on the rebased tree, with or without `m3-signals`, so its root cause is not found. Next step: run `STRESS_MODE=all` with several seeds and `QEMU_FAST=1`-like configurations (`STRESS_CONFIGS="4:1:128"`) for a long time on a kernel with `m3-signals`.
 - hvf runs (`4:1:128`) sometimes failed to start ("cannot connect to qemu") when other agents used the accelerator; a retry worked.
 
+Crash reproduced (not fixed): `STRESS_MODE=all STRESS_CONFIGS="4:1:64" STRESS_SEEDS=3` (hvf, 4 CPUs, 64 MByte, so the kernel swaps) on the tree with `m3-signals` merged: user processes are killed by translation faults on pages that exist (instruction abort ESR 0x82000004 at ELR=FAR=0x40c62c, data abort ESR 0x92000007), then `KERNEL EXCEPTION kind=0 ELR=...stack_top` (the same signature as the first crash above, which also happened under memory pressure), then a BKL timeout from the exception handler. So the suspect is the swap / page-in / eviction path on SMP (a page that is being evicted or paged in on one CPU is seen as not present on another, and a kernel stack or return address gets lost). The 4:0:128, 2:1:128 configurations pass 100 s. Next step: run `STRESS_MODE=mmap` and `all` at `4:1:64` with several seeds, then read the eviction code in `lit/memory.nw` (`alloc_frame_try`, the swap-out and page-in functions) for the lock held across the writes to `/tmp/swap`.
+
 ## 58. Lock audit (branches `m3-lock-audit`, `m3-lock-audit2`)
 
 Static audit of the big kernel lock (BKL) and the places where interrupts are let in. Findings and fixes:
