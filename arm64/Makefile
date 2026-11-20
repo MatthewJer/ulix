@@ -165,7 +165,7 @@ ulix.elf: $(OBJS) ulix.ld
 # ---- kernel code taken from the book (ulix-book.nw) ----
 # notangle assembles declarations / globals / functions from the book's chunks; port.py
 # picks the functions listed in port.manifest.  The result is compiled unchanged.
-PORT_PFD ?= 16   # 64 hangs the kernel tests, see ARM64-PORT.md section 50
+PORT_PFD ?= 64   # (ARM64-PORT.md section 60)
 GENFILES = $(GENDIR)/ulix-decl.h $(GENDIR)/ulix-globals.c $(GENDIR)/ulix-functions.c $(GENDIR)/ulix-init.c
 
 $(GENFILES): ../ulix-book.nw ulix-arm64.nw Makefile

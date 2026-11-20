@@ -1382,8 +1382,8 @@ static long linux_getdents64 (int fd, char *buf, u64 size) {
 \paragraph{Descriptors.} \texttt{dup}, \texttt{dup3} and \texttt{fcntl (F\_DUPFD)} copy an entry of the process's descriptor table with
 \texttt{u\_share}, the function that \texttt{fork} uses (chapter~\ref{ch:pipes}). For a file that gives a second descriptor of the \emph{same} open file,
 so both share the read/write position as in Unix (the book's \texttt{u\_reopen} made a copy with its own position); for a pipe end it is one more user of
-the same end. The table has 16 entries (\texttt{MAX\_PFD} of the book; the Makefile variable \texttt{PORT\_PFD} can change it, see section~50 of \texttt{ARM64-PORT.md}
-for why it is not larger), so \texttt{EMFILE} comes early; \texttt{open} now gives the file back when there is no free entry. \texttt{pipe2} and \texttt{dup3} use the
+the same end. The table has 64 entries (\texttt{MAX\_PFD} is 16 in the book; the Makefile variable \texttt{PORT\_PFD} sets the port's value, see section~60 of \texttt{ARM64-PORT.md}),
+so \texttt{EMFILE} comes at 61 open files; \texttt{open} now gives the file back when there is no free entry. \texttt{pipe2} and \texttt{dup3} use the
 book's calls from \texttt{pipes.c}; the flags \texttt{O\_CLOEXEC} and \texttt{O\_NONBLOCK} are accepted and ignored (a descriptor
 is never closed by \texttt{exec} yet, and reads on pipes always block).
 
@@ -3040,7 +3040,7 @@ int main (void) {
   int fds[1100];
   int n = fill_table (fds, 1100), err = errno;
   printf ("  info: %d descriptors of /test.txt opened before the table was full\n", n);
-  CHECK (n >= 10 && n < 1100 && err == EMFILE, "a full table ends with EMFILE (the limit is MAX_PFD minus the 3 standard descriptors)");
+  CHECK (n >= 60 && n < 1100 && err == EMFILE, "a full table (64 entries, 3 of them standard descriptors) holds at least 60 files and ends with EMFILE");
   for (int i = 0; i < n; i++) close (fds[i]);
   int m = fill_table (fds, 1100);
   CHECK (m == n, "after closing them all, the same number can be opened again (nothing leaked)");
