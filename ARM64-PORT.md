@@ -962,12 +962,7 @@ Adding these up (an estimate, not a measurement) gives about 10 MByte for an idl
 
 **Known faults, not fixed (marked `user KNOWN:`, not failures; if the kernel is repaired the check says `user ok:`). Issue drafts:**
 1. *Open files are not shared between parent and child*: after `fork` each has its own offset (POSIX: one open file description). Related to #138 (descriptor table, section 49).
-2. *Signals other than `SIGKILL` do not end a process as a signal*: `kill (pid, SIGTERM)`, `SIGSEGV` of a fault and `abort ()` end the process as "Killed" (signal replaced by 9, section "Signals" of the book), and `waitpid` reports a normal exit, not `WIFSIGNALED`/`WTERMSIG`.
-3. *A handler in another process is never called*: `kill (child, SIGUSR1)` kills the child instead of calling its handler (the handler works for signals a process sends to itself).
-4. *`SIGCHLD` is not sent* when a child ends.
-5. *`execve` ignores `envp`* (`syscall_execv` takes no environment): the program starts with the environment of the caller.
-6. *Missing Linux system calls*: `rt_sigpending` (136), `rt_sigsuspend` (133), `setitimer` (103; so `alarm` and `ITIMER_REAL` fail with "not implemented").
-7. *A signal does not end a blocking `read` of a pipe* (no EINTR): a process that waits for a pipe cannot be interrupted by a handler. The test of this hung the program, so it is not in the suite.
+2. to 7. (signals, `SIGCHLD`, `execve` envp, `rt_sigpending`/`rt_sigsuspend`/`setitimer`, EINTR of a pipe read) are **fixed**, see section 59. libctest now has 0 known faults and `tools/libc_test.py` demands that.
 
 **Not tested, on purpose:** `popen`/`system` (the shell has no `-c`), real locales, `iconv`, `gettext` (not in musl).
 
@@ -1020,6 +1015,15 @@ Static audit of the big kernel lock (BKL) and the places where interrupts are le
 - **User pointers.** `user_ok` accepted a length that wraps around the end of the address space (`va + len < va`): the loop did not run and the kernel wrote through an unchecked range. Fixed. No regression test yet (needs a musl program that calls a system call with length -1).
 - Checked and fine: wake-ups in pipes, futex, network are under the BKL with interrupts masked (no lost wake-up); DMA cache maintenance of virtio-blk, virtio-net and genet is symmetric (clean before, flush/invalidate after); the SD card is PIO (no ADMA2).
 - **Doubtful / not reviewed:** pipe/futex/net waits ignore a signal (loop again, no EINTR; topic of `m3-signals`); lock ordering fs/hd/paging/swapper/exec/run_lock only skimmed (all are sleeping book mutexes taken under the BKL, hd lock inside the fs lock); frame allocator, buffer cache, TLB shootdown, stack depth (BearSSL, printf), `uchan`/`usem` not reviewed.
+
+## 59. Signals and blocking calls (branch `m3-signals`)
+
+- **Death by signal:** `linux_kill` calls `linux_signal_send` (`lit/libc.nw`): a signal whose default action ends the process, and SIGKILL, is only queued (pending bit, atomic) and the sleeper is woken (pipe, network, futex queue, keyboard queue). The process ends itself in `arch_signal_check` (`arch_linux_exit` with `EXIT_SIGNALED | signal`), so `wait4` reports `WIFSIGNALED`/`WTERMSIG`; a fault (exit code -1) is reported as SIGSEGV. A process asleep where no signal wakes it (disk, lock) is still killed by the book's `u_kill`; Ctrl-C and the pty hangup also use the book's path. Each sleeper leaves its queue once: `pipes_before_kill`/`net_before_kill`/`futex_before_kill` test the state first.
+- **Handlers:** a signal with a handler is queued and wakes the sleeper; `pipe_read`/`pipe_write`, sockets, `ppoll`, `nanosleep`, futex and `wait4` return EINTR when `signal_interrupts ()` (deliverable = pending and not blocked), or restart with `SA_RESTART` (read, write, wait4, accept, connect, send, recv: the `svc` is executed again). `sa_mask`, `SA_NODEFER` and the blocking of the signal during its handler work; `sigreturn` restores the mask (saved in the frame). `wait4` sleeps in 10 ms ticks of the futex queue.
+- **SIGCHLD** goes to the parent when a child ends (`linux_process_ended`); default ignore; `SIG_IGN`/`SA_NOCLDWAIT`: no zombie, `waitpid` says ECHILD. Not sent for stopped children (no WUNTRACED).
+- New calls: `rt_sigpending` 136, `rt_sigsuspend` 133, `setitimer`/`getitimer` 102/103 (ITIMER_REAL, so `alarm`). `execve` passes `envp` (24 variables, 1200 bytes; NULL gives `PATH=/bin`) and resets handlers.
+- **Not done:** a read of the console tty (state WAITKEY) is woken by a signal but the book's `READCHAR` loop sleeps again; SA_RESETHAND; a SIGSEGV handler; process-time timers.
+- **Tests:** libctest 208 checks, 0 known faults (`QEMU_FAST=1 make libc-test`). The kernel tests hang at "3 worker threads" with QEMU_FAST=1 (hvf) also on the unmodified rpi4 (checked at smp 2), so they were not usable as a regression check here.
 
 ## 60. The hang with a larger descriptor table: kernel threads had `files[]` = 0 (2026-11-20, branch `m3-fd-hang`, issue #138)
 
