@@ -116,6 +116,8 @@ static u64 next_free;                       // physical address
 static unsigned short frame_refs[MAX_RAM / PAGE_SIZE];     // how many page table entries use a frame (COW)
 #define REFS(pa)  frame_refs[((pa) - RAM_START) / PAGE_SIZE]
 static u64 free_list = 0;                   // singly linked through the frames themselves
+static long free_list_len = 0;              // how many frames are in it
+long frames_available (void) { return free_list_len + (long) ((RAM_START + RAM_SIZE - next_free) / PAGE_SIZE); }   // frames that can be allocated without evicting a page
 long frames_in_use = 0;
 
 u64 arch_ram_frames (void) { return plat.ram_size / PAGE_SIZE; }
@@ -175,6 +177,7 @@ u64 alloc_frame_try (void) {
     if (free_list) {
       pa = free_list;
       free_list = *(u64 *)KVA (pa);
+      free_list_len--;
     } else {
       pa = bump ();
     }
@@ -253,6 +256,7 @@ void free_frame (u64 pa) {
   if (--REFS (pa) > 0) return;
   *(u64 *)KVA (pa) = free_list;
   free_list = pa;
+  free_list_len++;
   frames_in_use--;
 }
 
@@ -614,6 +618,8 @@ static lock swap_io_lock = NULL;
 extern int fs_busy_by_me (void);
 extern void kill_hold_inc (void), kill_hold_dec (void);        // irq.c: a thread that swaps is not killed until it is done
 static int swap_nested_reports, swap_evicting_now;
+static volatile int swap_io_owner = -1;             // the thread that holds the swap lock
+int swap_io_by_me (void) { return swap_io_owner == current_task; }
 static int swap_io_enter (void) {                  // 1: locked, 0: no lock needed, -1: busy (the caller must not use the swap file now)
   if (current_task > 1 && fs_busy_by_me ()) {      // swap I/O inside the file system code of this very thread would run the Minix code twice at once (its tables are global)
     if (swap_nested_reports++ < 5) printf ("[kernel] BUG: swap I/O from inside the file system (thread %d, %s)\n", current_task, swap_evicting_now ? "eviction" : "page-in");
@@ -621,13 +627,15 @@ static int swap_io_enter (void) {                  // 1: locked, 0: no lock need
   }
   if (current_task <= 1) {                         // thread 1 cannot wait; but it must not use the swap file (one file position!) while another thread is in the middle of a transfer
     if (!swap_io_lock) return 0;
-    return mutex_try_lock (swap_io_lock) ? 1 : -1;
+    if (!mutex_try_lock (swap_io_lock)) return -1;
+    swap_io_owner = current_task;  return 1;
   }
   if (!swap_io_lock) swap_io_lock = get_new_lock ("swap io");
   mutex_lock (swap_io_lock);
+  swap_io_owner = current_task;
   return 1;
 }
-static void swap_io_leave (int locked) { if (locked > 0) mutex_unlock (swap_io_lock); }
+static void swap_io_leave (int locked) { if (locked > 0) { swap_io_owner = -1;  mutex_unlock (swap_io_lock); } }
 
 // \emph{A page must not be written while it is copied.} The first version of page\_out copied the page to the swap file while the page was still
 // mapped read+write, and cleared the page table entry afterwards. The copy takes a long time (it waits for the disk, and other threads run), and a thread of

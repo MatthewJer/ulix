@@ -62,6 +62,12 @@ static int running (void) {
   return t < deadline;
 }
 
+#define NOFORK do { if (errno != EAGAIN && errno != ENOMEM) FAIL ("fork"); nap (20); } while (0)       /* (no memory left for a process is an answer, not a failure) */
+static int spawn (pthread_t *t, void *(*f)(void *), void *a) {   /* the same for a thread: its stack is a mapping */
+  int r = pthread_create (t, 0, f, a);
+  if (r) { if (r != EAGAIN && r != ENOMEM) { errno = r;  FAIL ("pthread_create"); }  *t = 0; }
+  return r;
+}
 static unsigned char pat (unsigned s, long i) { return (unsigned char) (s * 31 + i * 7 + (i >> 8)); }
 static void fill (unsigned char *p, unsigned s, long n) { for (long i = 0; i < n; i++) p[i] = pat (s, i); }
 static int same_at (const unsigned char *p, unsigned s, long off, long n) { for (long i = 0; i < n; i++) if (p[i] != pat (s, off + i)) return 0;  return 1; }
@@ -92,7 +98,7 @@ static void mode_fork (void) {
     for (int i = 0; i < n; i++) {
       kind[i] = rnd (4);
       pids[i] = fork ();
-      if (pids[i] < 0) { FAIL ("fork");  kind[i] = -1;  continue; }
+      if (pids[i] < 0) { NOFORK;  kind[i] = -1;  continue; }
       if (pids[i] == 0) {
         if (kind[i] == 0) _exit (10 + i);
         if (kind[i] == 1) { nap (1 + rnd (20));  _exit (20 + i); }
@@ -131,7 +137,7 @@ static void mode_pipe (void) {
     unsigned s = rnd (1000);
     if (pipe (fd) < 0) { FAIL ("pipe");  continue; }
     pid_t w = fork ();
-    if (w < 0) { FAIL ("fork");  close (fd[0]);  close (fd[1]);  continue; }
+    if (w < 0) { NOFORK;  close (fd[0]);  close (fd[1]);  continue; }
     if (w == 0) {
       unsigned char buf[9000];
       close (fd[0]);
@@ -219,13 +225,14 @@ static void mode_futex (void) {
     stop_threads = 0;
     if (kind == 0) {                                          // contended mutex: the sum must be exact
       counter = 0;
-      for (int i = 0; i < n; i++) CHECK (pthread_create (&t[i], 0, count_body, 0) == 0, "pthread_create");
-      for (int i = 0; i < n; i++) pthread_join (t[i], 0);
-      CHECK (counter == 2000L * n, "mutex counter is exact");
+      int made = 0;
+      for (int i = 0; i < n; i++) made += spawn (&t[i], count_body, 0) == 0;
+      for (int i = 0; i < n; i++) if (t[i]) pthread_join (t[i], 0);
+      CHECK (counter == 2000L * made, "mutex counter is exact");
     } else if (kind == 1) {                                   // condition variable: every token is taken exactly once
       long given = 0;
       tokens = 0;  woken = 0;
-      for (int i = 0; i < n; i++) pthread_create (&t[i], 0, cond_body, 0);
+      for (int i = 0; i < n; i++) spawn (&t[i], cond_body, 0);
       for (int i = 0; i < 100; i++) {
         pthread_mutex_lock (&mx);  tokens++;  given++;
         if (rnd (2)) pthread_cond_signal (&cv); else pthread_cond_broadcast (&cv);
@@ -234,11 +241,11 @@ static void mode_futex (void) {
       }
       for (int tries = 0; tries < 2000; tries++) { pthread_mutex_lock (&mx);  long left = tokens;  pthread_mutex_unlock (&mx);  if (!left) break;  nap (2); }
       pthread_mutex_lock (&mx);  stop_threads = 1;  pthread_cond_broadcast (&cv);  pthread_mutex_unlock (&mx);
-      for (int i = 0; i < n; i++) pthread_join (t[i], 0);
-      CHECK (woken == given && tokens == 0, "every token is taken once");
+      for (int i = 0; i < n; i++) if (t[i]) pthread_join (t[i], 0);
+      CHECK (tokens == 0 && (woken == given), "every token is taken once");
     } else if (kind == 2) {                                   // raw futex: wake, requeue and time-outs, nobody may stay asleep
       woken = timedout = 0;
-      for (int i = 0; i < n; i++) pthread_create (&t[i], 0, futex_body, (void *) (long) i);
+      for (int i = 0; i < n; i++) spawn (&t[i], futex_body, (void *) (long) i);
       for (int i = 0; i < 30; i++) {
         nap (1 + rnd (3));
         int op = rnd (3);
@@ -249,10 +256,10 @@ static void mode_futex (void) {
       }
       stop_threads = 1;
       for (int tries = 0; tries < 50; tries++) { syscall (SYS_futex, &fa, FUTEX_WAKE_PRIVATE, 8, 0, 0, 0);  syscall (SYS_futex, &fb, FUTEX_WAKE_PRIVATE, 8, 0, 0, 0);  nap (1); }
-      for (int i = 0; i < n; i++) pthread_join (t[i], 0);
+      for (int i = 0; i < n; i++) if (t[i]) pthread_join (t[i], 0);
     } else {                                                  // threads that start and end at once, joined and detached
-      for (int i = 0; i < 8; i++) CHECK (pthread_create (&t[i], 0, short_body, (void *) (long) i) == 0, "pthread_create");
-      for (int i = 0; i < 8; i++) { void *r;  pthread_join (t[i], &r);  CHECK (r == (void *) (long) i, "thread result"); }
+      for (int i = 0; i < 8; i++) spawn (&t[i], short_body, (void *) (long) i);
+      for (int i = 0; i < 8; i++) if (t[i]) { void *r;  pthread_join (t[i], &r);  CHECK (r == (void *) (long) i, "thread result"); }
       pthread_attr_t a;  pthread_attr_init (&a);  pthread_attr_setdetachstate (&a, PTHREAD_CREATE_DETACHED);
       for (int i = 0; i < 4; i++) pthread_create (&t[i], &a, short_body, 0);
     }
@@ -293,7 +300,7 @@ static void mode_signal (void) {
     sigaction (SIGUSR1, &sa, 0);
     if (pipe (fd) < 0) { FAIL ("pipe");  continue; }
     pid_t p = fork ();
-    if (p < 0) { FAIL ("fork");  close (fd[0]);  close (fd[1]);  continue; }
+    if (p < 0) { NOFORK;  close (fd[0]);  close (fd[1]);  continue; }
     if (p == 0) { close (fd[1]);  signal_target (fd[0]);  _exit (0); }
     close (fd[0]);
     int n = 20 + rnd (60), term = rnd (3) == 0;
@@ -336,7 +343,7 @@ static void mode_mmap (void) {
         for (int k = 0; k < 64; k++) { long i = rnd (pages);  if (m[i * page] != pat (base, i) &&  /* a page may be picked twice */ m[i * page] != (unsigned char) (pat (base, i) ^ 0xff)) bad = 1;  m[i * page] ^= 0xff; }
         _exit (bad ? 1 : 0);
       }
-      if (p < 0) { FAIL ("fork");  continue; }
+      if (p < 0) { NOFORK;  continue; }
       int st = 0;
       if (reap (p, &st, 120)) CHECK (WIFEXITED (st) && WEXITSTATUS (st) == 0, "child sees the parent's pages");
       for (int k = 0; k < 64; k++) { long i = rnd (pages);  CHECK (m[i * page] == pat (base, i), "parent's page is unchanged by the child"); }
@@ -443,7 +450,7 @@ static void mode_sock (const char *host, int tcpport, int udpport) {
     if (kind <= 1) {                                          // socket pair: data both ways, a peer that leaves
       if (socketpair (AF_UNIX, SOCK_STREAM, 0, sv) < 0) { FAIL ("socketpair");  continue; }
       pid_t p = fork ();
-      if (p < 0) { FAIL ("fork");  close (sv[0]);  close (sv[1]);  continue; }
+      if (p < 0) { NOFORK;  close (sv[0]);  close (sv[1]);  continue; }
       if (p == 0) {
         unsigned char b[3000];
         close (sv[0]);

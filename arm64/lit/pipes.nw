@@ -441,7 +441,19 @@ extern int  book_u_chown (const char *path, short owner, short group), book_u_ch
 
 static int fs_owner = -1, fs_depth;                  // the thread that is in the file system (-1: nobody) and how often it entered
 
+// The file system code allocates frames now and then (buffers, tables). A swap transfer inside of it is not possible (see file_read), so nothing may
+// be evicted there; instead the frames are made free before the code is entered: a few dozen are enough for one call.
+extern long frames_available (void);
+extern int swap_io_by_me (void);
+extern int arch_evict_one (void);
+#define FS_FRAME_RESERVE 40
+static void fs_reserve_frames (void) {
+  for (int tries = 0; tries < 2 * FS_FRAME_RESERVE && frames_available () < FS_FRAME_RESERVE; tries++)
+    if (arch_evict_one () != 0) break;
+}
+
 static void fs_enter (void) {
+  if (fs_owner != current_task && current_task > 1 && !swap_io_by_me ()) fs_reserve_frames ();
   while (fs_owner != -1 && fs_owner != current_task) {
     if (!thread_table[fs_owner].used || thread_table[fs_owner].state == TSTATE_ZOMBIE) { fs_owner = -1;  fs_depth = 0;  break; }    // (it ended inside)
     arch_resign ();                                  // the owner waits for the SD card: let others run
