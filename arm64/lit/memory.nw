@@ -604,13 +604,16 @@ transfer at a time.
 
 <<arch_swap.c: swap_io_lock>>=
 static lock swap_io_lock = NULL;
-static int swap_io_enter (void) {
-  if (current_task <= 1) return 0;
+static int swap_io_enter (void) {                  // 1: locked, 0: no lock needed, -1: busy (the caller must not use the swap file now)
+  if (current_task <= 1) {                         // thread 1 cannot wait; but it must not use the swap file (one file position!) while another thread is in the middle of a transfer
+    if (!swap_io_lock) return 0;
+    return mutex_try_lock (swap_io_lock) ? 1 : -1;
+  }
   if (!swap_io_lock) swap_io_lock = get_new_lock ("swap io");
   mutex_lock (swap_io_lock);
   return 1;
 }
-static void swap_io_leave (int locked) { if (locked) mutex_unlock (swap_io_lock); }
+static void swap_io_leave (int locked) { if (locked > 0) mutex_unlock (swap_io_lock); }
 
 // \emph{A page must not be written while it is copied.} The first version of page\_out copied the page to the swap file while the page was still
 // mapped read+write, and cleared the page table entry afterwards. The copy takes a long time (it waits for the disk, and other threads run), and a thread of
@@ -657,6 +660,7 @@ int page_out (int as, int pageno) {
     swap_free_est -= 5;                                    // a page is 4 blocks, plus a block for the file's indirect table now and then
   }
   int l = swap_io_enter ();
+  if (l < 0) return -1;
   if (arch_as_l0 (as) != l0 || address_spaces[as].status != AS_USED) { swap_io_leave (l);  return -1; }   // (the program ended while we waited: its tables are gone)
   e = pte_of (l0, va);                                     // (the tables may have changed while we waited)
   if (!e || !(*e & PTE_VALID) || (*e & PTE_ADDR) != pa) { swap_io_leave (l); return -1; }
@@ -695,6 +699,7 @@ int page_in (int as, int pageno) {
   u64 pa = alloc_frame_try ();                             // reserve a frame
   if (!pa) return -1;
   int l = swap_io_enter ();
+  if (l < 0) { free_frame (pa);  return -1; }
   if (arch_as_l0 (as) != l0 || address_spaces[as].status != AS_USED) { swap_io_leave (l);  free_frame (pa);  return -1; }   // (the program ended while we waited)
   e = pte_of (l0, va);
   if (!e || (*e & PTE_VALID)) {                            // somebody else brought the page back while we waited
