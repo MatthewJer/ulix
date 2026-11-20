@@ -371,6 +371,7 @@ extern u64 user_to_phys (u64 va, int write);
 
 static int user_ok (u64 va, u64 len, int write) {
   if (len == 0) return 1;
+  if (va + len < va) return 0;                                // (a length that wraps around the end of the address space would skip the loop and pass)
   for (u64 p = va & ~4095UL; p < va + len; p += 4096)
     if (!user_to_phys (p < va ? va : p, write)) return 0;
   return 1;
