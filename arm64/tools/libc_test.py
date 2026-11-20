@@ -92,6 +92,7 @@ try:
             count = int(m.group(1)) if m else -1
         check(bad == 0, '%s: no check failed (%d "user FAIL" lines)' % (prog, bad))
         check(oks + bad + kn == count, '%s: %d checks ran (expected %d; %d of them are known faults of the kernel, see ARM64-PORT.md)' % (prog, oks + bad + kn, count, kn))
+        if prog == '/musl/libctest': check(kn == 0, '/musl/libctest: no known faults are left (%d)' % kn)
         check('not implemented' not in out, '%s needed no Linux system call that the kernel does not have' % prog)
     s.pump(0.5)
     if b'EXCEPTION' in s.log:
