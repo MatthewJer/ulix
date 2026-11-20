@@ -604,7 +604,13 @@ transfer at a time.
 
 <<arch_swap.c: swap_io_lock>>=
 static lock swap_io_lock = NULL;
+extern int fs_busy_by_me (void);
+static int swap_nested_reports, swap_evicting_now;
 static int swap_io_enter (void) {                  // 1: locked, 0: no lock needed, -1: busy (the caller must not use the swap file now)
+  if (current_task > 1 && fs_busy_by_me ()) {      // swap I/O inside the file system code of this very thread would run the Minix code twice at once (its tables are global)
+    if (swap_nested_reports++ < 5) printf ("[kernel] swap I/O from inside the file system (thread %d)\n", current_task);
+    if (swap_evicting_now) return -1;                // (an eviction is not needed that badly: the caller finds another way)
+  }
   if (current_task <= 1) {                         // thread 1 cannot wait; but it must not use the swap file (one file position!) while another thread is in the middle of a transfer
     if (!swap_io_lock) return 0;
     return mutex_try_lock (swap_io_lock) ? 1 : -1;
@@ -659,7 +665,9 @@ int page_out (int as, int pageno) {
     if (swap_free_est < SWAP_RESERVE_BLOCKS + 8) { swap_full = 1; return -1; }
     swap_free_est -= 5;                                    // a page is 4 blocks, plus a block for the file's indirect table now and then
   }
+  swap_evicting_now = 1;
   int l = swap_io_enter ();
+  swap_evicting_now = 0;
   if (l < 0) return -1;
   if (arch_as_l0 (as) != l0 || address_spaces[as].status != AS_USED) { swap_io_leave (l);  return -1; }   // (the program ended while we waited: its tables are gone)
   e = pte_of (l0, va);                                     // (the tables may have changed while we waited)
