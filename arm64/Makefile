@@ -346,6 +346,7 @@ machines: ulix.bin ulix-console.bin ulix-shell.bin $(DISK)
 run-shell: ulix-shell.bin $(DISK)
 	qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128 -nographic -kernel ulix-shell.bin -snapshot \
 		-drive file=$(DISK),format=raw,if=none,id=hd0 -device virtio-blk-device,drive=hd0 \
+		-device virtio-rng-device \
 		-netdev user,id=n0 -device virtio-net-device,netdev=n0
 
 # Everything: kernel test suites (EL1 with the legacy and EL2 with the modern virtio transport), the file system
