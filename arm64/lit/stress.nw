@@ -333,7 +333,7 @@ static void mode_mmap (void) {
       pid_t p = fork ();
       if (p == 0) {
         int bad = 0;
-        for (int k = 0; k < 64; k++) { long i = rnd (pages);  if (m[i * page] != pat (base, i) && m[i * page] != (unsigned char) (pat (base, i) ^ 0xff)) bad = 1;  m[i * page] ^= 0xff;   // (a page may be picked twice) }
+        for (int k = 0; k < 64; k++) { long i = rnd (pages);  if (m[i * page] != pat (base, i) &&  /* a page may be picked twice */ m[i * page] != (unsigned char) (pat (base, i) ^ 0xff)) bad = 1;  m[i * page] ^= 0xff; }
         _exit (bad ? 1 : 0);
       }
       if (p < 0) { FAIL ("fork");  continue; }
