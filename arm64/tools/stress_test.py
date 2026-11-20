@@ -77,7 +77,7 @@ def monitor(port, commands, wait=0.4):
 
 def run(smp, fast, mem, seed, index):
     port = PORT
-    tag = 'run%d-smp%d-%s-m%d-seed%d' % (index, smp, 'hvf' if fast else 'tcg', mem, seed)
+    tag = 'run%d-smp%d-%s-m%d-seed%d-%s' % (index, smp, 'hvf' if fast else 'tcg', mem, seed, MODE.replace(':', '').replace('/', ''))
     tcp = TcpServer(('127.0.0.1', port + 2), Echo); udp = UdpServer(('127.0.0.1', port + 2), Echo)
     for srv in (tcp, udp): threading.Thread(target=srv.serve_forever, daemon=True).start()
     cpu = ['-accel', 'hvf', '-cpu', 'host'] if fast else ['-cpu', 'cortex-a72']

@@ -811,6 +811,18 @@ static int grow_stack (u64 l0, u64 va) {
   return 1;
 }
 
+// A write fault that is stale when the handler runs (see exc_handler): the page was paged out meanwhile (read it back), or its entry allows the write now
+// (flush the entry of this CPU; the access is repeated). 0: the page is read-only and not shared: the program made a mistake.
+int arch_perm_retry (u64 va) {
+  u64 l0 = arch_as_l0 (current_as);
+  if (!l0 || va < USER_LO || va >= USER_HI) return 0;
+  u64 *e = pte_of (l0, va);
+  if (!e) return 0;
+  if (!(*e & PTE_VALID)) return (*e & PTE_SWAPPED) ? page_in (current_as, va >> 12) == 0 : 0;
+  if (!(*e & PTE_RO)) { flush_page (current_as, va);  return 1; }
+  return 0;
+}
+
 static int arch_user_fault_inner (u64 va);                                                  // DBG-HTTP
 
 int arch_user_fault (u64 va) {                                                              // DBG-HTTP

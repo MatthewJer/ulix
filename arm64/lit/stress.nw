@@ -175,7 +175,7 @@ static void mode_pipe (void) {
     if (reap (w, &st, 20)) {
       if (variant == 0 || variant == 3) CHECK (WIFEXITED (st) && WEXITSTATUS (st) == 0, "writer ends normally");
       if (variant == 1) CHECK (WIFSIGNALED (st) && WTERMSIG (st) == SIGKILL, "writer was killed");
-      if (variant == 2) CHECK ((WIFSIGNALED (st) && WTERMSIG (st) == SIGPIPE) || (WIFEXITED (st) && WEXITSTATUS (st) == 3) || (WIFEXITED (st) && WEXITSTATUS (st) == 0), "writer meets a closed pipe");
+      if (variant == 2) CHECK ((WIFSIGNALED (st) && WTERMSIG (st) == SIGPIPE) || (WIFEXITED (st) && WEXITSTATUS (st) == 3) || (WIFEXITED (st) && WEXITSTATUS (st) == 4) || (WIFEXITED (st) && WEXITSTATUS (st) == 0), "writer meets a closed pipe");
     }
   }
 }

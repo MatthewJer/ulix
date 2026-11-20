@@ -576,6 +576,7 @@ extern void blk_irq_ack (void);
 extern void hd_interrupt (void);
 extern void arch_kernel_fault_shell (void);
 extern int  arch_user_fault (u64 va);
+extern int  arch_perm_retry (u64 va);
 
 @
 \subsection{the interrupt controller is in gic.c; the interrupt numbers come from the device tree}
@@ -686,6 +687,13 @@ static void exc_handler_locked (struct frame *f, int kind) {
   // it writes into a user buffer during a system call. After the copy the instruction is simply repeated.
   if (kind == 0 && (ec == 0x24 || ec == 0x25) && (esr & (1 @<< 6)) && (esr & 0x3c) == 0x0c &&
       far < 0x80000000UL && book_scheduler_on && arch_cow_fault (far))
+    return;
+
+  // A write that faulted on a page that is not what the fault said any more: between the fault and this handler (which waits for the lock) another
+  // CPU paged the shared page out (its other owner had gone), or copied it, or the TLB of this CPU still had the old read-only entry. Then the
+  // page is brought back, or the access simply repeated; only a page that is read-only and not shared is a real error.
+  if (kind == 0 && (ec == 0x24 || ec == 0x25) && (esr & (1 @<< 6)) && (esr & 0x3c) == 0x0c &&
+      far < 0x80000000UL && book_scheduler_on && arch_perm_retry (far))
     return;
 
   // a page that was paged out (translation fault) or whose access flag was cleared for the page replacement
