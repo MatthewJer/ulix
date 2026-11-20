@@ -62,13 +62,14 @@ static int file_read (int fd, void *buf, int nbyte) {
 int u_read (int fd, void *buf, int nbyte)  { return is_pipe (fd) ? pipe_read (fd, buf, nbyte)  : is_vdev (fd) ? vdev_read (fd, buf, nbyte)  : is_sock (fd) ? sock_read (fd, buf, nbyte) : file_read (fd, buf, nbyte); }
 static int file_write1 (int fd, void *buf, int nbyte) { fs_enter ();  int k = book_u_write (fd, buf, nbyte);  fs_leave ();  return k; }
 static int file_write (int fd, void *buf, int nbyte) {
-  if (fd < 0 || !is_user_buffer (buf)) return file_write1 (fd, buf, nbyte);
+  if (!is_user_buffer (buf)) return file_write1 (fd, buf, nbyte);
   char piece[FS_PIECE];
   int total = 0;
   while (total < nbyte) {
     int n = nbyte - total < FS_PIECE ? nbyte - total : FS_PIECE;
     memcpy (piece, (char *) buf + total, n);                // (may fault: not inside the file system code)
     int k = file_write1 (fd, piece, n);
+    if (k < 0 && (fd == DEV_STDOUT || fd == DEV_STDERR)) k = n;     // (the book's console write falls into its error case after it wrote the text)
     if (k < 0) return total > 0 ? total : k;
     total += k;
     if (k < n) break;
