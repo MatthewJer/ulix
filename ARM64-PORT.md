@@ -1066,6 +1066,7 @@ Static audit of the big kernel lock (BKL) and the places where interrupts are le
 ## 65. `daemon-test`: `service heartbeat start` failed (branch `m3-daemon-fix`)
 
 Two causes. (1) `/var` and `/var/run` did not exist on the disk; since `telnetd` is started at boot by root (`rc.d/telnetd`), root made them (mode 0755) and the administrator `esser` could not write a pid file or the log (`daemon: cannot write /var/run/heartbeat.pid`). The disk image now has `/var`, `/var/run` and `/var/log` with mode 1777 (like `/tmp`), made by the Makefile. (2) `service` reads the pid file with `read (fd, text, 1023)` into a 32 byte buffer; the user pointer check of section 56 refused the whole range at the top of the stack (`EFAULT`, so the service looked as if it did not run). Linux copies only the bytes the file has. `read` now shortens the count to the mapped part of the buffer (`user_ok_prefix`); a buffer whose first byte is not mapped is still `EFAULT` (fdtest's bad-pointer checks). `QEMU_FAST=1`: daemon, shell, telnet and libc tests pass.
+
 ## 66. Line editing and history in the shell (branch `m3-readline`)
 
 **Why.** Typing a command with a mistake meant Backspace to the mistake and typing everything again; the arrow keys printed nothing useful. Other consoles have cursor keys and a history.
