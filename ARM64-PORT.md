@@ -1010,3 +1010,13 @@ All of `lib-build/tools` and `userland/` except the list below; including `init`
 ### Open
 
 The remaining table above; the musl programs are about three times as big as the ulixlib ones (`cat` 130 KByte instead of 4), which makes the disk image bigger and `vi` start a little slower.
+
+## 58. Lock audit (branches `m3-lock-audit`, `m3-lock-audit2`)
+
+Static audit of the big kernel lock (BKL) and the places where interrupts are let in. Findings and fixes:
+
+- **Thread 1 ran unprotected.** After `irq_init` the boot thread worked with interrupts unmasked while holding the BKL; a timer tick nested into it and ran the scheduler inside its update of shared data. Now `arch_threads_init` masks interrupts at its end; waits go through `arch_idle` / `arch_poll_pause`, the only windows. `irq_in_locked_code` counts any interrupt that arrives in locked kernel code; the kernel tests fail if it is not 0.
+- **Diagnostics for hangs.** `bkl_lock` reports after 2 s of waiting (owner, hold time, entry ELR/LR of every CPU, heartbeat = timer interrupts per CPU, backtrace via frame pointers, `smp_dump`); `smp_dump` is also printed on a kernel exception and at the end of the kernel tests. GIC waits, the polled virtio disk and `smp_stop_others` report instead of hanging silently; `arch_idle` reports a lock depth other than 1.
+- **User pointers.** `user_ok` accepted a length that wraps around the end of the address space (`va + len < va`): the loop did not run and the kernel wrote through an unchecked range. Fixed. No regression test yet (needs a musl program that calls a system call with length -1).
+- Checked and fine: wake-ups in pipes, futex, network are under the BKL with interrupts masked (no lost wake-up); DMA cache maintenance of virtio-blk, virtio-net and genet is symmetric (clean before, flush/invalidate after); the SD card is PIO (no ADMA2).
+- **Doubtful / not reviewed:** pipe/futex/net waits ignore a signal (loop again, no EINTR; topic of `m3-signals`); lock ordering fs/hd/paging/swapper/exec/run_lock only skimmed (all are sleeping book mutexes taken under the BKL, hd lock inside the fs lock); frame allocator, buffer cache, TLB shootdown, stack depth (BearSSL, printf), `uchan`/`usem` not reviewed.
