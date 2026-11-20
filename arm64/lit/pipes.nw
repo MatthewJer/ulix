@@ -36,7 +36,15 @@ have the book's names, look whether the descriptor is a pipe, and pass everythin
 
 <<pipes.c: wrappers>>=
 extern int minix_read_fast (int gfd, void *buf, int nbyte);       // fastfs.c: -2 means that the call is not for the fast path
-static int file_read1 (int fd, void *buf, int nbyte) { int k = minix_read_fast (fd, buf, nbyte);  return k == -2 ? book_u_read (fd, buf, nbyte) : k; }
+// (the book's read changes the same global state as its write: it runs one thread at a time, too. Before, a read from the swap file or from a program could
+// meet a write of another thread in the middle: a page that came back from the swap file with the wrong content, or all zeros)
+static int file_read1 (int fd, void *buf, int nbyte) {
+  int k = minix_read_fast (fd, buf, nbyte);
+  if (k != -2) return k;
+  if (fd < 0) return book_u_read (fd, buf, nbyte);          // (the terminal: no file system)
+  fs_enter ();  k = book_u_read (fd, buf, nbyte);  fs_leave ();
+  return k;
+}
 
 // \emph{The file system code never touches a user page.} The Minix code of the book keeps its state in global variables and runs
 // one thread at a time (fs_enter). If it read a buffer of the program that was paged out meanwhile (or wrote into one), the page fault would
