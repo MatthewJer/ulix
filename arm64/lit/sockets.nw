@@ -256,7 +256,7 @@ int sock_bind (int gfd, const struct saddr *a) {
   struct sock *s = sock_of (gfd);
   if (!s) return -E_NOTSOCK;
   if (a->v6 != s->v6) return -E_AFNOSUPPORT;                              // (the address of the call has the family of the socket)
-  if (s->type == SOCK_STREAM_) { s->local_port = a->port;  return 0; }    // remembered until listen () or connect ()
+  if (s->type == SOCK_STREAM_) { s->local_port = a->port ? a->port : next_port++;  return 0; }   // remembered until listen () or connect (); port 0 asks for a free port
   return bind_udp (s, a->port);
 }
 
