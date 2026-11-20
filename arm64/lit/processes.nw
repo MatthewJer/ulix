@@ -364,6 +364,8 @@ void arch_threads_init (void) {
   // With interrupts unmasked, a timer tick in the middle of its work on the shared data (frame allocator, thread table, buffer cache) ran
   // the scheduler inside that update and let other threads see it half done.
   __asm__ volatile ("msr daifset, #2" ::: "memory");
+  extern volatile int irq_window_checked;
+  irq_window_checked = 1;                       // from here on an interrupt in locked kernel code is a mistake (see exc_handler)
 }
 
 @
