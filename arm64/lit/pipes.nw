@@ -46,7 +46,7 @@ static int file_read1 (int fd, void *buf, int nbyte) { int k = minix_read_fast (
 #define FS_PIECE 2048
 static int is_user_buffer (const void *p) { return (unsigned long) p < 0x0001000000000000UL; }
 static int file_read (int fd, void *buf, int nbyte) {
-  if (!is_user_buffer (buf)) return file_read1 (fd, buf, nbyte);
+  if (fd < 0 || !is_user_buffer (buf)) return file_read1 (fd, buf, nbyte);       // (the terminal: no file system code, and it must read what was asked)
   char piece[FS_PIECE];
   int total = 0;
   while (total < nbyte) {
@@ -62,7 +62,7 @@ static int file_read (int fd, void *buf, int nbyte) {
 int u_read (int fd, void *buf, int nbyte)  { return is_pipe (fd) ? pipe_read (fd, buf, nbyte)  : is_vdev (fd) ? vdev_read (fd, buf, nbyte)  : is_sock (fd) ? sock_read (fd, buf, nbyte) : file_read (fd, buf, nbyte); }
 static int file_write1 (int fd, void *buf, int nbyte) { fs_enter ();  int k = book_u_write (fd, buf, nbyte);  fs_leave ();  return k; }
 static int file_write (int fd, void *buf, int nbyte) {
-  if (!is_user_buffer (buf)) return file_write1 (fd, buf, nbyte);
+  if (fd < 0 || !is_user_buffer (buf)) return file_write1 (fd, buf, nbyte);
   char piece[FS_PIECE];
   int total = 0;
   while (total < nbyte) {
