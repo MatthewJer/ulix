@@ -75,7 +75,7 @@ def run(cmd, answer, what=None, prompt=PROMPT):
 class Screen:
     """A very small terminal (80 columns, the cursor sequences of ANSI, the wrap of xterm that waits until the next character) to see
     where the line editor of the shell leaves the characters and the cursor."""
-    def __init__(s, w=80): s.w, s.rows, s.r, s.c, s.pend = w, [[' '] * w], 0, 0, False
+    def __init__(s, w=80): s.w, s.rows, s.r, s.c, s.pend, s.saved = w, [[' '] * w], 0, 0, False, (0, 0, False)
     def row(s):
         while len(s.rows) <= s.r: s.rows.append([' '] * s.w)
     def feed(s, data):
@@ -94,6 +94,8 @@ class Screen:
                 elif f == 'D': s.c = max(s.c - n, 0)
                 elif f == 'H':                                  # ESC [ line ; column H (the kernel moves the cursor for set_xy)
                     ps = par.split(b';'); s.r = int(ps[0] or 1) - 1; s.c = int(ps[1] or 1) - 1 if len(ps) > 1 else 0; s.row()
+            elif b == 27 and data[i:i + 1] == b'7': s.saved = (s.r, s.c, s.pend); i += 1      # save and restore the cursor (the status line is painted that way)
+            elif b == 27 and data[i:i + 1] == b'8': s.r, s.c, s.pend = s.saved; i += 1
             elif b == 13: s.c, s.pend = 0, False
             elif b == 10: s.r, s.c, s.pend = s.r + 1, 0, False
             elif b == 8: s.c, s.pend = max(s.c - 1, 0), False
@@ -103,7 +105,7 @@ class Screen:
                 if s.c == s.w - 1: s.pend = True
                 else: s.c += 1
             s.row()
-    def text(s, first_row): return ''.join(''.join(r) for r in s.rows[first_row:]).rstrip()
+    def text(s, first_row): return ''.join(''.join(r) for r in s.rows[first_row:24]).rstrip()
 
 try:
     expect(r'console ready', 'kernel booted')

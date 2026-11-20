@@ -1,3 +1,6 @@
+# The programs here are written in lit/*.nw and tangled (userland/musl/ulixcompat.c, ...). The top-level Makefile tangles first; this line does the same
+# for "make -C userland" alone, otherwise a stale tangled file is compiled (cpif keeps the dates of files that did not change).
+TANGLED := $(shell sh ../tools/tangle.sh)
 # The user space of Ulix for AArch64: the library (ulixlib, from ../../ulix-book.nw) and the programs of
 # ../../lib-build/tools (plain C files) and init (from the book), all compiled unchanged.
 #
