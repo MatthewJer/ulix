@@ -44,7 +44,6 @@ static int file_read1 (int fd, void *buf, int nbyte) { int k = minix_read_fast (
 // destroyed (files that vanish, wrong blocks; found by tools/stress_test.py with a small RAM). So a buffer of a program (an address in the user
 // half) is copied through a buffer of the kernel, in pieces, outside of the file system code: the page faults happen there.
 #define FS_PIECE 2048
-static int is_user_buffer (const void *p) { return (unsigned long) p < 0x0001000000000000UL; }
 static int file_read (int fd, void *buf, int nbyte) {
   if (fd < 0 || !is_user_buffer (buf)) return file_read1 (fd, buf, nbyte);       // (the terminal: no file system code, and it must read what was asked)
   char piece[FS_PIECE];
@@ -168,6 +167,7 @@ static int vdev_read (int gfd, void *buf, int n) {
 static int vdev_write (int gfd, void *buf, int n) { return n; }          // everything is accepted (a write to /dev/random adds nothing)
 
 int u_open (char *path, int oflag, int open_link) {
+  char kp0[FS_PATH];  path = (char *) kpath (path, kp0);
   for (int k = 0; k < VDEVS; k++)
     if (strequal (path, (char *) vdev_names[k])) return (FS_VDEV << 8) | k;
   fs_enter ();  int r = book_u_open (path, oflag, open_link);  fs_leave ();
@@ -439,6 +439,18 @@ extern int  book_u_getdent (const char *path, int index, struct dir_entry *buf);
 extern int  book_u_readlink (char *path, char *restrict buf, size_t bufsize);
 extern int  book_u_chown (const char *path, short owner, short group), book_u_chmod (const char *path, word mode);
 
+static int is_user_buffer (const void *p) { return (unsigned long) p < 0x0001000000000000UL; }
+// Names and result buffers of the calls below are copied the same way: a name of a program is copied into a buffer of the kernel before the file system
+// code runs (the copy may fault: outside of it), and what the code writes into a buffer of a program is written into a buffer of the kernel first.
+#define FS_PATH 256
+static const char *kpath (const char *p, char *kb) {
+  if (!p || !is_user_buffer (p)) return p;
+  int i = 0;
+  for (; i < FS_PATH - 1 && p[i]; i++) kb[i] = p[i];
+  kb[i] = 0;
+  return kb;
+}
+
 static int fs_owner = -1, fs_depth;                  // the thread that is in the file system (-1: nobody) and how often it entered
 
 static void fs_enter (void) {
@@ -454,18 +466,25 @@ int fs_busy_by_me (void) { return fs_owner == current_task; }      // swap.c: th
 
 static void fs_leave (void) { if (--fs_depth <= 0) { fs_owner = -1;  fs_depth = 0; } }
 
-int u_stat (const char *path, struct stat *buf)    { fs_enter ();  int r = book_u_stat (path, buf);  fs_leave ();  return r; }
-int u_unlink (const char *path)                    { fs_enter ();  int r = book_u_unlink (path);  fs_leave ();  return r; }
-int u_rmdir (const char *path)                     { fs_enter ();  int r = book_u_rmdir (path);  fs_leave ();  return r; }
-int u_chdir (const char *path)                     { fs_enter ();  int r = book_u_chdir (path);  fs_leave ();  return r; }
-int u_link (const char *path, const char *path2)   { fs_enter ();  int r = book_u_link (path, path2);  fs_leave ();  return r; }
-int u_symlink (const char *path, const char *path2) { fs_enter ();  int r = book_u_symlink (path, path2);  fs_leave ();  return r; }
+int u_stat (const char *path, struct stat *buf)    { char kp[FS_PATH];  struct stat st;  path = kpath (path, kp);  fs_enter ();  int r = book_u_stat (path, &st);  fs_leave ();  if (r == 0) *buf = st;  return r; }
+int u_unlink (const char *path)                    { char kp[FS_PATH];  path = kpath (path, kp);  fs_enter ();  int r = book_u_unlink (path);  fs_leave ();  return r; }
+int u_rmdir (const char *path)                     { char kp[FS_PATH];  path = kpath (path, kp);  fs_enter ();  int r = book_u_rmdir (path);  fs_leave ();  return r; }
+int u_chdir (const char *path)                     { char kp[FS_PATH];  path = kpath (path, kp);  fs_enter ();  int r = book_u_chdir (path);  fs_leave ();  return r; }
+int u_link (const char *path, const char *path2)   { char kp[FS_PATH], kp2[FS_PATH];  path = kpath (path, kp);  path2 = kpath (path2, kp2);  fs_enter ();  int r = book_u_link (path, path2);  fs_leave ();  return r; }
+int u_symlink (const char *path, const char *path2) { char kp[FS_PATH], kp2[FS_PATH];  path = kpath (path, kp);  path2 = kpath (path2, kp2);  fs_enter ();  int r = book_u_symlink (path, path2);  fs_leave ();  return r; }
 int u_ftruncate (int fd, int length)               { fs_enter ();  int r = book_u_ftruncate (fd, length);  fs_leave ();  return r; }
-int u_mkdir (const char *path, int mode)           { fs_enter ();  int r = book_u_mkdir (path, mode);  fs_leave ();  return r; }
-int u_getdent (const char *path, int index, struct dir_entry *buf) { fs_enter ();  int r = book_u_getdent (path, index, buf);  fs_leave ();  return r; }
-int u_readlink (char *path, char *restrict buf, size_t bufsize) { fs_enter ();  int r = book_u_readlink (path, buf, bufsize);  fs_leave ();  return r; }
-int u_chown (const char *path, short owner, short group) { fs_enter ();  int r = book_u_chown (path, owner, group);  fs_leave ();  return r; }
-int u_chmod (const char *path, word mode)          { fs_enter ();  int r = book_u_chmod (path, mode);  fs_leave ();  return r; }
+int u_mkdir (const char *path, int mode)           { char kp[FS_PATH];  path = kpath (path, kp);  fs_enter ();  int r = book_u_mkdir (path, mode);  fs_leave ();  return r; }
+int u_getdent (const char *path, int index, struct dir_entry *buf) { char kp[FS_PATH];  struct dir_entry de;  path = kpath (path, kp);  fs_enter ();  int r = book_u_getdent (path, index, &de);  fs_leave ();  if (r >= 0) *buf = de;  return r; }
+int u_readlink (char *path, char *restrict buf, size_t bufsize) {
+  char kp[FS_PATH], kb[FS_PATH];
+  path = (char *) kpath (path, kp);
+  if (!is_user_buffer (buf) || bufsize > sizeof kb) { fs_enter ();  int r = book_u_readlink (path, buf, bufsize);  fs_leave ();  return r; }
+  fs_enter ();  int r = book_u_readlink (path, kb, bufsize);  fs_leave ();
+  if (r > 0) memcpy (buf, kb, r < (int) bufsize ? r : bufsize);
+  return r;
+}
+int u_chown (const char *path, short owner, short group) { char kp[FS_PATH];  path = kpath (path, kp);  fs_enter ();  int r = book_u_chown (path, owner, group);  fs_leave ();  return r; }
+int u_chmod (const char *path, word mode)          { char kp[FS_PATH];  path = kpath (path, kp);  fs_enter ();  int r = book_u_chmod (path, mode);  fs_leave ();  return r; }
 @
 
 \section{The test program}
