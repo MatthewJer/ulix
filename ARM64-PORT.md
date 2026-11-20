@@ -1006,6 +1006,18 @@ All of `lib-build/tools` and `userland/` except the list below; including `init`
 
 The remaining table above; the musl programs are about three times as big as the ulixlib ones (`cat` 130 KByte instead of 4), which makes the disk image bigger and `vi` start a little slower.
 
+## 57. Stress tests (branch `m3-stress`)
+
+`/musl/stress MODE SECONDS SEED MB [HOST TCPPORT UDPPORT]` (chapter "Stress Tests", `lit/stress.nw`) hammers the kernel from many processes at once. Modes: `fork` (fork/exec/exit/wait, children killed while they pause), `pipe`, `futex` (mutex, condvar, wait with time-out, wake, requeue, thread storms), `signal`, `mmap` (about 0.9 x RAM in two processes, copy on write, swapping), `fs:DIR` (create/write/read/rename/truncate/unlink; `/tmp` is Minix v3, `/mnt` is Minix v2, `/` is the root disk), `sock` (socket pairs, TCP/UDP echo servers of the host), `timer`; `all` runs eleven of them at once. Every mode prints a progress line every 5 s.
+
+`make stress-test` runs `tools/stress_test.py`: it boots the kernel with three disks and a network card, runs `all`, and watches. A failed check, a kernel exception, a process killed by a fault, `BKL: CPU`, out of memory or a failed eviction is reported at once. When all output stops or one mode stops printing, the machine is asked through the qemu monitor (registers of every CPU, resolved with addr2line) and the kernel shell (`ps queues locks`); the dump goes to `stress-logs/` (ignored by git). Variables: `STRESS_SECONDS` (100), `STRESS_CONFIGS="SMP:FAST:MB ..."` (FAST=1 is hvf), `STRESS_SEEDS`, `STRESS_ROUNDS`, `STRESS_MODE` (one mode), `QEMU_PORT`. It is not part of `pcheck` (see the results below).
+
+Findings:
+
+- `fork` mode: a child that waits in `pause` (musl: `ppoll` without time-out) and is sent SIGKILL did not end (2 to 3 failures in 40 s, "child does not end"); also the parent's socket pair writes failed with EPIPE in `sock` mode and one `signal` check failed. All of this is cured by the signal work of branch `m3-signals` (703ea7c): merged into a scratch branch, `fork` runs 2000 rounds without a failure instead of about 100 with 2-3 failures, `pipe`, `futex`, `sock`, `timer`, `signal` pass 60 s each with 4 CPUs.
+- The kernel exception with the jump into `stack_top` after "cannot remove process N (state: 9) from blocked queue" was seen once (first run, before the signal work); it was not reproduced again on the rebased tree, with or without `m3-signals`, so its root cause is not found. Next step: run `STRESS_MODE=all` with several seeds and `QEMU_FAST=1`-like configurations (`STRESS_CONFIGS="4:1:128"`) for a long time on a kernel with `m3-signals`.
+- hvf runs (`4:1:128`) sometimes failed to start ("cannot connect to qemu") when other agents used the accelerator; a retry worked.
+
 ## 58. Lock audit (branches `m3-lock-audit`, `m3-lock-audit2`)
 
 Static audit of the big kernel lock (BKL) and the places where interrupts are let in. Findings and fixes:
