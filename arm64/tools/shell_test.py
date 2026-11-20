@@ -82,9 +82,8 @@ try:
     run('ls /', r'bin/.*hello\.c', 'ls /')
     run('cat /hello.c', r'Hello World', 'cat /hello.c')
     # line editor of the shell: history (Up) and editing in the line (Left, Delete, Backspace, Home); the escape sequences are those of a terminal
-    run('echo hi', r'\r?\nhi\r?\n', 'echo hi')
-    send('\\x1b[A\\r'); expect(r'\r?\nhi\r?\n', 'Up recalls "echo hi", Enter runs it again'); expect(PROMPT, 'prompt after the recalled line')
-    send('ecbo xy' + '\\x1b[D' * 5 + '\\x1b[3~h\\x1b[F\\x7fz\\r'); expect(r'\r?\nxz\r?\n', 'Left, Delete, insert, End, Backspace edit "ecbo xy" into "echo xz"')
+    send('\\x1b[A\\r'); expect(r'Hello World', 'Up recalls "cat /hello.c", Enter runs it again'); expect(PROMPT, 'prompt after the recalled line')
+    send('caxt /hello.c' + '\\x1b[D' * 10 + '\\x7f\\x1b[H\\x1b[3~c\\x1b[FZ\\x7f\\r'); expect(r'Hello World', 'Left, Backspace, Home, Delete, insert, End edit "caxt /hello.c" into "cat /hello.c"')
     expect(PROMPT, 'prompt after the edited line')
     if os.environ.get('HAVE_DISK2'):                     # qemu was given a second disk (make pcheck, job "shell2")
         run('df', r'/dev/hdb\s+32768 K .*/tmp/\r?\n', 'df: /dev/hdb (32 MByte) is mounted on /tmp/')
