@@ -20987,7 +20987,6 @@ The [[u_ftruncate]] function looks like all the other [[u_*]] functions that hav
 
 <<function implementations>>=
 int u_ftruncate (int fd, int length) {
-  printf ("DEBUG: u_ftruncate (%d,%d) entered\n", fd, length);  // REMOVE_DEBUGGING_CODE
   <<VFS functions: turn [[fd]] into [[(fs, localfd)]] pair or fail>>  
   switch (fs) {
     case FS_MINIX: return mx_ftruncate (localfd, length);
