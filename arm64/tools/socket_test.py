@@ -8,6 +8,8 @@ shut down its side, and a UDP server that answers every datagram in capital lett
 and getaddrinfo; this script prints what the program printed.
 """
 import os, re, socket, subprocess, sys, threading, time
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from hostdns import host_answers_localhost
 
 kernel, disk = sys.argv[1:3]
 PORT = int(os.environ.get('QEMU_PORT', 45172))
@@ -117,10 +119,13 @@ try:
     check(out.count('user ok:') == 32 and 'user FAIL' not in out, 'all 32 checks of sockext passed (IPv6 UDP, sendmsg/recvmsg, MSG_PEEK, SO_RCVTIMEO, SO_ERROR)')
     check('not implemented' not in out, 'no Linux system call that the kernel does not have (sockext)')
     # musl's resolver asks the name server of qemu (10.0.2.3, /etc/resolv.conf: put there by DHCP or by the disk), which asks the resolver of the host
-    out = s.run('/musl/resolvtest', r'(?s)user (ok|FAIL):.*gethostbyname[^\n]*\n|Killed', 'resolvtest runs', timeout=120)
-    print(out[-3000:])
-    check(out.count('user ok:') == 5 and 'user FAIL' not in out, 'all 5 checks of musl\'s resolver through qemu\'s name server passed')
-    check('not implemented' not in out, 'no Linux system call that the kernel does not have (resolvtest)')
+    if host_answers_localhost ():
+        out = s.run('/musl/resolvtest', r'(?s)user (ok|FAIL):.*gethostbyname[^\n]*\n|Killed', 'resolvtest runs', timeout=120)
+        print(out[-3000:])
+        check(out.count('user ok:') == 5 and 'user FAIL' not in out, 'all 5 checks of musl\'s resolver through qemu\'s name server passed')
+        check('not implemented' not in out, 'no Linux system call that the kernel does not have (resolvtest)')
+    else:
+        print('  skip: resolvtest (the name server of this host does not answer "localhost": tools/hostdns.py)')
     s.pump(0.5)
     if b'EXCEPTION' in s.log or b'killed:' in s.log:
         print('  FAIL: kernel exception or process killed by a fault'); fails += 1

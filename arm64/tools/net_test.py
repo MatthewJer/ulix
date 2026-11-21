@@ -7,6 +7,8 @@ of Ulix: UDP 127.0.0.1:5556 and TCP 127.0.0.1:5555 arrive at port 7 of the kerne
 pings the router, sends a datagram to the host (10.0.2.2:5557 is this program, port 5557) and connects to it (TCP port 5558).
 """
 import os, socket, struct, subprocess, sys, tempfile, threading, time
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from hostdns import host_answers_localhost
 
 kernel = sys.argv[1]
 tmp = tempfile.mkdtemp()
@@ -54,7 +56,8 @@ threading.Thread(target=dns_server, daemon=True).start()
 qemu = subprocess.Popen(["qemu-system-aarch64", "-M", os.environ.get("QEMU_M", "virt"), "-cpu", "cortex-a72", "-m", "128", "-display", "none",
     "-monitor", "none", "-serial", "file:" + log, "-kernel", kernel,
     "-netdev", "user,id=n0,hostfwd=udp:127.0.0.1:5556-10.0.2.15:7,hostfwd=tcp:127.0.0.1:5555-10.0.2.15:7",
-    "-device", "virtio-net-device,netdev=n0"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    "-device", "virtio-net-device,netdev=n0"] + ([] if host_answers_localhost () else ["-append", "dnshost=skip"]),   # (the kernel then skips its DNS check of "localhost" through qemu: tools/hostdns.py)
+    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 fails = 0
 def check(cond, msg):

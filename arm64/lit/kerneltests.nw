@@ -992,6 +992,21 @@ static void udp6_on_answer (const u8 *src, u16 src_port, const u8 *data, int len
   if (len < (int)sizeof udp6_answer) { for (int i = 0; i < len; i++) udp6_answer[i] = data[i];  udp6_answer[len] = 0;  udp6_answer_len = len; }
 }
 
+const char *plat_cmdline (void);                               // dt.c
+// is this word on the kernel command line (qemu -append "...")?
+static int cmdline_has_word (const char *want) {
+  const char *p = plat_cmdline ();
+  while (*p) {
+    while (*p == ' ') p++;
+    const char *w = p;
+    while (*p && *p != ' ') p++;
+    const char *q = want;
+    while (w < p && *q && *w == *q) { w++; q++; }
+    if (w == p && !*q) return 1;                            // (the whole word and the whole wanted text matched)
+  }
+  return 0;
+}
+
 int net_test (void) {
   printf ("network test:\n");
   CHECK (net_init () == 0, "virtio network card found and initialised");
@@ -1018,6 +1033,9 @@ int net_test (void) {
   CHECK (dns_resolve ("nx.test", &address, 0) == DNS_NOT_FOUND, "DNS: nx.test does not exist (the server says so)");
   CHECK (dns_resolve ("a..test", &address, 0) == DNS_FAILED, "DNS: a name with an empty label is refused before anything is sent");
   net_dns = IP (10, 0, 2, 3);  dns_port = 53;
+  if (cmdline_has_word ("dnshost=skip"))          // (the test program found that the name server of the host does not answer "localhost": tools/hostdns.py)
+    printf ("  skip: DNS: localhost from the name server of qemu (10.0.2.3): the name server of the host does not answer it\n");
+  else
   CHECK (dns_resolve ("localhost", &address, 0) == 0 && address == IP (127, 0, 0, 1), "DNS: localhost = 127.0.0.1 from the name server of qemu (10.0.2.3)");
 
   // IPv6: the router solicitation is answered by qemu's router with an advertisement (prefix fec0::/64, no DHCP involved)

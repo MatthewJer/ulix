@@ -6,6 +6,8 @@ programs in lib-build/tools), logs out, logs in again with a password and switch
 usage: shell_test.py KERNEL.elf DISK.img
 """
 import os, re, shlex, socket, subprocess, sys, time
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from hostdns import host_answers_localhost
 
 kernel, disk = sys.argv[1:3]
 PORT = int(os.environ.get('QEMU_PORT', 45125))
@@ -153,7 +155,10 @@ try:
         run('ping -c 2 10.0.2.2', r'2 packets transmitted, 2 received, 0% packet loss', 'ping -c 2 10.0.2.2: both requests are answered by the router of qemu')
         run('ping -c 1 10.0.2.99', r'0 packets transmitted, 0 received', 'ping of an address that nobody has: no answer to ARP, nothing is sent')
         run('ping', r'usage: ping', 'ping without an address shows how to use it')
-        run('host localhost', r'localhost has address 127\.0\.0\.1', 'host localhost: the name server of qemu (10.0.2.3) answers through the DNS resolver of the kernel')
+        if host_answers_localhost ():
+            run('host localhost', r'localhost has address 127\.0\.0\.1', 'host localhost: the name server of qemu (10.0.2.3) answers through the DNS resolver of the kernel')
+        else:
+            print('  skip: host localhost (the name server of this host does not answer "localhost": tools/hostdns.py)')
         run('host 10.0.2.2', r'10\.0\.2\.2 has address 10\.0\.2\.2', 'host with a dotted address needs no name server')
         run('host', r'usage: host name', 'host without a name shows how to use it')
         run('ifconfig', r'(?s)vioif0: flags=8843<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST> mtu 1500.*ether 52:54:00:12:34:56.*inet 10\.0\.2\.15 netmask 0xffffff00 broadcast 10\.0\.2\.255.*status: active', 'ifconfig shows the interface, the Ethernet address, the address and the link status (as the BSDs do)')
