@@ -91,6 +91,8 @@ struct ktermios { unsigned iflag, oflag, cflag, lflag;  unsigned char line, cc[1
 #define K_ICANON 0x2
 
 static struct ktermios tio[TERMINALS];
+static char tio_raw_out[TERMINALS];                      // a program has been in raw mode: its output goes out unchanged until it ends (nano writes its last escape sequences
+                                                         // after it has given the settings back)
 static struct ktermios *tio_of (int vt) {
   struct ktermios *t = &tio[vt];
   if (t->cflag == 0) {                                    // never set: the usual state (CR becomes LF, signals, lines, echo; 38400 baud, 8 bits)
@@ -105,9 +107,9 @@ static int tio_vt (void) {
   return vt < 0 || vt >= TERMINALS ? cur_vt : vt;
 }
 void tty_get_termios (void *out)       { memcpy (out, tio_of (tio_vt ()), sizeof (struct ktermios)); }
-void tty_set_termios (const void *in)  { memcpy (tio_of (tio_vt ()), in, sizeof (struct ktermios)); }
-void tty_reset (void)                  { tio[tio_vt ()].cflag = 0; }                       // (the next look starts from the usual state)
-int  tty_is_raw (void)                 { return !(tio_of (tio_vt ())->lflag & K_ICANON); }
+void tty_set_termios (const void *in)  { memcpy (tio_of (tio_vt ()), in, sizeof (struct ktermios)); if (!(tio_of (tio_vt ())->lflag & K_ICANON)) tio_raw_out[tio_vt ()] = 1; }
+void tty_reset (void)                  { tio[tio_vt ()].cflag = 0;  tio_raw_out[tio_vt ()] = 0; }       // (the next look starts from the usual state)
+int  tty_is_raw (void)                 { return tio_raw_out[tio_vt ()]; }
 int  tty_key_ready (void)              { return terminals[tio_vt ()].kbd_count > 0; }     // poll and select on the terminal
 
 @
@@ -155,7 +157,7 @@ static int is_job (int pid, int vt) {                   // a living process of t
 }
 
 static void kill_job (int vt, int whole_session) {
-  tio[vt].cflag = 0;                                    // a killed program leaves the terminal in the usual state
+  tio[vt].cflag = 0;  tio_raw_out[vt] = 0;               // a killed program leaves the terminal in the usual state
   int login = 3;
   while (login < MAX_THREADS && !(is_job (login, vt) && strncmp (thread_table[login].cmdline, "login", 5) == 0)) login++;
   if (login == MAX_THREADS) login = 2;                  // no login (kernel tests): everything on the terminal is the job

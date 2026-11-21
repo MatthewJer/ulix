@@ -1089,3 +1089,19 @@ Two causes. (1) `/var` and `/var/run` did not exist on the disk; since `telnetd`
 - **Kill of a thread that waits for a kernel lock.** `u_kill` of a thread in `TSTATE_LOCKED` printed "cannot remove process N (state: 9) from blocked queue" and left the dead thread in the queue of the lock; the next `mutex_unlock` woke it as a ready thread that does not exist (a jump to a wild address, `KERNEL EXCEPTION ... ELR=0x17` or in `stack_top`). `before_kill` (`hardware.nw`) removes the thread from every lock queue when the signal ends or stops it.
 
 Test: `make stress-test` (modes `fs:/tmp` and `mmap` at 4:1:64 hit all of them). The results of the 100 s runs are in the report of the branch.
+
+## 68. The editor nano (branch `m4-nano`; chapter `lit/nano.nw`)
+
+**Why.** Editing a Python or C file on the machine needed `vi`. The maintainer asked for GNU nano: `nano file.py` over the console, telnet and ssh, with colours for Python, C and C++.
+
+**What.** nano 8.7.1 (GPL-3.0-or-later; the release tarball, unpacked unmodified in `third_party/nano`, because the git tree has no `configure` and its `autogen.sh` fetches gnulib; SHA-256 checked against two hosts, the GPG signature could not be checked: no gpg on the host; `third_party/LICENCE-CHECK-nano.md`). It is built by `build/nano.elf` in `libc/Makefile` (static, musl, the wide-character ncurses of the Python port, no NLS, no libmagic, no speller; 580 KByte) and is part of the default build (`make NANO=0` leaves it out). On the disk: `/bin/nano`, `/etc/nanorc` (`arm64/etc/nanorc`), `/usr/share/nano/{python,c,sh,makefile}.nanorc` (`c.nanorc` covers C and C++). `TERM=xterm` and `HOME=/` are in the default environment of a program that the kernel starts (the xterm entry is compiled into ncurses).
+
+**What the kernel had to learn** (all small; sections in `lit/console.nw`, `lit/libc.nw`):
+- `ioctl TCGETS/TCSETS`: a termios per terminal; `ICRNL` (Enter as CR for nano), `ISIG` (Ctrl-C is a key of nano, not a kill) and `ICANON` are honoured; the settings go back when the program ends or is killed.
+- The Linux `write`/`writev` to a terminal in raw mode send escape sequences unchanged (the book's `write` printed `^[`), around the model of the screen; a session waits when the 8 KByte ring is nearly full.
+- The Linux `read` on the terminal returns after one key (the book's read waited for as many keys as the buffer is long and answered -1 and 0); `poll`/`select` on the terminal say whether a key is waiting (before: always yes; ncurses could not tell a lone Escape from `ESC O A`).
+- **UART receive interrupt race** (a real bug): the handler cleared the interrupt after reading, which lost the second byte of two bytes that came quickly (every escape sequence of a fast typist or a paste stayed in the UART). It clears first now.
+
+**Works** (`make nano-test`, job `nano` of pcheck): Python and C files typed, edited in the middle of a line (arrows, Home, Delete, Backspace), saved with Ctrl-O/Enter, left with Ctrl-X, `cat` shows the text; colours (keyword, string, comment, `#include`, `int`); a name that does not exist; 300 lines with Page Down/Up; search; Ctrl-C shows the position; cut and paste; leaving without saving; open, type, save, quit through telnet.
+
+**Does not work / differs:** no Ctrl-Z (no job control), no spell checker, no translations, no libmagic; fixed 80x24 size (no SIGWINCH); a real Ctrl-@ is lost (the book's readchar answers 0 for a wake-up); `bind ^J enter main` in the nanorc because the book's terminal and the shell still turn CR into LF; Ctrl-Q is a second way to cancel. Ctrl-C does not end nano (it is a key), so a hung nano cannot be killed from the keyboard of its terminal.

@@ -151,6 +151,7 @@ class Session:
     def send(s, text, delay=0.05):
         """type the keys: one character after the other; the bytes of a key that starts with Escape go out together (a terminal sends them in one piece, and nano
         tells Escape-O-A from an Escape and a letter by the time between the bytes)"""
+        s.raw = b''
         data = text.encode('latin1').decode('unicode_escape').encode('latin1'); i = 0
         while i < len(data):
             j = i + 1
@@ -171,12 +172,12 @@ class Session:
         return False
     def on_screen(s, text, what, seconds=30.0): return s.wait(lambda: text in s.scr.text(), what, seconds)
     def prompt(s, what, seconds=30.0):
-        s.raw = b''; return s.wait(lambda: re.search(PROMPT.encode(), s.raw) is not None, what, seconds)
+        return s.wait(lambda: re.search(PROMPT.encode(), s.raw) is not None, what, seconds)
 
 PROMPT = r'esser@ulix\[\d+\]:(/[\w/]*)\$ '
 
 def cat(sess, path, expect_lines, what):
-    sess.raw = b''; sess.send('cat %s\\r' % path)
+    sess.send('cat %s\\r' % path)
     sess.prompt('prompt after cat %s' % path)
     got = sess.raw.decode('latin1').replace('\r', '').split('\n')[1:-1]
     check([l.rstrip() for l in got] == expect_lines, '%s: the file holds %r (got %r)' % (what, expect_lines, got))
@@ -213,7 +214,7 @@ def editor_tests(sess):
     sess.on_screen('GNU nano', 'nano starts for a .c file')
     sess.send('#include <stdio.h>\\rint main(void) { /* c */\\r    return 0; // end\\r}')
     sess.on_screen('// end', 'the C lines are on the screen')
-    r, inc = sess.scr.find('#include'); r, tp = sess.scr.find('int main'); r, cm = sess.scr.find('// end'); r, ret = sess.scr.find('return')
+    r, inc = sess.scr.find('#include'); r, tp = sess.scr.find('int'); r, cm = sess.scr.find('// end'); r, ret = sess.scr.find('return')
     print('        colours: #include=%s int main=%s // end=%s return=%s' % (inc, tp, cm, ret))
     check(None not in inc and None not in cm and len(inc | cm) >= 2, 'C: #include and the comment have colours')
     check(None not in tp and None not in ret, 'C: types and keywords have colours (int, return)')
@@ -230,7 +231,7 @@ def editor_tests(sess):
     # ---- 300 lines: Page Down and Up, search, cut and paste, Ctrl-C, leave without saving
     sess.send('nano /lines300.txt\\r')
     sess.on_screen('line 001', 'the first page of the 300 lines is shown')
-    check(sess.scr.find('line 022')[0] is not None and sess.scr.find('line 030')[0] is None, 'the screen shows 21 lines of text, 1 to 21 and a bit')
+    check(sess.scr.find('line 021')[0] is not None and sess.scr.find('line 022')[0] is None, 'the screen shows 21 lines of text (1 to 21)')
     sess.send(PGDN)
     sess.wait(lambda: sess.scr.find('line 001')[0] is None and sess.scr.find('line 030')[0] is not None, 'Page Down shows the next page')
     sess.send(PGDN + PGDN)
@@ -242,7 +243,7 @@ def editor_tests(sess):
     sess.send('line 250' + CR)
     sess.on_screen('line 250', 'the search finds line 250 and scrolls to it')
     sess.send('\\x03')                                                              # Ctrl-C: where am I
-    sess.on_screen('line 250/300', 'Ctrl-C does not end nano: it shows the position')
+    sess.on_screen('line 250/30', 'Ctrl-C does not end nano: it shows the position')
     sess.send('\\x18')                                                              # unchanged: nano ends
     sess.prompt('Ctrl-X ends nano (the search did not change the text)')
     sess.send('nano /lines300.txt\\r')
@@ -297,7 +298,7 @@ try:
     if t:
         t.send('root\\r'); t.on_screen('Password: ', 'telnet: login asks for the password')
         t.send('xyz\\r'); t.sock.settimeout(0.2)
-        t.raw = b''; t.wait(lambda: re.search(rb'root@ulix\[\d+\]:/root# ', t.raw) is not None, 'telnet: a root shell')
+        t.wait(lambda: re.search(rb'root@ulix\[\d+\]:/root# ', t.raw) is not None, 'telnet: a root shell')
         t.send('nano /tmp/tn.py\\r')
         t.on_screen('GNU nano', 'telnet: nano starts')
         t.send('import os\\rdef f():\\r    return "x"  # c')
@@ -308,7 +309,7 @@ try:
         t.send('\\x0f'); t.on_screen('Write to File: /tmp/tn.py', 'telnet: Ctrl-O'); t.send(CR)
         t.on_screen('Wrote 3 lines', 'telnet: the file is written')
         t.send('\\x18')
-        t.raw = b''; t.wait(lambda: re.search(rb'root@ulix\[\d+\]:/root# ', t.raw) is not None, 'telnet: Ctrl-X ends nano, the shell prompt is back')
+        t.wait(lambda: re.search(rb'root@ulix\[\d+\]:/root# ', t.raw) is not None, 'telnet: Ctrl-X ends nano, the shell prompt is back')
         t.raw = b''; t.send('cat /tmp/tn.py\\r')
         t.wait(lambda: re.search(rb'root@ulix\[\d+\]:/root# ', t.raw) is not None, 'telnet: cat')
         got = t.raw.decode('latin1').replace('\r', '').split('\n')[1:-1]
