@@ -54,6 +54,10 @@ See `LICENCE-CHECK-musl.md`.
 | what we add | `arm64/userland/https.c`, `arm64/userland/tls/` (glue, `string.h`) and `arm64/sshcrypto.c` (chapters `lit/tls.nw`, `lit/tlsuser.nw`, `lit/ssh.nw`); no configuration, no patches |
 | what it costs | 2.3 MByte of source; linked into `https`: 110 KByte of code, 192 KByte of static data (128 KByte of it for the certificate authorities); client context 3.7 KByte, record buffer 16.7 KByte; no `malloc`; needs only `memcpy`, `memmove`, `memset`, `memcmp`, `strlen`; TLS 1.2 at most |
 
+### nano (the release tarball in `third_party/nano`, not a submodule)
+
+See `LICENCE-CHECK-nano.md`: GNU nano 8.7.1, GPL-3.0-or-later, unmodified; it needs only ncurses. `make NANO=0` leaves it out.
+
 ## etc/ssl/cacert.pem (data, not a submodule)
 
 | field | content |

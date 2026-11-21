@@ -38,6 +38,10 @@ The foreign code (musl, BearSSL, CPython and the libraries behind it) is not cop
     git submodule update --init                                         # everything (CPython alone is about 700 MByte; --depth 1 makes it 100)
     git submodule update --init --depth 1 third_party/musl third_party/bearssl     # the minimum for `make PYTHON=0 ARCHIVE=0`
 
+The text editor nano (`/bin/nano`, with colours for Python, C and C++) is the one exception: GNU nano 8.7.1 is the unmodified release tarball, unpacked in
+`third_party/nano` and part of the repository (its git tree needs gnulib to make `configure`); nothing to fetch. `make NANO=0` leaves it out
+(`third_party/LICENCE-CHECK-nano.md`).
+
 `make` in `arm64/` first runs `make check-submodules`. A missing submodule stops the build at once with the list of directories and the command that
 fetches them, instead of failing later on a missing header. `make TLS=0`, `make ARCHIVE=0` and `make PYTHON=0` leave out the features that need
 BearSSL, libarchive or CPython and their libraries, and then the check does not ask for these submodules either.

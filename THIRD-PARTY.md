@@ -23,6 +23,8 @@ compatible with it. Never copy Linux code (GPL-2.0-only).
 | GNU readline | <https://git.savannah.gnu.org/git/readline.git> | `readline-8.2` | GPL-3.0-or-later | Python `readline` |
 | OpenSSL | <https://github.com/openssl/openssl> | `openssl-3.0.22` | Apache-2.0 | Python `ssl` and `_hashlib` |
 
+| GNU nano (release tarball, unpacked unmodified in `third_party/nano`, not a submodule: its git tree needs gnulib to make `configure`) | <https://ftp.gnu.org/gnu/nano/nano-8.7.1.tar.xz> | `8.7.1` | GPL-3.0-or-later | `/bin/nano` (`make NANO=0` leaves it out), syntax files in `/usr/share/nano`; see `third_party/LICENCE-CHECK-nano.md` |
+
 Source of the tags: `third_party/LICENCE-CHECK-musl.md`, `LICENCE-CHECK-cpython.md`, `LICENCE-CHECK-libs-for-python.md` and the table in
 `third_party/README.md`; `git submodule status` shows the commits. A tag that disagrees with the commit is a bug in this list.
 
