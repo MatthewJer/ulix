@@ -15,9 +15,9 @@ input buffer of the current virtual terminal (terminals[[[cur_vt]]]); processes 
 in [[keyboard_queue]].  Here the UART receive interrupt does the same job; everything behind the
 buffer (kgetch, [[syscall_readchar]], kreadline, the kernel shell) is the code from the book.
 
-  Enter          -> '\textbackslash{}n'                (terminals send CR)
+  Enter          -> '\textbackslash{}n'                (terminals send CR; with ICRNL switched off the CR stays)
   Backspace/DEL  -> '\textbackslash{}b'
-  Ctrl-C         -> kill the foreground process of the terminal (like the [[x86]] keyboard handler)
+  Ctrl-C         -> kill the foreground process of the terminal (like the [[x86]] keyboard handler), unless the program has switched ISIG off
   Ctrl-]         -> stop the scheduler and enter the kernel shell ([[x86]]: Shift-Esc)
 
 @
@@ -26,6 +26,8 @@ The complete file is put together from these parts:
 
 <<arch_console.c>>=
 <<arch_console.c: includes>>
+
+<<arch_console.c: termios>>
 
 <<arch_console.c: console_enqueue>>
 
@@ -65,6 +67,48 @@ void uart_rx_enable (void) {
   UART_ICR  = 0x7ff;
   UART_IMSC = (1 @<< 4) | (1 @<< 6);          // receive interrupt and receive timeout interrupt
 }
+
+@
+\subsection{The terminal settings (termios)}
+
+A program that draws on the whole screen, like the editor [[nano]] (chapter \ref{ch:nano}), tells the terminal driver how it wants its keys and its output: that is
+the Linux system call [[ioctl]] with [[TCGETS]] and [[TCSETS]], and the structure [[termios]] (36 bytes in the kernel's form). The kernel keeps one for every terminal and
+looks at only three of its flags, the three that matter here:
+\begin{itemize}
+\item [[ICRNL]] (input): the Enter key, which sends a carriage return, is changed to a line feed. [[nano]] switches that off and wants the carriage return.
+\item [[ISIG]] (local): Ctrl-C ends the program that runs on the terminal. [[nano]] switches that off: for it Ctrl-C is the key ``where am I''.
+\item [[ICANON]] (local): off means that the program wants every key at once and draws the screen itself (raw or cbreak mode). Then [[write]] does not show the
+  escape sequences of the program as [[^[]] (the book's way to print a control character), but sends them to the terminal as they are
+  ([[tty_is_raw]], used by the Linux system call [[write]], \texttt{libc.nw}).
+\end{itemize}
+A terminal that has never been asked starts in the usual cooked state, and the settings go back to it when the program that set them ends
+([[tty_reset]]) or is killed: a program that crashes in raw mode does not leave the shell without its Enter key.
+
+<<arch_console.c: termios>>=
+struct ktermios { unsigned iflag, oflag, cflag, lflag;  unsigned char line, cc[19]; };     // the termios of the kernel (36 bytes)
+#define K_ICRNL  0x100
+#define K_ISIG   0x1
+#define K_ICANON 0x2
+
+static struct ktermios tio[TERMINALS];
+static struct ktermios *tio_of (int vt) {
+  struct ktermios *t = &tio[vt];
+  if (t->cflag == 0) {                                    // never set: the usual state (CR becomes LF, signals, lines, echo; 38400 baud, 8 bits)
+    memset (t, 0, sizeof *t);
+    t->iflag = K_ICRNL | 0x400;  t->oflag = 0x5;  t->cflag = 0xbf;  t->lflag = 0x803b;
+    t->cc[0] = 3;  t->cc[1] = 0x1c;  t->cc[2] = 8;  t->cc[3] = 0x15;  t->cc[4] = 4;  t->cc[6] = 1;       // ^C, ^\, erase (BS), ^U, ^D, VMIN 1
+  }
+  return t;
+}
+static int tio_vt (void) {
+  int vt = thread_table[current_task].terminal;
+  return vt < 0 || vt >= TERMINALS ? cur_vt : vt;
+}
+void tty_get_termios (void *out)       { memcpy (out, tio_of (tio_vt ()), sizeof (struct ktermios)); }
+void tty_set_termios (const void *in)  { memcpy (tio_of (tio_vt ()), in, sizeof (struct ktermios)); }
+void tty_reset (void)                  { tio[tio_vt ()].cflag = 0; }                       // (the next look starts from the usual state)
+int  tty_is_raw (void)                 { return !(tio_of (tio_vt ())->lflag & K_ICANON); }
+int  tty_key_ready (void)              { return terminals[tio_vt ()].kbd_count > 0; }     // poll and select on the terminal
 
 @
 the character is complete (already translated): put it where the book's keyboard handler puts it.
@@ -111,6 +155,7 @@ static int is_job (int pid, int vt) {                   // a living process of t
 }
 
 static void kill_job (int vt, int whole_session) {
+  tio[vt].cflag = 0;                                    // a killed program leaves the terminal in the usual state
   int login = 3;
   while (login < MAX_THREADS && !(is_job (login, vt) && strncmp (thread_table[login].cmdline, "login", 5) == 0)) login++;
   if (login == MAX_THREADS) login = 2;                  // no login (kernel tests): everything on the terminal is the job
@@ -135,9 +180,10 @@ ends \emph{all} programs of the terminal, the shell too, as if a modem line had 
 
 <<arch_console.c: pty>>=
 void pty_input (int vt, unsigned char c) {
-  if (c == '\r') c = '\n';
+  struct ktermios *t = tio_of (vt);
+  if (c == '\r' && (t->iflag & K_ICRNL)) c = '\n';
   if (c == 0x7f) c = 0x08;
-  if (c == 0x03) { kill_job (vt, 0); return; }
+  if (c == 0x03 && (t->lflag & K_ISIG)) { kill_job (vt, 0); return; }
   console_enqueue_vt (vt, (char)c);
 }
 
@@ -161,9 +207,10 @@ void arch_console_input (unsigned char c) {
     if (c >= '0' && c <= '9') { arch_vt_switch ((c - '0' + 9) % 10); return; }   // like Alt-1..Alt-0 of the book
   }
   if (c == 0x14) { vt_prefix = 1; return; }                                       // Ctrl-T
-  if (c == '\r') c = '\n';
+  struct ktermios *t = tio_of (cur_vt);
+  if (c == '\r' && (t->iflag & K_ICRNL)) c = '\n';
   if (c == 0x7f) c = 0x08;
-  if (c == 0x03) { console_interrupt (); return; }
+  if (c == 0x03 && (t->lflag & K_ISIG)) { console_interrupt (); return; }
   if (c == 0x1d) {                          // Ctrl-]
     if (scheduler_is_active) {
       scheduler_is_active = false;
@@ -213,12 +260,11 @@ called by the interrupt handler
 
 <<arch_console.c: uart_rx_irq>>=
 void uart_rx_irq (void) {
-  while (!(UART_FR & UART_FR_RXFE)) {
+  UART_ICR = 0x7ff;                                  // first: a key that arrives while we read the others raises the interrupt again (clearing it
+  while (!(UART_FR & UART_FR_RXFE)) {                // afterwards lost it: the second byte of a quickly sent Escape sequence stayed in the UART)
     unsigned char c = UART_DR & 0xff;
-    UART_ICR = 0x7ff;
     arch_console_input (c);
   }
-  UART_ICR = 0x7ff;
 }
 
 @
@@ -438,6 +484,19 @@ void kputch (byte c) {
     pty_putch ((char)c);
     if (wrapped) pty_putch ('\n');
   }
+}
+
+@
+A program that has put its terminal in raw mode (see the settings of the terminal above) draws the screen itself, with escape sequences. They must not go
+through [[kputch]], which would make [[^[]] of them and count them as characters in the model of the screen. [[vt_raw_out]] sends a byte to the UART if the
+terminal of the calling process is the visible one, and to the session if a remote session shows it, and does not touch the model. (The model keeps the picture of
+the screen from before the program, which is what the shell finds again when the program has ended and gone back from the second screen of the terminal.)
+
+<<arch_vt.c: kputch>>=
+void vt_raw_out (byte c) {
+  int t = scheduler_is_active ? thread_table[current_task].terminal : cur_vt;
+  if (t == cur_vt) putch ((char)c);
+  if (t == pty_vt) pty_putch ((char)c);
 }
 
 @

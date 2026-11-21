@@ -35,7 +35,15 @@ ifeq ($(ARCHIVE),1)
 ARCHIVE_PROGS = libc/build/bsdtar.elf libc/build/bsdunzip.elf
 ARCHIVE_DISK_FILES = /bin/tar=libc/build/bsdtar.elf /bin/unzip=libc/build/bsdunzip.elf
 endif
-MUSL_PROGS = $(foreach p,$(MUSL_NAMES),libc/build/$(p).elf) $(ARCHIVE_PROGS)
+# nano (third_party/nano, chapter "nano" of lit/nano.nw): /bin/nano, /etc/nanorc and the syntax files in /usr/share/nano. make NANO=0 leaves it out
+NANO ?= 1
+ifeq ($(NANO),1)
+NANO_PROGS = libc/build/nano.elf
+NANO_SYNTAX = python c sh makefile
+NANO_DISK_FILES = /bin/nano=libc/build/nano.elf /etc/nanorc=etc/nanorc --mkdir=/usr --mkdir=/usr/share --mkdir=/usr/share/nano \
+                  $(foreach n,$(NANO_SYNTAX),/usr/share/nano/$(n).nanorc=../third_party/nano/syntax/$(n).nanorc)
+endif
+MUSL_PROGS = $(foreach p,$(MUSL_NAMES),libc/build/$(p).elf) $(ARCHIVE_PROGS) $(NANO_PROGS)
 
 # Disk image: the Minix image of the x86 version plus the AArch64 user programs.
 # "-snapshot" keeps the file unmodified when running.
@@ -53,6 +61,7 @@ TLS ?= 1
 # stop much later with a message about a missing header. This check runs first and names what to fetch. Each entry is directory:file-that-must-exist.
 SUBMODULES_NEEDED = musl:COPYRIGHT $(if $(filter 1,$(TLS)),bearssl:LICENSE.txt) \
   $(if $(filter 1,$(PYTHON)),cpython:configure zlib:zlib.h libffi:configure.ac sqlite:configure ncurses:configure openssl:Configure bzip2:bzlib.h xz:configure.ac readline:readline.h) \
+  $(if $(filter 1,$(NANO)),nano:configure ncurses:configure) \
   $(if $(filter 1,$(ARCHIVE)),libarchive:CMakeLists.txt $(if $(filter 1,$(PYTHON)),,zlib:zlib.h bzip2:bzlib.h xz:configure.ac))
 check-submodules:
 	@missing=""; for e in $(sort $(SUBMODULES_NEEDED)); do d=$${e%%:*}; f=$${e#*:}; \
@@ -86,7 +95,7 @@ disk.img: $(wildcard userland/build/bin/*.elf) $(if $(filter 1,$(PYTHON)),libc/h
 	python3 -c "d=bytearray(open('user/hello.elf','rb').read()); d[68]=7; open('bad-wx.elf','wb').write(d)"
 	python3 tools/minix_add.py $@ --mkdir=/var --mkdir=/var/run --mkdir=/var/log --chmod=/tmp:1777 --chmod=/var:1777 --chmod=/var/run:1777 --chmod=/var/log:1777 hello64=user/hello.elf cat64=user/cat.elf crash64=user/crash.elf forktest64=user/forktest.elf sigtest64=user/sigtest.elf contest64=user/contest.elf cowtest64=user/cowtest.elf thtest64=user/thtest.elf badptr64=user/badptr.elf swaptest64=user/swaptest.elf screentest64=user/screentest.elf stacktest64=user/stacktest.elf memtest64=user/memtest.elf pipetest64=user/pipetest.elf muslhello64=libc/build/hello.elf \
 		badarch64=bad-arch.elf badwx64=bad-wx.elf \
-		--mkdir=/musl $(foreach p,$(MUSL_NAMES),/musl/$(p)=libc/build/$(p).elf) $(PYTHON_DISK_FILES) $(PYTHON_LINKS) $(ARCHIVE_DISK_FILES) /init=$(USERLAND_BIN)/init.elf /etc/rc.conf=etc/rc.conf /etc/hosts=etc/hosts /etc/resolv.conf=etc/resolv.conf /etc/services=etc/services $(if $(filter --v2,$(ROOT_MKFS_FLAGS)),,--hi-inode=/etc/hi-inode.txt=etc/hosts) --mkdir=/etc/rc.d /etc/rc.d/heartbeat=etc/rc.d/heartbeat /etc/rc.d/echod=etc/rc.d/echod /etc/rc.d/telnetd=etc/rc.d/telnetd \
+		--mkdir=/musl $(foreach p,$(MUSL_NAMES),/musl/$(p)=libc/build/$(p).elf) $(PYTHON_DISK_FILES) $(PYTHON_LINKS) $(ARCHIVE_DISK_FILES) $(NANO_DISK_FILES) /init=$(USERLAND_BIN)/init.elf /etc/rc.conf=etc/rc.conf /etc/hosts=etc/hosts /etc/resolv.conf=etc/resolv.conf /etc/services=etc/services $(if $(filter --v2,$(ROOT_MKFS_FLAGS)),,--hi-inode=/etc/hi-inode.txt=etc/hosts) --mkdir=/etc/rc.d /etc/rc.d/heartbeat=etc/rc.d/heartbeat /etc/rc.d/echod=etc/rc.d/echod /etc/rc.d/telnetd=etc/rc.d/telnetd \
 		$(if $(filter 1,$(TLS)),--mkdir=/etc/ssl /etc/ssl/cacert.pem=etc/ssl/cacert.pem --mkdir=/etc/ssh /etc/ssh/ssh_host_ecdsa_key=etc/ssh/ssh_host_ecdsa_key --chmod=/etc/ssh/ssh_host_ecdsa_key:600 /etc/rc.d/sshd=etc/rc.d/sshd) \
 		$$(for f in $(USERLAND_BIN)/*.elf; do n=$$(basename $$f .elf); [ $$n != init ] && echo /bin/$$n=$$f; done)
 
@@ -124,7 +133,7 @@ user/%.elf: FORCE
 
 # the programs linked with musl (libc/Makefile builds musl first, from the unmodified submodule third_party/musl)
 libc/build/%.elf: FORCE
-	$(MAKE) -C libc PYTHON=$(PYTHON) ARCHIVE=$(ARCHIVE)
+	$(MAKE) -C libc PYTHON=$(PYTHON) ARCHIVE=$(ARCHIVE) NANO=$(NANO)
 
 # the book of the ARM64 part (lit/build/ulix-arm64.pdf)
 book:
@@ -428,6 +437,10 @@ scp-test: ulix-shell.bin $(DISK)
 # tar and unzip (libarchive): packs, lists and unpacks tar, tar.gz and zip files in a login session
 archive-test: ulix-shell.bin $(DISK)
 	python3 tools/archive_test.py ulix-shell.bin $(DISK)
+
+# the text editor nano (chapter "nano"): typing, editing, colours, saving in a login session and through telnet
+nano-test: ulix-shell.bin $(DISK)
+	python3 tools/nano_test.py ulix-shell.bin $(DISK)
 
 # sockets for programs: a program of /musl talks to TCP and UDP servers of the host (chapter "Sockets for Programs")
 socket-test: ulix-shell.bin $(DISK)

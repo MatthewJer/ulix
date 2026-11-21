@@ -39,6 +39,7 @@ JOBLIST=(
   "httpd|a web server in Python: sockets listen and accept, the host asks it with curl|httpd|virt||256"
   "scp|scp: files go to the machine and come back over the SSH server on port 2222 (password login, no shell)|scp|virt||256"
   "archive|tar and unzip (libarchive): tar, tar.gz and zip files are made, listed and extracted|archive|virt||256"
+  "nano|the editor nano: a Python and a C file are typed, edited and saved with colours, 300 lines with Page Down and search, cut and paste; open, type, save, quit through telnet|nano|virt||256"
   "socket|sockets for programs: socket, connect, sendto, recvfrom, poll, select, non-blocking, getaddrinfo against servers of the host|socket|virt||128"
   "libc|C library conformance tests: libctest (strings, stdio, printf, math, time, malloc, setjmp, fork/exec/wait, signals), filetest, localetest, threadtest|libc|virt||128"
   "daemon|services: service and daemon, /etc/rc.d, pid file, a daemon on its own terminal, started at boot by rc.conf|daemon|virt||128"
@@ -130,6 +131,11 @@ if [ "$1" = "--job" ]; then
     archive)
       if [ -f libc/build/bsdtar.elf ]; then python3 tools/archive_test.py ulix-shell.bin $DISK > "$log" 2>&1
       else echo "archive test: all passed (tar and unzip are not part of this build: ARCHIVE=0)" > "$log"; fi
+      rc=$?; sum=$(tail -1 "$log")
+      [ $rc -eq 0 ] && grep -q "all passed" <<< "$sum" && st=ok || st=FAILED ;;
+    nano)
+      if [ -f libc/build/nano.elf ]; then python3 tools/nano_test.py ulix-shell.bin $DISK > "$log" 2>&1
+      else echo "nano test: all passed (nano is not part of this build: NANO=0)" > "$log"; fi
       rc=$?; sum=$(tail -1 "$log")
       [ $rc -eq 0 ] && grep -q "all passed" <<< "$sum" && st=ok || st=FAILED ;;
     socket)

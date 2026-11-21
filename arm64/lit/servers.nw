@@ -272,6 +272,8 @@ void pty_putch (char c) {                     // called by kputch for the sessio
   if (was_empty) net_wake_all ();             // the server may sleep: wake it
 }
 
+int pty_room (void) { return sizeof ring - (head - tail); }       // free bytes in the ring (the raw output of a program waits for room)
+
 int pty_ready (void) {                        // has the terminal output for the calling process (its holder)? net_syscalls.c asks
   return pty_vt >= 0 && holder == current_task && head != tail;
 }

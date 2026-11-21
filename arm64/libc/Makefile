@@ -19,6 +19,13 @@ ifeq ($(ARCHIVE),1)
 PROGS += bsdtar bsdunzip
 endif
 
+# nano (GNU nano, GPL-3.0-or-later, third_party/nano, chapter "nano" of lit/nano.nw): the text editor, with colours for Python, C and C++.
+# It needs only the wide-character ncurses below. make NANO=0 leaves it out.
+NANO ?= 1
+ifeq ($(NANO),1)
+PROGS += nano
+endif
+
 # CPython (third_party/cpython, issue #59): make PYTHON=1 also builds build/python.elf. It is configured out of the tree for
 # --host=aarch64-linux-musl with the compiler wrapper musl-cc, which links with the script musl.ld like every program here
 # (the build of CPython needs a CPython of the same version on the host).
@@ -135,6 +142,18 @@ $(B)/bsdtar.elf: $(SYSROOT)/lib/libz.a $(SYSROOT)/lib/libbz2.a $(SYSROOT)/lib/li
 	python3 ../tools/mark_musl.py $(B)/bsdtar.elf
 	python3 ../tools/mark_musl.py $(B)/bsdunzip.elf
 $(B)/bsdunzip.elf: $(B)/bsdtar.elf
+
+# nano: configure out of tree (the sources are the unmodified release tarball); no translations, no libmagic (file type by contents), no spell checker
+# (it starts another program). Colours, nanorc files and several buffers are on. /etc/nanorc and the syntax files in /usr/share/nano are on the disk.
+$(B)/nano.elf: $(SYSROOT)/lib/libncursesw.a musl.ld ../tools/mark_musl.py
+	mkdir -p $(B)/nano
+	cd $(B)/nano && MUSL_LDSCRIPT=$(abspath musl.ld) CC=$(abspath musl-cc) CPP="$(abspath musl-cc) -E" AR=$(CROSS)ar RANLIB=$(CROSS)ranlib CFLAGS=-Os \
+	  NCURSESW_CFLAGS=-I$(SYSROOT)/include NCURSESW_LIBS="-L$(SYSROOT)/lib -lncursesw" $(THIRD)/nano/configure --host=aarch64-linux-musl \
+	  --build=$$($(CPYTHON)/config.guess) --prefix=/usr --sysconfdir=/etc --disable-nls --disable-libmagic --disable-speller --disable-dependency-tracking \
+	  --enable-utf8 --enable-color --enable-nanorc --enable-multibuffer > configure.log 2>&1
+	cd $(B)/nano && export MUSL_LDSCRIPT=$(abspath musl.ld) && $(MAKE) -C lib > make.log 2>&1 && $(MAKE) -C src nano >> make.log 2>&1
+	$(CROSS)strip -o $@ $(B)/nano/src/nano
+	python3 ../tools/mark_musl.py $@
 
 # ncurses (for the Python module curses): the wide-character version, static. There are no terminfo files on the disk: the descriptions of a few
 # terminals are compiled in (--with-fallbacks). Making that table needs a tic and an infocmp that run on the host, with the same options, so a

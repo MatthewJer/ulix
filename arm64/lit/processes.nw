@@ -660,10 +660,10 @@ on a machine without one the cycle counter is used, which is enough for a canary
 #define AT_RANDOM 25
 
 static u64 build_linux_stack (byte *page, u64 base, u64 sp, int argc, u64 *ptrs) {
-  static const char env0[] = "PATH=/bin";
+  static const char env0[] = "PATH=/bin\0TERM=xterm\0HOME=/";   // TERM for ncurses programs (nano), HOME for the programs that want one
   int envn, envlen;
-  const char *env = linux_exec_env (&envn, &envlen);       // the environment of execve; a program that the kernel starts gets PATH=/bin
-  if (envn < 0) { env = env0;  envn = 1;  envlen = sizeof env0; }
+  const char *env = linux_exec_env (&envn, &envlen);       // the environment of execve; a program that the kernel starts gets PATH, TERM and HOME
+  if (envn < 0) { env = env0;  envn = 3;  envlen = sizeof env0; }
   if (envlen > 1200 || envn > 24) return 0;
   sp -= envlen;
   memcpy (page + (sp - base), env, envlen);

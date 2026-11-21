@@ -1,0 +1,95 @@
+\chapter{A text editor: nano}
+\label{ch:nano}
+
+The system has a shell, a C compiler's worth of tools (\texttt{ls}, \texttt{cat}, \texttt{grep}) and an interpreter for Python, but the only editor was \texttt{vi} of the
+original Ulix, which needs some practice. Anybody who wants to change a Python or C file on the machine, over the console, \texttt{telnet} or \texttt{ssh}, should be able to do
+that with an editor that shows its commands at the bottom of the screen. That is GNU \texttt{nano}: \texttt{nano file.py} opens a file; Ctrl-O saves it, Ctrl-X ends the
+editor, Ctrl-W searches, Ctrl-K and Ctrl-U cut and paste a line, the arrow keys, Home, End, Page Up and Page Down move, and the keywords, strings and comments of Python, C and C++
+files have colours.
+
+\section{Where the program comes from}
+
+\texttt{nano} 8.7.1 is GPL-3.0-or-later, the licence of this book (\texttt{third\_party/LICENCE-CHECK-nano.md}). It is the unmodified release tarball, unpacked in
+\texttt{third\_party/nano}: the git tree of nano does not contain the \texttt{configure} script, and its \texttt{autogen.sh} would fetch a second foreign
+package (gnulib). Nothing of nano is copied into the book; this chapter and the rules of \texttt{libc/Makefile} are our part.
+
+The build is one rule, \texttt{build/nano.elf} in \texttt{libc/Makefile}, in the same style as \texttt{bsdtar}: \texttt{configure} runs out of the tree with the compiler wrapper
+\texttt{musl-cc} (chapter on the C library) for \texttt{--host=aarch64-linux-musl}, links statically, and finds the wide-character ncurses that is already in the sysroot
+(it was made for the Python module \texttt{curses}). Three things are switched off because they need more than ncurses and musl: translations (\texttt{--disable-nls}), the
+guess of the file type from its contents (\texttt{--disable-libmagic}) and the spell checker (\texttt{--disable-speller}, it starts another program). Colours,
+\texttt{nanorc} files and several buffers are on. The result is 580 KByte, stripped. \texttt{make NANO=0} leaves it out, as \texttt{ARCHIVE=0} leaves out \texttt{tar}.
+
+\section{What is on the disk}
+
+\begin{description}
+\item[\texttt{/bin/nano}] the program.
+\item[\texttt{/etc/nanorc}] our settings (below).
+\item[\texttt{/usr/share/nano/*.nanorc}] the syntax files of nano for Python (\texttt{python.nanorc}), C and C++ (\texttt{c.nanorc}, one file for both: its pattern says
+  \texttt{c cc cpp cxx h hh hpp hxx}), the shell and makefiles. They are copied from the source tree, unchanged; \texttt{NANO\_SYNTAX} in \texttt{arm64/Makefile} is the list.
+\end{description}
+
+The global file is short:
+
+\begin{verbatim}
+set tabsize 4
+set nowrap
+bind ^Q cancel all
+bind ^J enter main
+include "/usr/share/nano/*.nanorc"
+\end{verbatim}
+
+A tab is four columns wide, long lines are not broken in the middle of typing, and every syntax file is read. The two \texttt{bind} lines are
+the answer to a difference of the Ulix terminal, see below: Ctrl-Q is a second way to cancel a question, and a line feed is also an Enter.
+
+\section{The terminal}
+
+nano draws the whole screen with the terminal's escape sequences and wants every key at once. Ulix is a teaching system and its terminal is the one of the book
+(80 times 24 characters, a model of the screen in the kernel), so some of the things that every Unix terminal driver does had to be added; they are small, and
+they are in the kernel because that is where the terminal is.
+
+\paragraph{The terminal description.} ncurses needs to know the codes of the terminal (the terminfo entry) and finds it by the environment variable \texttt{TERM}. There is no
+terminfo directory on the disk: \texttt{libc/Makefile} compiles the descriptions of \texttt{linux}, \texttt{vt100}, \texttt{vt220}, \texttt{xterm}, \texttt{xterm-256color}, \texttt{ansi},
+\texttt{screen} and \texttt{dumb} into the library (\texttt{--with-fallbacks}). A program that the kernel starts gets \texttt{TERM=xterm} (and \texttt{HOME=/}) beside
+\texttt{PATH} (\texttt{build\_linux\_stack}, chapter on processes); the clients of the console, \texttt{telnet} and \texttt{ssh} are xterm-like terminals, and xterm has what is needed:
+colours, a second screen (so the shell finds its screen again when nano ends), the cursor keys. A program can still set another \texttt{TERM}.
+
+\paragraph{Keys.} The cursor keys arrive as \texttt{ESC O A} (ncurses switches the terminal to the application mode with \texttt{smkx}) or \texttt{ESC [ A}; Home and End as
+\texttt{ESC O H}/\texttt{ESC O F} or \texttt{ESC [ H}/\texttt{ESC [ F}; Delete, Page Up and Page Down as \texttt{ESC [ 3 \~{}}, \texttt{5 \~{}} and \texttt{6 \~{}}. nano knows all of them (its own tables,
+besides those of the terminfo entry). A lone Escape is told from the start of a key sequence by waiting a moment: the system call \texttt{poll} on the terminal now says whether a key is
+waiting (before it always said yes).
+
+\paragraph{Settings (termios).} The kernel keeps a \texttt{struct termios} for every terminal and answers \texttt{ioctl} \texttt{TCGETS}/\texttt{TCSETS} (section on the terminal settings of the
+console chapter). It looks at three flags: \texttt{ICRNL} (Enter is sent as a line feed; nano switches it off and gets the carriage return, which it wants), \texttt{ISIG} (Ctrl-C ends
+the program; nano switches it off, and Ctrl-C means ``where am I?'' as it does everywhere else) and \texttt{ICANON} (off: the program draws the screen). When a program ends or is killed,
+the terminal goes back to the usual state. The \emph{shell} does not use any of this: it reads its keys itself, so for a program that does not ask, nothing changes.
+
+\paragraph{Output.} The book's \texttt{write} to the terminal prints a control character as \texttt{\^{}} and the letter (an Escape as \texttt{\^{}[}), which is right for a program that prints
+text. When the terminal is not in the line mode (ICANON off) the Linux system calls \texttt{write} and \texttt{writev} send the bytes as they are: to the UART if the terminal is the
+visible one, and into the ring of the session if \texttt{telnetd} or \texttt{sshd} serves it. The model of the screen in the kernel is not touched: it keeps the picture
+from before the editor, and since xterm brings the old screen back when nano ends (\texttt{rmcup}), the shell, which uses the model for its line editor, finds everything where it was.
+A full screen of nano is some kilobytes; the ring of a session holds 8 KByte, so the writing program waits when the ring is nearly full instead of losing bytes.
+
+\paragraph{Reading.} The book's \texttt{read} on the terminal waits for as many keys as the buffer is long and answers $-1$, and its \texttt{readchar} wakes a sleeping process with a $0$ that is
+not a key. The Linux \texttt{read} (\texttt{linux\_read}) returns as soon as a key is there, at least one byte, and asks again when it got such a $0$ (a real Ctrl-@ is lost).
+
+\section{What is different from nano on Linux}
+
+\begin{itemize}
+\item There is no Ctrl-Z (no job control), and Ctrl-S/Ctrl-Q are not flow control, so both reach nano. Ctrl-C is a key of nano, so a program that does not respond cannot be ended from
+  the keyboard of the terminal while it is in the raw mode; nano always responds, and Ctrl-X ends it.
+\item Enter arrives as a carriage return when nano is running, but the line editor of the shell, the book's terminal and the other programs still get a line feed: therefore
+  \texttt{bind ^J enter main} in the global file (a Ctrl-J typed by a person is an Enter, too).
+\item The terminal size is fixed (80 times 24, \texttt{TIOCGWINSZ}); the signal \texttt{SIGWINCH} never comes.
+\item No spell checker (Ctrl-T is ``Execute'' on Linux, which starts a program: it fails here), no translation, and no automatic choice of the syntax from the contents of a file: the syntax is chosen from the
+  name of the file (\texttt{.py}, \texttt{.c}, \texttt{.cpp}, \texttt{.h}, \texttt{.sh}, \texttt{Makefile}) or from the first line (\texttt{\#!/usr/bin/python}).
+\item nano writes a backup or a temporary file only when asked to (\texttt{set backup}); saving writes the file in place.
+\end{itemize}
+
+\section{The test}
+
+\texttt{make nano-test} (job \texttt{nano} of \texttt{make pcheck}, \texttt{tools/nano\_test.py}) logs in over the UART and starts the editor like a person: the program has to show a screen
+and answer to keys, so the test contains a small terminal (the \texttt{Screen} class: cursor addressing, scrolling regions, colours, the second screen) and looks at \emph{the screen}, not at the bytes.
+It types a Python file with a keyword, a string and a comment, checks that the three have colours (and different ones), edits in the middle of a line with Up, Home, Right, Delete,
+Down, End and Backspace, saves with Ctrl-O and Enter, leaves with Ctrl-X and compares the file with \texttt{cat}. The same for a C file (\texttt{\#include}, \texttt{int}, a comment); a name that does not exist; a file of
+300 lines with Page Down and Page Up, search (Ctrl-W), Ctrl-C (which shows \texttt{line 250/300} and does not end the program), cut and paste (Ctrl-K, Ctrl-U) and leaving without saving. A
+second boot with a network card repeats ``open, type, save, quit'' through the telnet server.

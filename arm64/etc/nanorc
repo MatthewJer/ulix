@@ -1,0 +1,9 @@
+# /etc/nanorc of Ulix: the global settings of the editor nano (see section 68 of ARM64-PORT.md).
+set tabsize 4
+set nowrap
+# Ctrl-C is taken by the kernel (it ends the program that runs on the terminal), so Ctrl-Q is the second key to cancel a question
+bind ^Q cancel all
+# the Enter key of the Ulix terminal arrives as Ctrl-J (the kernel turns the carriage return into a line feed)
+bind ^J enter main
+# colours for C, C++, Python, the shell and makefiles
+include "/usr/share/nano/*.nanorc"
