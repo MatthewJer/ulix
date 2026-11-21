@@ -8,11 +8,12 @@ saved, and the keywords, strings and comments have colours; a file that does not
 Ctrl-C does not end nano. A second boot with a network card repeats "open, type, save, quit" through the telnet server.
 QEMU_PORT, QEMU_FAST=1, QEMU_M and QEMU_EXTRA select the machine as in shell_test.py (hvf needs QEMU_M=virt,gic-version=3 and -smp 2).
 """
-import os, re, shlex, shutil, socket, subprocess, sys, tempfile, time
+import os, re, select, shlex, shutil, socket, subprocess, sys, tempfile, time
 
 kernel, disk = sys.argv[1:3]
 PORT = int(os.environ.get('QEMU_PORT', 45225))
 TELNET_PORT = int(os.environ.get('QEMU_TELNET_PORT', 45226))
+SSH_PORT = int(os.environ.get('QEMU_SSH_PORT', 45227))
 fails = 0
 def check(cond, msg):
     global fails
@@ -284,7 +285,8 @@ finally:
 # ---- the same through the telnet server: open, type, save, quit
 qemu = subprocess.Popen(['qemu-system-aarch64', '-M', 'virt', '-cpu', 'cortex-a72', '-m', '128', '-display', 'none', '-monitor', 'none', '-serial', 'null', '-kernel', kernel, '-snapshot',
     '-drive', 'file=%s,format=raw,if=none,id=hd0' % disk2, '-device', 'virtio-blk-device,drive=hd0',
-    '-netdev', 'user,id=n0,hostfwd=tcp:127.0.0.1:%d-10.0.2.15:23' % TELNET_PORT, '-device', 'virtio-net-device,netdev=n0'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    '-netdev', 'user,id=n0,hostfwd=tcp:127.0.0.1:%d-10.0.2.15:23,hostfwd=tcp:127.0.0.1:%d-10.0.2.15:22' % (TELNET_PORT, SSH_PORT), '-device', 'virtio-net-device,netdev=n0',
+    '-device', 'virtio-rng-device'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 try:
     t = None
     for _ in range(120):                                           # the system boots: connect when the server answers (it sends IAC WILL ECHO at once)
@@ -315,6 +317,47 @@ try:
         got = t.raw.decode('latin1').replace('\r', '').split('\n')[1:-1]
         check([l.rstrip() for l in got] == ['import oS', 'def f():', '    return "x"  # c'], 'telnet: the saved file holds the edited text (got %r)' % got)
         t.sock.close()
+        time.sleep(4)                                              # the hang up ends the session; the terminal is free again
+
+        # ---- and through the SSH server (the ssh client of the host, a terminal, single algorithms as in ssh_test.py)
+        known = os.path.join(work, 'known_hosts')
+        scan = ''
+        for _ in range(60):
+            scan = subprocess.run(['ssh-keyscan', '-p', str(SSH_PORT), '-t', 'ecdsa', '127.0.0.1'], capture_output=True, text=True, timeout=60).stdout
+            if 'ecdsa' in scan: break
+            time.sleep(1)
+        open(known, 'w').write(scan)
+        p = subprocess.Popen(['ssh', '-tt', '-p', str(SSH_PORT), '-o', 'BatchMode=yes', '-o', 'KexAlgorithms=curve25519-sha256', '-o', 'Ciphers=aes128-ctr', '-o', 'MACs=hmac-sha2-256',
+                              '-o', 'HostKeyAlgorithms=ecdsa-sha2-nistp256', '-o', 'LogLevel=ERROR', '-o', 'ConnectTimeout=20', '-o', 'UserKnownHostsFile=' + known,
+                              '-o', 'StrictHostKeyChecking=yes', 'root@127.0.0.1'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        class Pipe:
+            def settimeout(self, t): pass
+            def recv(self, n):
+                if not select.select([p.stdout], [], [], 0.2)[0]: raise socket.timeout()
+                return os.read(p.stdout.fileno(), n)
+            def send(self, b): p.stdin.write(b); p.stdin.flush()
+            def close(self): p.kill(); p.wait()
+        h = Session(Pipe())
+        h.wait(lambda: 'ulix login:' in h.scr.text(), 'ssh: the login prompt of terminal 5', 90)
+        h.send('root\\r'); h.on_screen('Password:', 'ssh: login asks for the password')
+        h.send('xyz\\r')
+        h.wait(lambda: re.search(rb'root@ulix\[\d+\]:/root# ', h.raw) is not None, 'ssh: a root shell')
+        h.send('nano /tmp/ss.c\\r')
+        h.on_screen('GNU nano', 'ssh: nano starts')
+        h.send('int main(void) { return 0; } // c')
+        h.on_screen('// c', 'ssh: the typed line is on the screen')
+        r, tp = h.scr.find('int'); r, cm = h.scr.find('// c')
+        check(None not in tp and None not in cm, 'ssh: keyword and comment have colours')
+        h.send(HOME + RIGHT * 4 + DEL + 'I')                       # "int main" -> "int Iain"
+        h.send('\\x0f'); h.on_screen('Write to File: /tmp/ss.c', 'ssh: Ctrl-O'); h.send(CR)
+        h.on_screen('Wrote 1 line', 'ssh: the file is written')
+        h.send('\\x18')
+        h.wait(lambda: re.search(rb'root@ulix\[\d+\]:/root# ', h.raw) is not None, 'ssh: Ctrl-X ends nano, the shell prompt is back')
+        h.send('cat /tmp/ss.c\\r')
+        h.wait(lambda: re.search(rb'root@ulix\[\d+\]:/root# ', h.raw) is not None, 'ssh: cat')
+        got = h.raw.decode('latin1').replace('\r', '').split('\n')[1:-1]
+        check([l.rstrip() for l in got] == ['int Iain(void) { return 0; } // c'], 'ssh: the saved file holds the edited text (got %r)' % got)
+        h.sock.close()
 finally:
     qemu.kill(); qemu.wait()
 
