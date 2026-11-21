@@ -28,8 +28,21 @@ or `xelatex`: `brew install tectonic`). A new source file is added to a chapter 
 
 ## Quick start (macOS)
 
+Set-up from a fresh clone (Apple silicon or Intel Mac; `brew` lives in `/opt/homebrew` or `/usr/local`). A plain `git clone` leaves `third_party/` empty:
+the foreign code comes as git submodules, and `make` stops at once when one is missing. The first `make` builds CPython, OpenSSL and the other
+libraries: some 10 to 20 minutes on Apple silicon, longer on an Intel Mac (not measured there). `make -j` helps. On an Intel Mac qemu has no hardware acceleration and is slower.
+
 ```sh
-brew install qemu noweb aarch64-elf-gcc aarch64-elf-binutils   # python3 is needed, too
+brew install qemu noweb aarch64-elf-gcc aarch64-elf-binutils python@3.12   # python3.12 is for PYTHON=1 (the default when the submodule is there)
+git submodule update --init --depth 1 $(git submodule status | awk '{print $2}' | grep -v llvm-project | grep -v bearssl)
+arm64/tools/fetch-llvm.sh                       # the C++ library: sparse checkout (150 MByte; a plain submodule update would fetch GBytes)
+git submodule update --init third_party/bearssl # no --depth: the BearSSL server refuses single commits
+```
+
+Less is possible: `make TLS=0 PYTHON=0 ARCHIVE=0` needs only `third_party/musl` and `fetch-llvm.sh` (no BearSSL, no Python, no `tar`/`unzip`).
+If a `git submodule update --depth 1` fails for one entry, fetch that one without `--depth`.
+
+```sh
 cd arm64
 make                 # kernel images, user programs, disk image (disk.img)
 make run-shell       # boots to the shell; Ctrl-A X leaves qemu (with a network card: try  ping 10.0.2.2  or  ifconfig )

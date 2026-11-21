@@ -30,6 +30,8 @@ See [`arm64/README.md`](arm64/README.md) (build, run, tests, and how the port re
 [`ARM64-PORT.md`](ARM64-PORT.md) (work log).
 
 ## Getting the sources (fork)
+Short version for a Mac, from `brew install` to `make`: [`arm64/README.md`](arm64/README.md), "Quick start". The details follow here.
+
 The foreign code (musl, BearSSL, CPython and the libraries behind it) is not copied into this repository; it comes as unmodified git submodules in
 `third_party/` (list: [`THIRD-PARTY.md`](THIRD-PARTY.md), rules: [`third_party/README.md`](third_party/README.md)). Clone with the submodules:
 
