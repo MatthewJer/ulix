@@ -244,6 +244,7 @@ void linux_abi_fork (int old_as, int new_as) {
 #define L_rt_sigsuspend 133
 #define L_rt_sigpending 136
 #define L_getrandom     278
+#define L_membarrier    283                              // (musl asks once when the first thread is made)
 #define L_uname         160
 #define L_umask         166
 #define L_gettimeofday  169
@@ -2489,6 +2490,7 @@ static void linux_syscall_inner (context_t *r) {
     case L_pselect6:    ret = linux_pselect6 (a0, (unsigned long *) a1, (unsigned long *) a2, (unsigned long *) a3, (struct ts *) a4); break;
     case L_renameat: case L_renameat2: ret = linux_renameat (a0, (const char *) a1, a2, (const char *) a3); break;
     case L_getrandom: ret = linux_getrandom ((char *) a0, a1, a2); break;
+    case L_membarrier: ret = -LE_ENOSYS; break;                 // (no memory barrier across threads on request: musl copes with ENOSYS and does it with signals itself; no notice)
     case L_getcwd: ret = linux_getcwd ((char *) a0, a1); break;
     case L_chdir: {                                            // (the book's chdir only says -1: ask stat for the reason)
       struct stat st;
