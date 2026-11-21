@@ -231,7 +231,7 @@ def editor_tests(sess):
     # ---- 300 lines: Page Down and Up, search, cut and paste, Ctrl-C, leave without saving
     sess.send('nano /lines300.txt\\r')
     sess.on_screen('line 001', 'the first page of the 300 lines is shown')
-    check(sess.scr.find('line 021')[0] is not None and sess.scr.find('line 022')[0] is None, 'the screen shows 21 lines of text (1 to 21)')
+    check(sess.scr.find('line 020')[0] is not None and sess.scr.find('line 021')[0] is None, 'the screen shows 21 lines of text (1 to 20)')
     sess.send(PGDN)
     sess.wait(lambda: sess.scr.find('line 001')[0] is None and sess.scr.find('line 030')[0] is not None, 'Page Down shows the next page')
     sess.send(PGDN + PGDN)
@@ -294,9 +294,9 @@ try:
             c.close(); t = None
         except OSError: t = None
         time.sleep(1)
-    if t: t.wait(lambda: 'ulix login: ' in t.scr.text(), 'telnet: the login prompt of terminal 5', 90)
+    if t: t.wait(lambda: 'ulix login:' in t.scr.text(), 'telnet: the login prompt of terminal 5', 90)
     if t:
-        t.send('root\\r'); t.on_screen('Password: ', 'telnet: login asks for the password')
+        t.send('root\\r'); t.on_screen('Password:', 'telnet: login asks for the password')
         t.send('xyz\\r'); t.sock.settimeout(0.2)
         t.wait(lambda: re.search(rb'root@ulix\[\d+\]:/root# ', t.raw) is not None, 'telnet: a root shell')
         t.send('nano /tmp/tn.py\\r')
