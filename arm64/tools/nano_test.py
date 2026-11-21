@@ -287,14 +287,14 @@ qemu = subprocess.Popen(['qemu-system-aarch64', '-M', 'virt', '-cpu', 'cortex-a7
     '-netdev', 'user,id=n0,hostfwd=tcp:127.0.0.1:%d-10.0.2.15:23' % TELNET_PORT, '-device', 'virtio-net-device,netdev=n0'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 try:
     t = None
-    for _ in range(300):                                           # the system boots, the server starts: try to connect until the login prompt appears
+    for _ in range(120):                                           # the system boots: connect when the server answers (it sends IAC WILL ECHO at once)
         try:
-            c = socket.create_connection(('127.0.0.1', TELNET_PORT), timeout=5); t = Session(c, telnet=True); t.pump(3)
-            if 'ulix login: ' in t.scr.text(): break
+            c = socket.create_connection(('127.0.0.1', TELNET_PORT), timeout=5); t = Session(c, telnet=True); t.pump(2)
+            if t.iac or t.raw or t.scr.text().strip(): break
             c.close(); t = None
-        except OSError: pass
+        except OSError: t = None
         time.sleep(1)
-    check(t is not None, 'telnet: the login prompt of terminal 5')
+    if t: t.wait(lambda: 'ulix login: ' in t.scr.text(), 'telnet: the login prompt of terminal 5', 90)
     if t:
         t.send('root\\r'); t.on_screen('Password: ', 'telnet: login asks for the password')
         t.send('xyz\\r'); t.sock.settimeout(0.2)
