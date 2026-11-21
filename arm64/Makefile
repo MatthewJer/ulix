@@ -343,11 +343,16 @@ machines: ulix.bin ulix-console.bin ulix-shell.bin $(DISK)
 
 # Use the system: boots /init -> login -> shell on this terminal. Ctrl-C ends the foreground program, Ctrl-T 2 switches
 # to terminal 2, Ctrl-] opens the kernel shell, Ctrl-A X leaves qemu. Changes to the disk are discarded (-snapshot).
+# The ports of the machine are passed on to this Mac, on 127.0.0.1 only:
+#   http://localhost:8080/          the web server /musl/hello_http.py (start it in the shell first)
+#   telnet localhost 2323           telnet (login on terminal 5)
+#   ssh -p 2222 localhost           ssh (login on terminal 5)      scp -P 2223 FILE localhost:   (scp server)
 run-shell: ulix-shell.bin $(DISK)
 	qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128 -nographic -kernel ulix-shell.bin -snapshot \
 		-drive file=$(DISK),format=raw,if=none,id=hd0 -device virtio-blk-device,drive=hd0 \
 		-device virtio-rng-device \
-		-netdev user,id=n0 -device virtio-net-device,netdev=n0
+		-netdev user,id=n0,hostfwd=tcp:127.0.0.1:8080-10.0.2.15:8080,hostfwd=tcp:127.0.0.1:2323-10.0.2.15:23,hostfwd=tcp:127.0.0.1:2222-10.0.2.15:22,hostfwd=tcp:127.0.0.1:2223-10.0.2.15:2222 \
+		-device virtio-net-device,netdev=n0
 
 # Everything: kernel test suites (EL1 with the legacy and EL2 with the modern virtio transport), the file system
 # check of the modified image, the console test and the complete shell session.
