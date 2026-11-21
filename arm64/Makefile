@@ -25,6 +25,7 @@ PYLIB = /usr/local/lib/python3.12
 PYLIB_EXCLUDE = test,tests,idlelib,tkinter,turtledemo,turtle.py,ensurepip,lib2to3,venv,pydoc_data,__pycache__,__phello__
 ifeq ($(PYTHON),1)
 MUSL_NAMES += python
+PYTHON_LINKS = --link=/bin/python=/musl/python --link=/bin/python3=/musl/python    # (second names, no second copy of the 7 MByte)
 PYTHON_DISK_FILES = /musl/hello.py=libc/hello.py /musl/hello_http.py=libc/hello_http.py /musl/zirkus.py=libc/zirkus.py /musl/modtest.py=libc/modtest.py --mkdir=/usr/local --mkdir=/usr/local/lib --mkdir=$(PYLIB) --mkdir=$(PYLIB)/lib-dynload --exclude=$(PYLIB_EXCLUDE) \
                     --tree=$(PYLIB)=../third_party/cpython/Lib $(PYLIB)/_sysconfigdata__linux_.py=libc/_sysconfigdata__linux_.py
 endif
@@ -85,7 +86,7 @@ disk.img: $(wildcard userland/build/bin/*.elf) $(if $(filter 1,$(PYTHON)),libc/h
 	python3 -c "d=bytearray(open('user/hello.elf','rb').read()); d[68]=7; open('bad-wx.elf','wb').write(d)"
 	python3 tools/minix_add.py $@ --mkdir=/var --mkdir=/var/run --mkdir=/var/log --chmod=/tmp:1777 --chmod=/var:1777 --chmod=/var/run:1777 --chmod=/var/log:1777 hello64=user/hello.elf cat64=user/cat.elf crash64=user/crash.elf forktest64=user/forktest.elf sigtest64=user/sigtest.elf contest64=user/contest.elf cowtest64=user/cowtest.elf thtest64=user/thtest.elf badptr64=user/badptr.elf swaptest64=user/swaptest.elf screentest64=user/screentest.elf stacktest64=user/stacktest.elf memtest64=user/memtest.elf pipetest64=user/pipetest.elf muslhello64=libc/build/hello.elf \
 		badarch64=bad-arch.elf badwx64=bad-wx.elf \
-		--mkdir=/musl $(foreach p,$(MUSL_NAMES),/musl/$(p)=libc/build/$(p).elf) $(PYTHON_DISK_FILES) $(ARCHIVE_DISK_FILES) /init=$(USERLAND_BIN)/init.elf /etc/rc.conf=etc/rc.conf /etc/hosts=etc/hosts /etc/resolv.conf=etc/resolv.conf /etc/services=etc/services $(if $(filter --v2,$(ROOT_MKFS_FLAGS)),,--hi-inode=/etc/hi-inode.txt=etc/hosts) --mkdir=/etc/rc.d /etc/rc.d/heartbeat=etc/rc.d/heartbeat /etc/rc.d/echod=etc/rc.d/echod /etc/rc.d/telnetd=etc/rc.d/telnetd \
+		--mkdir=/musl $(foreach p,$(MUSL_NAMES),/musl/$(p)=libc/build/$(p).elf) $(PYTHON_DISK_FILES) $(PYTHON_LINKS) $(ARCHIVE_DISK_FILES) /init=$(USERLAND_BIN)/init.elf /etc/rc.conf=etc/rc.conf /etc/hosts=etc/hosts /etc/resolv.conf=etc/resolv.conf /etc/services=etc/services $(if $(filter --v2,$(ROOT_MKFS_FLAGS)),,--hi-inode=/etc/hi-inode.txt=etc/hosts) --mkdir=/etc/rc.d /etc/rc.d/heartbeat=etc/rc.d/heartbeat /etc/rc.d/echod=etc/rc.d/echod /etc/rc.d/telnetd=etc/rc.d/telnetd \
 		$(if $(filter 1,$(TLS)),--mkdir=/etc/ssl /etc/ssl/cacert.pem=etc/ssl/cacert.pem --mkdir=/etc/ssh /etc/ssh/ssh_host_ecdsa_key=etc/ssh/ssh_host_ecdsa_key --chmod=/etc/ssh/ssh_host_ecdsa_key:600 /etc/rc.d/sshd=etc/rc.d/sshd) \
 		$$(for f in $(USERLAND_BIN)/*.elf; do n=$$(basename $$f .elf); [ $$n != init ] && echo /bin/$$n=$$f; done)
 

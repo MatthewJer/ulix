@@ -2,12 +2,16 @@
 """Add files to a Minix v2 image (14- or 30-character names) or a Minix v3 image (60-character names, 32-bit inode numbers).
 
 usage: minix_add.py IMAGE [--grow=ZONES] [--mkdir=PATH ...] [--chmod=PATH:OCTAL ...] [--exclude=NAME,NAME ...]
-                          [--tree=PATH=HOSTDIR ...] [--hi-inode=PATH=HOSTFILE ...] PATH=HOSTFILE [PATH=HOSTFILE ...]
+                          [--tree=PATH=HOSTDIR ...] [--hi-inode=PATH=HOSTFILE ...] [--link=NEWPATH=OLDPATH ...]
+                          PATH=HOSTFILE [PATH=HOSTFILE ...]
 
 PATH may name a directory ("/bin/ls"); the directory must exist. If PATH already exists, the old
 file is removed first and its inode and zones are freed. --grow enlarges the file system to ZONES
 zones first (more room for write tests). Needed because mkfs.minix and mounting a Minix image are
 not available on macOS. Files up to 7 direct + 256 indirect + 256 * 256 double indirect zones (64 MByte) are supported.
+
+--link=NEWPATH=OLDPATH makes a second name (a hard link, no second copy) for a file that is already on the image,
+after all files were added (/bin/python for /musl/python).
 
 --hi-inode=PATH=HOSTFILE adds a file whose inode number is at least 65536 (a test of 32-bit inode numbers; the image needs more inodes).
 
@@ -179,6 +183,19 @@ class Fs:
         self.put_inode(dirnr, ino)
         self.set_entry(dirnr, off, nr, name)
 
+    def link(self, newpath, oldpath):
+        """A second directory entry for the inode of OLDPATH; the link count goes up."""
+        od, on = os.path.split(oldpath)
+        off, nr = self.lookup(self.resolve_dir(od), on)
+        if not nr: sys.exit('--link: %s does not exist' % oldpath)
+        nd, nn = os.path.split(newpath)
+        parent = self.resolve_dir(nd)
+        if self.lookup(parent, nn)[1]: sys.exit('--link: %s exists already' % newpath)
+        self.add_entry(parent, nr, nn)
+        ino = self.get_inode(nr)
+        ino['nlinks'] += 1
+        self.put_inode(nr, ino)
+
     # ---- files ----
     def add_file(self, path, data, mode=0o100755, uid=0, gid=0, times=None):
         dirpath, _, name = path.rpartition('/')
@@ -273,6 +290,7 @@ def main(image, specs):
     for d in [s for s in specs if s.startswith('--mkdir=')]:
         fs.mkdir(d[8:])
     chmods = [s for s in specs if s.startswith('--chmod=')]
+    links = [s for s in specs if s.startswith('--link=')]
     excluded = set(','.join(s[10:] for s in specs if s.startswith('--exclude=')).split(','))
     for t in [s for s in specs if s.startswith('--tree=')]:
         path, host = t[7:].split('=', 1)
@@ -283,11 +301,14 @@ def main(image, specs):
         fs.min_inode = 65536
         fs.add_file(path, open(host, 'rb').read())
         fs.min_inode = 1
-    specs = [s for s in specs if not s.startswith(('--chmod=', '--mkdir=', '--exclude=', '--tree=', '--hi-inode='))]
+    specs = [s for s in specs if not s.startswith(('--chmod=', '--mkdir=', '--exclude=', '--tree=', '--hi-inode=', '--link='))]
     for spec in specs:
         path, host = spec.split('=', 1)
         if not path.startswith('/'): path = '/' + path
         fs.add_file(path, open(host, 'rb').read())
+    for l in links:
+        new, old = l[7:].split('=', 1)
+        fs.link(new, old)
     for c in chmods:
         path, mode = c[8:].split(':')
         fs.chmod(path, int(mode, 8))
