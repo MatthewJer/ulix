@@ -50,6 +50,10 @@ In the shell: `ls`, `cat`, `cd`, `cp`, `rm`, `mkdir`, `rmdir`, `touch`, `wc`, `g
 
 `top` shows the load of every CPU, the memory and the processes (`q` or Ctrl-C ends it).
 
+`nano file.py` is a text editor with colours for Python, C and C++ (also over telnet and ssh): Ctrl-O saves, Ctrl-X ends, Ctrl-W searches, Ctrl-K and Ctrl-U cut and paste, Ctrl-G
+helps; the arrow keys, Home, End, Page Up and Page Down work. Ctrl-C is a key of nano there (it shows the position); Ctrl-Q cancels a question. `make NANO=0` leaves it out,
+`make nano-test` tests it (chapter "A text editor: nano", section 68 of `../ARM64-PORT.md`).
+
 **Telnet:** a telnet server (the program `telnetd`, started by the boot as the service `telnetd`) listens on port 23. It shows terminal 5 (`tty4`, Ctrl-T 5 on the console): `telnet <address> 23`,
 then log in as on the console. One session at a time; when you hang up, the programs of the session end and `login` asks again.
 (The password goes over the network unencrypted: private networks only.) The server is switched on and off in `/etc/rc.conf`
