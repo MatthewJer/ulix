@@ -143,11 +143,13 @@ $(B)/bsdtar.elf: $(SYSROOT)/lib/libz.a $(SYSROOT)/lib/libbz2.a $(SYSROOT)/lib/li
 	python3 ../tools/mark_musl.py $(B)/bsdunzip.elf
 $(B)/bsdunzip.elf: $(B)/bsdtar.elf
 
-# nano: configure out of tree (the sources are the unmodified release tarball); no translations, no libmagic (file type by contents), no spell checker
+# nano: configure out of tree (the sources are the unmodified release tarball; the generated files come with it, so aclocal, autoconf and automake are switched
+# off (ACLOCAL=: ...): after a git checkout all files have the same time and make would think that Makefile.in is out of date and call automake); no translations, no libmagic (file type by contents), no spell checker
 # (it starts another program). Colours, nanorc files and several buffers are on. /etc/nanorc and the syntax files in /usr/share/nano are on the disk.
 $(B)/nano.elf: $(SYSROOT)/lib/libncursesw.a musl.ld ../tools/mark_musl.py
 	mkdir -p $(B)/nano
 	cd $(B)/nano && MUSL_LDSCRIPT=$(abspath musl.ld) CC=$(abspath musl-cc) CPP="$(abspath musl-cc) -E" AR=$(CROSS)ar RANLIB=$(CROSS)ranlib CFLAGS=-Os \
+	  ACLOCAL=: AUTOCONF=: AUTOMAKE=: AUTOHEADER=: MAKEINFO=: \
 	  NCURSESW_CFLAGS=-I$(SYSROOT)/include NCURSESW_LIBS="-L$(SYSROOT)/lib -lncursesw" $(THIRD)/nano/configure --host=aarch64-linux-musl \
 	  --build=$$($(CPYTHON)/config.guess) --prefix=/usr --sysconfdir=/etc --disable-nls --disable-libmagic --disable-speller --disable-dependency-tracking \
 	  --enable-utf8 --enable-color --enable-nanorc --enable-multibuffer > configure.log 2>&1
