@@ -59,7 +59,7 @@ TLS ?= 1
 
 # Foreign code lives in git submodules (third_party/, issue #18). A clone without --recursive leaves their directories empty, and the build would
 # stop much later with a message about a missing header. This check runs first and names what to fetch. Each entry is directory:file-that-must-exist.
-SUBMODULES_NEEDED = musl:COPYRIGHT $(if $(filter 1,$(TLS)),bearssl:LICENSE.txt) \
+SUBMODULES_NEEDED = musl:COPYRIGHT llvm-project:libcxx/include/vector $(if $(filter 1,$(TLS)),bearssl:LICENSE.txt) \
   $(if $(filter 1,$(PYTHON)),cpython:configure zlib:zlib.h libffi:configure.ac sqlite:configure ncurses:configure openssl:Configure bzip2:bzlib.h xz:configure.ac readline:readline.h) \
   $(if $(filter 1,$(NANO)),nano:configure ncurses:configure) \
   $(if $(filter 1,$(ARCHIVE)),libarchive:CMakeLists.txt $(if $(filter 1,$(PYTHON)),,zlib:zlib.h bzip2:bzlib.h xz:configure.ac))
@@ -68,7 +68,9 @@ check-submodules:
 	  test -e ../third_party/$$d/$$f || missing="$$missing third_party/$$d"; done; \
 	if test -n "$$missing"; then \
 	  echo "error: these submodules are not checked out:$$missing"; \
-	  echo "  fetch them with:  git submodule update --init --depth 1$$missing   (from the top of the repository)"; \
+	  case "$$missing" in *llvm-project*) echo "  llvm-project (C++ library, sparse checkout):  arm64/tools/fetch-llvm.sh"; missing=`echo "$$missing" | sed 's, third_party/llvm-project,,'`;; esac; \
+	  case "$$missing" in *bearssl*) echo "  bearssl (its server does not serve single commits):  git submodule update --init third_party/bearssl"; missing=`echo "$$missing" | sed 's, third_party/bearssl,,'`;; esac; \
+	  test -z "$$missing" || echo "  fetch them with:  git submodule update --init --depth 1$$missing   (from the top of the repository)"; \
 	  echo "  or leave a feature out: make TLS=0 (no BearSSL), make ARCHIVE=0 (no tar/unzip), make PYTHON=0 (no Python)"; \
 	  exit 1; fi
 all: check-submodules

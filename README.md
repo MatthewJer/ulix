@@ -36,7 +36,9 @@ The foreign code (musl, BearSSL, CPython and the libraries behind it) is not cop
     git clone --recursive https://github.com/MatthewJer/ulix.git        # shallow submodules: add --shallow-submodules
     # or, in a clone that was made without --recursive:
     git submodule update --init                                         # everything (CPython alone is about 700 MByte; --depth 1 makes it 100)
-    git submodule update --init --depth 1 third_party/musl third_party/bearssl     # the minimum for `make PYTHON=0 ARCHIVE=0`
+    git submodule update --init --depth 1 third_party/musl                          # the minimum for `make TLS=0 PYTHON=0 ARCHIVE=0` ...
+    arm64/tools/fetch-llvm.sh                                                       # ... plus the C++ library (sparse checkout, 150 MByte)
+    git submodule update --init third_party/bearssl                                 # TLS=1: no --depth, the BearSSL server refuses single commits
 
 The text editor nano (`/bin/nano`, with colours for Python, C and C++) is the one exception: GNU nano 8.7.1 is the unmodified release tarball, unpacked in
 `third_party/nano` and part of the repository (its git tree needs gnulib to make `configure`); nothing to fetch. `make NANO=0` leaves it out
