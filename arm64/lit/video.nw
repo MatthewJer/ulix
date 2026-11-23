@@ -10,7 +10,7 @@ The chapter has four parts:
   a small hardware mailbox: a message is a list of ``tags'', each a question or a request (``how big is the screen?'', ``give me a buffer of 1920 by 1080 pixels'');
 \item the \textbf{frame buffer} ([[fb.c]]): the message that asks for the buffer, and the pixel format in which we draw;
 \item the \textbf{font}: bitmap fonts of the free \emph{Terminus} family (SIL Open Font License), converted at build time by [[tools/bdf2c.py]] from the BDF files in
-  [[third_party/terminus]]. Four sizes (8$\times$16, 12$\times$24, 14$\times$28, 16$\times$32) are built in; the kernel takes the smallest one, so that a bigger screen shows more text, and 14$\times$28 from 4K on (about as much text as Windows shows at 150 percent scaling: 274 columns); [[fbfont=]] chooses another;
+  [[third_party/terminus]]. Four sizes (8$\times$16, 12$\times$24, 14$\times$28, 16$\times$32) are built in; the kernel takes the smallest one, so that a bigger screen shows more text, and 12$\times$24 from 4K on (320 columns, about as much as Notepad++ shows on Windows at 150 percent scaling); [[fbfont=]] chooses another;
 \item the \textbf{terminal} ([[fbcon.c]]): the text on the screen is what the programs send to their terminal. They do not know that they talk to a display: they send an
   \emph{ANSI escape sequence} such as ``ESC [ 12 ; 40 H'' (move the cursor to line 12, column 40) or ``ESC [ 31 m'' (red text) like to any terminal emulator. [[fbcon.c]] is such an
   emulator, a small one: it understands what the programs of Ulix (the shell, nano, ncurses) need. It is fed with every byte that goes to the serial console
@@ -496,7 +496,7 @@ void fbcon_putch (char ch) {
 @
 
 \subsection{Start}
-[[fbcon_init]] reads the two options of the kernel command line, asks for the screen and chooses the font: 8$\times$16, so that a bigger screen shows more text (1920 by 1080: 240 columns and 67 lines); from 3000 pixels on (4K) 14$\times$28 (274 columns, 77 lines); 12$\times$24 and 16$\times$32 with [[fbfont=24]] or [[fbfont=32]]. Then it clears the screen, draws a first line and from now on [[putch]] sends every character here, too.
+[[fbcon_init]] reads the two options of the kernel command line, asks for the screen and chooses the font: 8$\times$16, so that a bigger screen shows more text (1920 by 1080: 240 columns and 67 lines); from 3000 pixels on (4K) 12$\times$24 (320 columns, 90 lines); the other sizes with [[fbfont=]]. Then it clears the screen, draws a first line and from now on [[putch]] sends every character here, too.
 
 <<fbcon.c: fbcon_init>>=
 static int cmdline_number (const char *key, int *a, int *b) {      // "key=123" or "key=123x456" of the command line: returns 1 if it is there
@@ -521,7 +521,7 @@ int fbcon_init (void) {
   cmdline_number ("video", &w, &h);
   cmdline_number ("fbfont", &fh, 0);
   if (fb_init (w, h) < 0) { printf ("Screen: the VideoCore did not give a frame buffer (mailbox at 0x%lx)\n", plat.mbox);  return -1; }
-  if (!fh) fh = fb.w >= 3000 ? 28 : 16;                              // small letters, so that a bigger screen shows more text; on 4K the size of Windows at 150 percent
+  if (!fh) fh = fb.w >= 3000 ? 24 : 16;                              // small letters, so that a bigger screen shows more text; on 4K as much as Notepad++ shows on Windows at 150 percent
   int k = 0;
   for (int i = 0; i < fb_nfonts; i++) if (fb_fonts[i].h == fh) k = i;
   font = &fb_fonts[k];
