@@ -155,3 +155,7 @@ fb.c
 fb.h
 fbcon.c
 mbox.c
+usb.h
+pci.c
+xhci.c
+usbhid.c

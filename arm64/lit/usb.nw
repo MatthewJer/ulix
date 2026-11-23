@@ -1,0 +1,775 @@
+\chapter{USB: Keyboard and Mouse}
+\label{ch:usb}
+
+With a screen on the HDMI port ({\it chapter \ref{ch:video}}) the machine also needs a keyboard that does not hang on a serial line. On the Raspberry Pi 4B the USB sockets are
+connected in a roundabout way: a chip (the VIA VL805) sits on the PCI Express bus and offers four ports. To use them the kernel needs three layers:
+
+\begin{enumerate}
+\item \textbf{PCI Express} ([[pci.c]]): the bus on which the USB chip is found. Every device on it has a 4096 byte \emph{configuration space} with its vendor, its class and its
+  \emph{base address registers} (BARs): the device says how much address space it needs, the kernel chooses where it goes. The code here is for the \emph{generic} PCI host (qemu's [[virt]] machine,
+  ``ECAM'': the configuration space of device $d$ is a piece of memory); the Raspberry Pi's own controller is the second part of this chapter.
+\item \textbf{xHCI} ([[xhci.c]]): the \emph{host controller} for USB 3. Software and controller talk through \emph{rings} in RAM, circular lists of 16 byte entries (\emph{transfer request blocks}, TRBs): the
+  driver writes commands and transfers into rings and rings a doorbell, the controller writes the results into the event ring. Each side marks the entries that are new with a \emph{cycle bit}, which is
+  flipped on every round.
+  The driver enumerates the devices (reset the port, get an address, read the descriptors) and starts the HID interrupt transfers.
+\item \textbf{HID} ([[usbhid.c]]): keyboards and mice speak the \emph{boot protocol}: a keyboard sends 8 bytes (modifier keys, up to six keys that are pressed now), a mouse 3 or 4 bytes (buttons, movement).
+  A key press becomes a character (US or German layout) or an escape sequence for the cursor keys, and goes the way of a character from the serial line ([[arch_console_input]]).
+\end{enumerate}
+
+The driver polls: the timer calls [[usb_tick]] a hundred times a second, which reads the event ring. No interrupt handler is needed for a keyboard, and it keeps the code short.
+
+Not done: hubs (a keyboard must sit directly on a port of the controller), isochronous and bulk transfers (USB sticks, audio), the LEDs of the keyboard, interrupts.
+
+@
+\section{PCI Express, the generic host (see \texttt{pci.c})}
+\label{src:pci.c}
+
+The device tree tells where the configuration space is and which address window the devices may use ([[plat.pci_cfg]], [[plat.pci_mem_pci]], [[plat.pci_mem_cpu]], [[plat.pci_mem_size]]: the window as the devices
+see it and as the cores see it; they are the same on qemu). Device $d$ of bus $b$, function $f$ has its registers at [[cfg + (b << 20 | d << 15 | f << 12)]]. The first 64 bytes are the same for all devices:
+vendor and device (offset 0), command (4: bit 1 memory space on, bit 2 bus master on), class code (8, the upper 24 bits: base class, sub class, interface), header type (0x0c), the six BARs (0x10 \ldots).
+
+To find the size of a BAR the kernel writes all ones into it and reads it back: the bits that the device does not implement stay zero, so the size is the lowest bit that is set. Bits 1 and 2 say whether
+the BAR is memory (bit 0 clear) and whether it is 64 bits wide (it then uses the next BAR for the upper half). A BAR must be put on an address that is a multiple of its size.
+
+<<pci.c>>=
+#include "ulix.h"
+#include "plat.h"
+#include "usb.h"
+
+static volatile u32 *cfg_word (int bus, int dev, int fn, int reg) {
+  return (volatile u32 *) (KERNEL_VA + plat.pci_cfg + ((u64) bus << 20 | (u64) dev << 15 | (u64) fn << 12 | (reg & 0xffc)));
+}
+u32  pci_read (int bus, int dev, int fn, int reg)            { return *cfg_word (bus, dev, fn, reg); }
+void pci_write (int bus, int dev, int fn, int reg, u32 v)    { *cfg_word (bus, dev, fn, reg) = v; }
+
+static u64 mem_next;                                          // the next free address of the window (as the devices see it)
+
+u64 pci_assign_bar (const struct pci_dev *d, int bar, u64 *size_out) {   // gives BAR number bar an address; returns it as the cores see it (0: no)
+  int reg = 0x10 + 4 * bar;
+  u32 old = pci_read (d->bus, d->dev, d->fn, reg);
+  if (old & 1) return 0;                                      // an I/O BAR: not on this machine
+  int is64 = ((old >> 1) & 3) == 2;
+  pci_write (d->bus, d->dev, d->fn, reg, 0xffffffff);
+  u32 lo = pci_read (d->bus, d->dev, d->fn, reg) & ~0xfu;
+  u64 mask = lo;
+  if (is64) {
+    pci_write (d->bus, d->dev, d->fn, reg + 4, 0xffffffff);
+    mask |= (u64) pci_read (d->bus, d->dev, d->fn, reg + 4) << 32;
+  } else mask |= 0xffffffff00000000UL;
+  u64 size = ~mask + 1;
+  if (size == 0) return 0;
+  mem_next = (mem_next + size - 1) & ~(size - 1);            // a multiple of its size
+  if (mem_next + size > plat.pci_mem_pci + plat.pci_mem_size) return 0;
+  u64 bus_addr = mem_next;
+  mem_next += size;
+  pci_write (d->bus, d->dev, d->fn, reg, (u32) bus_addr | (old & 0xf));
+  if (is64) pci_write (d->bus, d->dev, d->fn, reg + 4, (u32) (bus_addr >> 32));
+  if (size_out) *size_out = size;
+  return bus_addr - plat.pci_mem_pci + plat.pci_mem_cpu;
+}
+
+void pci_enable (const struct pci_dev *d) {                   // memory space and bus master on
+  u32 cmd = pci_read (d->bus, d->dev, d->fn, 4);
+  pci_write (d->bus, d->dev, d->fn, 4, (cmd & 0xffff) | 0x6);
+}
+
+int pci_find (u32 class_if, struct pci_dev *d) {              // the first device with this class code (base, sub, interface): 0 if there is one
+  if (!plat.pci_cfg) return -1;
+  if (!mem_next) mem_next = plat.pci_mem_pci;
+  for (int dev = 0; dev < 32; dev++) {
+    u32 id = pci_read (0, dev, 0, 0);
+    if ((id & 0xffff) == 0xffff) continue;                    // nobody there
+    if ((pci_read (0, dev, 0, 8) >> 8) == class_if) {
+      d->bus = 0;  d->dev = dev;  d->fn = 0;  d->vendor = id & 0xffff;  d->device = id >> 16;
+      return 0;
+    }
+  }
+  return -1;
+}
+@
+
+<<usb.h>>=
+#ifndef USB_H
+#define USB_H
+#include "ulix.h"
+
+struct pci_dev { int bus, dev, fn; unsigned vendor, device; };
+u32  pci_read (int bus, int dev, int fn, int reg);
+void pci_write (int bus, int dev, int fn, int reg, u32 v);
+u64  pci_assign_bar (const struct pci_dev *d, int bar, u64 *size_out);
+void pci_enable (const struct pci_dev *d);
+int  pci_find (u32 class_if, struct pci_dev *d);
+
+int  usb_init (void);                  // 0: a controller was found (it may have no device)
+void usb_tick (void);                  // from the timer: look at the event ring
+void usb_keyboard_report (const u8 *r, int n);
+void usb_mouse_report (const u8 *r, int n);
+void usb_keys_tick (void);             // key repeat
+extern int usb_debug;
+#endif
+@
+\section{The xHCI host controller (see \texttt{xhci.c})}
+\label{src:xhci.c}
+
+The controller has three groups of registers behind BAR 0. The \emph{capability registers} (read only: number of ports and slots, the offsets of the others), the \emph{operational registers} (command and status, the
+pointers to the rings, one set of port registers per root port) and the \emph{runtime registers} (the event ring: where it is and how far we have read). A fourth group, the \emph{doorbells}, is an array of
+registers: writing the number of a slot (0: the controller itself) and of an endpoint tells the controller that new work is in a ring.
+
+Everything the controller reads or writes lives in RAM at addresses that the \emph{controller} can use: on our boards the physical addresses ([[PA]]). The structures are static, aligned arrays of the kernel;
+because the controller does not look at the caches of the cores (on the Pi it does not), every structure that we write is cleaned out of the cache before the controller reads it ([[cache_clean]]) and
+every one that the controller wrote is invalidated before we read it ([[cache_flush_inval]]); on qemu that does nothing wrong.
+
+\paragraph{Rings.} A ring is an array of TRBs; the last one is a \emph{link} that points back to the start. The producer owns a \emph{cycle bit}: it writes it into the TRBs it makes; the
+consumer treats a TRB as new if its cycle bit equals the one it expects. When the producer passes the link TRB it flips its bit (and the link TRB has the ``toggle cycle'' flag, so the consumer flips, too).
+There are three kinds: the \emph{command ring} (we produce commands, the controller consumes), the \emph{event ring} (the controller produces, we consume; it is described by a table of segments) and one \emph{transfer ring} per endpoint.
+
+<<xhci.c>>=
+<<xhci.c: includes and registers>>
+
+<<xhci.c: rings>>
+
+<<xhci.c: commands>>
+
+<<xhci.c: control transfers>>
+
+<<xhci.c: devices>>
+
+<<xhci.c: init and poll>>
+@
+
+<<xhci.c: includes and registers>>=
+#include "ulix.h"
+#include "plat.h"
+#include "cache.h"
+#include "delay.h"
+#include "usb.h"
+
+int usb_debug = 0;
+#define DBG(...) do { if (usb_debug) printf (__VA_ARGS__); } while (0)
+
+struct trb { u64 param; u32 status; u32 control; };            // 16 bytes
+
+// the TRB types (bits 10..15 of the control word)
+#define TRB_NORMAL  1
+#define TRB_SETUP   2
+#define TRB_DATA    3
+#define TRB_STATUS  4
+#define TRB_LINK    6
+#define TRB_ENABLE_SLOT   9
+#define TRB_ADDRESS_DEV   11
+#define TRB_CONFIGURE_EP  12
+#define TRB_EVAL_CONTEXT  13
+#define TRB_EV_TRANSFER   32
+#define TRB_EV_COMMAND    33
+#define TRB_EV_PORT       34
+#define TRB_TYPE(c)  (((c) >> 10) & 63)
+
+#define MAXDEV    4                                           // slots that we use (a keyboard, a mouse, ...)
+#define EP_RING   16                                          // TRBs of an endpoint ring (the last is the link)
+
+static volatile u8 *base;                                     // BAR 0
+static volatile u8 *op, *rt, *db;                             // operational and runtime registers, doorbells
+static int ctx_size = 32, nports, nslots;                     // context size (32 or 64 bytes: HCCPARAMS1 bit 2), root ports, slots
+
+static inline u32 rd32 (volatile u8 *p, int off) { return *(volatile u32 *) (p + off); }
+static inline void wr32 (volatile u8 *p, int off, u32 v) { *(volatile u32 *) (p + off) = v; }
+static inline void wr64 (volatile u8 *p, int off, u64 v) { wr32 (p, off, (u32) v);  wr32 (p, off + 4, (u32) (v >> 32)); }
+
+#define USBCMD   0x00
+#define USBSTS   0x04
+#define CRCR     0x18
+#define DCBAAP   0x30
+#define CONFIG   0x38
+#define PORTSC(n) (0x400 + 0x10 * (n))                        // n from 0
+#define CMD_RUN  1
+#define CMD_RESET 2
+#define STS_HALTED 1
+#define STS_NOTREADY (1 << 11)                                // controller not ready (after a reset)
+
+#define PORT_CONNECTED (1 << 0)
+#define PORT_ENABLED   (1 << 1)
+#define PORT_RESET     (1 << 4)
+#define PORT_RESET_DONE (1 << 21)
+#define PORT_SPEED(v)  (((v) >> 10) & 15)                     // 1 full, 2 low, 3 high, 4 super speed
+#define PORT_KEEP(v)   ((v) & ~((1u << 1) | (0x7fu << 17) | (1u << 31)))     // PED and the change bits are "write 1 to clear": write them as 0
+@
+
+\subsection{Rings}
+A ring needs: where it is, how many entries, the next free one, and the cycle bit of the producer. [[ring_put]] fills the next TRB and, at the link TRB, flips the cycle bit; the cycle bit of a TRB
+is written last, because the controller may be looking: here that is not an issue, since it only looks after the doorbell.
+
+<<xhci.c: rings>>=
+struct ring { struct trb *trb; int n, enq, cycle; };
+
+static void ring_init (struct ring *r, struct trb *t, int n) {
+  r->trb = t;  r->n = n;  r->enq = 0;  r->cycle = 1;
+  for (int i = 0; i < n; i++) { t[i].param = 0; t[i].status = 0; t[i].control = 0; }
+  t[n - 1].param = PA (t);                                    // the link TRB: back to the start,
+  t[n - 1].control = (TRB_LINK << 10) | (1 << 1) | 1;         // toggle cycle, cycle bit
+  cache_clean (t, n * sizeof *t);
+}
+
+static u64 ring_put (struct ring *r, u64 param, u32 status, u32 control) {      // returns the physical address of the TRB
+  struct trb *t = &r->trb[r->enq];
+  t->param = param;  t->status = status;
+  t->control = control | r->cycle;
+  cache_clean (t, sizeof *t);
+  u64 pa = PA (t);
+  if (++r->enq == r->n - 1) {                                  // the link TRB is next: hand it to the controller and start again
+    r->trb[r->n - 1].control = (TRB_LINK << 10) | (1 << 1) | r->cycle;
+    cache_clean (&r->trb[r->n - 1], sizeof (struct trb));
+    r->cycle ^= 1;  r->enq = 0;
+  }
+  return pa;
+}
+
+static struct trb cmd_trbs[64]  __attribute__ ((aligned (1024)));
+static struct trb ev_trbs[256]  __attribute__ ((aligned (4096)));
+static u64 erst[2]              __attribute__ ((aligned (64)));       // event ring segment table: base, size
+static u64 dcbaa[256]           __attribute__ ((aligned (64)));       // device context base address array: slot -> its device context
+static u8  scratch_page[16][4096] __attribute__ ((aligned (4096)));   // the controller may ask for scratchpad pages
+static u64 scratch_array[16]    __attribute__ ((aligned (64)));
+static struct ring cmd_ring;
+static int ev_deq = 0, ev_cycle = 1;                           // the consumer side of the event ring
+@
+
+\subsection{Commands and events}
+A command is a TRB in the command ring; when it is done the controller writes a \emph{command completion event} that contains the address of the command and a
+\emph{completion code} (1 = success). The driver polls the event ring until it sees it. Events that arrive meanwhile (a transfer finished) are handled, too, so nothing gets lost: [[ev_poll]] hands every
+transfer event to [[transfer_event]] and returns the completion event that [[cmd]] is waiting for. Having read events, we tell the controller where we are: the \emph{event ring dequeue pointer}.
+
+<<xhci.c: commands>>=
+static void transfer_event (int slot, int dci, int code, u32 residual);       // below
+
+static struct trb last_cmd_event;                              // the last command completion event
+static int cmd_event_seen;
+
+static void ev_poll (void) {                                   // handles every event that is there
+  int any = 0;
+  for (;;) {
+    struct trb *e = &ev_trbs[ev_deq];
+    cache_flush_inval (e, sizeof *e);
+    if ((e->control & 1) != ev_cycle) break;                   // not written yet
+    int type = TRB_TYPE (e->control);
+    if (type == TRB_EV_COMMAND) { last_cmd_event = *e;  cmd_event_seen = 1; }
+    else if (type == TRB_EV_TRANSFER) transfer_event ((e->control >> 24) & 255, (e->control >> 16) & 31, (e->status >> 24) & 255, e->status & 0xffffff);
+    if (++ev_deq == 256) { ev_deq = 0; ev_cycle ^= 1; }
+    any = 1;
+  }
+  if (any) wr64 (rt, 0x20 + 0x18, (PA (&ev_trbs[ev_deq])) | (1 << 3));      // ERDP: new dequeue pointer, and clear "event handler busy"
+}
+
+static int cmd (u64 param, u32 status, u32 control, int *slot_out) {         // a command: returns the completion code (1: success), -1: timed out
+  cmd_event_seen = 0;
+  ring_put (&cmd_ring, param, status, control);
+  wr32 (db, 0, 0);                                             // doorbell 0: the command ring
+  for (int t = 0; t < 500000; t++) {                           // 500 ms
+    ev_poll ();
+    if (cmd_event_seen) {
+      if (slot_out) *slot_out = (last_cmd_event.control >> 24) & 255;
+      return (last_cmd_event.status >> 24) & 255;
+    }
+    delay_us (1);
+  }
+  return -1;
+}
+@
+
+\subsection{Devices, contexts and control transfers}
+For every device that the controller manages there is a \emph{slot}. Its state lives in two structures: the \emph{device context} (written by the controller: it holds the slot state and one
+context per endpoint) and the \emph{input context} that we fill in and give to the controller with a command ([[Address Device]], [[Configure Endpoint]]): a header that says which contexts are valid, then the contexts.
+An endpoint number plus direction becomes a \emph{device context index} (DCI): endpoint 0 is index 1, endpoint 1 OUT is 2, endpoint 1 IN is 3, and so on ($2n$ for OUT, $2n+1$ for IN).
+
+Setting up a device takes these steps (see [[enumerate]]):
+\begin{enumerate}
+\item reset the port; the speed is in the port register;
+\item [[Enable Slot]]: the controller answers with a slot number;
+\item [[Address Device]]: input context with the slot context (speed, root port) and the context of endpoint 0 (the transfer ring); the controller gives the device an USB address;
+\item control transfers on endpoint 0: read the descriptors (device, configuration with its interfaces and endpoints), [[SET_CONFIGURATION]], and for HID [[SET_PROTOCOL]] (boot) and [[SET_IDLE]];
+\item [[Configure Endpoint]] for the interrupt-in endpoint of the HID interface, then put a transfer TRB on its ring: the controller completes it when the device has something to say (a key, a movement).
+\end{enumerate}
+
+A \emph{control transfer} is three TRBs on the endpoint 0 ring: [[Setup]] (the 8 bytes of the request, immediate data), [[Data]] (the buffer, if there is one), [[Status]] (the handshake in the opposite direction,
+with ``interrupt on completion''). Then the doorbell of the slot, target 1.
+
+<<xhci.c: control transfers>>=
+struct hid_ep {                                                // an interrupt-in endpoint that delivers keyboard or mouse reports
+  int used, dci, proto, iface, mps, interval;                  // proto: 1 keyboard, 2 mouse; the interface number, max packet size and bInterval of the endpoint
+  struct ring ring;
+  u8 *buf;
+};
+
+struct slot {
+  int used, port, speed, id;
+  struct ring ep0;
+  struct hid_ep hid[2];
+  volatile int ep0_done, ep0_code;                             // set by the event handler when a control transfer has ended
+};
+
+static struct slot slots[MAXDEV];
+static u8  in_ctx[MAXDEV][2176]  __attribute__ ((aligned (64)));        // input context: 33 contexts of up to 64 bytes
+static u8  out_ctx[MAXDEV][2048] __attribute__ ((aligned (64)));        // device context: 32 contexts of up to 64 bytes
+static struct trb ep0_trbs[MAXDEV][EP_RING]      __attribute__ ((aligned (256)));
+static struct trb hid_trbs[MAXDEV][2][EP_RING]   __attribute__ ((aligned (256)));
+static u8  hid_buf[MAXDEV][2][64]                __attribute__ ((aligned (64)));
+static u8  xfer_buf[512]                         __attribute__ ((aligned (64)));  // descriptors and the like
+
+static void transfer_event (int slot, int dci, int code, u32 residual) {
+  struct slot *s = 0;
+  for (int i = 0; i < MAXDEV; i++) if (slots[i].used && slots[i].id == slot) s = &slots[i];
+  if (!s) return;
+  if (dci == 1) { s->ep0_code = code;  s->ep0_done = 1;  return; }
+  for (int i = 0; i < 2; i++) {
+    struct hid_ep *h = &s->hid[i];
+    if (!h->used || h->dci != dci) continue;
+    if (code == 1 || code == 13) {                             // success or short packet: a report
+      cache_flush_inval (h->buf, 64);
+      if (h->proto == 1) usb_keyboard_report (h->buf, h->mps - residual); else usb_mouse_report (h->buf, h->mps - residual);
+    }
+    if (code == 1 || code == 13) {                             // ask for the next one
+      ring_put (&h->ring, PA (h->buf), h->mps, (TRB_NORMAL << 10) | (1 << 5) | (1 << 2));      // interrupt on completion, short packets are fine
+      wr32 (db, 4 * slot, dci);
+    } else DBG ("usb: transfer error %d on slot %d\n", code, slot);
+  }
+}
+
+static int control (struct slot *s, int type, int req, int value, int index, int len, int dir_in) {     // returns the completion code; data in xfer_buf
+  u64 setup = (u64) (type & 255) | ((u64) (req & 255) << 8) | ((u64) (value & 0xffff) << 16) | ((u64) (index & 0xffff) << 32) | ((u64) (len & 0xffff) << 48);
+  int trt = len == 0 ? 0 : (dir_in ? 3 : 2);
+  s->ep0_done = 0;
+  if (len && dir_in) { for (int i = 0; i < len; i++) xfer_buf[i] = 0;  cache_clean (xfer_buf, len); }
+  ring_put (&s->ep0, setup, 8, (TRB_SETUP << 10) | (1 << 6) | (trt << 16));                 // immediate data
+  if (len) ring_put (&s->ep0, PA (xfer_buf), len, (TRB_DATA << 10) | ((dir_in ? 1 : 0) << 16));
+  ring_put (&s->ep0, 0, 0, (TRB_STATUS << 10) | (1 << 5) | ((len && dir_in) ? 0 : (1 << 16)));  // interrupt on completion; the direction is the opposite one
+  wr32 (db, 4 * s->id, 1);                                    // doorbell of the slot, endpoint 0
+  for (int t = 0; t < 1000000 && !s->ep0_done; t++) { ev_poll ();  delay_us (1); }
+  if (!s->ep0_done) return -1;
+  if (len && dir_in) cache_flush_inval (xfer_buf, len);
+  return s->ep0_code;
+}
+@
+
+<<xhci.c: devices>>=
+static u32 *ctx_at (u8 *ctx, int i) { return (u32 *) (ctx + i * ctx_size); }              // context i of an input context (0: control, 1: slot, 2: endpoint 0, ...)
+
+static int mps_of_speed (int speed) { return speed == 4 ? 512 : speed == 3 ? 64 : 8; }     // the first guess for endpoint 0 (full speed: read it from the device)
+
+static int address_device (struct slot *s) {
+  int n = s - slots;
+  u8 *in = in_ctx[n];
+  for (int i = 0; i < (int) sizeof in_ctx[n]; i++) in[i] = 0;
+  for (int i = 0; i < (int) sizeof out_ctx[n]; i++) out_ctx[n][i] = 0;
+  ctx_at (in, 0)[1] = 3;                                       // add flags: slot context and endpoint 0
+  u32 *slotc = ctx_at (in, 1);
+  slotc[0] = (s->speed << 20) | (1u << 27);                    // speed; context entries: 1
+  slotc[1] = (s->port + 1) << 16;                              // root hub port number (from 1)
+  u32 *ep = ctx_at (in, 2);
+  ep[1] = (3 << 1) | (4 << 3) | (mps_of_speed (s->speed) << 16);        // error count 3, type control, max packet size
+  u64 deq = PA (s->ep0.trb) | 1;
+  ep[2] = (u32) deq;  ep[3] = (u32) (deq >> 32);
+  ep[4] = 8;                                                   // average TRB length
+  dcbaa[s->id] = PA (out_ctx[n]);
+  cache_clean (&dcbaa[s->id], 8);  cache_clean (in, sizeof in_ctx[n]);  cache_clean (out_ctx[n], sizeof out_ctx[n]);
+  return cmd (PA (in), 0, (TRB_ADDRESS_DEV << 10) | (s->id << 24), 0);
+}
+
+static void set_mps (struct slot *s, int mps) {                // a full speed device may have another maximum packet size on endpoint 0
+  int n = s - slots;
+  u8 *in = in_ctx[n];
+  for (int i = 0; i < (int) sizeof in_ctx[n]; i++) in[i] = 0;
+  ctx_at (in, 0)[1] = 2;                                       // endpoint 0 only
+  ctx_at (in, 2)[1] = (3 << 1) | (4 << 3) | (mps << 16);
+  cache_clean (in, sizeof in_ctx[n]);
+  cmd (PA (in), 0, (TRB_EVAL_CONTEXT << 10) | (s->id << 24), 0);
+}
+
+static int interval_of (int speed, int binterval) {            // xHCI wants an exponent of 125 microsecond units
+  if (speed >= 3) return binterval > 0 ? binterval - 1 : 0;    // high and super speed: 2^(bInterval-1) microframes
+  int frames = binterval ? binterval : 1, e = 3;               // low and full speed: bInterval milliseconds = 8 * bInterval microframes
+  while ((1 << e) < frames * 8 && e < 10) e++;
+  return e;
+}
+
+static int configure_endpoints (struct slot *s) {
+  int n = s - slots, maxdci = 1;
+  u8 *in = in_ctx[n];
+  for (int i = 0; i < (int) sizeof in_ctx[n]; i++) in[i] = 0;
+  u32 add = 1;                                                 // the slot context
+  for (int i = 0; i < 2; i++) {
+    struct hid_ep *h = &s->hid[i];
+    if (!h->used) continue;
+    add |= 1u << h->dci;
+    if (h->dci > maxdci) maxdci = h->dci;
+    u32 *ep = ctx_at (in, 1 + h->dci);
+    ep[0] = interval_of (s->speed, h->interval) << 16;
+    ep[1] = (3 << 1) | (7 << 3) | (h->mps << 16);               // error count 3, type interrupt in, max packet size
+    u64 deq = PA (h->ring.trb) | 1;
+    ep[2] = (u32) deq;  ep[3] = (u32) (deq >> 32);
+    ep[4] = h->mps | (h->mps << 16);                            // average TRB length, max ESIT payload
+  }
+  ctx_at (in, 0)[1] = add;
+  u32 *slotc = ctx_at (in, 1);
+  slotc[0] = (s->speed << 20) | ((u32) maxdci << 27);
+  slotc[1] = (s->port + 1) << 16;
+  cache_clean (in, sizeof in_ctx[n]);
+  return cmd (PA (in), 0, (TRB_CONFIGURE_EP << 10) | (s->id << 24), 0);
+}
+
+static void hid_setup (struct slot *s, int idx, int proto, int iface, int ep_addr, int mps, int binterval) {
+  int n = s - slots;
+  struct hid_ep *h = &s->hid[idx];
+  h->used = 1;  h->proto = proto;  h->iface = iface;
+  h->dci = (ep_addr & 15) * 2 + 1;                             // an IN endpoint
+  h->mps = mps & 0x7ff;  if (h->mps > 64) h->mps = 64;         // (the buffers are 64 bytes; boot reports have 8)
+  h->interval = binterval;
+  ring_init (&h->ring, hid_trbs[n][idx], EP_RING);
+  h->buf = hid_buf[n][idx];
+}
+
+static int read_configuration (struct slot *s, int *config) {   // the whole configuration descriptor into xfer_buf: returns its length, 0 if not
+  if (control (s, 0x80, 6, 0x0200, 0, 9, 1) != 1) return 0;     // first the length of it,
+  int total = xfer_buf[2] | xfer_buf[3] << 8;
+  *config = xfer_buf[5];
+  if (total > (int) sizeof xfer_buf) total = sizeof xfer_buf;
+  return control (s, 0x80, 6, 0x0200, 0, total, 1) == 1 ? total : 0;      // then all of it
+}
+
+static void enumerate (int port) {
+  int speed = PORT_SPEED (rd32 (op, PORTSC (port)));
+  int sl = -1;
+  for (int i = 0; i < MAXDEV; i++) if (!slots[i].used) { sl = i; break; }
+  if (sl < 0) return;
+  struct slot *s = &slots[sl];
+  int slot_id = 0;
+  if (cmd (0, 0, TRB_ENABLE_SLOT << 10, &slot_id) != 1 || slot_id == 0 || slot_id >= 256) { printf ("usb: no slot for port %d\n", port + 1); return; }
+  s->used = 1;  s->id = slot_id;  s->port = port;  s->speed = speed;
+  s->hid[0].used = s->hid[1].used = 0;
+  ring_init (&s->ep0, ep0_trbs[sl], EP_RING);
+  if (address_device (s) != 1) { printf ("usb: port %d: the device did not get an address\n", port + 1); s->used = 0; return; }
+  if (control (s, 0x80, 6, 0x0100, 0, 8, 1) != 1) { printf ("usb: port %d: no device descriptor\n", port + 1); s->used = 0; return; }   // GET_DESCRIPTOR: device, the first 8 bytes
+  if (speed <= 2 && xfer_buf[7] != 8 && xfer_buf[7] >= 8) set_mps (s, xfer_buf[7]);
+  if (control (s, 0x80, 6, 0x0100, 0, 18, 1) != 1) { s->used = 0; return; }
+  int vendor = xfer_buf[8] | xfer_buf[9] << 8, product = xfer_buf[10] | xfer_buf[11] << 8;
+  int config = 1, total = read_configuration (s, &config);
+  if (!total) { s->used = 0; return; }
+  int nhid = 0, iface = -1, iclass = 0, isub = 0, iproto = 0;
+  for (int p = 0; p + 2 <= total && xfer_buf[p] >= 2; p += xfer_buf[p]) {                  // the interfaces and their endpoints
+    if (xfer_buf[p + 1] == 4) { iface = xfer_buf[p + 2];  iclass = xfer_buf[p + 5];  isub = xfer_buf[p + 6];  iproto = xfer_buf[p + 7]; }
+    else if (xfer_buf[p + 1] == 5 && iclass == 3 && isub == 1 && (iproto == 1 || iproto == 2) && nhid < 2) {
+      int addr = xfer_buf[p + 2], attr = xfer_buf[p + 3];
+      if ((addr & 0x80) && (attr & 3) == 3) {                  // the interrupt-in endpoint of a boot keyboard or mouse
+        hid_setup (s, nhid++, iproto, iface, addr, xfer_buf[p + 4] | xfer_buf[p + 5] << 8, xfer_buf[p + 6]);
+        iclass = 0;                                            // one endpoint per interface
+      }
+    }
+  }
+  if (nhid == 0) { printf ("usb: port %d: device %04x:%04x is not a keyboard or a mouse (not supported)\n", port + 1, vendor, product); s->used = 0; return; }
+  if (control (s, 0, 9, config, 0, 0, 0) != 1) { printf ("usb: port %d: SET_CONFIGURATION failed\n", port + 1); s->used = 0; return; }
+  for (int i = 0; i < nhid; i++) {
+    control (s, 0x21, 0x0b, 0, s->hid[i].iface, 0, 0);         // SET_PROTOCOL: the boot protocol (a device in it already may stall: no matter)
+    control (s, 0x21, 0x0a, 0, s->hid[i].iface, 0, 0);         // SET_IDLE: report only when something changes
+  }
+  if (configure_endpoints (s) != 1) { printf ("usb: port %d: Configure Endpoint failed\n", port + 1); s->used = 0; return; }
+  for (int i = 0; i < nhid; i++) {
+    struct hid_ep *h = &s->hid[i];
+    ring_put (&h->ring, PA (h->buf), h->mps, (TRB_NORMAL << 10) | (1 << 5) | (1 << 2));    // the first report is asked for
+    wr32 (db, 4 * s->id, h->dci);
+    printf ("usb: port %d: %s (%04x:%04x, %s speed)\n", port + 1, h->proto == 1 ? "keyboard" : "mouse", vendor, product,
+            speed == 4 ? "super" : speed == 3 ? "high" : speed == 2 ? "low" : "full");
+  }
+}
+@
+
+\subsection{Start}
+[[usb_init]] looks for a PCI device with the class code of an xHCI controller (0x0c0330: serial bus, USB, interface ``xHCI''), gives its BAR an address and switches the device on, then follows the
+sequence of the specification: stop and \emph{reset} the controller, tell it where the three structures are (device context array, command ring, event ring), set the run bit and look at the ports. A port with something
+connected is reset (the device then runs at its speed, which the port register tells) and enumerated.
+
+<<xhci.c: init and poll>>=
+static int controller_up = 0;
+
+extern void arch_map_device (u64 pa);                          // mmu.c: the 1 GByte block of pa as device memory
+extern const char *plat_cmdline (void);
+
+static int wait_for (volatile u8 *regs, int off, u32 mask, u32 want, int ms) {
+  for (int t = 0; t < ms * 10; t++) {
+    if ((rd32 (regs, off) & mask) == want) return 1;
+    delay_us (100);
+  }
+  return 0;
+}
+
+static int has_word (const char *cl, const char *w) {          // is w a word of the kernel command line?
+  for (; *cl; cl++) {
+    if (cl != plat_cmdline () && cl[-1] != ' ') continue;
+    const char *a = cl, *b = w;
+    while (*b && *a == *b) { a++; b++; }
+    if (!*b && (*a == ' ' || *a == 0)) return 1;
+  }
+  return 0;
+}
+
+static void scan_ports (void) {
+  for (int p = 0; p < nports; p++) {
+    u32 v = rd32 (op, PORTSC (p));
+    if (!(v & PORT_CONNECTED)) continue;
+    wr32 (op, PORTSC (p), PORT_KEEP (v) | (0x7f << 17));       // acknowledge the changes (connect, ...)
+    if (!(v & PORT_ENABLED)) {                                 // a USB 3 port enables itself; the others are reset
+      wr32 (op, PORTSC (p), PORT_KEEP (v) | PORT_RESET);
+      if (!wait_for (op, PORTSC (p), PORT_RESET_DONE, PORT_RESET_DONE, 500)) { printf ("usb: port %d: reset did not finish\n", p + 1); continue; }
+      wr32 (op, PORTSC (p), PORT_KEEP (rd32 (op, PORTSC (p))) | (0x7f << 17));
+      delay_us (20000);                                        // the device needs 10 ms to recover
+      v = rd32 (op, PORTSC (p));
+      if (!(v & PORT_ENABLED)) { printf ("usb: port %d: not enabled after the reset\n", p + 1); continue; }
+    }
+    enumerate (p);
+  }
+}
+
+int usb_init (void) {
+  const char *cl = plat_cmdline ();
+  if (has_word (cl, "usb=off")) return -1;
+  usb_debug = has_word (cl, "debug=usb");
+  if (!plat.pci_cfg) return -1;
+  arch_map_device (plat.pci_cfg);
+  arch_map_device (plat.pci_mem_cpu);
+  struct pci_dev d;
+  if (pci_find (0x0c0330, &d) < 0) return -1;                  // no xHCI controller on the bus (silent: most machines have none)
+  u64 size = 0, bar = pci_assign_bar (&d, 0, &size);
+  if (!bar) { printf ("usb: no address for the controller\n"); return -1; }
+  pci_enable (&d);
+  arch_map_device (bar);
+  base = (volatile u8 *) (KERNEL_VA + bar);
+  int caplen = *(volatile u8 *) base;
+  op = base + caplen;  rt = base + (rd32 (base, 0x18) & ~0x1fu);  db = base + (rd32 (base, 0x14) & ~3u);
+  u32 hcs1 = rd32 (base, 0x04), hcs2 = rd32 (base, 0x08), hcc = rd32 (base, 0x10);
+  nslots = hcs1 & 255;  nports = hcs1 >> 24;  ctx_size = (hcc & 4) ? 64 : 32;
+  int nscratch = ((hcs2 >> 21) & 31) * 32 + ((hcs2 >> 27) & 31);
+  if (nscratch > 16) { printf ("usb: the controller wants %d scratchpad pages (we have 16)\n", nscratch); return -1; }
+  printf ("usb: xHCI controller %04x:%04x, %d ports, %d slots\n", d.vendor, d.device, nports, nslots);
+
+  wr32 (op, USBCMD, rd32 (op, USBCMD) & ~CMD_RUN);             // stop, then reset
+  if (!wait_for (op, USBSTS, STS_HALTED, STS_HALTED, 100)) { printf ("usb: the controller does not stop\n"); return -1; }
+  wr32 (op, USBCMD, CMD_RESET);
+  if (!wait_for (op, USBCMD, CMD_RESET, 0, 500) || !wait_for (op, USBSTS, STS_NOTREADY, 0, 500)) { printf ("usb: the controller does not come out of the reset\n"); return -1; }
+
+  if (nslots > 8) nslots = 8;
+  wr32 (op, CONFIG, nslots);
+  for (int i = 0; i < 256; i++) dcbaa[i] = 0;
+  if (nscratch) { for (int i = 0; i < nscratch; i++) scratch_array[i] = PA (scratch_page[i]);  dcbaa[0] = PA (scratch_array);  cache_clean (scratch_array, sizeof scratch_array); }
+  cache_clean (dcbaa, sizeof dcbaa);
+  wr64 (op, DCBAAP, PA (dcbaa));
+  ring_init (&cmd_ring, cmd_trbs, 64);
+  wr64 (op, CRCR, PA (cmd_trbs) | 1);                          // bit 0: the cycle bit that the controller expects first
+  for (int i = 0; i < 256; i++) { ev_trbs[i].param = 0; ev_trbs[i].status = 0; ev_trbs[i].control = 0; }
+  cache_clean (ev_trbs, sizeof ev_trbs);
+  erst[0] = PA (ev_trbs);  erst[1] = 256;  cache_clean (erst, sizeof erst);
+  wr32 (rt, 0x20 + 0x08, 1);                                   // interrupter 0: one segment,
+  wr64 (rt, 0x20 + 0x18, PA (ev_trbs));                        // dequeue pointer,
+  wr64 (rt, 0x20 + 0x10, PA (erst));                           // and the table (this last write starts the ring)
+  wr32 (op, USBCMD, CMD_RUN);                                  // no interrupts (INTE stays 0): we poll
+  if (!wait_for (op, USBSTS, STS_HALTED, 0, 100)) { printf ("usb: the controller does not start\n"); return -1; }
+  delay_us (100000);                                           // the ports need a moment to see what is plugged in
+  scan_ports ();
+  controller_up = 1;
+  return 0;
+}
+
+void usb_tick (void) {                                         // from the timer, 100 times a second
+  if (!controller_up) return;
+  ev_poll ();
+  usb_keys_tick ();
+}
+@
+\section{Keyboard and mouse (see \texttt{usbhid.c})}
+\label{src:usbhid.c}
+
+In the boot protocol a keyboard report has 8 bytes: byte 0 has one bit per modifier key (Ctrl, Shift, Alt, GUI, left and right), byte 1 is reserved and bytes 2 to 7 hold the \emph{usage numbers} of up to six keys that
+are held down now (0 = none; 1 = too many keys). The usage numbers name keys, not letters: 4 is the key A, 0x28 is Enter. A report is sent whenever the set of keys changes, so what a press is shows up as a number that was not in the
+previous report.
+
+The layout turns a usage number into a character: [[us]] and [[de]] (German; AltGr gives \texttt{@ \{ [ ] \} \textbackslash{} \~{} | €}). Characters above 127 go out as UTF-8 (the console of the screen
+shows Latin-1 and more). Control keys send the usual codes: Ctrl and a letter the code 1 to 26, Alt an Escape in front, the cursor keys the sequences of the xterm (\texttt{ESC [ A}, or \texttt{ESC O A} when a program has asked for the application mode of the cursor keys, see [[fbcon_app_cursor]]).
+A key that is held down repeats after half a second, 30 times a second.
+Alt and F1 to F10 switch the virtual terminal (like Ctrl-T and a digit on the serial line). Command line: [[keymap=us]] or [[keymap=de]] (default: German).
+
+<<usbhid.c>>=
+#include "ulix.h"
+#include "plat.h"
+#include "usb.h"
+
+extern void arch_console_input (unsigned char c);             // arch_console.c: a character arrives, from the UART or from here
+extern void arch_vt_switch (int n);
+extern int fbcon_app_cursor;                                   // video.nw: ESC [ ? 1 h
+extern const char *plat_cmdline (void);
+
+static int layout_de = 1;                                      // keymap=us on the command line switches to the US layout
+static int layout_checked = 0;
+static int caps = 0, numlock = 1;
+
+static void out_cp (unsigned cp) {                             // a character (Unicode) as UTF-8 to the console
+  if (cp < 0x80) arch_console_input (cp);
+  else if (cp < 0x800) { arch_console_input (0xc0 | (cp >> 6));  arch_console_input (0x80 | (cp & 63)); }
+  else { arch_console_input (0xe0 | (cp >> 12));  arch_console_input (0x80 | ((cp >> 6) & 63));  arch_console_input (0x80 | (cp & 63)); }
+}
+
+static void out_str (const char *s) { while (*s) arch_console_input (*s++); }
+
+// usage numbers 0x04 .. 0x38: a to z, 1 to 9 and 0, Enter, Esc, Backspace, Tab, Space, - = [ ] \ # ; ' ` , . /
+static const char us_plain[] = "abcdefghijklmnopqrstuvwxyz1234567890\r\033\177\t -=[]\\#;'`,./";
+static const char us_shift[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()\r\033\177\t _+{}|~:\"~<>?";
+
+static unsigned us_key (int u, int shift) { return (shift ? us_shift : us_plain)[u - 4]; }
+
+static unsigned de_key (int u, int shift, int altgr) {         // the German layout: y and z swapped, the digits and the symbols are elsewhere
+  if (u == 0x1c) u = 0x1d; else if (u == 0x1d) u = 0x1c;       // Y <-> Z
+  if (u >= 0x1e && u <= 0x27) {
+    static const char sh[] = "!\"\0$%&/()=";                   // 3 is the paragraph sign, below
+    int i = u - 0x1e;
+    if (altgr) { static const unsigned ag[] = { 0, 0, 0xb2, 0xb3, 0, 0, '{', '[', ']', '}' }; return ag[i]; }
+    if (shift) return i == 2 ? 0xa7 : sh[i];
+  }
+  switch (u) {
+    case 0x14: if (altgr) return '@'; break;                   // Q
+    case 0x08: if (altgr) return 0x20ac; break;                // E
+    case 0x2d: return altgr ? '\\' : shift ? '?' : 0xdf;       // sz
+    case 0x2e: return shift ? '`' : '\'';                      // the acute key (no dead keys)
+    case 0x2f: return shift ? 0xdc : 0xfc;                     // u umlaut
+    case 0x30: return altgr ? '~' : shift ? '*' : '+';
+    case 0x31: case 0x32: return shift ? '\'' : '#';
+    case 0x33: return shift ? 0xd6 : 0xf6;                     // o umlaut
+    case 0x34: return shift ? 0xc4 : 0xe4;                     // a umlaut
+    case 0x35: return shift ? 0xb0 : '^';
+    case 0x36: return shift ? ';' : ',';
+    case 0x37: return shift ? ':' : '.';
+    case 0x38: return shift ? '_' : '-';
+    case 0x64: return altgr ? '|' : shift ? '>' : '<';         // the key left of Y on an ISO keyboard
+    default: break;
+  }
+  return us_key (u, shift);
+}
+
+static void key_down (int u, int mods) {
+  int shift = (mods & 0x22) != 0, ctrl = (mods & 0x11) != 0, lalt = (mods & 0x04) != 0, ralt = (mods & 0x40) != 0;
+  int altgr = layout_de && ralt, alt = lalt || (ralt && !layout_de);
+  if (u == 0x39) { caps ^= 1; return; }                        // Caps Lock
+  if (u == 0x53) { numlock ^= 1; return; }                     // Num Lock
+  if (alt && u >= 0x3a && u <= 0x43) { arch_vt_switch (u - 0x3a); return; }     // Alt F1 .. F10
+  const char *app = fbcon_app_cursor ? "\033O" : "\033[";
+  char seq[8];
+  const char *special = 0;
+  switch (u) {
+    case 0x52: seq[0] = app[0]; seq[1] = app[1]; seq[2] = 'A'; seq[3] = 0; special = seq; break;       // up, down, right, left
+    case 0x51: seq[0] = app[0]; seq[1] = app[1]; seq[2] = 'B'; seq[3] = 0; special = seq; break;
+    case 0x4f: seq[0] = app[0]; seq[1] = app[1]; seq[2] = 'C'; seq[3] = 0; special = seq; break;
+    case 0x50: seq[0] = app[0]; seq[1] = app[1]; seq[2] = 'D'; seq[3] = 0; special = seq; break;
+    case 0x4a: seq[0] = app[0]; seq[1] = app[1]; seq[2] = 'H'; seq[3] = 0; special = seq; break;       // Home, End
+    case 0x4d: seq[0] = app[0]; seq[1] = app[1]; seq[2] = 'F'; seq[3] = 0; special = seq; break;
+    case 0x49: special = "\033[2~"; break;                     // Insert, Delete, Page up, Page down
+    case 0x4c: special = "\033[3~"; break;
+    case 0x4b: special = "\033[5~"; break;
+    case 0x4e: special = "\033[6~"; break;
+    case 0x3a: special = "\033OP"; break;                      // F1 .. F12
+    case 0x3b: special = "\033OQ"; break;
+    case 0x3c: special = "\033OR"; break;
+    case 0x3d: special = "\033OS"; break;
+    case 0x3e: special = "\033[15~"; break;
+    case 0x3f: special = "\033[17~"; break;
+    case 0x40: special = "\033[18~"; break;
+    case 0x41: special = "\033[19~"; break;
+    case 0x42: special = "\033[20~"; break;
+    case 0x43: special = "\033[21~"; break;
+    case 0x44: special = "\033[23~"; break;
+    case 0x45: special = "\033[24~"; break;
+    default: break;
+  }
+  if (special) { out_str (special); return; }
+  unsigned c = 0;
+  if (u >= 0x04 && u <= 0x38) {
+    int letter = u <= 0x1d;
+    c = layout_de ? de_key (u, shift ^ (caps && letter), altgr) : us_key (u, shift ^ (caps && letter));
+  } else if (u == 0x64 && layout_de) c = de_key (u, shift, altgr);
+  else if (u >= 0x54 && u <= 0x63) {                           // the keypad
+    static const char pad[] = "/*-+\r1234567890.";
+    if (u >= 0x59 && u <= 0x62 && !numlock) {                  // without Num Lock the keys move the cursor
+      static const char *mv[] = { 0, "\033[F", "\033[B", "\033[6~", "\033[D", 0, "\033[C", "\033[H", "\033[A", "\033[5~", "\033[2~" };
+      if (mv[u - 0x59]) { out_str (mv[u - 0x59]); }
+      return;
+    }
+    if (u == 0x63 && !numlock) { out_str ("\033[3~"); return; }
+    c = pad[u - 0x54];
+  }
+  if (!c) return;
+  if (ctrl && c >= '@' && c <= '~') c &= 0x1f;                 // Ctrl-A .. Ctrl-Z, Ctrl-[ ...
+  else if (ctrl && c == ' ') c = 0;
+  if (alt) arch_console_input (27);                            // Alt: the key with an Escape in front (nano's M-keys)
+  out_cp (c);
+}
+
+static u8 prev[8];
+static int rep_key = 0, rep_mods = 0, rep_ticks = 0;
+
+void usb_keyboard_report (const u8 *r, int n) {
+  if (n < 8) return;
+  if (!layout_checked) {                                       // (the command line is known only after the device tree is read: look when the first key comes)
+    const char *p = plat_cmdline ();
+    for (; *p; p++) if ((p == plat_cmdline () || p[-1] == ' ') && p[0] == 'k' && p[1] == 'e' && p[2] == 'y' && p[3] == 'm' && p[4] == 'a' && p[5] == 'p' && p[6] == '=') layout_de = !(p[7] == 'u');
+    layout_checked = 1;
+  }
+  int still = 0;
+  for (int i = 2; i < 8; i++) {
+    int k = r[i];
+    if (k < 4) continue;                                       // none (0), roll-over error (1)
+    int was = 0;
+    for (int j = 2; j < 8; j++) if (prev[j] == k) was = 1;
+    if (!was) { key_down (k, r[0]);  rep_key = k;  rep_mods = r[0];  rep_ticks = 0; }
+    if (k == rep_key) still = 1;
+  }
+  if (!still) rep_key = 0;
+  for (int i = 0; i < 8; i++) prev[i] = r[i];
+}
+
+void usb_keys_tick (void) {                                    // key repeat: after 500 ms, then every 30 ms
+  if (!rep_key) return;
+  rep_ticks++;
+  if (rep_ticks >= 50 && (rep_ticks - 50) % 3 == 0) key_down (rep_key, rep_mods);
+}
+@
+
+\paragraph{The mouse.} A boot protocol report has the buttons (bit 0: left, 1: right, 2: middle), the movement to the right and downward as signed bytes, and, if the mouse has a wheel, the wheel. We collect
+the position and the buttons and put what happened into a small ring of \emph{input events}, which any later user (a window system, for instance) can take: [[input_get]] returns the next one. With [[debug=usb]] they are printed.
+
+<<usbhid.c>>=
+struct input_event { int kind, a, b; };                        // kind 1: movement by (a, b); 2: button a (0 left, 1 right, 2 middle) is b (1 down, 0 up); 3: wheel by a
+#define NEVENTS 64
+static struct input_event events[NEVENTS];
+static int ev_head = 0, ev_tail = 0;
+int mouse_x = 0, mouse_y = 0, mouse_buttons = 0;
+extern int usb_debug;
+
+static void input_put (int kind, int a, int b) {
+  int next = (ev_head + 1) % NEVENTS;
+  if (next == ev_tail) return;                                 // full: drop it
+  events[ev_head].kind = kind;  events[ev_head].a = a;  events[ev_head].b = b;
+  ev_head = next;
+}
+
+int input_get (int *kind, int *a, int *b) {                    // 0: nothing there
+  if (ev_tail == ev_head) return 0;
+  *kind = events[ev_tail].kind;  *a = events[ev_tail].a;  *b = events[ev_tail].b;
+  ev_tail = (ev_tail + 1) % NEVENTS;
+  return 1;
+}
+
+void usb_mouse_report (const u8 *r, int n) {
+  if (n < 3) return;
+  int dx = (signed char) r[1], dy = (signed char) r[2];
+  if (dx || dy) { mouse_x += dx;  mouse_y += dy;  input_put (1, dx, dy);  if (usb_debug) printf ("mouse: move %d %d (at %d %d)\n", dx, dy, mouse_x, mouse_y); }
+  for (int b = 0; b < 3; b++) {
+    int down = (r[0] >> b) & 1, was = (mouse_buttons >> b) & 1;
+    if (down != was) { input_put (2, b, down);  if (usb_debug) printf ("mouse: button %d %s\n", b, down ? "down" : "up"); }
+  }
+  mouse_buttons = r[0] & 7;
+  if (n >= 4 && (signed char) r[3]) { input_put (3, (signed char) r[3], 0);  if (usb_debug) printf ("mouse: wheel %d\n", (signed char) r[3]); }
+}
+@

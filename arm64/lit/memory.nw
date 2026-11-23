@@ -143,6 +143,11 @@ void platform_map (void) {
   __asm__ volatile ("dsb ishst; tlbi vmalle1is; dsb ish; isb" ::: "memory");
 }
 
+void arch_map_device (u64 pa) {                    // a driver that finds its device later (PCI) maps the 1 GByte block of it
+  map_block (pa, 1);
+  __asm__ volatile ("dsb ishst; tlbi vmalle1is; dsb ish; isb" ::: "memory");
+}
+
 void kstack_reserve (int n);
 void frames_init (void) {
   next_free = (PA (__kernel_end) + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);

@@ -42,6 +42,10 @@ fb.h
 mbox.c
 fb.c
 fbcon.c
+usb.h
+pci.c
+xhci.c
+usbhid.c
 sntp.c
 stats.c
 bookfs_test.c

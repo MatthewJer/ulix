@@ -76,7 +76,7 @@ check-submodules:
 all: check-submodules
 .PHONY: check-submodules
 
-OBJS = start.o vectors.o linux_abi.o pipes.o fastfs.o sockets.o pty.o irq.o mmu.o virtio.o sdcard.o virtionet.o genet.o netdev.o net.o ip6.o tcp.o dhcp.o dns.o netconf.o echo.o net_test.o net_syscalls.o random.o mbox.o fb.o fbcon.o fbfont.o sntp.o netd.o rcconf.o stats.o dbg_http.o minixfs.o elf.o ulix-port.o glue.o arch_thread.o arch_console.o arch_clock.o arch_swap.o arch_vt.o dt.o gic.o smp.o \
+OBJS = start.o vectors.o linux_abi.o pipes.o fastfs.o sockets.o pty.o irq.o mmu.o virtio.o sdcard.o virtionet.o genet.o netdev.o net.o ip6.o tcp.o dhcp.o dns.o netconf.o echo.o net_test.o net_syscalls.o random.o mbox.o fb.o fbcon.o fbfont.o pci.o xhci.o usbhid.o sntp.o netd.o rcconf.o stats.o dbg_http.o minixfs.o elf.o ulix-port.o glue.o arch_thread.o arch_console.o arch_clock.o arch_swap.o arch_vt.o dt.o gic.o smp.o \
        bookfs_test.o thread_test.o proc_test.o kmain.o
 
 all: ulix.elf ulix-console.elf ulix-shell.elf ulix.bin ulix-console.bin ulix-shell.bin $(DISK) $(GENDIR)/disk_expected.h
@@ -263,11 +263,12 @@ irq.o mmu.o virtio.o sdcard.o dt.o gic.o smp.o kmain.o kmain-console.o kmain-she
 virtionet.o genet.o netdev.o net.o ip6.o tcp.o dhcp.o dns.o netconf.o echo.o net_test.o rcconf.o sntp.o: net.h plat.h ulix.h cache.h delay.h
 random.o: plat.h ulix.h cache.h
 mbox.o fb.o fbcon.o: plat.h ulix.h cache.h fb.h
+pci.o xhci.o usbhid.o: plat.h ulix.h cache.h delay.h usb.h
 # the screen code moves megabytes (a scroll): optimised, but without the "replace this loop by a call of memmove" (the kernel has none)
 fbcon.o: fbcon.c
 	$(CC) $(CFLAGS) -O2 -fno-tree-loop-distribute-patterns -c -o $@ $<
 # the fonts of the HDMI console: C table made from the BDF files of Terminus (third_party/terminus, SIL OFL 1.1)
-FONTS = ../third_party/terminus/ter-u16n.bdf ../third_party/terminus/ter-u24n.bdf ../third_party/terminus/ter-u32n.bdf
+FONTS = ../third_party/terminus/ter-u16n.bdf ../third_party/terminus/ter-u24n.bdf ../third_party/terminus/ter-u28n.bdf ../third_party/terminus/ter-u32n.bdf
 $(GENDIR)/font.c: tools/bdf2c.py $(FONTS)
 	mkdir -p $(GENDIR)
 	python3 tools/bdf2c.py $(FONTS) > $@
