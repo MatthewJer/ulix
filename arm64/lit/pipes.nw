@@ -144,8 +144,14 @@ does not know them), but \texttt{open} finds them.
 
 <<pipes.c: virtual devices>>=
 #define FS_VDEV   5                           // /dev/null, /dev/zero, /dev/random and /dev/urandom
-static const char *vdev_names[] = { "/dev/null", "/dev/zero", "/dev/random", "/dev/urandom", "/dev/cpustat" };
-enum { VDEV_NULL, VDEV_ZERO, VDEV_RANDOM, VDEV_URANDOM, VDEV_CPUSTAT, VDEVS };
+static const char *vdev_names[] = { "/dev/null", "/dev/zero", "/dev/random", "/dev/urandom", "/dev/cpustat", "/dev/kmsg" };
+enum { VDEV_NULL, VDEV_ZERO, VDEV_RANDOM, VDEV_URANDOM, VDEV_CPUSTAT, VDEV_KMSG, VDEVS };
+
+// /dev/kmsg: the kernel log, the last 16 KByte that the console showed, from the oldest on. Opening it starts at the beginning, a read returns what is there and 0 at the end
+// (so that cat stops). One reader at a time.
+extern char klog[];  extern unsigned klog_head;
+#define KLOG_SIZE 16384
+static unsigned kmsg_pos = 0;
 
 // /dev/cpustat: every read returns the numbers of the moment as text (a program reads it with one read of 512 bytes or more and subtracts the numbers of the
 // read before): the timer ticks since the start, and for every CPU the ticks in which it ran a process and the ticks in which it waited (stats.c, as top shows them)
@@ -163,6 +169,13 @@ static int vdev_read (int gfd, void *buf, int n) {
   switch (gfd & 0xff) {
     case VDEV_NULL: return 0;                                            // end of file
     case VDEV_ZERO: memset (buf, 0, n);  return n;
+    case VDEV_KMSG: {
+      unsigned oldest = klog_head > KLOG_SIZE ? klog_head - KLOG_SIZE : 0;
+      if (kmsg_pos < oldest) kmsg_pos = oldest;
+      int k = 0;
+      while (k < n && kmsg_pos < klog_head) ((char *) buf)[k++] = klog[kmsg_pos++ % KLOG_SIZE];
+      return k;
+    }
     case VDEV_CPUSTAT: { char text[256];  int len = cpustat_text (text);  if (len > n) len = n;  memcpy (buf, text, len);  return len; }
     default: {
       char tmp[256];                                                     // the generator is asked for a few bytes at a time
@@ -182,7 +195,7 @@ static int vdev_write (int gfd, void *buf, int n) { return n; }          // ever
 int u_open (char *path, int oflag, int open_link) {
   char kp0[FS_PATH];  path = (char *) kpath (path, kp0);
   for (int k = 0; k < VDEVS; k++)
-    if (strequal (path, (char *) vdev_names[k])) return (FS_VDEV << 8) | k;
+    if (strequal (path, (char *) vdev_names[k])) { if (k == VDEV_KMSG) kmsg_pos = 0;  return (FS_VDEV << 8) | k; }
   fs_enter ();  int r = book_u_open (path, oflag, open_link);  fs_leave ();
   return r;
 }

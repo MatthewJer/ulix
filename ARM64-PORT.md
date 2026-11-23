@@ -1126,6 +1126,12 @@ Test: `make stress-test` (modes `fs:/tmp` and `mmap` at 4:1:64 hit all of them).
 
 **Not done:** hubs, hot plug (a stick that is plugged in later is found by `mount`), interrupts (the timer polls), isochronous transfers, UAS, the LEDs of the keyboard, a program that reads the mouse events. **Not tested on a board:** everything about the Pi's PCIe and the VL805 (the parser of the device tree was checked on the host against the firmware's `bcm2711-rpi-4-b.dtb`).
 
+**On the board (2026-11-23).** The Pi's controller (VL805, 1106:3483, 5 ports) came up after two corrections found in the log: it wants 31 scratchpad pages (64 are reserved now), and all USB 2 sockets sit behind a hub on the board (VIA 2109:3431), so keyboards and mice are *behind a hub* in every socket. Hubs are supported (high speed hubs: hub descriptor, Configure Endpoint with the hub flag, port power, reset through class requests, route string and transaction translator in the slot context of the devices behind it; the ports are looked at by `mount`, not by interrupts). SuperSpeed ports get time to train (1.5 s) and a warm reset when they are "inactive". A 128 GByte exFAT stick on a blue socket was found at a root port, mounted as `/Volumes/USBDISK`, and Python wrote `cpu_load.csv` on it (`arm64/examples/cpu_test.py`, `/dev/cpustat`). Not tested on the board: a keyboard or mouse behind the hub, the transaction translator, hot plug.
+
+**Tools for the board.** `cat /dev/kmsg` shows the last 16 KByte of the console (boot messages without a serial line), `/dev/cpustat` the busy and idle ticks of every CPU as text.
+
+**A build bug.** `make -C userland` without a target builds only its first rule (`swapper.c`), so the top-level Makefile never rebuilt the programs of `userland/` (`sshd`, `telnetd`, the new `mount`) after the first build: the board ran an old `sshd` without the window size. The call is now `make -C userland all`.
+
 **Bugs found on the way.** The event ring is read by the timer (CPU 0) and by a process that waits for a transfer: a lock makes one of them skip. The mount table of the book is built when the threads start (`arch_threads_init`): mounting before that put the entries into a table that was set up again later.
 
 ## 71. FAT32 and exFAT, mount, umount, eject (chapters `lit/fat.nw`)

@@ -100,6 +100,7 @@ static int scan_bus (int bus, u32 class_if, struct pci_dev *d) {   // the device
   for (int dev = 0; dev < 32; dev++) {
     if (plat.pci_type == 2 && dev != 0) break;               // on the Pi only device 0 exists on a bus (looking at the others hangs the memory controller)
     u32 id = pci_read (bus, dev, 0, 0);
+    if (plat.pci_type == 2) printf ("pci: bus %d device %d: id 0x%08x class 0x%06x\n", bus, dev, id, pci_read (bus, dev, 0, 8) >> 8);
     if ((id & 0xffff) == 0xffff || id == 0) continue;        // nobody there
     u32 type = (pci_read (bus, dev, 0, 0x0c) >> 16) & 0x7f;
     u32 class = pci_read (bus, dev, 0, 8) >> 8;
@@ -277,6 +278,8 @@ There are three kinds: the \emph{command ring} (we produce commands, the control
 
 <<xhci.c: devices>>
 
+<<xhci.c: hubs>>
+
 <<xhci.c: init and poll>>
 @
 
@@ -307,7 +310,7 @@ struct trb { u64 param; u32 status; u32 control; };            // 16 bytes
 #define TRB_EV_PORT       34
 #define TRB_TYPE(c)  (((c) >> 10) & 63)
 
-#define MAXDEV    4                                           // slots that we use (a keyboard, a mouse, ...)
+#define MAXDEV    8                                           // slots that we use (hubs, a keyboard, a mouse, a stick ...)
 #define EP_RING   16                                          // TRBs of an endpoint ring (the last is the link)
 
 static volatile u8 *base;                                     // BAR 0
@@ -370,8 +373,8 @@ static struct trb cmd_trbs[64]  __attribute__ ((aligned (1024)));
 static struct trb ev_trbs[256]  __attribute__ ((aligned (4096)));
 static u64 erst[2]              __attribute__ ((aligned (64)));       // event ring segment table: base, size
 static u64 dcbaa[256]           __attribute__ ((aligned (64)));       // device context base address array: slot -> its device context
-static u8  scratch_page[16][4096] __attribute__ ((aligned (4096)));   // the controller may ask for scratchpad pages
-static u64 scratch_array[16]    __attribute__ ((aligned (64)));
+static u8  scratch_page[64][4096] __attribute__ ((aligned (4096)));   // the controller may ask for scratchpad pages (the VL805 of the Pi wants 31)
+static u64 scratch_array[64]    __attribute__ ((aligned (64)));
 static struct ring cmd_ring;
 static int ev_deq = 0, ev_cycle = 1;                           // the consumer side of the event ring
 @
@@ -454,7 +457,8 @@ struct msc {                                                   // a USB stick: t
 };
 
 struct slot {
-  int used, port, speed, id;
+  int used, port, speed, id;                                   // port: the root port (from 0) of a device on the controller, the number of the port (from 1) on its hub otherwise
+  int rootport, route, tier, parent_id, hub, nports, mtt, think, tt_slot, tt_port;   // see "Hubs"
   struct ring ep0;
   struct hid_ep hid[2];
   struct msc msc;
@@ -516,15 +520,19 @@ static u32 *ctx_at (u8 *ctx, int i) { return (u32 *) (ctx + i * ctx_size); }    
 
 static int mps_of_speed (int speed) { return speed == 4 ? 512 : speed == 3 ? 64 : 8; }     // the first guess for endpoint 0 (full speed: read it from the device)
 
+static void fill_slot (struct slot *s, u32 *c, int entries) {  // the slot context: where the device is (route string, root port), what it is (speed, hub), which transaction translator serves it
+  c[0] = s->route | (s->speed << 20) | ((s->hub && s->mtt) ? 1u << 25 : 0) | (s->hub ? 1u << 26 : 0) | ((u32) entries << 27);
+  c[1] = (s->rootport << 16) | (s->hub ? (u32) s->nports << 24 : 0);
+  c[2] = s->tt_slot | (s->tt_port << 8) | (s->hub ? (u32) s->think << 16 : 0);
+}
+
 static int address_device (struct slot *s) {
   int n = s - slots;
   u8 *in = in_ctx[n];
   for (int i = 0; i < (int) sizeof in_ctx[n]; i++) in[i] = 0;
   for (int i = 0; i < (int) sizeof out_ctx[n]; i++) out_ctx[n][i] = 0;
   ctx_at (in, 0)[1] = 3;                                       // add flags: slot context and endpoint 0
-  u32 *slotc = ctx_at (in, 1);
-  slotc[0] = (s->speed << 20) | (1u << 27);                    // speed; context entries: 1
-  slotc[1] = (s->port + 1) << 16;                              // root hub port number (from 1)
+  fill_slot (s, ctx_at (in, 1), 1);                            // context entries: 1
   u32 *ep = ctx_at (in, 2);
   ep[1] = (3 << 1) | (4 << 3) | (mps_of_speed (s->speed) << 16);        // error count 3, type control, max packet size
   u64 deq = PA (s->ep0.trb) | 1;
@@ -585,9 +593,7 @@ static int configure_endpoints (struct slot *s) {
     }
   }
   ctx_at (in, 0)[1] = add;
-  u32 *slotc = ctx_at (in, 1);
-  slotc[0] = (s->speed << 20) | ((u32) maxdci << 27);
-  slotc[1] = (s->port + 1) << 16;
+  fill_slot (s, ctx_at (in, 1), maxdci);
   cache_clean (in, sizeof in_ctx[n]);
   return cmd (PA (in), 0, (TRB_CONFIGURE_EP << 10) | (s->id << 24), 0);
 }
@@ -738,24 +744,44 @@ static int read_configuration (struct slot *s, int *config) {   // the whole con
   return control (s, 0x80, 6, 0x0200, 0, total, 1) == 1 ? total : 0;      // then all of it
 }
 
-static void enumerate (int port) {
-  int speed = PORT_SPEED (rd32 (op, PORTSC (port)));
+static u8 hub_failed[MAXDEV][16];                                // ports of hubs where a device did not work (not tried again before the next mount)
+
+static const char *wh (struct slot *s) {                      // "port 2" or "port 1.3" (port 3 of the hub on root port 1), for the messages
+  static char text[24];
+  int root = s->rootport, n = 0;
+  text[n++] = 'p';  text[n++] = 'o';  text[n++] = 'r';  text[n++] = 't';  text[n++] = ' ';
+  text[n++] = '0' + root;
+  if (s->parent_id) { text[n++] = '.';  text[n++] = s->port >= 10 ? '1' : '0' + s->port;  if (s->port >= 10) text[n++] = '0' + s->port - 10; }
+  text[n] = 0;
+  return text;
+}
+
+static void scan_hub (struct slot *h);
+static int hub_attach (struct slot *s, int config, int proto);
+
+static void enumerate (int rootport, struct slot *hub, int hubport, int speed) {       // a device on a root port, or on a port of a hub
   int sl = -1;
   for (int i = 0; i < MAXDEV; i++) if (!slots[i].used) { sl = i; break; }
   if (sl < 0) return;
   struct slot *s = &slots[sl];
   int slot_id = 0;
-  if (cmd (0, 0, TRB_ENABLE_SLOT << 10, &slot_id) != 1 || slot_id == 0 || slot_id >= 256) { printf ("usb: no slot for port %d\n", port + 1); return; }
-  s->used = 1;  s->id = slot_id;  s->port = port;  s->speed = speed;
+  if (cmd (0, 0, TRB_ENABLE_SLOT << 10, &slot_id) != 1 || slot_id == 0 || slot_id >= 256) { printf ("usb: no slot for the device on port %d\n", rootport + 1); return; }
+  s->used = 1;  s->id = slot_id;  s->speed = speed;
+  s->port = hub ? hubport : rootport;  s->rootport = rootport + 1;  s->parent_id = hub ? hub->id : 0;
+  s->route = hub ? hub->route | (hubport << (4 * hub->tier)) : 0;  s->tier = hub ? hub->tier + 1 : 0;
+  s->hub = s->nports = s->mtt = s->think = s->tt_slot = s->tt_port = 0;
+  if (hub && (speed == 1 || speed == 2) && hub->speed == 3) { s->tt_slot = hub->id;  s->tt_port = hubport; }       // a slow device behind a high speed hub: the hub translates
   s->hid[0].used = s->hid[1].used = 0;  s->msc.used = 0;
   ring_init (&s->ep0, ep0_trbs[sl], EP_RING);
-  if (address_device (s) != 1) { printf ("usb: port %d: the device did not get an address\n", port + 1); s->used = 0; return; }
-  if (control (s, 0x80, 6, 0x0100, 0, 8, 1) != 1) { printf ("usb: port %d: no device descriptor\n", port + 1); s->used = 0; return; }   // GET_DESCRIPTOR: device, the first 8 bytes
+  int r = address_device (s);
+  if (r != 1) { printf ("usb: %s: the device did not get an address (completion code %d)\n", wh (s), r); s->used = 0; return; }
+  if (control (s, 0x80, 6, 0x0100, 0, 8, 1) != 1) { printf ("usb: %s: no device descriptor\n", wh (s)); s->used = 0; return; }   // GET_DESCRIPTOR: device, the first 8 bytes
   if (speed <= 2 && xfer_buf[7] != 8 && xfer_buf[7] >= 8) set_mps (s, xfer_buf[7]);
   if (control (s, 0x80, 6, 0x0100, 0, 18, 1) != 1) { s->used = 0; return; }
-  int vendor = xfer_buf[8] | xfer_buf[9] << 8, product = xfer_buf[10] | xfer_buf[11] << 8;
+  int vendor = xfer_buf[8] | xfer_buf[9] << 8, product = xfer_buf[10] | xfer_buf[11] << 8, dclass = xfer_buf[4], dproto = xfer_buf[6];
   int config = 1, total = read_configuration (s, &config);
   if (!total) { s->used = 0; return; }
+  if (dclass == 9) { if (hub_attach (s, config, dproto) != 0) { printf ("usb: %s: the hub (%04x:%04x) does not work\n", wh (s), vendor, product); s->used = 0; } return; }      // a hub: its ports are looked at
   int nhid = 0, iface = -1, iclass = 0, isub = 0, iproto = 0, msc_if = -1, got_in = 0, got_out = 0;
   struct msc *m = &s->msc;
   for (int p = 0; p + 2 <= total && xfer_buf[p] >= 2; p += xfer_buf[p]) {                  // the interfaces and their endpoints
@@ -776,20 +802,90 @@ static void enumerate (int port) {
     }
   }
   if (got_in && got_out) { m->used = 1;  m->iface = msc_if;  ring_init (&m->in, msc_trbs[sl][0], 64);  ring_init (&m->out, msc_trbs[sl][1], 64);  m->tag = 0; }
-  if (nhid == 0 && !m->used) { printf ("usb: port %d: device %04x:%04x is not a keyboard, a mouse or a stick (not supported)\n", port + 1, vendor, product); s->used = 0; return; }
-  if (control (s, 0, 9, config, 0, 0, 0) != 1) { printf ("usb: port %d: SET_CONFIGURATION failed\n", port + 1); s->used = 0; return; }
+  if (nhid == 0 && !m->used) { printf ("usb: %s: device %04x:%04x is not a keyboard, a mouse or a stick (not supported)\n", wh (s), vendor, product); s->used = 0; return; }
+  if (control (s, 0, 9, config, 0, 0, 0) != 1) { printf ("usb: %s: SET_CONFIGURATION failed\n", wh (s)); s->used = 0; return; }
   for (int i = 0; i < nhid; i++) {
     control (s, 0x21, 0x0b, 0, s->hid[i].iface, 0, 0);         // SET_PROTOCOL: the boot protocol (a device in it already may stall: no matter)
     control (s, 0x21, 0x0a, 0, s->hid[i].iface, 0, 0);         // SET_IDLE: report only when something changes
   }
-  if (configure_endpoints (s) != 1) { printf ("usb: port %d: Configure Endpoint failed\n", port + 1); s->used = 0; return; }
+  if (configure_endpoints (s) != 1) { printf ("usb: %s: Configure Endpoint failed\n", wh (s)); s->used = 0; return; }
   if (m->used) msc_attach (s);
   for (int i = 0; i < nhid; i++) {
     struct hid_ep *h = &s->hid[i];
     ring_put (&h->ring, PA (h->buf), h->mps, (TRB_NORMAL << 10) | (1 << 5) | (1 << 2));    // the first report is asked for
     wr32 (db, 4 * s->id, h->dci);
-    printf ("usb: port %d: %s (%04x:%04x, %s speed)\n", port + 1, h->proto == 1 ? "keyboard" : "mouse", vendor, product,
+    printf ("usb: %s: %s (%04x:%04x, %s speed)\n", wh (s), h->proto == 1 ? "keyboard" : "mouse", vendor, product,
             speed == 4 ? "super" : speed == 3 ? "high" : speed == 2 ? "low" : "full");
+  }
+}
+@
+
+
+\subsection{Hubs}
+The four sockets of the Raspberry Pi 4B are not connected to the controller one by one: the USB 2 side of all of them goes through a \emph{hub} on the board (VIA Labs 2109:3431), which sits on a port of the controller. Only the extra pairs of wires for SuperSpeed of the blue sockets
+go to ports of the controller. So a keyboard or a mouse, which are USB 2 devices, are \emph{behind a hub} in every socket.
+
+A hub is a device with a class of its own. After [[SET_CONFIGURATION]] the driver reads its \emph{hub descriptor} (the number of ports, the time that a port needs to have power, the \emph{think time} of its transaction translators) with a class request, tells the controller that this slot is a hub
+(the slot context gets the flag, the number of ports and the think time: Configure Endpoint) and switches the power on at every port (class request [[SET_FEATURE]], feature [[PORT_POWER]]). Then it looks at the ports one after the other with [[GET_STATUS]]: if something is connected, the port is reset
+([[SET_FEATURE PORT_RESET]]; the hub says through a change bit that it is done), and the speed (low, full, high) is in the status. The device is then set up like one on a root port, with two additions in its slot context:
+the \emph{route string} (20 bits, one nibble for the port on every hub between the controller and the device, the hub next to the controller first) and, for a slow device (low or full speed) behind a high speed hub, the slot and the port of the hub, because
+the hub \emph{translates} between the speeds (the transaction translator, TT).
+
+Not done: hubs that report changes through their interrupt endpoint (the ports are looked at by [[mount]]: [[usb_rescan]]), SuperSpeed hubs.
+
+<<xhci.c: hubs>>=
+static int hub_attach (struct slot *s, int config, int proto) {
+  if (s->speed == 4) { printf ("usb: %s: SuperSpeed hubs are not supported\n", wh (s));  return -1; }
+  if (control (s, 0, 9, config, 0, 0, 0) != 1) return -1;                          // SET_CONFIGURATION
+  if (control (s, 0xa0, 6, 0x2900, 0, 9, 1) != 1) return -1;                        // GET_DESCRIPTOR: the hub descriptor
+  int nports = xfer_buf[2], chars = xfer_buf[3] | xfer_buf[4] << 8, power_good = xfer_buf[5];
+  if (nports < 1 || nports > 15 || s->tier > 3) return -1;
+  s->hub = 1;  s->nports = nports;  s->mtt = proto == 2;  s->think = (chars >> 5) & 3;
+  int n = s - slots;
+  u8 *in = in_ctx[n];
+  for (int i = 0; i < (int) sizeof in_ctx[n]; i++) in[i] = 0;
+  ctx_at (in, 0)[1] = 1;                                                           // add flags: the slot context only
+  fill_slot (s, ctx_at (in, 1), 1);
+  cache_clean (in, sizeof in_ctx[n]);
+  int r = cmd (PA (in), 0, (TRB_CONFIGURE_EP << 10) | (s->id << 24), 0);            // Configure Endpoint: this slot is a hub
+  if (r != 1) { printf ("usb: %s: the controller does not accept the hub (completion code %d)\n", wh (s), r);  return -1; }
+  for (int p = 1; p <= nports; p++) control (s, 0x23, 3, 8, p, 0, 0);               // SET_FEATURE PORT_POWER
+  delay_us ((power_good * 2 + 100) * 1000);
+  printf ("usb: %s: hub with %d ports\n", wh (s), nports);
+  scan_hub (s);
+  return 0;
+}
+
+static void hub_port_status (struct slot *h, int p, int *status, int *change) {      // GET_STATUS of port p: four bytes, status and change
+  if (control (h, 0xa3, 0, 0, p, 4, 1) != 1) { *status = *change = 0;  return; }
+  *status = xfer_buf[0] | xfer_buf[1] << 8;  *change = xfer_buf[2] | xfer_buf[3] << 8;
+}
+
+static struct slot *child_of (struct slot *h, int p) {
+  for (int i = 0; i < MAXDEV; i++) if (slots[i].used && slots[i].parent_id == h->id && slots[i].port == p) return &slots[i];
+  return 0;
+}
+
+static void remove_slot (struct slot *s);
+
+static void scan_hub (struct slot *h) {                          // new devices on the ports of a hub are set up, devices that went are removed
+  int n = h - slots;
+  for (int p = 1; p <= h->nports; p++) {
+    int status, change;
+    hub_port_status (h, p, &status, &change);
+    if (change & 1) control (h, 0x23, 1, 16, p, 0, 0);          // CLEAR_FEATURE C_PORT_CONNECTION
+    struct slot *known = child_of (h, p);
+    if (!(status & 1)) { if (known) remove_slot (known);  continue; }       // nothing connected: and if there was something, it has gone
+    if (known || hub_failed[n][p]) continue;
+    control (h, 0x23, 3, 4, p, 0, 0);                            // SET_FEATURE PORT_RESET
+    int done = 0;
+    for (int t = 0; t < 60 && !done; t++) { delay_us (10000);  hub_port_status (h, p, &status, &change);  if (change & 0x10) done = 1; }
+    control (h, 0x23, 1, 20, p, 0, 0);                           // CLEAR_FEATURE C_PORT_RESET
+    if (!done || !(status & 2)) { printf ("usb: %s.%d: the hub port does not come up after the reset\n", wh (h), p);  hub_failed[n][p] = 1;  continue; }
+    delay_us (20000);
+    int speed = (status & 0x200) ? 2 : (status & 0x400) ? 3 : 1;       // low, high, else full speed (the numbers of the controller: 2 low, 3 high, 1 full)
+    enumerate (h->rootport - 1, h, p, speed);
+    if (!child_of (h, p)) hub_failed[n][p] = 1;                    // (it did not work: do not try again and again)
   }
 }
 @
@@ -823,25 +919,35 @@ static int has_word (const char *cl, const char *w) {          // is w a word of
   return 0;
 }
 
-static int port_served (int p) {                              // is a device of this port set up already?
-  for (int i = 0; i < MAXDEV; i++) if (slots[i].used && slots[i].port == p) return 1;
+static int port_served (int p) {                              // is a device of this root port set up already?
+  for (int i = 0; i < MAXDEV; i++) if (slots[i].used && slots[i].parent_id == 0 && slots[i].port == p) return 1;
   return 0;
 }
 
+static u8 port_failed[32];                                    // root ports where a device did not work (not tried again before the next mount)
+
 static void scan_ports (void) {
-  for (int p = 0; p < nports; p++) {
+  for (int p = 0; p < nports && p < 32; p++) {
     u32 v = rd32 (op, PORTSC (p));
-    if (!(v & PORT_CONNECTED) || port_served (p)) continue;
+    int link = (v >> 5) & 15;
+    if (!(v & PORT_CONNECTED) && link == 6) {                  // a SuperSpeed port in "inactive": a warm reset starts the link training again
+      wr32 (op, PORTSC (p), PORT_KEEP (v) | (1u << 31));
+      delay_us (100000);
+      v = rd32 (op, PORTSC (p));
+    }
+    if (!(v & PORT_CONNECTED) || port_served (p) || port_failed[p]) continue;
+    printf ("usb: port %d: something is connected (status 0x%08x, link state %d, speed %d)\n", p + 1, v, link, PORT_SPEED (v));
     wr32 (op, PORTSC (p), PORT_KEEP (v) | (0x7f << 17));       // acknowledge the changes (connect, ...)
     if (!(v & PORT_ENABLED)) {                                 // a USB 3 port enables itself; the others are reset
       wr32 (op, PORTSC (p), PORT_KEEP (v) | PORT_RESET);
-      if (!wait_for (op, PORTSC (p), PORT_RESET_DONE, PORT_RESET_DONE, 500)) { printf ("usb: port %d: reset did not finish\n", p + 1); continue; }
+      if (!wait_for (op, PORTSC (p), PORT_RESET_DONE, PORT_RESET_DONE, 500)) { printf ("usb: port %d: reset did not finish\n", p + 1); port_failed[p] = 1; continue; }
       wr32 (op, PORTSC (p), PORT_KEEP (rd32 (op, PORTSC (p))) | (0x7f << 17));
       delay_us (20000);                                        // the device needs 10 ms to recover
       v = rd32 (op, PORTSC (p));
-      if (!(v & PORT_ENABLED)) { printf ("usb: port %d: not enabled after the reset\n", p + 1); continue; }
+      if (!(v & PORT_ENABLED)) { printf ("usb: port %d: not enabled after the reset\n", p + 1); port_failed[p] = 1; continue; }
     }
-    enumerate (p);
+    enumerate (p, 0, 0, PORT_SPEED (rd32 (op, PORTSC (p))));
+    if (!port_served (p)) port_failed[p] = 1;                  // (it did not work)
   }
 }
 
@@ -854,7 +960,7 @@ int usb_init (void) {
   arch_map_device (plat.pci_cfg);
   arch_map_device (plat.pci_mem_cpu);
   struct pci_dev d;
-  if (pci_find (0x0c0330, &d) < 0) return -1;                  // no xHCI controller on the bus (silent: most machines have none)
+  if (pci_find (0x0c0330, &d) < 0) { if (plat.pci_type) printf ("usb: no xHCI controller found on the PCI bus\n");  return -1; }      // (silent on a machine without PCI)
   u64 size = 0, bar = pci_assign_bar (&d, 0, &size);
   if (!bar) { printf ("usb: no address for the controller\n"); return -1; }
   pci_vl805_reset (&d);                                        // the Pi: the VideoCore loads the program of the USB chip
@@ -866,7 +972,7 @@ int usb_init (void) {
   u32 hcs1 = rd32 (base, 0x04), hcs2 = rd32 (base, 0x08), hcc = rd32 (base, 0x10);
   nslots = hcs1 & 255;  nports = hcs1 >> 24;  ctx_size = (hcc & 4) ? 64 : 32;
   int nscratch = ((hcs2 >> 21) & 31) * 32 + ((hcs2 >> 27) & 31);
-  if (nscratch > 16) { printf ("usb: the controller wants %d scratchpad pages (we have 16)\n", nscratch); return -1; }
+  if (nscratch > 64) { printf ("usb: the controller wants %d scratchpad pages (we have 64)\n", nscratch); return -1; }
   printf ("usb: xHCI controller %04x:%04x, %d ports, %d slots\n", d.vendor, d.device, nports, nslots);
 
   wr32 (op, USBCMD, rd32 (op, USBCMD) & ~CMD_RUN);             // stop, then reset
@@ -890,24 +996,36 @@ int usb_init (void) {
   wr64 (rt, 0x20 + 0x10, PA (erst));                           // and the table (this last write starts the ring)
   wr32 (op, USBCMD, CMD_RUN);                                  // no interrupts (INTE stays 0): we poll
   if (!wait_for (op, USBSTS, STS_HALTED, 0, 100)) { printf ("usb: the controller does not start\n"); return -1; }
-  delay_us (100000);                                           // the ports need a moment to see what is plugged in
-  scan_ports ();
+  for (int round = 0; round < 15; round++) {                   // the ports need a moment to see what is plugged in; a SuperSpeed link needs up to a second to train
+    delay_us (100000);
+    scan_ports ();
+  }
   controller_up = 1;
   return 0;
 }
 
+static void remove_slot (struct slot *s) {                    // a device that is gone (and, if it is a hub, everything behind it): its slot is disabled, its disk is no more
+  for (int i = 0; i < MAXDEV; i++) if (slots[i].used && slots[i].parent_id == s->id && s->hub) remove_slot (&slots[i]);
+  if (s->msc.used) { udisk[s->msc.disk].present = 0;  printf ("usb: disk %s removed\n", udisk[s->msc.disk].name); }
+  else printf ("usb: %s: device removed\n", wh (s));
+  cmd (0, 0, (10 << 10) | (s->id << 24), 0);                   // Disable Slot
+  dcbaa[s->id] = 0;  cache_clean (&dcbaa[s->id], 8);
+  s->used = 0;  s->hid[0].used = s->hid[1].used = 0;  s->msc.used = 0;
+}
+
 void usb_rescan (void) {                                       // from a process (the mount command): devices that came, devices that went
   if (!controller_up) return;
-  for (int i = 0; i < MAXDEV; i++) {                           // a device that is gone: its slot is disabled, its disk is no more
+  for (int i = 0; i < 32; i++) port_failed[i] = 0;
+  for (int i = 0; i < MAXDEV; i++) for (int p = 0; p < 16; p++) hub_failed[i][p] = 0;
+  for (int i = 0; i < MAXDEV; i++) {
     struct slot *s = &slots[i];
-    if (!s->used || (rd32 (op, PORTSC (s->port)) & PORT_CONNECTED)) continue;
-    if (s->msc.used) { udisk[s->msc.disk].present = 0;  printf ("usb: disk %s removed\n", udisk[s->msc.disk].name); }
-    else printf ("usb: port %d: device removed\n", s->port + 1);
-    cmd (0, 0, (10 << 10) | (s->id << 24), 0);                 // Disable Slot
-    dcbaa[s->id] = 0;  cache_clean (&dcbaa[s->id], 8);
-    s->used = 0;  s->hid[0].used = s->hid[1].used = 0;  s->msc.used = 0;
+    if (s->used && s->parent_id == 0 && !(rd32 (op, PORTSC (s->port)) & PORT_CONNECTED)) remove_slot (s);
   }
-  scan_ports ();
+  for (int round = 0; round < 4; round++) {                    // (a SuperSpeed link that was just plugged in needs a moment)
+    scan_ports ();
+    for (int i = 0; i < MAXDEV; i++) if (slots[i].used && slots[i].hub) scan_hub (&slots[i]);
+    if (round < 3) delay_us (200000);
+  }
 }
 
 void usb_tick (void) {                                         // from the timer, 100 times a second

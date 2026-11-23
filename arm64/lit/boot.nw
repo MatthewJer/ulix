@@ -552,10 +552,13 @@ void uart_init (void) {
 }
 
 extern int fbcon_active;  extern void fbcon_putch (char c);
+#define KLOG_SIZE 16384
+char klog[KLOG_SIZE];  unsigned klog_head = 0;   // the last 16 KByte of everything that putch wrote: cat /dev/kmsg shows them (pipes.nw)
 int console_quiet = 0;                       // 1: output is dropped (for noisy debugging output of the book's code)
 void putch (char c) {
   if (console_quiet) return;
   if (cap_on && cap_len < (int)sizeof cap_buf - 1) cap_buf[cap_len++] = c;
+  klog[klog_head++ % KLOG_SIZE] = c;
   if (c == '\n') putch ('\r');
   while (UART_FR & UART_FR_TXFF) ;
   UART_DR = c;
