@@ -215,6 +215,7 @@ terminals, and a student can read all of it on three pages. The kernel already h
     pty_read (&m)          m.buf, m.len, m.timeout_ms: the output of the terminal: its length, 0 = time over, -1 = you do not hold it (633)
     pty_write (&m)         m.buf, m.len: keys for the terminal, as if they were typed: m.len, or -1 (634)
     pty_hangup ()          end all programs on the terminal and let it go (635)
+    pty_winsize (rows, cols)   the size of the client's window: 0 = ok, -1 = refused; programs of the session get SIGWINCH when it changes (636)
 \end{verbatim}\end{quote}
 
 \begin{quote}\begin{verbatim}
@@ -249,6 +250,7 @@ for every signal, hangs up when the signal ends the holder. (A holder that has v
 
 int pty_vt = -1;                              // the terminal of the session; -1: nobody holds one (arch_vt.c looks at it)
 static int holder = 0;                        // the process that holds it (the server)
+int pty_rows = 0, pty_cols = 0;               // the size of the client's window, as the client has said it (0: nothing said; console.nw uses it)
 static unsigned char ring[8192];
 static volatile unsigned head = 0, tail = 0;  // written at head, read at tail; the place is the count modulo the size
 
@@ -305,6 +307,7 @@ void pty_close (void) {
   if (pty_vt < 0) return;
   int vt = pty_vt;
   pty_vt = -1;  holder = 0;
+  pty_rows = pty_cols = 0;                    // the next client starts with the usual size
   console_hangup (vt);                        // the programs of the session end, login starts again
 }
 
@@ -348,6 +351,17 @@ void syscall_pty_write (context_t *r) {
   eax_return (m->len);
 }
 
+// The size of the client's window (ssh: pty-req and window-change, telnet: NAWS). A server may say it before it takes the terminal
+// (ssh knows the size when the shell starts), or later, when the client changes its window: then the programs of the session get SIGWINCH.
+void syscall_pty_winsize (context_t *r) {
+  int rows = (int)r->ebx, cols = (int)r->ecx;
+  if (!is_root () || (pty_vt >= 0 && !mine ()) || rows < 0 || rows > 1000 || cols < 0 || cols > 1000) eax_return (-1);
+  int changed = rows != pty_rows || cols != pty_cols;
+  pty_rows = rows;  pty_cols = cols;
+  if (changed && pty_vt >= 0) console_winch (pty_vt);
+  r->eax = 0;
+}
+
 void syscall_pty_hangup (context_t *r) {
   if (mine ()) pty_close ();
   r->eax = 0;
@@ -361,6 +375,7 @@ void syscall_pty_hangup (context_t *r) {
 
 extern void console_attach (int vt);            // arch_console.c: empty the keyboard buffer of the terminal
 extern void console_hangup (int vt);            // arch_console.c: end the programs of the terminal
+extern void console_winch (int vt);             // arch_console.c: SIGWINCH for the programs of the terminal
 extern void pty_input (int vt, unsigned char c);       // arch_console.c: a key
 extern void arch_vt_pty_attach (void);          // arch_vt.c: paint the screen of the terminal into the ring
 extern void net_wake_all (void);                // net_syscalls.c: wake the sleepers of the network waiters' queue
@@ -385,11 +400,50 @@ The wrappers for programs:
 #define __NR_pty_read     633
 #define __NR_pty_write    634
 #define __NR_pty_hangup   635
+#define __NR_pty_winsize  636
 struct pty_msg { unsigned char *buf; int len, timeout_ms; };
 static inline int pty_attach (int vt)             { return syscall2 (__NR_pty_attach, vt); }                      // 0 = ok, -1 = in use, -2 = only root, -3 = no such terminal
 static inline int pty_read (struct pty_msg *m)    { return syscall2 (__NR_pty_read, (int)(long)m); }              // bytes, 0 = time over, -1 = not yours (hung up)
 static inline int pty_write (struct pty_msg *m)   { return syscall2 (__NR_pty_write, (int)(long)m); }            // bytes, -1 = not yours
 static inline int pty_hangup (void)               { return syscall1 (__NR_pty_hangup); }
+static inline int pty_winsize (int rows, int cols) { return syscall3 (__NR_pty_winsize, rows, cols); }       // the client's window: 0 = ok, -1 = refused; 0 by 0: it is not known
+@
+
+\subsection{A test program: \texttt{winsize}}
+\label{src:libc/winsize.c}
+
+\texttt{winsize} is what \texttt{stty size} is on Unix: it asks \texttt{TIOCGWINSZ} and prints ``\texttt{winsize: ROWS x COLS}''. With the option \texttt{-w} it then
+waits (it reads a line) and prints the size again every time \texttt{SIGWINCH} arrives, so that the tests of the telnet and the SSH server can see that
+the client's window and its changes arrive in a program.
+
+<<libc/winsize.c>>=
+#include <stdio.h>
+#include <signal.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+
+static void show (void) {
+  struct winsize ws;
+  if (ioctl (0, TIOCGWINSZ, &ws) != 0) { printf ("winsize: no terminal\n");  return; }
+  printf ("winsize: %d x %d\n", ws.ws_row, ws.ws_col);
+  fflush (stdout);
+}
+
+static void on_winch (int signo) { show (); }
+
+int main (int argc, char **argv) {
+  show ();
+  if (argc > 1 && strcmp (argv[1], "-w") == 0) {
+    struct sigaction sa;
+    memset (&sa, 0, sizeof sa);
+    sa.sa_handler = on_winch;                      // (no SA_RESTART: the read below is interrupted)
+    sigaction (SIGWINCH, &sa, 0);
+    char line[80];
+    while (read (0, line, sizeof line) < 0) ;      // until Enter
+  }
+  return 0;
+}
 @
 
 \subsection{A test program: \texttt{ptytest}}
@@ -491,7 +545,11 @@ other side to \emph{do} or \emph{not do} it (RFC 854). Two things are needed to 
 \item The client must not show the keys itself: Ulix echoes what is typed (the program that reads the line does this, as on the
 console), so we say \texttt{WILL ECHO}: ``I do the echo.''
 \end{itemize}
-All answers and all other commands of the client are read and ignored; for these two options that is good enough. A line ends with
+A third thing is asked of the client, not said: \texttt{DO NAWS} (``negotiate about window size'', option 31, RFC 1073). A client that can do it answers
+\texttt{WILL NAWS} and sends, now and whenever its window changes, \texttt{IAC SB NAWS} and four bytes: columns and rows, each as a 16 bit number (the byte 255 doubled, as everywhere),
+\texttt{IAC SE}. The server gives the size to the kernel with \texttt{pty\_winsize}, which makes it the answer of \texttt{TIOCGWINSZ} and sends \texttt{SIGWINCH} to the programs
+of the session when it changes. A client that does not know NAWS sends nothing, and the terminal stays at 24 by 80.
+All answers and all other commands of the client are read and ignored; for these options that is good enough. A line ends with
 CR LF (or CR NUL), which the server turns into one Enter. The pseudo terminal has already made CR LF of every line end of the output; the byte 255 in the
 text is sent twice. \texttt{IAC IP} (``interrupt process'', what some clients send for Ctrl-C) becomes the key Ctrl-C.
 
@@ -529,6 +587,7 @@ write. Before this change the kernel read \texttt{telnetd\_enable} itself.
 #define IP    244                               // "interrupt process": what some clients send for Ctrl-C
 #define OPT_ECHO 1
 #define OPT_SGA  3
+#define OPT_NAWS 31                             // window size (RFC 1073)
 
 static volatile int stop = 0;
 static void on_term (int signo) { stop = 1; }   // SIGTERM (service telnetd stop): end after the current round
@@ -543,6 +602,11 @@ are collected in a small buffer and given to the terminal together, after the wh
 static int state = 0;                           // 0 = text, 1 = after IAC, 2 = after WILL/WONT/DO/DONT (one byte to skip), 3 = in SB ... SE, 4 = IAC inside SB
 static int after_cr = 0;
 static unsigned char keys[512];  static int nkeys = 0;      // the keys of this message, for pty_write
+static unsigned char sb[8];  static int nsb = 0;            // the bytes of a sub negotiation (between SB and SE)
+
+static void sub_negotiation (void) {                        // IAC SB NAWS cols-high cols-low rows-high rows-low IAC SE
+  if (nsb == 5 && sb[0] == OPT_NAWS) pty_winsize (sb[3] << 8 | sb[4], sb[1] << 8 | sb[2]);
+}
 
 static void key (unsigned char c) { if (nkeys < (int)sizeof keys) keys[nkeys++] = c; }
 
@@ -551,13 +615,17 @@ static void from_client (unsigned char c) {
     case 1:                                     // the byte behind IAC
       state = 0;
       if (c == WILL || c == WONT || c == DO || c == DONT) state = 2;
-      else if (c == SB) state = 3;
+      else if (c == SB) { state = 3;  nsb = 0; }
       else if (c == IP) key (3);                // interrupt process: like Ctrl-C
       else if (c == IAC) key (IAC);             // the byte 255 as text
       return;
     case 2: state = 0; return;                  // the option that WILL/WONT/DO/DONT is about: ignored
-    case 3: if (c == IAC) state = 4; return;
-    case 4: state = (c == SE) ? 0 : 3; return;
+    case 3: if (c == IAC) state = 4; else if (nsb < (int)sizeof sb) sb[nsb++] = c; return;
+    case 4:
+      state = 3;
+      if (c == SE) { state = 0;  sub_negotiation (); }
+      else if (c == IAC && nsb < (int)sizeof sb) sb[nsb++] = IAC;      // (255 as data)
+      return;
   }
   if (c == IAC) { state = 1; return; }
   if (after_cr) {                               // the byte behind Enter: LF or NUL belongs to it
@@ -614,7 +682,8 @@ static void say_busy (int s) {                  // somebody has the terminal: te
 
 static void session_start (int s) {
   static const unsigned char hello[] = { IAC, WILL, OPT_ECHO,       // "I echo": the client must not show the keys itself
-                                         IAC, WILL, OPT_SGA };      // "send every key at once"
+                                         IAC, WILL, OPT_SGA,        // "send every key at once"
+                                         IAC, DO, OPT_NAWS };       // "tell me the size of your window"
   if (pty_attach (TELNET_VT) != 0) { say_busy (s);  return; }
   sock = s;
   state = 0;  after_cr = 0;  nkeys = 0;

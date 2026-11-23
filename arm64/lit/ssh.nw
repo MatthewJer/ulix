@@ -19,7 +19,7 @@ has exactly one algorithm, so there is nothing to negotiate except to check that
   integrity           & [[hmac-sha2-256]] (RFC 6668) \\
   compression         & [[none]] \\
   user authentication & [[none]], see below \\
-  channels            & one [[session]] with a terminal ([[pty-req]] is accepted and ignored) and a [[shell]]
+  channels            & one [[session]] with a terminal ([[pty-req]] gives the size of the window, [[window-change]] a new one) and a [[shell]]
 \end{tabular}\end{center}
 
 Ed25519 host keys are not possible (BearSSL has no Ed25519), and [[chacha20-poly1305@openssh.com]], the cipher that OpenSSH prefers, needs
@@ -777,17 +777,36 @@ static int scp_command (const u8 *cmd, int len) {
   return 0;
 }
 @
-A request on the channel. [[pty-req]] (a terminal of some size and kind) is answered with ``yes'' and otherwise ignored: the terminal is the one of the kernel, 80 times 25
-characters. [[shell]] starts the session on the terminal, if nobody else (telnet) has it: the terminal is taken over and its screen is painted into the ring, so that the
+A request on the channel. [[pty-req]] (a terminal of some size and kind) is answered with ``yes''; the kind (the name \texttt{TERM}) is ignored, the size is kept: the
+number of columns and rows, in characters, behind the name (RFC 4254, 6.2; the sizes in pixels are of no use to us). The same two numbers come in a later [[window-change]]
+request (6.7), which has no answer: the client has changed the size of its window, and the kernel tells the programs of the session (\texttt{pty\_winsize}: [[TIOCGWINSZ]]
+and the signal [[SIGWINCH]], on which nano and the ncurses programs redraw their screen). [[shell]] starts the session on the terminal, if nobody else (telnet) has it:
+the size is given to the kernel first, then the terminal is taken over and its screen is painted into the ring, so that the
 client sees the prompt of [[login]] at once. Everything else that asks for an answer is refused; [[exec]] belongs there.
 
 <<userland/sshd.c: messages>>=
+static int win_cols = 0, win_rows = 0;                              // the window of the client (0: it has not said)
+
+static void get_window (const u8 *m, int n, int off) {              // two numbers: columns and rows (the end of the message is checked)
+  if (off + 8 <= n) { win_cols = (int)get32 (m + off);  win_rows = (int)get32 (m + off + 4); }
+}
+
 static void channel_request (const u8 *m, int n) {
   int off = 5;
   const u8 *type;  int type_len;
   if (!get_string (m, n, &off, &type, &type_len) || off >= n) return;
   int want_reply = m[off];
-  if (same_text (type, type_len, "pty-req")) { if (want_reply) send_channel_reply (scp_only ? MSG_CHANNEL_FAILURE : MSG_CHANNEL_SUCCESS); return; }
+  if (same_text (type, type_len, "pty-req")) {
+    const u8 *term;  int tl, o = off + 1;
+    if (get_string (m, n, &o, &term, &tl)) get_window (m, n, o);
+    if (want_reply) send_channel_reply (scp_only ? MSG_CHANNEL_FAILURE : MSG_CHANNEL_SUCCESS);
+    return;
+  }
+  if (same_text (type, type_len, "window-change")) {
+    get_window (m, n, off + 1);
+    if (shell_open) pty_winsize (win_rows, win_cols);               // (the programs get SIGWINCH)
+    return;
+  }
   if (same_text (type, type_len, "exec")) {                          // scp: only on SCP_PORT, only after a password
     int o = off + 1;  const u8 *cmd;  int cl;
     if (!scp_only || !authed || scp_mode || !get_string (m, n, &o, &cmd, &cl) || scp_command (cmd, cl) != 0) { if (want_reply) send_channel_reply (MSG_CHANNEL_FAILURE);  return; }
@@ -795,7 +814,9 @@ static void channel_request (const u8 *m, int n) {
     return;
   }
   if (same_text (type, type_len, "shell")) {
-    if (scp_only || shell_open || pty_attach (SSH_VT) != 0) { if (want_reply) send_channel_reply (MSG_CHANNEL_FAILURE); return; }      // the terminal is in use
+    if (scp_only || shell_open || pty_winsize (win_rows, win_cols) != 0 || pty_attach (SSH_VT) != 0) {      // (the size first: the terminal is painted for it)
+      if (want_reply) send_channel_reply (MSG_CHANNEL_FAILURE);  return;                                                                 // the terminal is in use
+    }
     shell_open = 1;  after_cr = 0;                                  // (pty_attach has painted the terminal: the client sees the prompt of login)
     if (want_reply) send_channel_reply (MSG_CHANNEL_SUCCESS);
     return;
@@ -804,7 +825,7 @@ static void channel_request (const u8 *m, int n) {
 }
 
 @
-Now the dispatch on the message number. Messages that the client may send before and during the session and that we do not use (ignore, debug, global requests, window changes)
+Now the dispatch on the message number. Messages that the client may send before and during the session and that we do not use (ignore, debug, global requests)
 are skipped, or answered with ``failure'' if they ask for an answer. A message that we do not know at all is answered with UNIMPLEMENTED, as the RFC says.
 
 <<userland/sshd.c: messages>>=
@@ -981,7 +1002,7 @@ static void session_start (int s, int on_scp_port) {
   sock = s;  started_at = clock_us ();
   stage = S_BANNER;  broken = 0;  tx_len = 0;  rx_len = 0;  seq_in = seq_out = 0;
   enc_in = enc_out = 0;  first_block_decrypted = 0;
-  channel_is_open = 0;  shell_open = 0;
+  channel_is_open = 0;  shell_open = 0;  win_cols = win_rows = 0;
   scp_only = on_scp_port;  authed = 0;  scp_mode = 0;
   static const char banner[] = "SSH-2.0-Ulix_1\r\n";
   for (int i = 0; i < (int)sizeof banner - 1; i++) tx[tx_len++] = banner[i];

@@ -179,7 +179,7 @@ void syscall_tcp_connect (context_t *r), syscall_tcp_send (context_t *r), syscal
 void syscall_rc_enabled (context_t *r);
 void syscall_tcp_listen (context_t *r), syscall_tcp_accept (context_t *r);           // net_syscalls.c (chapter on servers)
 void syscall_mount (context_t *r);                                      // fatvfs.c: mount, umount, eject, the list of mounts
-void syscall_pty_attach (context_t *r), syscall_pty_read (context_t *r), syscall_pty_write (context_t *r), syscall_pty_hangup (context_t *r);   // pty.c
+void syscall_pty_attach (context_t *r), syscall_pty_read (context_t *r), syscall_pty_write (context_t *r), syscall_pty_hangup (context_t *r), syscall_pty_winsize (context_t *r);   // pty.c
 void arch_clock_init (void);
 void syscall_read_screen (context_t *r);          // the book defines these without prototypes
 void syscall_write_screen (context_t *r);
@@ -594,6 +594,7 @@ Returns the initial user stack pointer, 0 on error.
 #define ARCH_NR_PTY_WRITE    634
 #define ARCH_NR_PTY_HANGUP   635
 #define ARCH_NR_MOUNT        640             // AArch64 only: mount, umount, eject (fatvfs.c, chapter "Mounting")
+#define ARCH_NR_PTY_WINSIZE  636
 
 static int map_sigpage (u64 l0) {
   u64 pa = alloc_frame_try ();
@@ -1358,6 +1359,7 @@ static void arch_syscalls_init (void) {
   install_syscall_handler (ARCH_NR_PTY_WRITE,  syscall_pty_write);
   install_syscall_handler (ARCH_NR_PTY_HANGUP, syscall_pty_hangup);
   install_syscall_handler (ARCH_NR_MOUNT,      syscall_mount);
+  install_syscall_handler (ARCH_NR_PTY_WINSIZE, syscall_pty_winsize);
 }
 
 @

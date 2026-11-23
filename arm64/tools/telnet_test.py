@@ -119,6 +119,27 @@ try:
     t3.expect(r"(?s)PID.*root@ulix\[\d+\]:/root# ", 30)
     shells = len(re.findall(r"tty4 \S+\s+/root\s+/bin/sh", t3.text))
     check(shells == 1, "only one shell runs on tty4 (the old one was ended: %d)" % shells)
+    t3.text = ""
+    t3.send("/musl/winsize\n")
+    check(t3.expect(r"winsize: 24 x 80\s", 30), "a client that sends no NAWS: 24 rows by 80 columns")
+    check((253, 31) in t3.commands, "the server asks IAC DO NAWS")
+    t3.expect(r"root@ulix\[\d+\]:/root# ", 30)
+
+    # window size (RFC 1073): IAC SB NAWS columns(2 bytes) rows(2 bytes) IAC SE
+    naws = lambda cols, rows: bytes([255, 250, 31, cols >> 8, cols & 255, rows >> 8, rows & 255, 255, 240])
+    t3.send(bytes([255, 251, 31]) + naws(120, 40))
+    time.sleep(1)
+    t3.text = ""
+    t3.send("/musl/winsize\n")
+    check(t3.expect(r"winsize: 40 x 120\s", 30), "NAWS 120 by 40: ioctl TIOCGWINSZ says 40 rows by 120 columns")
+    t3.expect(r"root@ulix\[\d+\]:/root# ", 30)
+    t3.text = ""
+    t3.send("/musl/winsize -w\n")
+    check(t3.expect(r"winsize: 40 x 120\s", 30), "winsize -w starts with 40 by 120")
+    t3.send(naws(100, 30))
+    check(t3.expect(r"winsize: 30 x 100\s", 30), "a new NAWS: the program gets SIGWINCH and sees 30 rows by 100 columns")
+    t3.send("\r\n")
+    t3.expect(r"root@ulix\[\d+\]:/root# ", 30)
     t3.close()
 finally:
     qemu.kill(); qemu.wait()

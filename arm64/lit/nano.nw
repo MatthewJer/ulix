@@ -79,7 +79,7 @@ not a key. The Linux \texttt{read} (\texttt{linux\_read}) returns as soon as a k
   the keyboard of the terminal while it is in the raw mode; nano always responds, and Ctrl-X ends it.
 \item Enter arrives as a carriage return when nano is running, but the line editor of the shell, the book's terminal and the other programs still get a line feed: therefore
   \texttt{bind \^{}J enter main} in the global file (a Ctrl-J typed by a person is an Enter, too).
-\item The terminal size is fixed (80 times 24, \texttt{TIOCGWINSZ}); the signal \texttt{SIGWINCH} never comes.
+\item The terminal size is that of the screen (HDMI) or of the client of a remote session (ssh, telnet; \texttt{TIOCGWINSZ}), and \texttt{SIGWINCH} comes when a remote client changes its window; on the serial line it is 80 times 24 and does not change.
 \item No spell checker (Ctrl-T is ``Execute'' on Linux, which starts a program: it fails here), no translation, and no automatic choice of the syntax from the contents of a file: the syntax is chosen from the
   name of the file (\texttt{.py}, \texttt{.c}, \texttt{.cpp}, \texttt{.h}, \texttt{.sh}, \texttt{Makefile}) or from the first line (\texttt{\#!/usr/bin/python}).
 \item nano writes a backup or a temporary file only when asked to (\texttt{set backup}); saving writes the file in place.

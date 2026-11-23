@@ -156,8 +156,10 @@ static int is_job (int pid, int vt) {                   // a living process of t
          thread_table[pid].state != TSTATE_ZOMBIE && thread_table[pid].state != TSTATE_EXIT;
 }
 
-static void kill_job (int vt, int whole_session) {
-  tio[vt].cflag = 0;  tio_raw_out[vt] = 0;               // a killed program leaves the terminal in the usual state
+#define SIGWINCH 28                                      // the window of the terminal has a new size (Linux and BSD: 28; the book has no name for it)
+extern int linux_signal_send (int pid, int signo);      // libc.nw: the signals of the programs of musl (the book's u_kill does not know SIGWINCH)
+
+static void job_signal (int vt, int whole_session, int signo) {   // signo to the job of terminal vt (the whole session: the shell, too)
   int login = 3;
   while (login < MAX_THREADS && !(is_job (login, vt) && strncmp (thread_table[login].cmdline, "login", 5) == 0)) login++;
   if (login == MAX_THREADS) login = 2;                  // no login (kernel tests): everything on the terminal is the job
@@ -168,9 +170,18 @@ static void kill_job (int vt, int whole_session) {
     for (int i = login + 1; i < MAX_THREADS; i++) {
       int in_session = false;                           // login, shell: the processes before fg
       for (int p = login; p != fg && !whole_session; p = thread_table[p].waitfor) if (p == i) in_session = true;
-      if (is_job (i, vt) && !in_session && (i == current_task) == pass) u_kill (i, SIGKILL);
+      if (is_job (i, vt) && !in_session && (i == current_task) == pass) {
+        if (signo == SIGWINCH) linux_signal_send (i, signo); else u_kill (i, signo);
+      }
     }
 }
+
+static void kill_job (int vt, int whole_session) {
+  tio[vt].cflag = 0;  tio_raw_out[vt] = 0;               // a killed program leaves the terminal in the usual state
+  job_signal (vt, whole_session, SIGKILL);
+}
+
+void console_winch (int vt) { job_signal (vt, 0, SIGWINCH); }    // pty.c: the client of a remote session has changed its window; nano and ncurses redraw
 
 static void console_interrupt (void) { kill_job (cur_vt, 0); }
 
@@ -331,6 +342,7 @@ The complete file is put together from these parts:
 extern void putch (char c);
 void vt_scroll_mem (word *address);                // the book defines it without a prototype
 extern int  pty_vt;                             // pty.c: the terminal that a remote session shows (-1: none)
+extern int  pty_rows, pty_cols;                 // pty.c: the size of the client's window (0: it has not said)
 extern void pty_putch (char c);
 
 static void (*out) (char) = putch;                 // where the host_... functions send their characters: the UART, or (for a moment) the remote session
@@ -384,8 +396,14 @@ static char sl_text[80];
 static int  sl_red = 0, sl_dirty = 1;
 
 extern int fbcon_active, fbcon_rows, fbcon_cols;   // video.nw: the HDMI screen is bigger than 80 by 25
-static int host_rows (void) { return (out == putch && fbcon_active) ? fbcon_rows : 25; }     // lines of the terminal that shows the model (with the status line)
-static int host_cols (void) { return (out == putch && fbcon_active) ? fbcon_cols : 80; }
+static int host_rows (void) {                      // lines of the terminal that shows the model (with the status line)
+  if (out != putch) return pty_rows ? pty_rows : 25;    // the remote session: the window of the client
+  return fbcon_active ? fbcon_rows : 25;
+}
+static int host_cols (void) {
+  if (out != putch) return pty_cols ? pty_cols : 80;
+  return fbcon_active ? fbcon_cols : 80;
+}
 
 static void host_status_draw (void) {
   esc ("\0337\033["); num (host_rows ()); esc (";1H");     // save the cursor, go to the last line
@@ -411,13 +429,17 @@ paint the whole model of terminal t on the console
 static void host_repaint (int t) {
   word *mem = (word *)vt[t].mem;
   if (!synced) { esc ("\033[2J\033[1;"); num (host_rows () - 1); out ('r'); }    // first time: clear, scroll region = the lines above the status line
-  for (int row = 0; row < VT_HEIGHT; row++) {
+  int rows = host_rows () - 1, cols = host_cols ();      // (a small window of a client gets no more than it has)
+  if (rows > VT_HEIGHT) rows = VT_HEIGHT;
+  if (cols > VT_WIDTH) cols = VT_WIDTH;
+  for (int row = 0; row < rows; row++) {
     int last = -1;
-    for (int col = 0; col < VT_WIDTH; col++) {
+    for (int col = 0; col < cols; col++) {
       word w = mem[row * VT_WIDTH + col];
       if ((w & 0xff) > ' ' || (w >> 8 & 0xff) != 0x0F) last = col;
     }
     if (row == vt[t].y && last < vt[t].x - 1) last = vt[t].x - 1;     // text up to the cursor (a prompt ends with a blank)
+    if (last >= cols) last = cols - 1;
     host_move (0, row);
     int cur_attr = -1;
     for (int col = 0; col <= last; col++) {
@@ -567,8 +589,9 @@ void arch_vt_switch (int n) {
 
 void arch_tty_winsize (unsigned short *rows, unsigned short *cols) {     // TIOCGWINSZ: what the terminal of the calling process can show
   int t = scheduler_is_active ? thread_table[current_task].terminal : cur_vt;
-  if (fbcon_active && t != pty_vt) { *rows = fbcon_rows;  *cols = fbcon_cols; }    // the HDMI screen: as big as the resolution allows (video.nw)
-  else                             { *rows = 24;  *cols = 80; }                    // the serial line and the remote sessions: 25 lines with the status line
+  if (t == pty_vt && pty_rows)     { *rows = pty_rows;  *cols = pty_cols; }        // a remote session: the window of the client (ssh and telnet tell it)
+  else if (fbcon_active && t != pty_vt) { *rows = fbcon_rows;  *cols = fbcon_cols; }    // the HDMI screen: as big as the resolution allows (video.nw)
+  else                             { *rows = 24;  *cols = 80; }                    // the serial line, and a client that has not said: 25 lines with the status line
 }
 
 @

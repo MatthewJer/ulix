@@ -7,7 +7,7 @@ kernel (10.0.2.15). The host's own ssh client (OpenSSH) is the other side: it ch
 program) logs in on the terminal with the password, runs programs, hangs up and connects again. A second boot with
 sshd_enable="NO" in /etc/rc.conf checks that the server can be switched off. Every check says what it proves.
 """
-import os, re, shutil, socket, subprocess, sys, tempfile, threading, time
+import fcntl, os, pty, re, shutil, signal, socket, struct, subprocess, sys, tempfile, termios, threading, time
 
 kernel, disk = sys.argv[1:3]
 work = tempfile.mkdtemp(prefix="ulix-ssh-")
@@ -61,6 +61,28 @@ class Ssh:
         self.p.stdin.write(s.encode()); self.p.stdin.flush()
     def close(self):
         self.p.kill(); self.p.wait()
+
+class SshWindow(Ssh):
+    """the ssh client of the host on a pseudo terminal of its own, so that it has a window whose size we can set (pty-req and window-change)"""
+    def __init__(self, known_hosts, rows, cols):
+        master, slave = pty.openpty()
+        self.master = master
+        self.resize(rows, cols)
+        self.p = subprocess.Popen(["ssh", "-tt", *SSH_OPTIONS, "-o", "UserKnownHostsFile=" + known_hosts, "-o", "StrictHostKeyChecking=yes", "root@127.0.0.1"],
+                                  stdin=slave, stdout=slave, stderr=slave, start_new_session=True)
+        os.close(slave)
+        self.text = ""
+        self.lock = threading.Lock()
+        threading.Thread(target=self.reader, daemon=True).start()
+    def resize(self, rows, cols):
+        fcntl.ioctl(self.master, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+    def reader(self):
+        while True:
+            try: d = os.read(self.master, 4096)
+            except OSError: return
+            if not d: return
+            with self.lock: self.text += d.decode("latin1")
+    def send(self, s): os.write(self.master, s.encode())
 
 qemu, log = boot(disk)
 try:
@@ -163,6 +185,30 @@ try:
     c3.send("root\n"); c3.expect(r"Password: ", 30); c3.send("xyz\n")
     check(c3.expect(r"root@ulix\[\d+\]:/root# ", 30), "the next session can log in")
     c3.close()
+
+    # --- the size of the window: pty-req brings it, window-change changes it, TIOCGWINSZ and SIGWINCH deliver it to the programs
+    time.sleep(3)
+    w = SshWindow(known, 40, 120)
+    check(w.expect(r"ulix login: ", 60), "a client with a window of 40 rows by 120 columns gets the login prompt")
+    w.send("root\n"); w.expect(r"Password: ", 30); w.send("xyz\n")
+    check(w.expect(r"root@ulix\[\d+\]:/root# ", 30), "login on the window client")
+    w.send("/musl/winsize\n")
+    check(w.expect(r"winsize: 40 x 120\s.*root@ulix\[\d+\]:/root# ", 30), "ioctl TIOCGWINSZ says 40 rows by 120 columns: the size of pty-req")
+    w.send("/musl/winsize -w\n")
+    check(w.expect(r"winsize: 40 x 120\s", 30), "winsize -w starts with the size of pty-req")
+    w.resize(30, 100)
+    os.kill(w.p.pid, signal.SIGWINCH)                           # ssh looks at its window again and sends window-change
+    check(w.expect(r"winsize: 30 x 100\s", 30), "window-change: the program gets SIGWINCH and TIOCGWINSZ now says 30 rows by 100 columns")
+    w.send("\n")
+    check(w.expect(r"root@ulix\[\d+\]:/root# ", 30), "the program ends")
+    w.close()
+    time.sleep(3)
+    c4 = Ssh(known)                                             # a client without a window: pipes, no terminal of its own
+    c4.expect(r"ulix login: ", 60); c4.send("root\n"); c4.expect(r"Password: ", 30); c4.send("xyz\n")
+    c4.expect(r"root@ulix\[\d+\]:/root# ", 30)
+    c4.send("/musl/winsize\n")
+    check(c4.expect(r"winsize: 24 x 80\s.*root@ulix\[\d+\]:/root# ", 30), "the next session (a client without a window) does not keep the size of the last one: 24 by 80")
+    c4.close()
     check(b"EXCEPTION" not in open(log, "rb").read(), "no kernel exception")
 finally:
     qemu.kill(); qemu.wait()

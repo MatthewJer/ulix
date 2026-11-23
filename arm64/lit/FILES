@@ -121,6 +121,7 @@ libc/chantest.c
 sockets.c
 libc/sockettest.c
 libc/localetest.c
+libc/winsize.c
 dbg_http.c
 libc/sockext.c
 libc/cxxtest.cc

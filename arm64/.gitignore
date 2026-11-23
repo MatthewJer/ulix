@@ -141,6 +141,7 @@ libc/threadtest.c
 sockets.c
 libc/sockettest.c
 libc/localetest.c
+libc/winsize.c
 libc/sockext.c
 libc/cxxtest.cc
 libc/resolvtest.c

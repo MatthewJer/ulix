@@ -354,7 +354,7 @@ book's number for Linux signal \texttt{n}, 0 if the book has no such signal; \te
 <<linux_abi.c: errors, flags and signal numbers>>=
 static const char to_ulix[32] = {
   0,  1,  2,  3,  4,  5,  6, 10,  8,  9, 30, 11, 31, 13, 14, 15,      //  0..15:  Linux 7 = SIGBUS, 10 = SIGUSR1, 12 = SIGUSR2
-  0, 20, 19, 17, 18, 21, 22, 16, 24, 25, 26, 27,  0, 23,  0, 12 };    // 16..31:  17 = SIGCHLD, 18 = SIGCONT, 19 = SIGSTOP, 20 = SIGTSTP
+  0, 20, 19, 17, 18, 21, 22, 16, 24, 25, 26, 27, 28, 23,  0, 12 };    // 16..31:  17 = SIGCHLD, 18 = SIGCONT, 19 = SIGSTOP, 20 = SIGTSTP, 28 = SIGWINCH (the book has no name for it: console.nw)
 static signed char to_linux[32];
 
 static void signal_tables (void) {
@@ -1303,6 +1303,7 @@ static long linux_read (context_t *r, int fd, long buf, long len) {
   while (n < len && (n == 0 || tty_key_ready ())) {
     ulix_call (r, syscall_read, fd, buf + n, 1, 0, 0);        // (the answer of the book is not the count: the key is in the buffer)
     if (((unsigned char *) buf)[n] != 0) n++;
+    else if (n == 0 && signal_interrupts ()) return -LE_EINTR;   // woken without a key by a signal with a handler (SIGWINCH of a remote client, Ctrl-Z ...): EINTR
   }
   return n;
 }
@@ -1440,7 +1441,7 @@ static long linux_ioctl (int fd, unsigned long req, unsigned short *ws) {
   if (req == TIOCGWINSZ && u_isatty (pfd2gfd (fd))) {         // musl asks this to decide whether stdout is line buffered
     if (!user_ok ((u64) ws, 8, 1)) return -LE_EFAULT;
     extern void arch_tty_winsize (unsigned short *rows, unsigned short *cols);
-    arch_tty_winsize (&ws[0], &ws[1]);  ws[2] = ws[3] = 0;     // 24 by 80 (25 lines with the status line), on the HDMI screen as many as fit (chapter "Screen")
+    arch_tty_winsize (&ws[0], &ws[1]);  ws[2] = ws[3] = 0;     // 24 by 80 (25 lines with the status line), on the HDMI screen as many as fit (chapter "Screen"), in a remote session what the client said
     return 0;
   }
   if (req >= TCGETS && req <= TCSETSF && u_isatty (pfd2gfd (fd))) {      // the terminal settings (chapter on the console: termios; ncurses and nano ask for them)
