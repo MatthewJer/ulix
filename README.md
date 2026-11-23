@@ -29,6 +29,8 @@ Ulix also runs on 64-bit ARM (AArch64) in `qemu-system-aarch64`, for example on 
 See [`arm64/README.md`](arm64/README.md) (build, run, tests, and how the port reuses the code of this book) and
 [`ARM64-PORT.md`](ARM64-PORT.md) (work log).
 
+**Running it on a Raspberry Pi 4B:** [`arm64/INSTALL-RPI4.md`](arm64/INSTALL-RPI4.md) (writing the SD card, firmware, first login, USB sticks).
+
 ## Getting the sources (fork)
 Short version for a Mac, from `brew install` to `make`: [`arm64/README.md`](arm64/README.md), "Quick start". The details follow here.
 

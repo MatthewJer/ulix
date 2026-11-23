@@ -166,3 +166,5 @@ fatvfs.c
 userland/mount.c
 userland/umount.c
 userland/eject.c
+arm64/dist/
+.DS_Store

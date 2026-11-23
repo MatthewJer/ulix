@@ -738,7 +738,7 @@ static void disk_test (void) {
   CHECK (n == 35, "root directory has 35 entries (16 from x86 Ulix + 19 AArch64 files and directories, among them /var)");
   n = 0;
   minix_readdir (minix_lookup ("/bin"), count_cb, &n);
-  CHECK (n >= 83 && n <= 88, "/bin has 83 entries (+2 with tar and unzip, ARCHIVE=1; +2 with python and python3, PYTHON=1; +1 with nano, NANO=1: every combination is between 83 and 88) (the programs of lib-build/tools, init, ping, ping6, host, ifconfig, route, dhclient, top, shutdown, poweroff, reboot, sntp, rand, https, daemon, service, heartbeat, echod, ptytest, telnetd and sshd)");
+  CHECK (n >= 86 && n <= 91, "/bin has 86 entries (+2 with tar and unzip, ARCHIVE=1; +2 with python and python3, PYTHON=1; +1 with nano, NANO=1: every combination is between 86 and 91) (the programs of lib-build/tools, init, ping, ping6, host, ifconfig, route, dhclient, top, shutdown, poweroff, reboot, sntp, rand, https, daemon, service, heartbeat, echod, ptytest, telnetd, sshd, mount, umount and eject)");
   CHECK (minix_lookup ("/nonexistent") == 0, "unknown path not found");
 
   // reference values computed on the host from the same image with an independent parser

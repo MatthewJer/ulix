@@ -228,13 +228,17 @@ if [ "$1" = "--job" ]; then
 fi
 
 # ---- driver ----
+# ONLY="el1 rpi4 sdisk" (or: make pcheck ONLY="...") runs just these jobs, for a second look at the ones that failed; the others are not run and not counted
 JOBS=${1:-${JOBS:-6}}
-mkdir -p $L; rm -f $L/*.res
+mkdir -p $L
+selected() { [ -z "$ONLY" ] && return 0; for o in $ONLY; do [ "$o" = "$1" ] && return 0; done; return 1; }
+for j in "${JOBLIST[@]}"; do selected "${j%%|*}" && rm -f $L/${j%%|*}.res; done
 start=$(date +%s)
-printf '%s\n' "${JOBLIST[@]}" | cut -d'|' -f1 | xargs -P "$JOBS" -I{} bash "$0" --job {}
+for j in "${JOBLIST[@]}"; do selected "${j%%|*}" && echo "${j%%|*}"; done | xargs -P "$JOBS" -I{} bash "$0" --job {}
 fails=0
 for j in "${JOBLIST[@]}"; do
   IFS='|' read -r name desc rest <<< "$j"
+  selected "$name" || continue
   r=$(cat $L/$name.res 2>/dev/null || echo "FAILED (no result)")
   printf '  %-52s %s\n' "$desc" "$r"
   case $r in ok*) ;; *) fails=$((fails + 1)) ;; esac

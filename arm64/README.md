@@ -26,6 +26,8 @@ programs). `make` runs `tools/tangle.sh` first, which writes the files with `not
 `lit/*.nw`, never the generated files. `make book` weaves the chapters into a book, `lit/build/ulix-arm64.pdf` (needs `tectonic`
 or `xelatex`: `brew install tectonic`). A new source file is added to a chapter and to `lit/FILES`.
 
+**Raspberry Pi 4B:** writing the SD card, the firmware, the first login, USB sticks: [`INSTALL-RPI4.md`](INSTALL-RPI4.md).
+
 ## Quick start (macOS)
 
 Set-up from a fresh clone (Apple silicon or Intel Mac; `brew` lives in `/opt/homebrew` or `/usr/local`). A plain `git clone` leaves `third_party/` empty:
