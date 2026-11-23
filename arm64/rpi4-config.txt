@@ -15,3 +15,12 @@ dtoverlay=disable-bt
 
 # uncomment to see the messages of the boot loader on the serial console, too
 #uart_2ndstage=1
+
+# no black border around the screen (the console uses every pixel of the monitor)
+disable_overscan=1
+
+# HDMI: the kernel asks the firmware for the resolution that the monitor announces (EDID). To force a mode, uncomment (group 1 = TV, 2 = monitor)
+# and see "hdmi_mode" in the Raspberry Pi documentation; a monitor that is not seen at boot needs hdmi_force_hotplug=1.
+#hdmi_force_hotplug=1
+#hdmi_group=2
+#hdmi_mode=82

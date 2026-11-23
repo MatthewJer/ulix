@@ -1427,7 +1427,8 @@ static long linux_ioctl (int fd, unsigned long req, unsigned short *ws) {
   }
   if (req == TIOCGWINSZ && u_isatty (pfd2gfd (fd))) {         // musl asks this to decide whether stdout is line buffered
     if (!user_ok ((u64) ws, 8, 1)) return -LE_EFAULT;
-    ws[0] = 24; ws[1] = 80; ws[2] = ws[3] = 0;                // the terminals of Ulix have 25 lines of 80 columns
+    extern void arch_tty_winsize (unsigned short *rows, unsigned short *cols);
+    arch_tty_winsize (&ws[0], &ws[1]);  ws[2] = ws[3] = 0;     // 24 by 80 (25 lines with the status line), on the HDMI screen as many as fit (chapter "Screen")
     return 0;
   }
   if (req >= TCGETS && req <= TCSETSF && u_isatty (pfd2gfd (fd))) {      // the terminal settings (chapter on the console: termios; ncurses and nano ask for them)

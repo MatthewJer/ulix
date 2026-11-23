@@ -76,6 +76,12 @@
 			interrupts = <0 126 4>;
 		};
 
+		/* the mailbox of the VideoCore: the frame buffer of the HDMI console is asked for here (chapter "Screen") */
+		mailbox@7e00b880 {
+			compatible = "brcm,bcm2835-mbox";
+			reg = <0x7e00b880 0x40>;
+		};
+
 		interrupt-controller@40041000 {
 			compatible = "arm,gic-400", "arm,cortex-a15-gic";
 			#interrupt-cells = <3>;

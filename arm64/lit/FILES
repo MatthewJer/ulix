@@ -38,6 +38,10 @@ netd.c
 rcconf.c
 net_syscalls.c
 random.c
+fb.h
+mbox.c
+fb.c
+fbcon.c
 sntp.c
 stats.c
 bookfs_test.c

@@ -383,10 +383,14 @@ escape sequences never split a line of output.
 static char sl_text[80];
 static int  sl_red = 0, sl_dirty = 1;
 
+extern int fbcon_active, fbcon_rows, fbcon_cols;   // video.nw: the HDMI screen is bigger than 80 by 25
+static int host_rows (void) { return (out == putch && fbcon_active) ? fbcon_rows : 25; }     // lines of the terminal that shows the model (with the status line)
+static int host_cols (void) { return (out == putch && fbcon_active) ? fbcon_cols : 80; }
+
 static void host_status_draw (void) {
-  esc ("\0337\033[25;1H");                        // save the cursor, go to line 25
+  esc ("\0337\033["); num (host_rows ()); esc (";1H");     // save the cursor, go to the last line
   esc (sl_red ? "\033[0;97;41m" : "\033[0;97;44m");
-  for (int i = 0; i < 80; i++) out (sl_text[i] >= ' ' ? sl_text[i] : ' ');
+  for (int i = 0; i < host_cols (); i++) out (i < 80 && sl_text[i] >= ' ' ? sl_text[i] : ' ');
   esc ("\033[0m\0338");                           // restore the cursor
   sl_dirty = 0;
 }
@@ -406,7 +410,7 @@ paint the whole model of terminal t on the console
 <<arch_vt.c: host_repaint>>=
 static void host_repaint (int t) {
   word *mem = (word *)vt[t].mem;
-  if (!synced) esc ("\033[2J\033[1;24r");          // first time: clear, scroll region = the 24 lines of the terminal
+  if (!synced) { esc ("\033[2J\033[1;"); num (host_rows () - 1); out ('r'); }    // first time: clear, scroll region = the lines above the status line
   for (int row = 0; row < VT_HEIGHT; row++) {
     int last = -1;
     for (int col = 0; col < VT_WIDTH; col++) {
@@ -559,6 +563,12 @@ void arch_vt_switch (int n) {
   if (n < 0 || n > MAX_VT || n == cur_vt) return;
   cur_vt = n;
   host_repaint (n);
+}
+
+void arch_tty_winsize (unsigned short *rows, unsigned short *cols) {     // TIOCGWINSZ: what the terminal of the calling process can show
+  int t = scheduler_is_active ? thread_table[current_task].terminal : cur_vt;
+  if (fbcon_active && t != pty_vt) { *rows = fbcon_rows;  *cols = fbcon_cols; }    // the HDMI screen: as big as the resolution allows (video.nw)
+  else                             { *rows = 24;  *cols = 80; }                    // the serial line and the remote sessions: 25 lines with the status line
 }
 
 @

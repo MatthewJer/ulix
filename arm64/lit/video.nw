@@ -1,0 +1,542 @@
+\chapter{Screen: the HDMI Console}
+\label{ch:video}
+
+Until now the system had one console: the serial line. On the Raspberry Pi 4B the second one is the HDMI port, and this chapter drives it.
+There is no VGA text memory here: the graphics hardware shows a \emph{frame buffer}, an array of pixels in RAM, and the kernel has to draw every letter itself.
+The chapter has four parts:
+
+\begin{itemize}
+\item the \textbf{mailbox} ([[mbox.c]]): the Raspberry Pi's graphics processor (the VideoCore) owns the display and the clocks. The ARM cores talk to it through
+  a small hardware mailbox: a message is a list of ``tags'', each a question or a request (``how big is the screen?'', ``give me a buffer of 1920 by 1080 pixels'');
+\item the \textbf{frame buffer} ([[fb.c]]): the message that asks for the buffer, and the pixel format in which we draw;
+\item the \textbf{font}: bitmap fonts of the free \emph{Terminus} family (SIL Open Font License), converted at build time by [[tools/bdf2c.py]] from the BDF files in
+  [[third_party/terminus]]. Three sizes (8$\times$16, 12$\times$24, 16$\times$32) are built in; the kernel takes the largest one that gives a screen of at least 80 columns and chooses by the
+  width of the screen (so that a full HD or 4K monitor shows readable text and not a postage stamp);
+\item the \textbf{terminal} ([[fbcon.c]]): the text on the screen is what the programs send to their terminal. They do not know that they talk to a display: they send an
+  \emph{ANSI escape sequence} such as ``ESC [ 12 ; 40 H'' (move the cursor to line 12, column 40) or ``ESC [ 31 m'' (red text) like to any terminal emulator. [[fbcon.c]] is such an
+  emulator, a small one: it understands what the programs of Ulix (the shell, nano, ncurses) need. It is fed with every byte that goes to the serial console
+  ([[putch]]), so HDMI and serial line show the same.
+\end{itemize}
+
+The number of lines and columns is no longer fixed to 24 and 80: it follows from the resolution of the screen and the size of the font, and [[ioctl(TIOCGWINSZ)]] tells the programs.
+(Command line of the kernel: [[video=1280x720]] asks for another resolution, [[video=off]] switches the screen off, [[fbfont=16]], [[fbfont=24]] or [[fbfont=32]]
+fixes the font height.)
+
+@
+\section{The mailbox of the VideoCore (see \texttt{mbox.c})}
+\label{src:mbox.c}
+
+The mailbox has a write register, a read register and a status register. A message is written as one word: the \emph{bus address} of a buffer in RAM, in which the
+tags are, plus the number of the channel (8: property tags, ``ARM to VideoCore'') in the lowest four bits (the buffer is aligned to 16 bytes, so these bits are free). The
+VideoCore sees the RAM of the ARM cores at the bus address [[0xC0000000]] plus the physical address. It reads and writes the buffer itself, bypassing the caches of the ARM cores: before we send,
+we write our cache lines back ([[cache_clean]]), and after the answer we throw away what we have cached ([[cache_flush_inval]]).
+
+The buffer is a list: its size in bytes, the request code 0, the tags (each: tag number, size of the value buffer, request/response size, the values) and a tag 0 at the end. When
+the VideoCore answers, the code is [[0x80000000]]. Qemu's [[raspi4b]] machine has the same mailbox, so this works without a board.
+
+<<mbox.c>>=
+#include "ulix.h"
+#include "plat.h"
+#include "cache.h"
+#include "fb.h"
+
+#define MB_READ     (*(volatile u32 *)(KERNEL_VA + plat.mbox + 0x00))
+#define MB_STATUS   (*(volatile u32 *)(KERNEL_VA + plat.mbox + 0x18))        // bit 31: write full, bit 30: read empty
+#define MB_WRITE    (*(volatile u32 *)(KERNEL_VA + plat.mbox + 0x20))
+#define MB_FULL     0x80000000u
+#define MB_EMPTY    0x40000000u
+#define MB_CH_PROP  8
+#define BUS_ALIAS   0xC0000000UL
+
+int mbox_property (u32 *buf) {                       // buf: 16-byte aligned, buf[0] = size of the message in bytes. 0: answered, -1: no answer
+  if (!plat.mbox) return -1;
+  buf[1] = 0;
+  cache_clean (buf, buf[0]);
+  u32 msg = (u32) ((PA (buf) | BUS_ALIAS) & ~0xfUL) | MB_CH_PROP;
+  for (int t = 0; MB_STATUS & MB_FULL; t++) if (t > 1000000) return -1;
+  MB_WRITE = msg;
+  for (int t = 0; t < 2000000; t++) {               // wait for our answer (other channels would be ignored)
+    if (MB_STATUS & MB_EMPTY) continue;
+    if (MB_READ != msg) continue;
+    cache_flush_inval (buf, buf[0]);
+    return buf[1] == 0x80000000u ? 0 : -1;
+  }
+  return -1;
+}
+@
+\section{The frame buffer (see \texttt{fb.c} and \texttt{fb.h})}
+\label{src:fb.c}
+
+The tags that make a screen: [[0x00040003]] (get the size of the display; with an HDMI monitor that is the resolution that it announces itself, its \emph{native} one), [[0x00048003]] (set
+the physical size: what the display shows), [[0x00048004]] (set the virtual size: the part of the buffer in the picture; the same), [[0x00048005]] (depth in bits per pixel: 32),
+[[0x00048006]] (pixel order), [[0x00040001]] (allocate the buffer: answer is its bus address and size) and [[0x00040008]] (bytes per line, the \emph{pitch}: it can be larger than width$\times$4).
+With pixel order 0 a pixel is a 32 bit word [[0x00RRGGBB]].
+
+The buffer lies in memory that belongs to the graphics processor, inside the first GByte of the address space, which the kernel has mapped as normal memory already. The graphics hardware reads it
+from RAM, not from the caches: so after drawing the console writes the changed lines back ([[fb_clean]]).
+
+<<fb.h>>=
+#ifndef FB_H
+#define FB_H
+#include "ulix.h"
+
+struct font { int w, h, bpr, n; const unsigned short *cp; const unsigned char *bits; };    // bpr: bytes per row of a glyph, n glyphs for the code points cp[]
+extern const struct font fb_fonts[];
+extern const int fb_nfonts;
+
+struct framebuffer { u8 *base; u32 pitch, w, h; u64 pa, size; };
+extern struct framebuffer fb;
+
+int  mbox_property (u32 *buf);
+int  fb_init (int want_w, int want_h);                 // 0: there is a screen
+void fb_clean (const void *p, u64 len);                // write the cache lines back: the display reads RAM
+const char *plat_cmdline (void);                       // dt.c
+int  fbcon_init (void);                                // 0: the screen shows the console
+void fbcon_putch (char c);
+extern int fbcon_active, fbcon_cols, fbcon_rows;
+#endif
+@
+
+<<fb.c>>=
+#include "ulix.h"
+#include "plat.h"
+#include "fb.h"
+
+struct framebuffer fb;
+
+static u32 msg[36] __attribute__ ((aligned (16)));
+
+static u32 *tag (u32 *p, u32 id, u32 size, u32 a, u32 b) {     // one tag with a value buffer of size bytes (of which a and b are filled in)
+  p[0] = id;  p[1] = size;  p[2] = 0;  p[3] = a;  p[4] = b;
+  return p + 3 + size / 4;
+}
+
+void fb_clean (const void *p, u64 len) {
+  for (u64 a = (u64) p & ~63UL; a < (u64) p + len; a += 64) __asm__ volatile ("dc cvac, %0" :: "r" (a) : "memory");
+}
+
+int fb_init (int want_w, int want_h) {
+  if (!plat.mbox) return -1;
+  u32 *p = msg + 2;                                            // 1. what does the monitor want?
+  p = tag (p, 0x00040003, 8, 0, 0);  *p = 0;
+  msg[0] = (u32) ((char *)p + 4 - (char *)msg);
+  if (mbox_property (msg) < 0) return -1;
+  u32 w = msg[5], h = msg[6];
+  if (want_w > 0 && want_h > 0) { w = want_w; h = want_h; }
+  if (w < 320 || h < 200 || w > 4096 || h > 2304) { w = 1024; h = 768; }   // nothing sensible announced (no monitor): a usual size
+
+  p = msg + 2;                                                 // 2. a buffer of that size
+  p = tag (p, 0x00048003, 8, w, h);                            // physical size
+  p = tag (p, 0x00048004, 8, w, h);                            // virtual size
+  p = tag (p, 0x00048005, 4, 32, 0);                           // depth
+  p = tag (p, 0x00048006, 4, 0, 0);                            // pixel order: 0x00RRGGBB
+  u32 *alloc = p;  p = tag (p, 0x00040001, 8, 16, 0);          // allocate (alignment 16)
+  u32 *pitch = p;  p = tag (p, 0x00040008, 4, 0, 0);           // bytes per line
+  *p = 0;
+  msg[0] = (u32) ((char *)p + 4 - (char *)msg);
+  if (mbox_property (msg) < 0) return -1;
+  u32 bus = alloc[3], size = alloc[4];
+  if (!bus || !size || !pitch[3]) return -1;
+  fb.pa = bus & 0x3fffffffUL;                                  // the bus address of the VideoCore -> the address of the ARM cores
+  fb.pitch = pitch[3];  fb.w = w;  fb.h = h;  fb.size = size;
+  fb.base = (u8 *) KVA (fb.pa);
+  return 0;
+}
+@
+\section{The terminal on the screen (see \texttt{fbcon.c})}
+\label{src:fbcon.c}
+
+The terminal keeps the text in a grid of \emph{cells}: a character (a Unicode code point below 0x2600) and its colours, as packed into a 32 bit word. That grid is the truth; the pixels are a copy made by [[draw_cell]]. A cell is drawn
+by looking up its glyph in the font (a bitmap of one bit per pixel, row by row) and writing the pixel in the foreground or background colour. That is all of graphics we need. When the screen
+scrolls, we move the pixels (and the cells) instead of drawing all cells again.
+
+The cursor is a block, drawn by drawing its cell with swapped colours; it is taken away before and put back after every character.
+
+<<fbcon.c>>=
+<<fbcon.c: includes and state>>
+
+<<fbcon.c: drawing>>
+
+<<fbcon.c: screen operations>>
+
+<<fbcon.c: escape sequences>>
+
+<<fbcon.c: fbcon_putch>>
+
+<<fbcon.c: fbcon_init>>
+@
+
+<<fbcon.c: includes and state>>=
+#include "ulix.h"
+#include "plat.h"
+#include "fb.h"
+
+#define MAXCOLS 480
+#define MAXROWS 150
+
+int fbcon_active = 0, fbcon_cols = 80, fbcon_rows = 24;
+static const struct font *font;
+static int cols, rows;                                    // the same as fbcon_cols and fbcon_rows
+static u32 cell[MAXROWS * MAXCOLS];                       // bits 0..15: code point, 16..19: foreground, 20..23: background
+static u32 saved_cell[MAXROWS * MAXCOLS];                 // the main screen while a program uses the alternate screen (nano: ESC [ ? 1049 h)
+static int saved_valid = 0, saved_cx, saved_cy;
+static int cx, cy, wrapnext;                              // cursor, and "the last column is written, the next letter wraps"
+static int top, bot;                                      // the scroll region (lines, both included)
+static int fg = 7, bg = 0, bold = 0, reverse = 0;        // the current colours (0..15)
+static int sx, sy;                                        // saved cursor (ESC 7 / ESC 8)
+static int cursor_on = 1, cursor_drawn = 0, graphics = 0;  // visible? is it on the screen now? DEC graphics set (ESC ( 0) selected?
+static int alt_screen = 0;
+
+// the 16 colours as xterm shows them: black, red, green, yellow, blue, magenta, cyan, white; then the bright ones
+static int starts (const char *s, const char *prefix) { while (*prefix) if (*s++ != *prefix++) return 0; return 1; }
+
+static void move (void *to, const void *from, u64 n) {            // copy n bytes; the areas may overlap (the kernel has no memmove). 8 bytes at a time: a screen is megabytes
+  u8 *d = to;  const u8 *s = from;
+  if (d < s) {
+    for (; n >= 8 && (((u64) d | (u64) s) & 7) == 0; d += 8, s += 8, n -= 8) *(u64 *) d = *(const u64 *) s;
+    for (; n > 0; n--) *d++ = *s++;
+  } else {
+    d += n;  s += n;
+    for (; n >= 8 && (((u64) d | (u64) s) & 7) == 0; n -= 8) { d -= 8;  s -= 8;  *(u64 *) d = *(const u64 *) s; }
+    for (; n > 0; n--) *--d = *--s;
+  }
+}
+
+static const u32 palette[16] = {
+  0x000000, 0xcd0000, 0x00cd00, 0xcdcd00, 0x0000ee, 0xcd00cd, 0x00cdcd, 0xe5e5e5,
+  0x7f7f7f, 0xff0000, 0x00ff00, 0xffff00, 0x5c5cff, 0xff00ff, 0x00ffff, 0xffffff };
+@
+
+\subsection{Drawing a cell}
+A glyph is found by binary search in the sorted table of code points; a code point without glyph is drawn as U+FFFD (the replacement character of the font).
+
+<<fbcon.c: drawing>>=
+static const unsigned char *glyph (unsigned c) {
+  int lo = 0, hi = font->n - 1;
+  for (int pass = 0; pass < 2; pass++, c = 0xfffd) {
+    lo = 0; hi = font->n - 1;
+    while (lo <= hi) {
+      int mid = (lo + hi) / 2;
+      if (font->cp[mid] == c) return font->bits + mid * font->h * font->bpr;
+      if (font->cp[mid] < c) lo = mid + 1; else hi = mid - 1;
+    }
+  }
+  return font->bits;
+}
+
+static void draw_cell (int x, int y, u32 v, int inverse) {
+  int f = (v >> 16) & 15, b = (v >> 20) & 15;
+  if (inverse) { int t = f; f = b; b = t; }
+  u32 fgc = palette[f], bgc = palette[b];
+  const unsigned char *g = glyph (v & 0xffff);
+  u8 *line = fb.base + (u64) y * font->h * fb.pitch + (u64) x * font->w * 4;
+  for (int r = 0; r < font->h; r++, line += fb.pitch) {
+    u32 *px = (u32 *) line;
+    const unsigned char *bits = g + r * font->bpr;
+    for (int i = 0; i < font->w; i++) px[i] = (bits[i >> 3] & (0x80 >> (i & 7))) ? fgc : bgc;
+    fb_clean (line, font->w * 4);
+  }
+  __asm__ volatile ("dsb sy" ::: "memory");
+}
+
+static void cursor_hide (void) { if (cursor_drawn) { draw_cell (cx, cy, cell[cy * cols + cx], 0); cursor_drawn = 0; } }
+static void cursor_show (void) { if (cursor_on && !cursor_drawn) { draw_cell (cx, cy, cell[cy * cols + cx], 1); cursor_drawn = 1; } }
+
+static u32 blank (void) { return ' ' | (fg << 16) | (bg << 20); }      // an empty cell has the current background colour (as xterm: "back colour erase")
+
+static void put_cell (int x, int y, u32 v) { cell[y * cols + x] = v; draw_cell (x, y, v, 0); }
+
+static void repaint (void) {
+  for (int y = 0; y < rows; y++) for (int x = 0; x < cols; x++) draw_cell (x, y, cell[y * cols + x], 0);
+  cursor_drawn = 0;
+}
+@
+
+\subsection{Scrolling and erasing}
+Scrolling by one line moves the cells (one [[memmove]]) and the pixels of the region (a second one, then the
+cache lines are written back); the line that became free is cleared.
+
+<<fbcon.c: screen operations>>=
+static void clear_cells (int y, int x0, int x1) {                // cells x0..x1-1 of line y become empty
+  u32 b = blank ();
+  for (int x = x0; x < x1; x++) put_cell (x, y, b);
+}
+
+static void scroll_up (int n) {                                   // the lines top..bot move up by n, n empty lines appear at the bottom
+  int lines = bot - top + 1;
+  if (n > lines) n = lines;
+  if (n <= 0) return;
+  if (n < lines) {
+    move (cell + top * cols, cell + (top + n) * cols, (u64) (lines - n) * cols * sizeof (u32));
+    u8 *dst = fb.base + (u64) top * font->h * fb.pitch;
+    move (dst, dst + (u64) n * font->h * fb.pitch, (u64) (lines - n) * font->h * fb.pitch);
+    fb_clean (dst, (u64) (lines - n) * font->h * fb.pitch);
+  }
+  for (int y = bot - n + 1; y <= bot; y++) clear_cells (y, 0, cols);
+}
+
+static void scroll_down (int n) {                                 // the other direction: insert n lines at the cursor line (or the top of the region)
+  int lines = bot - top + 1;
+  if (n > lines) n = lines;
+  if (n <= 0) return;
+  if (n < lines) {
+    move (cell + (top + n) * cols, cell + top * cols, (u64) (lines - n) * cols * sizeof (u32));
+    u8 *src = fb.base + (u64) top * font->h * fb.pitch;
+    move (src + (u64) n * font->h * fb.pitch, src, (u64) (lines - n) * font->h * fb.pitch);
+    fb_clean (src, (u64) lines * font->h * fb.pitch);
+  }
+  for (int y = top; y < top + n; y++) clear_cells (y, 0, cols);
+}
+
+static void linefeed (void) {
+  if (cy == bot) scroll_up (1);
+  else if (cy < rows - 1) cy++;
+}
+
+static void reverse_linefeed (void) {
+  if (cy == top) scroll_down (1);
+  else if (cy > 0) cy--;
+}
+
+static void clamp (void) {
+  if (cx < 0) cx = 0;
+  if (cx >= cols) cx = cols - 1;
+  if (cy < 0) cy = 0;
+  if (cy >= rows) cy = rows - 1;
+}
+
+static void screen_clear (void) { for (int y = 0; y < rows; y++) clear_cells (y, 0, cols); }
+
+static void use_alt_screen (int on) {                             // nano and vi draw on a second screen and leave the shell's text behind
+  if (on && !alt_screen) {
+    move (saved_cell, cell, (u64) rows * cols * sizeof (u32));  saved_cx = cx;  saved_cy = cy;  saved_valid = 1;
+    screen_clear ();  cx = cy = 0;
+  } else if (!on && alt_screen && saved_valid) {
+    move (cell, saved_cell, (u64) rows * cols * sizeof (u32));  cx = saved_cx;  cy = saved_cy;  saved_valid = 0;
+    cursor_drawn = 0;  repaint ();
+  }
+  alt_screen = on;
+}
+@
+
+\subsection{Escape sequences}
+A program that wants more than letters sends the byte 27 (Escape). What follows tells what to do:
+
+\begin{itemize}
+\item [[ESC [ ... letter]] is a \emph{control sequence}: up to a few numbers, separated by semicolons, and a letter that says what to do (the table in [[csi]]). A question mark after the bracket (``private'') marks switches such as
+  the visible cursor ([[?25]]) and the alternate screen ([[?1049]]);
+\item [[ESC ] ... BEL]] (or ending with ESC \textbackslash{}) is an \emph{operating system command} (set the window title): we skip it;
+\item [[ESC ( B]] and [[ESC ( 0]] choose the character set: the second one is the ``line drawing'' set in which the letters [[q]], [[x]], [[l]] \ldots{} are the pieces of boxes; [[ESC 7]]/[[ESC 8]] save and restore the cursor, [[ESC M]] moves it up and scrolls if need be.
+\end{itemize}
+Bytes above 127 are UTF-8: the first one tells how many follow (110xxxxx: one more, 1110xxxx: two, 11110xxx: three). Everything we do not know is skipped, never printed.
+
+<<fbcon.c: escape sequences>>=
+static int param[8], nparam, private_mode;
+
+static int par (int i, int dflt) { return (i < nparam && param[i] > 0) ? param[i] : dflt; }
+
+static int nearest16 (int r, int g, int b) {                       // a colour of the 256-colour or true colour modes -> one of our 16
+  int v = (r > 127 ? 1 : 0) | (g > 127 ? 2 : 0) | (b > 127 ? 4 : 0);
+  static const int ansi[8] = { 0, 1, 2, 3, 4, 5, 6, 7 };
+  int bright = (r > 200 || g > 200 || b > 200) && v != 0;
+  if (v == 0 && (r > 60 || g > 60 || b > 60)) return 8;
+  return ansi[v] + (v == 7 ? (r > 220 && g > 220 && b > 220 ? 8 : 0) : (bright ? 8 : 0));
+}
+
+static int color256 (int n) {
+  if (n < 16) return n;
+  if (n >= 232) return n < 244 ? 8 : 7;
+  n -= 16;
+  int r = (n / 36) * 51, g = ((n / 6) % 6) * 51, b = (n % 6) * 51;
+  return nearest16 (r, g, b);
+}
+
+static void sgr (void) {                                           // ESC [ ... m: colours and attributes
+  if (nparam == 0) { param[0] = 0; nparam = 1; }
+  for (int i = 0; i < nparam; i++) {
+    int p = param[i];
+    if (p == 0) { fg = 7; bg = 0; bold = 0; reverse = 0; }
+    else if (p == 1) bold = 1;
+    else if (p == 22) bold = 0;
+    else if (p == 7) reverse = 1;
+    else if (p == 27) reverse = 0;
+    else if (p >= 30 && p <= 37) fg = p - 30;
+    else if (p == 39) fg = 7;
+    else if (p >= 40 && p <= 47) bg = p - 40;
+    else if (p == 49) bg = 0;
+    else if (p >= 90 && p <= 97) fg = p - 90 + 8;
+    else if (p >= 100 && p <= 107) bg = p - 100 + 8;
+    else if ((p == 38 || p == 48) && i + 2 < nparam && param[i + 1] == 5) { int c = color256 (param[i + 2]);  if (p == 38) fg = c; else bg = c;  i += 2; }
+    else if ((p == 38 || p == 48) && i + 4 < nparam && param[i + 1] == 2) { int c = nearest16 (param[i + 2], param[i + 3], param[i + 4]);  if (p == 38) fg = c; else bg = c;  i += 4; }
+  }
+}
+
+static void csi (int c) {                                          // the sequence ESC [ params c is complete
+  int n = par (0, 1);
+  if (private_mode) {                                              // ESC [ ? n h (on) and l (off)
+    if (c == 'h' || c == 'l') for (int i = 0; i < nparam; i++) {
+      int on = c == 'h';
+      if (param[i] == 25) cursor_on = on;
+      else if (param[i] == 1049 || param[i] == 1047 || param[i] == 47) use_alt_screen (on);
+    }
+    return;
+  }
+  switch (c) {
+    case 'A': cy -= n; clamp (); break;                            // cursor up, down, right, left
+    case 'B': case 'e': cy += n; clamp (); break;
+    case 'C': case 'a': cx += n; clamp (); break;
+    case 'D': cx -= n; clamp (); break;
+    case 'E': cy += n; cx = 0; clamp (); break;                    // next and previous line
+    case 'F': cy -= n; cx = 0; clamp (); break;
+    case 'G': case '`': cx = par (0, 1) - 1; clamp (); break;       // column
+    case 'd': cy = par (0, 1) - 1; clamp (); break;                // line
+    case 'H': case 'f': cy = par (0, 1) - 1; cx = par (1, 1) - 1; clamp (); break;
+    case 'J': {                                                    // erase in the display: 0 cursor to end, 1 start to cursor, 2 all
+      int m = nparam ? param[0] : 0;
+      if (m == 0) { clear_cells (cy, cx, cols); for (int y = cy + 1; y < rows; y++) clear_cells (y, 0, cols); }
+      else if (m == 1) { for (int y = 0; y < cy; y++) clear_cells (y, 0, cols); clear_cells (cy, 0, cx + 1); }
+      else screen_clear ();
+      break; }
+    case 'K': {                                                    // erase in the line
+      int m = nparam ? param[0] : 0;
+      if (m == 0) clear_cells (cy, cx, cols); else if (m == 1) clear_cells (cy, 0, cx + 1); else clear_cells (cy, 0, cols);
+      break; }
+    case 'L': { int t = top; if (cy >= top && cy <= bot) { top = cy; scroll_down (n); top = t; } break; }    // insert lines
+    case 'M': { int t = top; if (cy >= top && cy <= bot) { top = cy; scroll_up (n); top = t; } break; }      // delete lines
+    case '@': {                                                    // insert n blank cells
+      if (n > cols - cx) n = cols - cx;
+      for (int x = cols - 1; x >= cx + n; x--) put_cell (x, cy, cell[cy * cols + x - n]);
+      clear_cells (cy, cx, cx + n);
+      break; }
+    case 'P': {                                                    // delete n cells
+      if (n > cols - cx) n = cols - cx;
+      for (int x = cx; x < cols - n; x++) put_cell (x, cy, cell[cy * cols + x + n]);
+      clear_cells (cy, cols - n, cols);
+      break; }
+    case 'X': if (n > cols - cx) n = cols - cx;  clear_cells (cy, cx, cx + n); break;     // erase n cells
+    case 'm': sgr (); break;
+    case 'r': top = par (0, 1) - 1; bot = par (1, rows) - 1;       // set the scroll region
+      if (top < 0 || bot >= rows || top >= bot) { top = 0; bot = rows - 1; }
+      cx = 0; cy = 0; break;
+    case 's': sx = cx; sy = cy; break;
+    case 'u': cx = sx; cy = sy; clamp (); break;
+    default: break;                                                // t (window operations), c, n, ... : not for us
+  }
+  wrapnext = 0;
+}
+
+static int state = 0;                                              // 0 text, 1 after ESC, 2 in ESC [, 3 in ESC ] (OSC), 4 after ESC ( or ESC ), 5 after ESC in OSC
+static int utf_left = 0;  static unsigned utf_val = 0;
+
+static void show_char (unsigned ch) {
+  if (graphics && ch >= 0x6a && ch <= 0x78) {                      // the line drawing set of the DEC terminals
+    static const unsigned short line[] = { 0x2518, 0x2510, 0x250c, 0x2514, 0x253c, 0x23ba, 0x23bb, 0x2500, 0x23bc, 0x23bd, 0x251c, 0x2524, 0x2534, 0x252c, 0x2502 };
+    ch = line[ch - 0x6a];
+    if (ch >= 0x23ba && ch <= 0x23bd) ch = '-';                    // (the scan lines have no glyph in the font)
+  }
+  if (wrapnext) { cx = 0; linefeed (); wrapnext = 0; }
+  int f = fg, b = bg;
+  if (bold && f < 8) f += 8;
+  if (reverse) { int t = f; f = b; b = t; }
+  put_cell (cx, cy, (ch & 0xffff) | (f << 16) | (b << 20));
+  if (cx < cols - 1) cx++; else wrapnext = 1;
+}
+@
+
+<<fbcon.c: fbcon_putch>>=
+void fbcon_putch (char ch) {
+  unsigned char c = ch;
+  if (!fbcon_active) return;
+  cursor_hide ();
+  if (state == 3 || state == 5) {                                  // inside an operating system command: skip to BEL or ESC \
+    if (c == 7) state = 0; else if (c == 27) state = 5; else if (state == 5 && c == '\\') state = 0; else state = 3;
+  } else if (state == 1) {                                         // after ESC
+    state = 0;
+    switch (c) {
+      case '[': state = 2; nparam = 0; private_mode = 0; for (int i = 0; i < 8; i++) param[i] = 0; break;
+      case ']': state = 3; break;
+      case '(': case ')': case '*': case '+': state = 4; graphics = 0; break;
+      case '7': sx = cx; sy = cy; break;
+      case '8': cx = sx; cy = sy; clamp (); break;
+      case 'M': reverse_linefeed (); break;
+      case 'D': linefeed (); break;
+      case 'E': cx = 0; linefeed (); break;
+      case 'c': fg = 7; bg = 0; bold = reverse = 0; top = 0; bot = rows - 1; screen_clear (); cx = cy = 0; break;
+      default: break;                                              // ESC = and ESC > (keypad), ...: no effect on the screen
+    }
+    wrapnext = 0;
+  } else if (state == 4) {                                         // ESC ( c: c = 0 selects the line drawing set, B the normal one
+    graphics = (c == '0');
+    state = 0;
+  } else if (state == 2) {                                         // in a control sequence: digits, semicolons, then a letter
+    if (c >= '0' && c <= '9') { if (nparam == 0) nparam = 1; if (nparam <= 8) param[nparam - 1] = param[nparam - 1] * 10 + (c - '0'); }
+    else if (c == ';') { if (nparam == 0) nparam = 1; if (nparam < 8) nparam++; }
+    else if (c == '?') private_mode = 1;
+    else if (c >= 0x40 && c <= 0x7e) { state = 0; csi (c); }
+    else if (c == 27) state = 1;
+  } else if (c == 27) state = 1;
+  else if (c < 0x20) {                                             // control characters
+    switch (c) {
+      case '\n': case 11: case 12: linefeed (); wrapnext = 0; break;        // (the kernel sends CR LF, so a line feed only moves down)
+      case '\r': cx = 0; wrapnext = 0; break;
+      case '\b': if (cx > 0) cx--; wrapnext = 0; break;
+      case '\t': cx = (cx + 8) & ~7; if (cx >= cols) cx = cols - 1; wrapnext = 0; break;
+      default: break;                                              // BEL and the rest: nothing
+    }
+  } else if (c < 0x80) { utf_left = 0; show_char (c); }
+  else if (c >= 0xc0) {                                            // first byte of a UTF-8 sequence
+    if (c >= 0xf0) { utf_left = 3; utf_val = c & 7; } else if (c >= 0xe0) { utf_left = 2; utf_val = c & 15; } else { utf_left = 1; utf_val = c & 31; }
+  } else if (utf_left > 0) {                                       // a following byte: 10xxxxxx
+    utf_val = (utf_val << 6) | (c & 63);
+    if (--utf_left == 0) show_char (utf_val > 0xffff ? 0xfffd : utf_val);
+  }
+  cursor_show ();
+}
+@
+
+\subsection{Start}
+[[fbcon_init]] reads the two options of the kernel command line, asks for the screen and chooses the font: at least 80 columns, and the biggest letters for the width: 16$\times$32
+from 3000 pixels on (4K), 12$\times$24 from 1800 (full HD), else 8$\times$16. Then it clears the screen, draws a first line and from now on [[putch]] sends every character here, too.
+
+<<fbcon.c: fbcon_init>>=
+static int cmdline_number (const char *key, int *a, int *b) {      // "key=123" or "key=123x456" of the command line: returns 1 if it is there
+  const char *p = plat_cmdline ();
+  int kl = 0;  while (key[kl]) kl++;
+  for (; *p; p++) {
+    if ((p == plat_cmdline () || p[-1] == ' ') && starts (p, key) && p[kl] == '=') {
+      p += kl + 1;
+      *a = 0; while (*p >= '0' && *p <= '9') *a = *a * 10 + *p++ - '0';
+      if (b) { *b = 0; if (*p == 'x') { p++; while (*p >= '0' && *p <= '9') *b = *b * 10 + *p++ - '0'; } }
+      return 1;
+    }
+  }
+  return 0;
+}
+
+int fbcon_init (void) {
+  if (!plat.mbox) return -1;                                       // no VideoCore (qemu virt): no screen, and no message
+  const char *cl = plat_cmdline ();
+  for (; *cl; cl++) if ((cl == plat_cmdline () || cl[-1] == ' ') && starts (cl, "video=off")) return -1;
+  int w = 0, h = 0, fh = 0;
+  cmdline_number ("video", &w, &h);
+  cmdline_number ("fbfont", &fh, 0);
+  if (fb_init (w, h) < 0) { printf ("Screen: the VideoCore did not give a frame buffer (mailbox at 0x%lx)\n", plat.mbox);  return -1; }
+  int k = fb.w >= 3000 ? 2 : fb.w >= 1800 ? 1 : 0;                  // by the width of the screen
+  for (int i = 0; fh && i < fb_nfonts; i++) if (fb_fonts[i].h == fh) k = i;
+  font = &fb_fonts[k];
+  cols = fb.w / font->w;  rows = fb.h / font->h;
+  if (cols > MAXCOLS) cols = MAXCOLS;
+  if (rows > MAXROWS) rows = MAXROWS;
+  fbcon_cols = cols;  fbcon_rows = rows;
+  top = 0;  bot = rows - 1;  cx = cy = 0;
+  fg = 7; bg = 0;
+  u32 b = blank ();
+  for (int i = 0; i < rows * cols; i++) cell[i] = b;
+  for (u64 *q = (u64 *) fb.base; q < (u64 *) (fb.base + fb.size); q++) *q = 0;
+  fb_clean (fb.base, fb.size);       // (also the margin right and below the last cell)
+  fbcon_active = 1;
+  cursor_show ();
+  printf ("Screen: %dx%d pixels, letters %dx%d, %d columns and %d lines\n", (int) fb.w, (int) fb.h, font->w, font->h, cols, rows);
+  return 0;
+}
+@

@@ -481,6 +481,7 @@ struct platform {
   u8  genet_mac[6];  int genet_has_mac;           // its Ethernet address as the firmware wrote it into the device tree
   u64 rtc;                       // PL031
   u64 rng;                       // the random number generator of the Raspberry Pi 4 (RNG200), 0: none (random.c)
+  u64 mbox;                      // the mailbox of the VideoCore (frame buffer, clocks), 0: none (mbox.c, chapter "Screen")
   int timer_irq;                 // INTID of the EL1 physical timer (a PPI)
   int ncpus;  u64 cpu_mpidr[MAX_CPUS];
   u64 cpu_release[MAX_CPUS];     // spin table: the address where the firmware's loop waits for the entry address of each CPU (0: none)
@@ -548,6 +549,7 @@ void uart_init (void) {
   UART_CR = 0x301;                            // UART, transmitter and receiver on
 }
 
+extern int fbcon_active;  extern void fbcon_putch (char c);
 int console_quiet = 0;                       // 1: output is dropped (for noisy debugging output of the book's code)
 void putch (char c) {
   if (console_quiet) return;
@@ -555,6 +557,7 @@ void putch (char c) {
   if (c == '\n') putch ('\r');
   while (UART_FR & UART_FR_TXFF) ;
   UART_DR = c;
+  if (fbcon_active) fbcon_putch (c);              // the HDMI screen shows what the serial line shows (chapter "Screen")
 }
 
 @
@@ -835,6 +838,8 @@ void kmain (void) {
   uart_base = plat.uart;
   platform_map ();
   uart_init ();
+  extern int fbcon_init (void);
+  fbcon_init ();                                   // the HDMI screen, if the board has one (chapter "Screen"); from here on putch draws on it, too
   __asm__ volatile ("mrs %0, CurrentEL" : "=r" (el));
   printf ("Ulix-arm64 (work in progress)\n");
   printf ("Running at EL%d, sizeof(void*) = %d, kmain at 0x%lx (upper half)\n",

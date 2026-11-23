@@ -151,3 +151,7 @@ userland/musl/
 stress-logs/
 libc/libctest.c
 libc/stress.c
+fb.c
+fb.h
+fbcon.c
+mbox.c
