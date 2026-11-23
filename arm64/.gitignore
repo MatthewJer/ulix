@@ -159,3 +159,9 @@ usb.h
 pci.c
 xhci.c
 usbhid.c
+fat.c
+fat.h
+fatvfs.c
+userland/mount.c
+userland/umount.c
+userland/eject.c

@@ -240,6 +240,14 @@ void usb_tick (void);                  // from the timer: look at the event ring
 void usb_keyboard_report (const u8 *r, int n);
 void usb_mouse_report (const u8 *r, int n);
 void usb_keys_tick (void);             // key repeat
+void usb_rescan (void);                // look for devices that were plugged in or taken out (from a process)
+int  usb_disks (void);                 // USB sticks: how many were found (one number each, never reused), and for disk n:
+int  usb_disk_present (int n);
+u64  usb_disk_sectors (int n);
+const char *usb_disk_name (int n);     // "usb0"
+int  usb_disk_read (int n, u64 lba, void *buf, u32 cnt);        // 0: done (512 byte sectors)
+int  usb_disk_write (int n, u64 lba, void *buf, u32 cnt);
+void usb_disk_sync (int n);
 extern int usb_debug;
 #endif
 @
@@ -379,7 +387,10 @@ static void transfer_event (int slot, int dci, int code, u32 residual);       //
 static struct trb last_cmd_event;                              // the last command completion event
 static int cmd_event_seen;
 
+static volatile int ev_lock = 0;                                // the event ring is read by the timer (CPU 0) and by processes that wait for a transfer: one at a time
+
 static void ev_poll (void) {                                   // handles every event that is there
+  if (__sync_lock_test_and_set (&ev_lock, 1)) return;          // somebody else is reading it just now: he will see our events, too
   int any = 0;
   for (;;) {
     struct trb *e = &ev_trbs[ev_deq];
@@ -392,6 +403,7 @@ static void ev_poll (void) {                                   // handles every 
     any = 1;
   }
   if (any) wr64 (rt, 0x20 + 0x18, (PA (&ev_trbs[ev_deq])) | (1 << 3));      // ERDP: new dequeue pointer, and clear "event handler busy"
+  __sync_lock_release (&ev_lock);
 }
 
 static int cmd (u64 param, u32 status, u32 control, int *slot_out) {         // a command: returns the completion code (1: success), -1: timed out
@@ -434,10 +446,19 @@ struct hid_ep {                                                // an interrupt-i
   u8 *buf;
 };
 
+struct msc {                                                   // a USB stick: the bulk-only transport (two bulk endpoints) with SCSI commands
+  int used, iface, in_dci, out_dci, in_mps, out_mps, in_burst, out_burst, disk;
+  struct ring in, out;
+  u32 tag;
+  u64 sectors;
+};
+
 struct slot {
   int used, port, speed, id;
   struct ring ep0;
   struct hid_ep hid[2];
+  struct msc msc;
+  volatile int bulk_done[2];  volatile int bulk_code[2];  volatile u32 bulk_resid[2];       // [0]: the in endpoint, [1]: the out endpoint
   volatile int ep0_done, ep0_code;                             // set by the event handler when a control transfer has ended
 };
 
@@ -446,6 +467,7 @@ static u8  in_ctx[MAXDEV][2176]  __attribute__ ((aligned (64)));        // input
 static u8  out_ctx[MAXDEV][2048] __attribute__ ((aligned (64)));        // device context: 32 contexts of up to 64 bytes
 static struct trb ep0_trbs[MAXDEV][EP_RING]      __attribute__ ((aligned (256)));
 static struct trb hid_trbs[MAXDEV][2][EP_RING]   __attribute__ ((aligned (256)));
+static struct trb msc_trbs[MAXDEV][2][64]        __attribute__ ((aligned (1024)));
 static u8  hid_buf[MAXDEV][2][64]                __attribute__ ((aligned (64)));
 static u8  xfer_buf[512]                         __attribute__ ((aligned (64)));  // descriptors and the like
 
@@ -454,6 +476,11 @@ static void transfer_event (int slot, int dci, int code, u32 residual) {
   for (int i = 0; i < MAXDEV; i++) if (slots[i].used && slots[i].id == slot) s = &slots[i];
   if (!s) return;
   if (dci == 1) { s->ep0_code = code;  s->ep0_done = 1;  return; }
+  if (s->msc.used && (dci == s->msc.in_dci || dci == s->msc.out_dci)) {         // a bulk transfer of the USB stick has ended
+    int k = dci == s->msc.in_dci ? 0 : 1;
+    s->bulk_code[k] = code;  s->bulk_resid[k] = residual;  s->bulk_done[k] = 1;
+    return;
+  }
   for (int i = 0; i < 2; i++) {
     struct hid_ep *h = &s->hid[i];
     if (!h->used || h->dci != dci) continue;
@@ -542,6 +569,21 @@ static int configure_endpoints (struct slot *s) {
     ep[2] = (u32) deq;  ep[3] = (u32) (deq >> 32);
     ep[4] = h->mps | (h->mps << 16);                            // average TRB length, max ESIT payload
   }
+  if (s->msc.used) {                                           // the two bulk endpoints: type 6 (bulk in) and 2 (bulk out)
+    struct msc *m = &s->msc;
+    for (int k = 0; k < 2; k++) {
+      int dci = k == 0 ? m->in_dci : m->out_dci, mps = k == 0 ? m->in_mps : m->out_mps, burst = k == 0 ? m->in_burst : m->out_burst;
+      struct ring *r = k == 0 ? &m->in : &m->out;
+      add |= 1u << dci;
+      if (dci > maxdci) maxdci = dci;
+      u32 *ep = ctx_at (in, 1 + dci);
+      ep[0] = 0;
+      ep[1] = (3 << 1) | ((k == 0 ? 6 : 2) << 3) | (burst << 8) | (mps << 16);
+      u64 deq = PA (r->trb) | 1;
+      ep[2] = (u32) deq;  ep[3] = (u32) (deq >> 32);
+      ep[4] = mps;
+    }
+  }
   ctx_at (in, 0)[1] = add;
   u32 *slotc = ctx_at (in, 1);
   slotc[0] = (s->speed << 20) | ((u32) maxdci << 27);
@@ -561,6 +603,133 @@ static void hid_setup (struct slot *s, int idx, int proto, int iface, int ep_add
   h->buf = hid_buf[n][idx];
 }
 
+static int clear_stall (struct slot *s, int in) {              // an endpoint that stalled: Reset Endpoint, move the dequeue pointer past the failed TRB, CLEAR_FEATURE(ENDPOINT_HALT)
+  struct msc *m = &s->msc;
+  int dci = in ? m->in_dci : m->out_dci;
+  struct ring *r = in ? &m->in : &m->out;
+  cmd (0, 0, (14 << 10) | (dci << 16) | (s->id << 24), 0);     // Reset Endpoint
+  cmd (PA (&r->trb[r->enq]) | r->cycle, 0, (16 << 10) | (dci << 16) | (s->id << 24), 0);   // Set TR Dequeue Pointer: the next TRB we will write
+  control (s, 0x02, 1, 0, (in ? 0x80 : 0) | (dci / 2), 0, 0);  // CLEAR_FEATURE, feature 0 (halt), the endpoint address
+  return 0;
+}
+
+static int bulk (struct slot *s, int in, u64 pa, u32 len) {    // one bulk transfer, waits for it; 0: done, a negative completion code: error (-1: timed out)
+  struct msc *m = &s->msc;
+  int k = in ? 0 : 1;
+  s->bulk_done[k] = 0;
+  DBG ("usb: bulk %s %u bytes\n", in ? "in" : "out", len);
+  ring_put (in ? &m->in : &m->out, pa, len, (TRB_NORMAL << 10) | (1 << 5));      // interrupt on completion
+  wr32 (db, 4 * s->id, in ? m->in_dci : m->out_dci);
+  u64 freq, t0, now;                                           // two seconds, measured with the counter of the timer
+  __asm__ volatile ("mrs %0, cntfrq_el0" : "=r" (freq));
+  __asm__ volatile ("mrs %0, cntpct_el0" : "=r" (t0));
+  do { ev_poll ();  __asm__ volatile ("mrs %0, cntpct_el0" : "=r" (now)); } while (!s->bulk_done[k] && now - t0 < 2 * freq);
+  if (!s->bulk_done[k]) { printf ("usb: bulk %s transfer of %u bytes timed out\n", in ? "in" : "out", len);  return -1; }
+  int c = s->bulk_code[k];
+  if (c == 1 || c == 13) return 0;                             // success or a short packet
+  printf ("usb: bulk %s transfer of %u bytes failed with code %d\n", in ? "in" : "out", len, c);
+  return -c;
+}
+
+static u8 msc_buf[65536] __attribute__ ((aligned (65536)));     // the data of a command (a transfer must not cross a 64 KByte boundary)
+static u8 cbw[64] __attribute__ ((aligned (64))), csw[64] __attribute__ ((aligned (64)));
+
+static void put32 (u8 *p, u32 v) { p[0] = v; p[1] = v >> 8; p[2] = v >> 16; p[3] = v >> 24; }          // little endian
+static u32  get32 (const u8 *p) { return p[0] | p[1] << 8 | p[2] << 16 | (u32) p[3] << 24; }
+static u32  be32v (const u8 *p) { return (u32) p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3]; }
+
+static int scsi (struct slot *s, const u8 *cdb, int cdblen, u8 *data, u32 len, int in) {     // the bulk-only transport: command block, data, status; 0: good
+  struct msc *m = &s->msc;
+  for (int i = 0; i < 31; i++) cbw[i] = 0;
+  put32 (cbw, 0x43425355);  put32 (cbw + 4, ++m->tag);  put32 (cbw + 8, len);         // "USBC", tag, the length of the data
+  cbw[12] = in ? 0x80 : 0;  cbw[14] = cdblen;
+  for (int i = 0; i < cdblen; i++) cbw[15 + i] = cdb[i];
+  cache_clean (cbw, 31);
+  if (bulk (s, 0, PA (cbw), 31) < 0) return -1;
+  if (len) {
+    if (!in) { for (u32 i = 0; i < len; i++) msc_buf[i] = data[i];  cache_clean (msc_buf, len); }
+    else cache_flush_inval (msc_buf, len);
+    int r = bulk (s, in, PA (msc_buf), len);
+    if (r < 0 && r != -1) clear_stall (s, in);                 // the device refused the data: see its status
+    else if (r == -1) return -1;
+    if (in) { cache_flush_inval (msc_buf, len);  for (u32 i = 0; i < len; i++) data[i] = msc_buf[i]; }
+  }
+  cache_flush_inval (csw, 13);
+  int r = bulk (s, 1, PA (csw), 13);
+  if (r < 0 && r != -1) { clear_stall (s, 1);  r = bulk (s, 1, PA (csw), 13); }
+  if (r < 0) return -1;
+  cache_flush_inval (csw, 13);
+  if (get32 (csw) != 0x53425355 || get32 (csw + 4) != m->tag) return -1;                // "USBS" and our tag
+  return csw[12];                                              // 0: good, 1: command failed, 2: phase error
+}
+
+#define MAXUSBDISK 4
+static struct { int present, slot; u64 sectors; char name[8]; } udisk[MAXUSBDISK];
+static int nudisk = 0;
+
+static void msc_attach (struct slot *s) {
+  u8 cdb[16], buf[36];
+  for (int i = 0; i < 16; i++) cdb[i] = 0;
+  cdb[0] = 0x12;  cdb[4] = 36;                                 // INQUIRY
+  char vendor[17] = "";
+  if (scsi (s, cdb, 6, buf, 36, 1) == 0) { for (int i = 0; i < 16; i++) vendor[i] = buf[8 + i] >= ' ' && buf[8 + i] < 127 ? buf[8 + i] : ' ';  vendor[16] = 0; }
+  for (int i = 0; i < 16; i++) cdb[i] = 0;
+  int ready = 0;
+  for (int t = 0; t < 30 && !ready; t++) {                     // TEST UNIT READY: a stick needs a moment; REQUEST SENSE clears its complaint
+    cdb[0] = 0x00;
+    if (scsi (s, cdb, 6, 0, 0, 0) == 0) { ready = 1; break; }
+    cdb[0] = 0x03;  cdb[4] = 18;
+    scsi (s, cdb, 6, buf, 18, 1);
+    for (int i = 0; i < 16; i++) cdb[i] = 0;
+    delay_us (100000);
+  }
+  cdb[0] = 0x25;                                               // READ CAPACITY (10): the last block number and the block size, big endian
+  u8 cap[8];
+  if (!ready || scsi (s, cdb, 10, cap, 8, 1) != 0) { printf ("usb: the stick does not tell its size\n"); s->msc.used = 0; return; }
+  u64 sectors = (u64) be32v (cap) + 1;
+  u32 bsize = be32v (cap + 4);
+  if (bsize != 512 || nudisk >= MAXUSBDISK) { printf ("usb: block size %u is not supported (512 only)\n", bsize); s->msc.used = 0; return; }
+  int n = nudisk++;
+  udisk[n].present = 1;  udisk[n].slot = s - slots;  udisk[n].sectors = sectors;
+  udisk[n].name[0] = 'u'; udisk[n].name[1] = 's'; udisk[n].name[2] = 'b'; udisk[n].name[3] = '0' + n; udisk[n].name[4] = 0;
+  s->msc.disk = n;
+  printf ("usb: port %d: disk %s \"%s\", %lu MByte\n", s->port + 1, udisk[n].name, vendor, sectors / 2048);
+}
+
+int usb_disks (void) { return nudisk; }
+int usb_disk_present (int n) { return n >= 0 && n < nudisk && udisk[n].present; }
+u64 usb_disk_sectors (int n) { return usb_disk_present (n) ? udisk[n].sectors : 0; }
+const char *usb_disk_name (int n) { return n >= 0 && n < nudisk ? udisk[n].name : ""; }
+
+static volatile int msc_lock = 0;
+
+static int disk_io (int n, u64 lba, void *buf, u32 cnt, int write) {     // 0: done
+  if (!usb_disk_present (n) || lba + cnt > udisk[n].sectors) return -1;
+  struct slot *s = &slots[udisk[n].slot];
+  while (__sync_lock_test_and_set (&msc_lock, 1)) ;
+  int r = 0;
+  u8 *p = buf;
+  while (cnt > 0 && r == 0) {
+    u32 k = cnt > 64 ? 64 : cnt;                               // 32 KByte at a time
+    u8 cdb[10] = { write ? 0x2a : 0x28, 0, lba >> 24, lba >> 16, lba >> 8, lba, 0, k >> 8, k, 0 };
+    r = scsi (s, cdb, 10, p, k * 512, !write);
+    p += k * 512;  lba += k;  cnt -= k;
+  }
+  __sync_lock_release (&msc_lock);
+  return r == 0 ? 0 : -1;
+}
+
+int usb_disk_read (int n, u64 lba, void *buf, u32 cnt)  { return disk_io (n, lba, buf, cnt, 0); }
+int usb_disk_write (int n, u64 lba, void *buf, u32 cnt) { return disk_io (n, lba, buf, cnt, 1); }
+
+void usb_disk_sync (int n) {                                   // SYNCHRONIZE CACHE: the stick writes what it holds in its cache (before it is taken out)
+  if (!usb_disk_present (n)) return;
+  u8 cdb[10] = { 0x35, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+  while (__sync_lock_test_and_set (&msc_lock, 1)) ;
+  scsi (&slots[udisk[n].slot], cdb, 10, 0, 0, 0);
+  __sync_lock_release (&msc_lock);
+}
+
 static int read_configuration (struct slot *s, int *config) {   // the whole configuration descriptor into xfer_buf: returns its length, 0 if not
   if (control (s, 0x80, 6, 0x0200, 0, 9, 1) != 1) return 0;     // first the length of it,
   int total = xfer_buf[2] | xfer_buf[3] << 8;
@@ -578,7 +747,7 @@ static void enumerate (int port) {
   int slot_id = 0;
   if (cmd (0, 0, TRB_ENABLE_SLOT << 10, &slot_id) != 1 || slot_id == 0 || slot_id >= 256) { printf ("usb: no slot for port %d\n", port + 1); return; }
   s->used = 1;  s->id = slot_id;  s->port = port;  s->speed = speed;
-  s->hid[0].used = s->hid[1].used = 0;
+  s->hid[0].used = s->hid[1].used = 0;  s->msc.used = 0;
   ring_init (&s->ep0, ep0_trbs[sl], EP_RING);
   if (address_device (s) != 1) { printf ("usb: port %d: the device did not get an address\n", port + 1); s->used = 0; return; }
   if (control (s, 0x80, 6, 0x0100, 0, 8, 1) != 1) { printf ("usb: port %d: no device descriptor\n", port + 1); s->used = 0; return; }   // GET_DESCRIPTOR: device, the first 8 bytes
@@ -587,9 +756,17 @@ static void enumerate (int port) {
   int vendor = xfer_buf[8] | xfer_buf[9] << 8, product = xfer_buf[10] | xfer_buf[11] << 8;
   int config = 1, total = read_configuration (s, &config);
   if (!total) { s->used = 0; return; }
-  int nhid = 0, iface = -1, iclass = 0, isub = 0, iproto = 0;
+  int nhid = 0, iface = -1, iclass = 0, isub = 0, iproto = 0, msc_if = -1, got_in = 0, got_out = 0;
+  struct msc *m = &s->msc;
   for (int p = 0; p + 2 <= total && xfer_buf[p] >= 2; p += xfer_buf[p]) {                  // the interfaces and their endpoints
     if (xfer_buf[p + 1] == 4) { iface = xfer_buf[p + 2];  iclass = xfer_buf[p + 5];  isub = xfer_buf[p + 6];  iproto = xfer_buf[p + 7]; }
+    else if (xfer_buf[p + 1] == 5 && iclass == 8 && isub == 6 && iproto == 0x50 && (msc_if < 0 || msc_if == iface) && (xfer_buf[p + 3] & 3) == 2) {   // a bulk endpoint of a USB stick (SCSI, bulk-only)
+      int addr = xfer_buf[p + 2], mps = xfer_buf[p + 4] | xfer_buf[p + 5] << 8;
+      int burst = (p + xfer_buf[p] + 3 <= total && xfer_buf[p + xfer_buf[p] + 1] == 0x30) ? xfer_buf[p + xfer_buf[p] + 2] : 0;    // a super speed endpoint companion follows
+      msc_if = iface;
+      if (addr & 0x80) { m->in_dci = (addr & 15) * 2 + 1;  m->in_mps = mps;  m->in_burst = burst;  got_in = 1; }
+      else             { m->out_dci = (addr & 15) * 2;  m->out_mps = mps;  m->out_burst = burst;  got_out = 1; }
+    }
     else if (xfer_buf[p + 1] == 5 && iclass == 3 && isub == 1 && (iproto == 1 || iproto == 2) && nhid < 2) {
       int addr = xfer_buf[p + 2], attr = xfer_buf[p + 3];
       if ((addr & 0x80) && (attr & 3) == 3) {                  // the interrupt-in endpoint of a boot keyboard or mouse
@@ -598,13 +775,15 @@ static void enumerate (int port) {
       }
     }
   }
-  if (nhid == 0) { printf ("usb: port %d: device %04x:%04x is not a keyboard or a mouse (not supported)\n", port + 1, vendor, product); s->used = 0; return; }
+  if (got_in && got_out) { m->used = 1;  m->iface = msc_if;  ring_init (&m->in, msc_trbs[sl][0], 64);  ring_init (&m->out, msc_trbs[sl][1], 64);  m->tag = 0; }
+  if (nhid == 0 && !m->used) { printf ("usb: port %d: device %04x:%04x is not a keyboard, a mouse or a stick (not supported)\n", port + 1, vendor, product); s->used = 0; return; }
   if (control (s, 0, 9, config, 0, 0, 0) != 1) { printf ("usb: port %d: SET_CONFIGURATION failed\n", port + 1); s->used = 0; return; }
   for (int i = 0; i < nhid; i++) {
     control (s, 0x21, 0x0b, 0, s->hid[i].iface, 0, 0);         // SET_PROTOCOL: the boot protocol (a device in it already may stall: no matter)
     control (s, 0x21, 0x0a, 0, s->hid[i].iface, 0, 0);         // SET_IDLE: report only when something changes
   }
   if (configure_endpoints (s) != 1) { printf ("usb: port %d: Configure Endpoint failed\n", port + 1); s->used = 0; return; }
+  if (m->used) msc_attach (s);
   for (int i = 0; i < nhid; i++) {
     struct hid_ep *h = &s->hid[i];
     ring_put (&h->ring, PA (h->buf), h->mps, (TRB_NORMAL << 10) | (1 << 5) | (1 << 2));    // the first report is asked for
@@ -644,10 +823,15 @@ static int has_word (const char *cl, const char *w) {          // is w a word of
   return 0;
 }
 
+static int port_served (int p) {                              // is a device of this port set up already?
+  for (int i = 0; i < MAXDEV; i++) if (slots[i].used && slots[i].port == p) return 1;
+  return 0;
+}
+
 static void scan_ports (void) {
   for (int p = 0; p < nports; p++) {
     u32 v = rd32 (op, PORTSC (p));
-    if (!(v & PORT_CONNECTED)) continue;
+    if (!(v & PORT_CONNECTED) || port_served (p)) continue;
     wr32 (op, PORTSC (p), PORT_KEEP (v) | (0x7f << 17));       // acknowledge the changes (connect, ...)
     if (!(v & PORT_ENABLED)) {                                 // a USB 3 port enables itself; the others are reset
       wr32 (op, PORTSC (p), PORT_KEEP (v) | PORT_RESET);
@@ -710,6 +894,20 @@ int usb_init (void) {
   scan_ports ();
   controller_up = 1;
   return 0;
+}
+
+void usb_rescan (void) {                                       // from a process (the mount command): devices that came, devices that went
+  if (!controller_up) return;
+  for (int i = 0; i < MAXDEV; i++) {                           // a device that is gone: its slot is disabled, its disk is no more
+    struct slot *s = &slots[i];
+    if (!s->used || (rd32 (op, PORTSC (s->port)) & PORT_CONNECTED)) continue;
+    if (s->msc.used) { udisk[s->msc.disk].present = 0;  printf ("usb: disk %s removed\n", udisk[s->msc.disk].name); }
+    else printf ("usb: port %d: device removed\n", s->port + 1);
+    cmd (0, 0, (10 << 10) | (s->id << 24), 0);                 // Disable Slot
+    dcbaa[s->id] = 0;  cache_clean (&dcbaa[s->id], 8);
+    s->used = 0;  s->hid[0].used = s->hid[1].used = 0;  s->msc.used = 0;
+  }
+  scan_ports ();
 }
 
 void usb_tick (void) {                                         // from the timer, 100 times a second

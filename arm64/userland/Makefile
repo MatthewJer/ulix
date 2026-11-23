@@ -27,7 +27,7 @@ $(BUILD)/tools/swapper.c: $(TOOLSRC)/swapper.c $(BUILD)/ulixlib.h $(BUILD)/arm64
 	grep -q 'total_frames () / 16' $@
 
 # new programs of the AArch64 port (the network is not part of the original Ulix; the rule for them is further down)
-NEWTOOLS = ping ping6 host ifconfig route dhclient shutdown poweroff reboot top sntp rand https daemon service heartbeat echod ptytest telnetd sshd
+NEWTOOLS = ping ping6 host ifconfig route dhclient shutdown poweroff reboot top sntp rand https daemon service heartbeat echod ptytest telnetd sshd mount umount eject
 TOOLS    = $(filter-out $(SKIP),$(patsubst $(TOOLSRC)/%.c,%,$(wildcard $(TOOLSRC)/*.c))) $(NEWTOOLS)
 
 # GCC 4.4 accepted a lot that current compilers reject (return without value, missing types);

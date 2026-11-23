@@ -1,0 +1,1548 @@
+\chapter{FAT32 and exFAT: Reading and Writing a USB Stick}
+\label{ch:fat}
+
+A USB stick or an SD card from a camera or from another computer almost always has a file system of the DOS and Windows world: \emph{FAT32} for sticks up to 32 GByte, \emph{exFAT} for bigger ones.
+Both are older and simpler than the Minix file system of Ulix, and they fit together in one file:
+
+\begin{itemize}
+\item The disk is an array of \emph{clusters} (a power of two of 512 byte sectors). A \emph{file allocation table} (FAT) has one 32 bit entry for every cluster: the number of the
+  next cluster of the same file, or an end mark, or 0 for ``free''. A file is a chain: the directory entry knows the first cluster and the size.
+\item A \emph{directory} is a file whose content is a list of 32 byte entries. FAT32 has one entry for the short name (8 characters, a dot, 3 characters, upper case) and, for every other name, a few entries \emph{before} it
+  that hold the long name (13 UTF-16 characters each, the ``long file name'', LFN). exFAT has no short names: a \emph{set} of entries (the file with its times, a ``stream extension'' with the first cluster, the size and a hash of the name, and the name in pieces of 15 characters)
+  that ends with a checksum. exFAT keeps the free clusters in a \emph{bitmap}, and a file that lies in consecutive clusters can leave the FAT unused (a flag in the stream extension).
+\item There are no owners, permissions or links: every file belongs to root, a directory has the mode 0777, a file 0777, and a write protected file 0555.
+\end{itemize}
+
+The code does not know the rest of the kernel. It uses three functions that the caller provides ([[fat_dev_read]], [[fat_dev_write]], [[fat_dev_time]]) and it can therefore be
+tried on a PC with a disk image and the tools of the host ([[tools/fat_host_test.sh]]). The file [[fatvfs.c]] connects it to the file system layer of the kernel (chapter ``Mounting'').
+
+Limits: sectors of 512 bytes; FAT12 and FAT16 are not supported (only FAT32 and exFAT); a file size above 4 GByte is cut at 4 GByte; a name has at most 63 bytes in UTF-8 (the directory entry of the kernel has no room for more); the partition table is the old MBR (or the
+disk is one volume, like a floppy disk).
+
+@
+\section{The interface (see \texttt{fat.h})}
+
+<<fat.h>>=
+#ifndef FAT_H
+#define FAT_H
+#include "ulix.h"
+
+struct fat_stat { u32 ino, size, mtime, ctime, atime; int is_dir, readonly; };
+
+// what the caller provides: 512 byte sectors of disk number disk (0: done), and the time (seconds since 1970)
+extern int fat_dev_read (int disk, u64 lba, void *buf, u32 count);
+extern int fat_dev_write (int disk, u64 lba, const void *buf, u32 count);
+extern u32 fat_dev_time (void);
+extern void fat_dev_sync (int disk);
+
+int  fat_mount (int disk, int part);                   // part 0: the whole disk is the volume, 1..4: a partition. Returns the volume number or a negative error
+void fat_umount (int vol);
+int  fat_vol_used (int vol);
+const char *fat_vol_label (int vol);
+int  fat_vol_disk (int vol);
+int  fat_vol_exfat (int vol);
+void fat_vol_space (int vol, u64 *total_clusters, u64 *free_clusters, u32 *cluster_bytes);
+
+int  fat_open (int vol, const char *path, int create);      // a file number (>= 0), or -1; create: make the file if it is not there. Directories can be opened, too (for fstat)
+int  fat_close (int fd);
+int  fat_read (int fd, void *buf, int n);
+int  fat_write (int fd, const void *buf, int n);
+long fat_lseek (int fd, long offset, int whence);
+int  fat_ftruncate (int fd, long length);
+int  fat_fstat (int fd, struct fat_stat *st);
+int  fat_share (int fd);                                     // the same file again (a dup): the position is shared
+int  fat_open_files (int vol);                               // how many files of the volume are open
+int  fat_vol_of (int fd);                                    // the volume of an open file
+int  fat_reopen (int fd);                                    // one more file number for the same file, with its own position
+int  fat_stat (int vol, const char *path, struct fat_stat *st);
+int  fat_mkdir (int vol, const char *path);
+int  fat_rmdir (int vol, const char *path);
+int  fat_unlink (int vol, const char *path);
+int  fat_rename (int vol, const char *from, const char *to);
+int  fat_readdir (int fd, int index, char *name, int namesize, u32 *ino, int *is_dir);   // the same for an open directory
+int  fat_getdent (int vol, const char *path, int index, char *name, int namesize, u32 *ino);   // 0: entry index, -1: no more ("." and ".." come first)
+#endif
+@
+\section{The volumes and the sectors (see \texttt{fat.c})}
+
+A \emph{volume} is a FAT32 or exFAT file system on a disk (or on a partition of a disk). Its numbers are read from the first sector of the volume, the \emph{boot sector}. Four values are all that the rest of the code needs:
+where the FAT is, where cluster 2 is (the first two clusters do not exist), how many sectors a cluster has and where the root directory begins.
+
+Sectors are read and written one by one through a small cache of 32 sectors (a direct mapped cache: the sector number modulo 32 chooses the place). The cache is \emph{write through}: a changed sector goes to the disk at once, so
+that the stick is consistent when somebody pulls it out. Data of files do not use the cache: they are moved in pieces of clusters directly. (A cluster that is given out again is first forgotten by the cache: [[forget]].)
+
+<<fat.c>>=
+<<fat.c: includes and volumes>>
+
+<<fat.c: sectors>>
+
+<<fat.c: clusters>>
+
+<<fat.c: names and times>>
+
+<<fat.c: directories>>
+
+<<fat.c: creating and deleting>>
+
+<<fat.c: mounting>>
+
+<<fat.c: files>>
+
+<<fat.c: path operations>>
+@
+
+<<fat.c: includes and volumes>>=
+#include "fat.h"
+
+typedef unsigned short u16;
+#define MAXVOL   4
+#define MAXFILES 16
+#define NCACHE   32
+
+struct vol {
+  int used, disk, exfat;
+  u64 start;                                   // the first sector of the volume
+  u32 spc, nclusters;                          // sectors per cluster, number of clusters (numbered from 2)
+  u64 fat_lba, data_lba;
+  u32 fat_sectors, nfats, root, free_hint;
+  u32 bm_cluster, bm_size;                     // exFAT: the allocation bitmap
+  char label[32];
+};
+static struct vol vols[MAXVOL];
+
+static u16 rd16 (const u8 *p) { return p[0] | p[1] << 8; }
+static u32 rd32 (const u8 *p) { return p[0] | p[1] << 8 | p[2] << 16 | (u32) p[3] << 24; }
+static void wr16 (u8 *p, u32 v) { p[0] = v; p[1] = v >> 8; }
+static void wr32 (u8 *p, u32 v) { p[0] = v; p[1] = v >> 8; p[2] = v >> 16; p[3] = v >> 24; }
+static void zero (void *p, u32 n) { u8 *q = p; while (n--) *q++ = 0; }
+static void copy (void *d, const void *s, u32 n) { u8 *a = d; const u8 *b = s; while (n--) *a++ = *b++; }
+static int  same (const char *a, const char *b) { while (*a && *a == *b) { a++; b++; } return *a == *b; }
+static u32  len (const char *s) { u32 n = 0; while (s[n]) n++; return n; }
+
+#define EOC_FAT32  0x0fffffff
+#define EOC_EXFAT  0xffffffff
+@
+
+<<fat.c: sectors>>=
+static struct { int disk; u64 lba; int valid; u8 d[512]; } cache[NCACHE];
+
+static int sec_read (struct vol *v, u64 lba, u8 *out) {         // one sector of the volume (counted from its start) through the cache
+  u64 abs = v->start + lba;
+  int k = abs % NCACHE;
+  if (!cache[k].valid || cache[k].disk != v->disk || cache[k].lba != abs) {
+    if (fat_dev_read (v->disk, abs, cache[k].d, 1) != 0) { cache[k].valid = 0; return -1; }
+    cache[k].valid = 1;  cache[k].disk = v->disk;  cache[k].lba = abs;
+  }
+  copy (out, cache[k].d, 512);
+  return 0;
+}
+
+static int sec_patch (struct vol *v, u64 lba, int off, const void *data, int n) {   // change n bytes of a sector and write it at once
+  u8 s[512];
+  if (sec_read (v, lba, s) != 0) return -1;
+  copy (s + off, data, n);
+  u64 abs = v->start + lba;
+  int k = abs % NCACHE;
+  copy (cache[k].d, s, 512);
+  return fat_dev_write (v->disk, abs, s, 1);
+}
+
+static void forget (struct vol *v, u64 lba, u32 count) {         // sectors that were written without the cache: drop them
+  for (u32 i = 0; i < count; i++) {
+    u64 abs = v->start + lba + i;
+    int k = abs % NCACHE;
+    if (cache[k].valid && cache[k].disk == v->disk && cache[k].lba == abs) cache[k].valid = 0;
+  }
+}
+
+static u64 cluster_lba (struct vol *v, u32 c) { return v->data_lba + (u64) (c - 2) * v->spc; }
+
+static int data_read (struct vol *v, u64 lba, void *buf, u32 count)  { return fat_dev_read (v->disk, v->start + lba, buf, count); }
+static int data_write (struct vol *v, u64 lba, const void *buf, u32 count) { forget (v, lba, count);  return fat_dev_write (v->disk, v->start + lba, buf, count); }
+@
+
+\section{Clusters: the table, the chains, free space}
+The FAT has 4 bytes per cluster ([[fat_get]], [[fat_set]]; all copies are written). Values from [[0x0ffffff8]] (FAT32) or [[0xfffffff8]] (exFAT) on end a chain. Free clusters:
+FAT32 has them as zeros in the FAT; exFAT keeps one bit per cluster in the allocation bitmap (a set bit: in use), and the FAT entry is only written for chains.
+
+A file of exFAT may have the flag \emph{no FAT chain}: its clusters are consecutive and the FAT says nothing about them. [[next_cluster]] knows both.
+
+<<fat.c: clusters>>=
+static u32 fat_get (struct vol *v, u32 c) {
+  u8 s[512];
+  if (c < 2 || c >= v->nclusters + 2) return v->exfat ? EOC_EXFAT : EOC_FAT32;
+  if (sec_read (v, v->fat_lba + (c * 4) / 512, s) != 0) return v->exfat ? EOC_EXFAT : EOC_FAT32;
+  u32 e = rd32 (s + (c * 4) % 512);
+  return v->exfat ? e : (e & 0x0fffffff);
+}
+
+static int is_end (struct vol *v, u32 e) { return v->exfat ? e >= 0xfffffff8 : e >= 0x0ffffff8; }
+
+static int fat_set (struct vol *v, u32 c, u32 val) {
+  u8 w[4];
+  for (u32 f = 0; f < v->nfats; f++) {
+    u64 lba = v->fat_lba + (u64) f * v->fat_sectors + (c * 4) / 512;
+    int off = (c * 4) % 512;
+    if (!v->exfat) {                                           // FAT32: the upper four bits of an entry belong to nobody, keep them
+      u8 s[512];
+      if (sec_read (v, lba, s) != 0) return -1;
+      val = (val & 0x0fffffff) | (rd32 (s + off) & 0xf0000000);
+    }
+    wr32 (w, val);
+    if (sec_patch (v, lba, off, w, 4) != 0) return -1;
+  }
+  return 0;
+}
+
+static u32 next_cluster (struct vol *v, u32 c, int nofat) {      // the cluster after c in its chain (an end mark: the chain ends)
+  if (nofat) return c + 1;
+  return fat_get (v, c);
+}
+
+// exFAT: the allocation bitmap (cluster 2 is bit 0 of byte 0)
+static int bm_get (struct vol *v, u32 c) {
+  u32 bit = c - 2;
+  u8 s[512];
+  if (sec_read (v, cluster_lba (v, v->bm_cluster) + bit / 8 / 512, s) != 0) return 1;
+  return (s[(bit / 8) % 512] >> (bit % 8)) & 1;
+}
+
+static int bm_set (struct vol *v, u32 c, int on) {
+  u32 bit = c - 2;
+  u8 s[512];
+  u64 lba = cluster_lba (v, v->bm_cluster) + bit / 8 / 512;
+  if (sec_read (v, lba, s) != 0) return -1;
+  u8 b = s[(bit / 8) % 512];
+  b = on ? (b | (1 << (bit % 8))) : (b & ~(1 << (bit % 8)));
+  return sec_patch (v, lba, (bit / 8) % 512, &b, 1);
+}
+
+static u32 alloc_cluster (struct vol *v, u32 prev, int zero_it) {   // a free cluster, linked behind prev (0: none); 0: the disk is full
+  u32 c = v->free_hint;
+  if (c < 2 || c >= v->nclusters + 2) c = 2;
+  for (u32 n = 0; n < v->nclusters; n++, c++) {
+    if (c >= v->nclusters + 2) c = 2;
+    if (v->exfat ? bm_get (v, c) : fat_get (v, c) != 0) continue;
+    if (v->exfat && bm_set (v, c, 1) != 0) return 0;
+    if (fat_set (v, c, v->exfat ? EOC_EXFAT : EOC_FAT32) != 0) return 0;
+    if (prev && fat_set (v, prev, c) != 0) return 0;
+    v->free_hint = c + 1;
+    if (zero_it) {                                             // a directory must start empty
+      static u8 z[4096];
+      for (u32 i = 0; i < v->spc; i += 8) { u32 k = v->spc - i < 8 ? v->spc - i : 8; if (data_write (v, cluster_lba (v, c) + i, z, k) != 0) return 0; }
+    } else forget (v, cluster_lba (v, c), v->spc);
+    return c;
+  }
+  return 0;
+}
+
+static void free_chain (struct vol *v, u32 c, int nofat, u32 count) {      // gives a chain back (nofat: count clusters from c)
+  u32 n = 0;
+  while (c >= 2 && c < v->nclusters + 2 && (!nofat || n < count)) {
+    u32 next = nofat ? c + 1 : fat_get (v, c);
+    if (v->exfat) bm_set (v, c, 0);
+    fat_set (v, c, 0);
+    if (c < v->free_hint) v->free_hint = c;
+    n++;
+    if (!nofat && is_end (v, next)) break;
+    c = next;
+  }
+}
+@
+
+\section{Names and times}
+The kernel works with UTF-8 names; FAT stores UTF-16. [[utf8_to_utf16]] and [[utf16_to_utf8]] convert (only the first plane: no letters outside it are on a stick that matters here). Names are compared without regard to case:
+[[upper]] makes ASCII, Latin-1 and Greek and Cyrillic letters (the simple ranges) upper case. exFAT has a table on the disk that says it exactly, and the hash of a name is computed from it; for the plain letters the table agrees with [[upper]], and a name with
+exotic letters would just get a different hash than Windows computes, which only hurts if the name has such letters (Windows then cannot find the file by name: it still lists it).
+
+Time: a FAT date has the year (since 1980), month and day in 16 bits, a time has hours, minutes and seconds divided by two. [[dos_to_unix]] and [[unix_to_dos]] use the formulas of Howard Hinnant for the days of the calendar.
+
+<<fat.c: names and times>>=
+static u32 upper (u32 c) {
+  if (c >= 'a' && c <= 'z') return c - 32;
+  if (c >= 0xe0 && c <= 0xfe && c != 0xf7) return c - 32;
+  if (c >= 0x3b1 && c <= 0x3c9 && c != 0x3c2) return c - 32;
+  if (c >= 0x430 && c <= 0x44f) return c - 32;
+  return c;
+}
+
+static int utf8_to_utf16 (const char *s, u16 *out, int max) {      // returns the number of UTF-16 units, -1 if it does not fit or is not valid
+  int n = 0;
+  while (*s) {
+    u32 c = (u8) *s++;
+    if (c >= 0xf0) return -1;                                  // outside the first plane
+    if (c >= 0xe0) { u32 c1 = (u8) *s++, c2 = (u8) *s++; if ((c1 & 0xc0) != 0x80 || (c2 & 0xc0) != 0x80) return -1; c = (c & 15) << 12 | (c1 & 63) << 6 | (c2 & 63); }
+    else if (c >= 0xc0) { u32 c1 = (u8) *s++; if ((c1 & 0xc0) != 0x80) return -1; c = (c & 31) << 6 | (c1 & 63); }
+    else if (c >= 0x80) return -1;
+    if (n >= max) return -1;
+    out[n++] = c;
+  }
+  return n;
+}
+
+static void utf16_to_utf8 (const u16 *in, int n, char *out, int size) {
+  int o = 0;
+  for (int i = 0; i < n; i++) {
+    u32 c = in[i];
+    int need = c < 0x80 ? 1 : c < 0x800 ? 2 : 3;
+    if (o + need + 1 > size) break;
+    if (need == 1) out[o++] = c;
+    else if (need == 2) { out[o++] = 0xc0 | (c >> 6); out[o++] = 0x80 | (c & 63); }
+    else { out[o++] = 0xe0 | (c >> 12); out[o++] = 0x80 | ((c >> 6) & 63); out[o++] = 0x80 | (c & 63); }
+  }
+  out[o] = 0;
+}
+
+static int names_equal (const u16 *a, int na, const u16 *b, int nb) {
+  if (na != nb) return 0;
+  for (int i = 0; i < na; i++) if (upper (a[i]) != upper (b[i])) return 0;
+  return 1;
+}
+
+static u32 days_from_civil (int y, int m, int d) {             // days since 1970-01-01
+  y -= m <= 2;
+  int era = (y >= 0 ? y : y - 399) / 400;
+  unsigned yoe = y - era * 400;
+  unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+  unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097 + (int) doe - 719468;
+}
+
+static u32 dos_to_unix (u32 date, u32 time) {
+  if (date == 0) return 0;
+  return days_from_civil (1980 + (date >> 9), (date >> 5) & 15, date & 31) * 86400 + (time >> 11) * 3600 + ((time >> 5) & 63) * 60 + (time & 31) * 2;
+}
+
+static void unix_to_dos (u32 t, u32 *date, u32 *time) {
+  u32 days = t / 86400, rest = t % 86400;
+  int z = days + 719468;
+  int era = (z >= 0 ? z : z - 146096) / 146097;
+  unsigned doe = z - era * 146097;
+  unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+  int y = yoe + era * 400;
+  unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+  unsigned mp = (5 * doy + 2) / 153;
+  unsigned d = doy - (153 * mp + 2) / 5 + 1;
+  unsigned m = mp < 10 ? mp + 3 : mp - 9;
+  y += m <= 2;
+  if (y < 1980) { *date = (1 << 5) | 1;  *time = 0;  return; }
+  *date = ((y - 1980) << 9) | (m << 5) | d;
+  *time = (rest / 3600) << 11 | ((rest % 3600) / 60) << 5 | ((rest % 60) / 2);
+}
+@
+
+\section{Directories}
+A directory is a chain of clusters full of 32 byte entries, numbered from 0. [[dir_entry_at]] finds the sector and the offset of entry $n$ by following the chain ([[cache_cl]] remembers the last cluster that was found, so reading a directory from top to bottom is
+not quadratic).
+
+[[dir_next]] reads the \emph{logical} entries: for FAT32 it puts the long name together from the pieces before a short entry (checking their checksum against the short name), for exFAT it reads the file entry, the stream extension and the name pieces of a set. The result is a [[struct finfo]]: the name, the first cluster,
+the size, the flags, and where the entries are, so that the code can change or delete them later.
+
+FAT32 entries: a first byte of 0 ends the directory, [[0xe5]] marks a deleted entry, the attribute [[0x0f]] marks a piece of a long name, [[0x08]] the volume label, [[0x10]] a directory, [[0x01]] read only. exFAT: type [[0x85]] file, [[0xc0]] stream extension, [[0xc1]] name; deleted entries lose the top bit.
+
+<<fat.c: directories>>=
+struct finfo {
+  char name[256];
+  u32 first, size;                              // first cluster, size in bytes
+  int is_dir, readonly, nofat;                  // exFAT: the clusters are consecutive
+  u32 mtime, ctime, atime;
+  u32 dir_first;  int dir_nofat;                // the directory that holds the entry
+  u32 idx, nent;                                // the first entry of the set (the first piece of the long name), and how many entries it has
+  u32 short_idx;                                // FAT32: the short entry; exFAT: the stream extension is idx + 1
+};
+
+static u32 cache_dir = 0, cache_idx = 0, cache_cl = 0;
+
+static int dir_entry_at (struct vol *v, u32 dir, int nofat, u32 n, u64 *lba, int *off) {   // 0, or -1 if the chain ends before entry n
+  u32 per_cluster = v->spc * 16;
+  u32 ci = n / per_cluster, cl = dir, k = 0;
+  if (cache_dir == dir && cache_cl && ci >= cache_idx) { cl = cache_cl;  k = cache_idx; }
+  for (; k < ci; k++) {
+    cl = next_cluster (v, cl, nofat);
+    if (cl < 2 || is_end (v, cl)) return -1;
+  }
+  cache_dir = dir;  cache_idx = ci;  cache_cl = cl;
+  u32 within = n % per_cluster;
+  *lba = cluster_lba (v, cl) + within / 16;
+  *off = (within % 16) * 32;
+  return 0;
+}
+
+static int dir_get (struct vol *v, u32 dir, int nofat, u32 n, u8 *e) {
+  u64 lba;  int off;  u8 s[512];
+  if (dir_entry_at (v, dir, nofat, n, &lba, &off) != 0) return -1;
+  if (sec_read (v, lba, s) != 0) return -1;
+  copy (e, s + off, 32);
+  return 0;
+}
+
+static int dir_put (struct vol *v, u32 dir, int nofat, u32 n, const u8 *e) {
+  u64 lba;  int off;
+  if (dir_entry_at (v, dir, nofat, n, &lba, &off) != 0) return -1;
+  return sec_patch (v, lba, off, e, 32);
+}
+
+static u8 short_checksum (const u8 *name11) {
+  u8 sum = 0;
+  for (int i = 0; i < 11; i++) sum = ((sum & 1) ? 0x80 : 0) + (sum >> 1) + name11[i];
+  return sum;
+}
+
+static void short_to_name (const u8 *e, char *out) {           // "HELLO   TXT" -> "HELLO.TXT" (lower case if the flags of Windows NT say so)
+  int o = 0;
+  int low_base = e[12] & 0x08, low_ext = e[12] & 0x10;
+  for (int i = 0; i < 8 && e[i] != ' '; i++) { char c = e[i]; if (low_base && c >= 'A' && c <= 'Z') c += 32; out[o++] = c; }
+  if (e[8] != ' ') {
+    out[o++] = '.';
+    for (int i = 8; i < 11 && e[i] != ' '; i++) { char c = e[i]; if (low_ext && c >= 'A' && c <= 'Z') c += 32; out[o++] = c; }
+  }
+  out[o] = 0;
+  if ((u8) out[0] == 0x05) out[0] = (char) 0xe5;
+}
+
+static int dir_next (struct vol *v, u32 dir, int nofat, u32 *pos, struct finfo *fi) {    // the next logical entry at or after *pos: 0, or -1 at the end
+  u8 e[32];
+  static u16 lfn[260];  int lfn_len = 0, lfn_ok = 0;  u8 lfn_sum = 0;  u32 lfn_start = 0;
+  for (u32 n = *pos; ; n++) {
+    if (dir_get (v, dir, nofat, n, e) != 0) { *pos = n;  return -1; }
+    if (!v->exfat) {
+      if (e[0] == 0) { *pos = n;  return -1; }
+      if (e[0] == 0xe5) { lfn_ok = 0;  continue; }
+      if (e[11] == 0x0f) {                                     // a piece of a long name: 13 characters, the last piece comes first
+        int ord = e[0] & 0x3f;
+        if (e[0] & 0x40) { lfn_ok = 1;  lfn_sum = e[13];  lfn_len = ord * 13;  lfn_start = n;  zero (lfn, sizeof lfn); }
+        if (!lfn_ok || e[13] != lfn_sum || ord < 1 || ord * 13 > 255) { lfn_ok = 0;  continue; }
+        static const u8 pos13[13] = { 1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30 };
+        for (int i = 0; i < 13; i++) lfn[(ord - 1) * 13 + i] = rd16 (e + pos13[i]);
+        continue;
+      }
+      if (e[11] & 0x08) { lfn_ok = 0;  continue; }             // the volume label
+      if (e[0] == '.' && (e[1] == ' ' || (e[1] == '.' && e[2] == ' '))) { lfn_ok = 0;  continue; }   // "." and ".." are made up by the caller
+      zero (fi, sizeof *fi);
+      if (lfn_ok && short_checksum (e) == lfn_sum) {
+        int nl = 0;  while (nl < lfn_len && lfn[nl] != 0 && lfn[nl] != 0xffff) nl++;
+        utf16_to_utf8 (lfn, nl, fi->name, sizeof fi->name);
+        fi->idx = lfn_start;  fi->nent = n - lfn_start + 1;
+      } else { short_to_name (e, fi->name);  fi->idx = n;  fi->nent = 1; }
+      fi->short_idx = n;
+      fi->first = rd16 (e + 20) << 16 | rd16 (e + 26);
+      fi->size = rd32 (e + 28);
+      fi->is_dir = (e[11] & 0x10) != 0;  fi->readonly = e[11] & 1;
+      fi->mtime = dos_to_unix (rd16 (e + 24), rd16 (e + 22));
+      fi->ctime = dos_to_unix (rd16 (e + 16), rd16 (e + 14));
+      fi->atime = dos_to_unix (rd16 (e + 18), 0);
+      fi->dir_first = dir;  fi->dir_nofat = nofat;
+      *pos = n + 1;
+      return 0;
+    }
+    // exFAT
+    if (e[0] == 0) { *pos = n;  return -1; }
+    if (e[0] != 0x85) continue;                                // (other types, and deleted entries)
+    int secondary = e[1];
+    u8 st[32];
+    if (secondary < 2 || dir_get (v, dir, nofat, n + 1, st) != 0 || st[0] != 0xc0) continue;
+    zero (fi, sizeof *fi);
+    int nl = st[3];
+    static u16 name[256];
+    for (int k = 0; k < secondary - 1; k++) {
+      u8 ne[32];
+      if (dir_get (v, dir, nofat, n + 2 + k, ne) != 0 || ne[0] != 0xc1) break;
+      for (int i = 0; i < 15 && k * 15 + i < nl; i++) name[k * 15 + i] = rd16 (ne + 2 + 2 * i);
+    }
+    utf16_to_utf8 (name, nl, fi->name, sizeof fi->name);
+    fi->first = rd32 (st + 20);
+    fi->size = rd32 (st + 24);                                 // (the upper half of the 64 bit size is dropped: files above 4 GByte are cut)
+    if (rd32 (st + 28)) fi->size = 0xffffffff;
+    fi->nofat = (st[1] & 2) != 0;
+    fi->is_dir = (rd16 (e + 4) & 0x10) != 0;  fi->readonly = rd16 (e + 4) & 1;
+    fi->ctime = dos_to_unix (rd16 (e + 10), rd16 (e + 8));
+    fi->mtime = dos_to_unix (rd16 (e + 14), rd16 (e + 12));
+    fi->atime = dos_to_unix (rd16 (e + 18), rd16 (e + 16));
+    fi->dir_first = dir;  fi->dir_nofat = nofat;
+    fi->idx = n;  fi->nent = secondary + 1;  fi->short_idx = n + 1;
+    *pos = n + secondary + 1;
+    return 0;
+  }
+}
+@
+
+\section{Creating and deleting}
+To make a file or directory the code needs a run of free entries in the directory: one for the short name plus the pieces of the long name (FAT32), or the whole set (exFAT). Free entries are the deleted ones and everything after the end mark; if the
+chain is full a new cluster is added to the directory.
+
+\paragraph{FAT32 short names.} A long name needs a short name, too, and it must be unique in the directory. If the long name is an upper case 8.3 name already, it is the short name and there are no extra entries.
+Otherwise the short name is the first six letters of the name (upper case, illegal characters replaced by an underscore), then [[~1]], [[~2]] \ldots{} until it is unique, and the extension. The long name is
+stored in pieces of 13 characters, each with the checksum of the short name, so that a program that knows only short names still sees the file, and a damaged chain of pieces is recognised.
+
+\paragraph{exFAT sets.} The first entry has the number of secondary entries and a checksum over the whole set (a 16 bit rotation sum, without the checksum field itself); the stream extension has the name length and a hash of the upper case name.
+
+<<fat.c: creating and deleting>>=
+static int dir_grew = 0;                                       // set when a directory got another cluster (exFAT: its own entry must say so)
+
+static int dir_find_free (struct vol *v, u32 dir, int nofat, u32 count, u32 *where) {      // a run of count free entries: 0, or -1 (disk full)
+  u32 run = 0, start = 0;
+  u8 e[32];
+  u32 n;
+  for (n = 0; ; n++) {
+    if (dir_get (v, dir, nofat, n, e) != 0) break;             // the chain ends: it must grow
+    int deleted = v->exfat ? !(e[0] & 0x80) : (e[0] == 0xe5);
+    int end = e[0] == 0;
+    if (deleted || end) { if (run == 0) start = n;  run++;  if (run >= count) { *where = start;  return 0; } }
+    else run = 0;
+    if (end) {                                                 // everything after the end mark is free, if the chain is long enough
+      u32 per = v->spc * 16, left = per - (n % per);
+      if (run + left - 1 >= count) { *where = start;  return 0; }
+    }
+  }
+  u32 last = dir, c;                                           // add a cluster to the directory
+  while (!is_end (v, c = next_cluster (v, last, nofat))) last = c;
+  u32 fresh = alloc_cluster (v, last, 1);
+  if (!fresh) return -1;
+  cache_cl = 0;  dir_grew = 1;
+  if (run == 0) start = n;
+  *where = start;
+  return 0;
+}
+
+static int valid_short_char (u32 c) {                          // a character that a short name may have besides upper case letters and digits
+  const char *ok = "!#$%&'()-@^_`{}~";
+  for (; *ok; ok++) if ((u32) *ok == c) return 1;
+  return (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
+}
+
+static void make_short (const char *name, u8 *out11, int *needs_lfn) {      // the short name for a long name (without the tail ~N)
+  zero (out11, 11);  for (int i = 0; i < 11; i++) out11[i] = ' ';
+  *needs_lfn = 0;
+  int dot = -1, n = len (name);
+  for (int i = 0; i < n; i++) if (name[i] == '.') dot = i;
+  int base_len = dot < 0 ? n : dot, bi = 0, ei = 0;
+  for (int i = 0; i < base_len; i++) {
+    u32 c = (u8) name[i];
+    if (c == ' ' || c == '.') { *needs_lfn = 1;  continue; }
+    if (c >= 'a' && c <= 'z') { c -= 32;  *needs_lfn = 1; }
+    if (c >= 0x80 || !valid_short_char (c)) { c = '_';  *needs_lfn = 1; }
+    if (bi < 8) out11[bi++] = c; else *needs_lfn = 1;
+  }
+  if (dot >= 0) for (int i = dot + 1; i < n; i++) {
+    u32 c = (u8) name[i];
+    if (c == ' ') { *needs_lfn = 1;  continue; }
+    if (c >= 'a' && c <= 'z') { c -= 32;  *needs_lfn = 1; }
+    if (c >= 0x80 || !valid_short_char (c)) { c = '_';  *needs_lfn = 1; }
+    if (ei < 3) out11[8 + ei++] = c; else *needs_lfn = 1;
+  }
+  if (bi == 0) { out11[0] = '_';  *needs_lfn = 1; }
+  if (out11[0] == 0xe5) out11[0] = 0x05;
+}
+
+static int short_taken (struct vol *v, u32 dir, int nofat, const u8 *out11) {
+  u32 pos = 0;
+  struct finfo fi;
+  u8 e[32];
+  while (dir_next (v, dir, nofat, &pos, &fi) == 0) {
+    if (dir_get (v, dir, nofat, fi.short_idx, e) == 0) { int eq = 1; for (int i = 0; i < 11; i++) if (e[i] != out11[i]) eq = 0;  if (eq) return 1; }
+  }
+  return 0;
+}
+
+static void fill_times (struct vol *v, u8 *e, u32 now) {
+  u32 d, t;
+  unix_to_dos (now, &d, &t);
+  if (!v->exfat) { wr16 (e + 14, t);  wr16 (e + 16, d);  wr16 (e + 18, d);  wr16 (e + 22, t);  wr16 (e + 24, d); }
+  else { wr16 (e + 8, t);  wr16 (e + 10, d);  wr16 (e + 12, t);  wr16 (e + 14, d);  wr16 (e + 16, t);  wr16 (e + 18, d); }
+}
+
+static u16 exfat_set_checksum (const u8 *set, int entries) {
+  u16 sum = 0;
+  for (int i = 0; i < entries * 32; i++) { if (i == 2 || i == 3) continue;  sum = ((sum & 1) ? 0x8000 : 0) + (sum >> 1) + set[i]; }
+  return sum;
+}
+
+static u16 exfat_name_hash (const u16 *name, int n) {
+  u16 h = 0;
+  for (int i = 0; i < n; i++) {
+    u32 c = upper (name[i]);
+    h = ((h & 1) ? 0x8000 : 0) + (h >> 1) + (c & 255);
+    h = ((h & 1) ? 0x8000 : 0) + (h >> 1) + (c >> 8);
+  }
+  return h;
+}
+
+static int dir_add (struct vol *v, u32 dir, int nofat, const char *name, int is_dir, u32 first, struct finfo *out) {   // makes the entries of a new file or directory
+  static u16 uni[260];                                         // (these arrays are static: the kernel stack of a process has 16 KByte, and the file system code runs one thread at a time)
+  int nl = utf8_to_utf16 (name, uni, 255);
+  if (nl <= 0) return -1;
+  u32 now = fat_dev_time ();
+  static u8 set[32 * 22];
+  zero (set, sizeof set);
+  u32 count, where;
+  if (v->exfat) {
+    int pieces = (nl + 14) / 15;
+    count = 2 + pieces;
+    if (count > 19) return -1;
+    set[0] = 0x85;  set[1] = 1 + pieces;  wr16 (set + 4, is_dir ? 0x10 : 0x20);
+    fill_times (v, set, now);
+    u8 *st = set + 32;
+    st[0] = 0xc0;  st[1] = 1;  st[3] = nl;  wr16 (st + 4, exfat_name_hash (uni, nl));
+    wr32 (st + 20, first);
+    for (int k = 0; k < pieces; k++) {
+      u8 *ne = set + 64 + 32 * k;
+      ne[0] = 0xc1;
+      for (int i = 0; i < 15 && k * 15 + i < nl; i++) wr16 (ne + 2 + 2 * i, uni[k * 15 + i]);
+    }
+    wr16 (set + 2, exfat_set_checksum (set, count));
+  } else {
+    u8 s11[11];  int lfn;
+    make_short (name, s11, &lfn);
+    if (lfn) {                                                 // a tail ~1, ~2, ... until the short name is free
+      int pos = 0;  while (pos < 8 && s11[pos] != ' ') pos++;
+      u8 base[11];  copy (base, s11, 11);
+      for (int t = 1; t < 1000000; t++) {
+        char digits[8];  int dn = 0, x = t;  while (x) { digits[dn++] = '0' + x % 10;  x /= 10; }
+        int cut = pos > 7 - dn ? 7 - dn : pos;  if (cut < 1) cut = 1;
+        copy (s11, base, 11);
+        s11[cut] = '~';  for (int i = 0; i < dn; i++) s11[cut + 1 + i] = digits[dn - 1 - i];
+        for (int i = cut + 1 + dn; i < 8; i++) s11[i] = ' ';
+        if (!short_taken (v, dir, nofat, s11)) break;
+      }
+    } else if (short_taken (v, dir, nofat, s11)) return -1;    // the name exists (in other letters)
+    int pieces = lfn ? (nl + 12) / 13 : 0;
+    count = pieces + 1;
+    for (int k = 0; k < pieces; k++) {                         // the pieces, the last one first
+      u8 *e = set + 32 * (pieces - 1 - k);
+      static const u8 pos13[13] = { 1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30 };
+      e[0] = (k + 1) | (k == pieces - 1 ? 0x40 : 0);  e[11] = 0x0f;  e[13] = short_checksum (s11);
+      for (int i = 0; i < 13; i++) {
+        int idx = k * 13 + i;
+        u32 c = idx < nl ? uni[idx] : (idx == nl ? 0 : 0xffff);
+        wr16 (e + pos13[i], c);
+      }
+    }
+    u8 *e = set + 32 * pieces;
+    copy (e, s11, 11);  e[11] = is_dir ? 0x10 : 0x20;
+    fill_times (v, e, now);
+    wr16 (e + 20, first >> 16);  wr16 (e + 26, first);
+  }
+  if (dir_find_free (v, dir, nofat, count, &where) != 0) return -1;
+  for (u32 i = 0; i < count; i++) if (dir_put (v, dir, nofat, where + i, set + 32 * i) != 0) return -1;
+  if (out) {
+    zero (out, sizeof *out);
+    out->first = first;  out->is_dir = is_dir;  out->dir_first = dir;  out->dir_nofat = nofat;
+    out->idx = where;  out->nent = count;  out->short_idx = v->exfat ? where + 1 : where + count - 1;
+    out->mtime = out->ctime = out->atime = now;
+  }
+  return 0;
+}
+
+static int dir_update (struct vol *v, struct finfo *fi) {      // writes size, first cluster and times of an entry back
+  u8 e[32], st[32];
+  u32 d, t;
+  unix_to_dos (fat_dev_time (), &d, &t);
+  if (!v->exfat) {
+    if (dir_get (v, fi->dir_first, fi->dir_nofat, fi->short_idx, e) != 0) return -1;
+    wr16 (e + 20, fi->first >> 16);  wr16 (e + 26, fi->first);  wr32 (e + 28, fi->size);
+    wr16 (e + 22, t);  wr16 (e + 24, d);  wr16 (e + 18, d);
+    return dir_put (v, fi->dir_first, fi->dir_nofat, fi->short_idx, e);
+  }
+  static u8 set[32 * 22];
+  for (u32 i = 0; i < fi->nent; i++) if (dir_get (v, fi->dir_first, fi->dir_nofat, fi->idx + i, set + 32 * i) != 0) return -1;
+  copy (e, set, 32);  copy (st, set + 32, 32);
+  wr32 (st + 20, fi->first);  wr32 (st + 24, fi->size);  wr32 (st + 28, 0);  wr32 (st + 8, fi->size);  wr32 (st + 12, 0);     // valid data length and data length
+  st[1] = 1 | (fi->nofat ? 2 : 0);
+  wr16 (e + 12, t);  wr16 (e + 14, d);  wr16 (e + 16, t);  wr16 (e + 18, d);
+  copy (set, e, 32);  copy (set + 32, st, 32);
+  wr16 (set + 2, exfat_set_checksum (set, fi->nent));
+  for (u32 i = 0; i < fi->nent; i++) if (dir_put (v, fi->dir_first, fi->dir_nofat, fi->idx + i, set + 32 * i) != 0) return -1;
+  return 0;
+}
+
+static int dir_remove (struct vol *v, struct finfo *fi) {      // the entries are marked as deleted (the clusters are not touched here)
+  u8 e[32];
+  for (u32 i = 0; i < fi->nent; i++) {
+    if (dir_get (v, fi->dir_first, fi->dir_nofat, fi->idx + i, e) != 0) return -1;
+    e[0] = v->exfat ? (e[0] & 0x7f) : 0xe5;
+    if (dir_put (v, fi->dir_first, fi->dir_nofat, fi->idx + i, e) != 0) return -1;
+  }
+  return 0;
+}
+@
+
+\section{Mounting}
+[[fat_mount]] reads the first sector of the disk. If it is a boot sector (it starts with a jump and has the number of bytes per sector, or says [[EXFAT]]), the whole disk is one volume (like a floppy disk, or a stick that was formatted without a partition table).
+If not, it is a partition table of four entries (the type byte, the first sector); partition $n$ is then read the same way.
+A FAT32 boot sector says: sectors per cluster, reserved sectors (before the FAT), the number of FATs, the size of one FAT, the total number of sectors, the first cluster of the root directory. The number of clusters tells
+the type of the file system (below 65525 it is FAT12 or FAT16: not supported here). exFAT says where the FAT and the cluster heap are and how large a cluster is (as a power of two).
+
+The first FAT32 volume write puts the \emph{free cluster count} in the information sector on ``unknown'', so that nobody trusts an old number. The label of the volume is an entry of the root directory (FAT32: attribute [[0x08]]; exFAT: type [[0x83]]);
+the exFAT bitmap is found there, too (type [[0x81]]).
+
+<<fat.c: mounting>>=
+static void trim_label (char *out, const u8 *in, int n) {
+  int e = n;  while (e > 0 && (in[e - 1] == ' ' || in[e - 1] == 0)) e--;
+  int o = 0;  for (int i = 0; i < e && o < 30; i++) out[o++] = in[i] >= ' ' && in[i] < 127 && in[i] != '/' ? in[i] : '_';
+  out[o] = 0;
+}
+
+static void find_label_and_bitmap (struct vol *v, const u8 *vbr) {
+  u8 e[32];
+  v->label[0] = 0;
+  for (u32 n = 0; dir_get (v, v->root, 0, n, e) == 0 && e[0] != 0; n++) {
+    if (!v->exfat && e[11] == 0x08) trim_label (v->label, e, 11);
+    if (v->exfat && e[0] == 0x83) {
+      u16 uni[11];  int nl = e[1] > 11 ? 11 : e[1];
+      for (int i = 0; i < nl; i++) uni[i] = rd16 (e + 2 + 2 * i);
+      char tmp[40];  utf16_to_utf8 (uni, nl, tmp, sizeof tmp);
+      trim_label (v->label, (u8 *) tmp, len (tmp));
+    }
+    if (v->exfat && e[0] == 0x81) { v->bm_cluster = rd32 (e + 20);  v->bm_size = rd32 (e + 24); }
+  }
+  if (!v->label[0] && !v->exfat) trim_label (v->label, vbr + 71, 11);
+  if (same (v->label, "NO NAME")) v->label[0] = 0;
+  if (!v->label[0]) { const char *d = "USBDISK";  for (int i = 0; i < 8; i++) v->label[i] = d[i]; }
+}
+
+static int looks_like_vbr (const u8 *s) {
+  if (rd16 (s + 510) != 0xaa55) return 0;
+  if (s[3] == 'E' && s[4] == 'X' && s[5] == 'F' && s[6] == 'A' && s[7] == 'T') return 1;
+  return (s[0] == 0xeb || s[0] == 0xe9) && rd16 (s + 11) == 512 && s[13] != 0;
+}
+
+int fat_mount (int disk, int part) {                            // -1: unreadable, -2: not a FAT32/exFAT volume, -3: FAT12/16, -4: no free volume slot
+  int k;
+  for (k = 0; k < MAXVOL; k++) if (!vols[k].used) break;
+  if (k == MAXVOL) return -4;
+  struct vol *v = &vols[k];
+  zero (v, sizeof *v);
+  u8 s[512];
+  u64 start = 0;
+  if (fat_dev_read (disk, 0, s, 1) != 0) return -1;
+  if (part == 0 && !looks_like_vbr (s)) return -2;
+  if (part > 0) {
+    if (looks_like_vbr (s) || rd16 (s + 510) != 0xaa55) return -2;
+    const u8 *pe = s + 446 + 16 * (part - 1);
+    u8 type = pe[4];
+    if (type != 0x0b && type != 0x0c && type != 0x07 && type != 0x01 && type != 0x04 && type != 0x06 && type != 0x0e) return -2;
+    start = rd32 (pe + 8);
+    if (fat_dev_read (disk, start, s, 1) != 0) return -1;
+    if (!looks_like_vbr (s)) return -2;
+  }
+  v->disk = disk;  v->start = start;
+  if (s[3] == 'E' && s[4] == 'X' && s[5] == 'F' && s[6] == 'A' && s[7] == 'T') {
+    if (s[108] != 9) return -2;                                // sectors of 512 bytes only
+    v->exfat = 1;  v->nfats = 1;
+    v->fat_lba = rd32 (s + 80);  v->fat_sectors = rd32 (s + 84);  v->data_lba = rd32 (s + 88);
+    v->nclusters = rd32 (s + 92);  v->root = rd32 (s + 96);  v->spc = 1u << s[109];
+  } else {
+    if (rd16 (s + 11) != 512 || rd16 (s + 17) != 0 || rd16 (s + 22) != 0) return -3;        // a FAT12 or FAT16 volume has a root directory of its own
+    v->spc = s[13];  v->nfats = s[16];
+    u32 reserved = rd16 (s + 14), total = rd16 (s + 19) ? rd16 (s + 19) : rd32 (s + 32);
+    v->fat_sectors = rd32 (s + 36);  v->root = rd32 (s + 44);
+    v->fat_lba = reserved;  v->data_lba = reserved + v->nfats * v->fat_sectors;
+    if (v->spc == 0 || (v->spc & (v->spc - 1)) || total <= v->data_lba) return -2;
+    v->nclusters = (total - v->data_lba) / v->spc;
+    if (v->nclusters < 65525) return -3;
+    u32 fsinfo = rd16 (s + 48);
+    v->used = 1;
+    if (fsinfo > 0 && fsinfo < reserved) {                     // free cluster count and next free cluster: unknown
+      u8 unknown[8] = { 255, 255, 255, 255, 255, 255, 255, 255 };
+      sec_patch (v, fsinfo, 488, unknown, 8);
+    }
+  }
+  if (v->nclusters < 1 || v->spc > 256) return -2;
+  v->used = 1;
+  v->free_hint = 2;
+  cache_cl = 0;  cache_dir = 0;
+  find_label_and_bitmap (v, s);
+  if (v->exfat && !v->bm_cluster) { v->used = 0;  return -2; }
+  return k;
+}
+
+int fat_vol_used (int vol) { return vol >= 0 && vol < MAXVOL && vols[vol].used; }
+const char *fat_vol_label (int vol) { return fat_vol_used (vol) ? vols[vol].label : ""; }
+int fat_vol_disk (int vol) { return fat_vol_used (vol) ? vols[vol].disk : -1; }
+int fat_vol_exfat (int vol) { return fat_vol_used (vol) && vols[vol].exfat; }
+
+void fat_vol_space (int vol, u64 *total, u64 *free_c, u32 *cbytes) {
+  struct vol *v = &vols[vol];
+  u64 f = 0;
+  for (u32 c = 2; c < v->nclusters + 2; c++) { if (v->exfat ? !bm_get (v, c) : fat_get (v, c) == 0) f++; }
+  *total = v->nclusters;  *free_c = f;  *cbytes = v->spc * 512;
+}
+@
+
+\section{Files}
+An open file has the entry of its directory ([[struct finfo]]), the position, and a bookmark for the chain: the number and the place of the cluster that was reached last. Reading goes forward from the bookmark if the position is behind it, otherwise from the start of the chain.
+
+\paragraph{Reading} takes, piece by piece, what is left of the cluster, at most 8 KByte, reads the sectors it touches and copies the part that was asked for.
+
+\paragraph{Writing} first makes sure that the chain is long enough: the clusters that lie before the end of the new data are allocated one after the other ([[alloc_cluster]] links each to the previous one, and the first cluster of an empty file is written into its entry). A piece of a sector is written by reading the
+sector, changing the bytes and writing it (read-modify-write). If the position is behind the end of the file, the gap is filled with zeros. When a write has finished, the size and the first cluster go into the directory entry at once.
+A file of exFAT whose clusters were consecutive (``no FAT chain'') gets its FAT chain written first, because the new clusters may not follow.
+
+<<fat.c: files>>=
+struct file {
+  int used, vol, refs;
+  struct finfo fi;
+  u32 pos;
+  u32 cur_idx, cur_cl;                                         // the bookmark: cluster number cur_idx of the chain is cur_cl
+  int dirty;
+};
+static struct file files[MAXFILES];
+
+static u32 clusters_of (struct vol *v, u32 size) { u32 b = v->spc * 512; return (size + b - 1) / b; }
+
+static u32 cluster_for (struct vol *v, struct file *f, u32 idx) {     // the cluster number idx of the file (0: no such cluster)
+  if (f->fi.first < 2) return 0;
+  u32 k = 0, cl = f->fi.first;
+  if (f->cur_cl && idx >= f->cur_idx) { k = f->cur_idx;  cl = f->cur_cl; }
+  for (; k < idx; k++) {
+    cl = next_cluster (v, cl, f->fi.nofat);
+    if (cl < 2 || is_end (v, cl)) return 0;
+  }
+  f->cur_idx = idx;  f->cur_cl = cl;
+  return cl;
+}
+
+static void to_chain (struct vol *v, struct file *f) {         // an exFAT file without FAT chain gets one (before it grows or shrinks)
+  if (!f->fi.nofat) return;
+  u32 n = clusters_of (v, f->fi.size);
+  for (u32 i = 0; i < n; i++) fat_set (v, f->fi.first + i, i + 1 < n ? f->fi.first + i + 1 : EOC_EXFAT);
+  f->fi.nofat = 0;  f->cur_cl = 0;
+}
+
+int fat_read (int fd, void *buf, int n) {
+  struct file *f = &files[fd];
+  struct vol *v = &vols[f->vol];
+  if (fd < 0 || fd >= MAXFILES || !f->used || f->fi.is_dir) return -1;
+  if (f->pos >= f->fi.size) return 0;
+  if ((u32) n > f->fi.size - f->pos) n = f->fi.size - f->pos;
+  u8 *out = buf;  int done = 0;
+  static u8 bounce[17 * 512];
+  u32 bpc = v->spc * 512;
+  while (done < n) {
+    u32 cl = cluster_for (v, f, f->pos / bpc);
+    if (!cl) break;
+    u32 off = f->pos % bpc, chunk = bpc - off;
+    if (chunk > (u32) (n - done)) chunk = n - done;
+    if (chunk > 8192) chunk = 8192;
+    u32 first = off / 512, nsec = (off % 512 + chunk + 511) / 512;
+    if (data_read (v, cluster_lba (v, cl) + first, bounce, nsec) != 0) return done > 0 ? done : -1;
+    copy (out + done, bounce + off % 512, chunk);
+    done += chunk;  f->pos += chunk;
+  }
+  return done;
+}
+
+int fat_write (int fd, const void *buf, int n) {
+  if (fd < 0 || fd >= MAXFILES || !files[fd].used) return -1;
+  struct file *f = &files[fd];
+  if (f->fi.is_dir) return -1;
+  struct vol *v = &vols[f->vol];
+  const u8 *in = buf;  int done = 0;
+  static u8 bounce[17 * 512];
+  u32 bpc = v->spc * 512;
+  if (f->fi.nofat) to_chain (v, f);
+  if (f->pos > f->fi.size) {                                   // a gap: zeros
+    u32 want = f->pos;  static u8 zeros[512];
+    f->pos = f->fi.size;
+    while (f->pos < want) { u32 k = want - f->pos > 512 ? 512 : want - f->pos; if (fat_write (fd, zeros, k) != (int) k) return -1; }
+  }
+  u32 chain_len = f->fi.first >= 2 ? clusters_of (v, f->fi.size) : 0;      // the clusters that the file has now
+  while (done < n) {
+    u32 idx = f->pos / bpc;
+    while (idx >= chain_len) {                                 // the chain is too short: one more cluster behind the last one
+      u32 prev = chain_len ? cluster_for (v, f, chain_len - 1) : 0;
+      u32 fresh = alloc_cluster (v, prev, 0);
+      if (!fresh) goto save;                                   // the stick is full
+      if (f->fi.first < 2) f->fi.first = fresh;
+      chain_len++;
+    }
+    u32 cl = cluster_for (v, f, idx);
+    if (!cl) break;
+    u32 off = f->pos % bpc, chunk = bpc - off;
+    if (chunk > (u32) (n - done)) chunk = n - done;
+    if (chunk > 8192) chunk = 8192;
+    u32 first = off / 512, nsec = (off % 512 + chunk + 511) / 512;
+    if (off % 512 || chunk % 512) { if (data_read (v, cluster_lba (v, cl) + first, bounce, nsec) != 0) break; }
+    copy (bounce + off % 512, in + done, chunk);
+    if (data_write (v, cluster_lba (v, cl) + first, bounce, nsec) != 0) break;
+    done += chunk;  f->pos += chunk;
+  }
+save:
+  if (f->pos > f->fi.size) f->fi.size = f->pos;
+  if (done > 0) dir_update (v, &f->fi);                        // size and first cluster go into the directory at once
+  return done > 0 || n == 0 ? done : -1;
+}
+
+long fat_lseek (int fd, long offset, int whence) {
+  if (fd < 0 || fd >= MAXFILES || !files[fd].used) return -1;
+  struct file *f = &files[fd];
+  long base = whence == 0 ? 0 : whence == 1 ? (long) f->pos : (long) f->fi.size;
+  long np = base + offset;
+  if (np < 0) return -1;
+  f->pos = np;
+  return np;
+}
+
+int fat_ftruncate (int fd, long length) {                       // shorter: the clusters behind the new end are given back; longer: filled with zeros
+  if (fd < 0 || fd >= MAXFILES || !files[fd].used || files[fd].fi.is_dir || length < 0) return -1;
+  struct file *f = &files[fd];
+  struct vol *v = &vols[f->vol];
+  if ((u32) length == f->fi.size) return 0;
+  if ((u32) length > f->fi.size) {
+    u32 keep = f->pos;  static u8 zeros[512];
+    f->pos = f->fi.size;
+    while (f->pos < (u32) length) { u32 k = length - f->pos > 512 ? 512 : length - f->pos; if (fat_write (fd, zeros, k) != (int) k) { f->pos = keep; return -1; } }
+    f->pos = keep;
+    return 0;
+  }
+  to_chain (v, f);
+  u32 keep = clusters_of (v, length);
+  if (keep == 0) { free_chain (v, f->fi.first, 0, 0);  f->fi.first = 0; }
+  else {
+    u32 last = cluster_for (v, f, keep - 1);
+    if (last) { u32 rest = fat_get (v, last);  fat_set (v, last, v->exfat ? EOC_EXFAT : EOC_FAT32);  if (!is_end (v, rest)) free_chain (v, rest, 0, 0); }
+  }
+  f->cur_cl = 0;
+  f->fi.size = length;
+  if (f->pos > (u32) length) f->pos = length;
+  return dir_update (v, &f->fi);
+}
+@
+
+\section{Paths and operations}
+A path ([[/Docs/letter.txt]], relative to the root of the volume) is looked up component by component: [[dir_find]] reads the entries of a directory until a name matches; [[resolve]] repeats it. [[.]] and [[..]] are handled while walking (a stack of
+the directories that were entered).
+[[open]] makes a file if it does not exist and the caller asks for it; [[mkdir]] takes a free cluster for the new directory, and (FAT32) writes the entries [[.]] and [[..]] into it; [[unlink]] and [[rmdir]] free the chain and mark the entries deleted;
+[[rename]] makes entries with the new name that point to the same clusters and deletes the old ones.
+
+<<fat.c: path operations>>=
+static int dir_find (struct vol *v, u32 dir, int nofat, const u16 *name, int nl, struct finfo *out) {
+  u32 pos = 0;
+  while (dir_next (v, dir, nofat, &pos, out) == 0) {
+    static u16 other[260];
+    int on = utf8_to_utf16 (out->name, other, 255);
+    if (on >= 0 && names_equal (name, nl, other, on)) return 0;
+  }
+  return -1;
+}
+
+static void root_info (struct vol *v, struct finfo *fi) {
+  zero (fi, sizeof *fi);
+  fi->first = v->root;  fi->is_dir = 1;
+}
+
+static int split (const char *path, int *pos, char *comp) {     // the next component of a path: 1, or 0 at the end
+  while (path[*pos] == '/') (*pos)++;
+  if (!path[*pos]) return 0;
+  int n = 0;
+  while (path[*pos] && path[*pos] != '/') { if (n < 255) comp[n++] = path[*pos];  (*pos)++; }
+  comp[n] = 0;
+  return 1;
+}
+
+static int resolve_parent (struct vol *v, const char *path, struct finfo *parent, char *leaf) {   // the directory that holds the last component, and its name; 0, or -1
+  char comp[256];  int pos = 0;
+  static struct { u32 first; int nofat; struct finfo fi; } stack[32];
+  int depth = 0;
+  root_info (v, &stack[0].fi);  stack[0].first = v->root;  stack[0].nofat = 0;
+  leaf[0] = 0;
+  while (split (path, &pos, comp)) {
+    int more = 0;  { int p2 = pos;  char tmp[256];  more = split (path, &p2, tmp); }
+    if (!more) {                                               // the last component: the caller deals with it
+      int i;  for (i = 0; comp[i]; i++) leaf[i] = comp[i];
+      leaf[i] = 0;
+      *parent = stack[depth].fi;
+      return 0;
+    }
+    if (same (comp, ".")) continue;
+    if (same (comp, "..")) { if (depth > 0) depth--;  continue; }
+    static u16 uni[260];  int nl = utf8_to_utf16 (comp, uni, 255);
+    struct finfo fi;
+    if (nl <= 0 || dir_find (v, stack[depth].fi.first, stack[depth].fi.nofat, uni, nl, &fi) != 0 || !fi.is_dir) return -1;
+    if (depth + 1 >= 32) return -1;
+    depth++;  stack[depth].fi = fi;
+  }
+  *parent = stack[depth].fi;                                   // the path was "/" (or empty): no last component
+  return 0;
+}
+
+static int resolve (struct vol *v, const char *path, struct finfo *out) {
+  struct finfo parent;  char leaf[256];
+  if (resolve_parent (v, path, &parent, leaf) != 0) return -1;
+  if (!leaf[0] || same (leaf, ".")) { *out = parent;  if (!parent.first) root_info (v, out);  return 0; }
+  if (same (leaf, "..")) return -1;                           // (a path that ends in "..": the caller has the shorter path)
+  static u16 uni[260];  int nl = utf8_to_utf16 (leaf, uni, 255);
+  if (nl <= 0) return -1;
+  return dir_find (v, parent.first, parent.nofat, uni, nl, out);
+}
+
+static void grew_hook (struct vol *v, struct finfo *dir) {       // an exFAT directory that got a cluster must say so in its own entry
+  if (!dir_grew) return;
+  dir_grew = 0;
+  if (v->exfat && dir->idx != 0 | dir->nent != 0) { dir->size += v->spc * 512;  dir_update (v, dir); }
+}
+
+static int new_file (struct vol *v, const char *path, int is_dir, struct finfo *out) {   // makes a file or directory: 0, or -1
+  struct finfo parent;  char leaf[256];
+  if (resolve_parent (v, path, &parent, leaf) != 0 || !leaf[0] || same (leaf, ".") || same (leaf, "..")) return -1;
+  static u16 uni[260];  int nl = utf8_to_utf16 (leaf, uni, 255);
+  struct finfo old;
+  if (nl <= 0 || dir_find (v, parent.first, parent.nofat, uni, nl, &old) == 0) return -1;      // exists already
+  u32 first = 0;
+  dir_grew = 0;
+  if (is_dir) { first = alloc_cluster (v, 0, 1);  if (!first) return -1; }
+  struct finfo fi;
+  if (dir_add (v, parent.first, parent.nofat, leaf, is_dir, first, &fi) != 0) { if (first) free_chain (v, first, 0, 0);  return -1; }
+  if (is_dir) {
+    if (v->exfat) { fi.size = v->spc * 512;  dir_update (v, &fi); }
+    else {                                                     // "." and ".." as the first two entries
+      u8 e[32];  u32 d, t;
+      unix_to_dos (fat_dev_time (), &d, &t);
+      zero (e, 32);  for (int i = 0; i < 11; i++) e[i] = ' ';  e[0] = '.';  e[11] = 0x10;
+      wr16 (e + 22, t);  wr16 (e + 24, d);  wr16 (e + 20, first >> 16);  wr16 (e + 26, first);
+      dir_put (v, first, 0, 0, e);
+      e[1] = '.';  wr16 (e + 20, parent.first == v->root ? 0 : parent.first >> 16);  wr16 (e + 26, parent.first == v->root ? 0 : parent.first);
+      dir_put (v, first, 0, 1, e);
+    }
+  }
+  grew_hook (v, &parent);
+  if (out) *out = fi;
+  return 0;
+}
+
+int fat_open (int vol, const char *path, int create) {
+  if (!fat_vol_used (vol)) return -1;
+  struct vol *v = &vols[vol];
+  struct finfo fi;
+  if (resolve (v, path, &fi) != 0) {
+    if (!create || new_file (v, path, 0, &fi) != 0) return -1;
+  }
+  int k;
+  for (k = 0; k < MAXFILES; k++) if (!files[k].used) break;
+  if (k == MAXFILES) return -1;
+  zero (&files[k], sizeof files[k]);
+  files[k].used = 1;  files[k].vol = vol;  files[k].refs = 1;  files[k].fi = fi;
+  return k;
+}
+
+int fat_close (int fd) {
+  if (fd < 0 || fd >= MAXFILES || !files[fd].used) return -1;
+  if (--files[fd].refs > 0) return 0;
+  files[fd].used = 0;
+  return 0;
+}
+
+int fat_reopen (int fd) {                                       // a copy with a position of its own
+  if (fd < 0 || fd >= MAXFILES || !files[fd].used) return -1;
+  int k;
+  for (k = 0; k < MAXFILES; k++) if (!files[k].used) break;
+  if (k == MAXFILES) return -1;
+  files[k] = files[fd];  files[k].refs = 1;
+  return k;
+}
+
+int fat_share (int fd) {                                        // the same open file again (dup, fork): the position is shared
+  if (fd < 0 || fd >= MAXFILES || !files[fd].used) return -1;
+  files[fd].refs++;
+  return fd;
+}
+
+int fat_vol_of (int fd) { return fd >= 0 && fd < MAXFILES && files[fd].used ? files[fd].vol : -1; }
+
+int fat_open_files (int vol) { int n = 0; for (int k = 0; k < MAXFILES; k++) if (files[k].used && files[k].vol == vol) n++; return n; }
+
+static void to_stat (struct finfo *fi, struct fat_stat *st) {
+  st->ino = fi->first ? fi->first : 1;  st->size = fi->is_dir ? 0 : fi->size;
+  st->mtime = fi->mtime;  st->ctime = fi->ctime;  st->atime = fi->atime;
+  st->is_dir = fi->is_dir;  st->readonly = fi->readonly;
+}
+
+int fat_fstat (int fd, struct fat_stat *st) {
+  if (fd < 0 || fd >= MAXFILES || !files[fd].used) return -1;
+  to_stat (&files[fd].fi, st);
+  return 0;
+}
+
+int fat_stat (int vol, const char *path, struct fat_stat *st) {
+  if (!fat_vol_used (vol)) return -1;
+  struct finfo fi;
+  if (resolve (&vols[vol], path, &fi) != 0) return -1;
+  to_stat (&fi, st);
+  return 0;
+}
+
+int fat_mkdir (int vol, const char *path) { return fat_vol_used (vol) ? new_file (&vols[vol], path, 1, 0) : -1; }
+
+int fat_unlink (int vol, const char *path) {
+  if (!fat_vol_used (vol)) return -1;
+  struct vol *v = &vols[vol];
+  struct finfo fi;
+  if (resolve (v, path, &fi) != 0 || fi.is_dir || fi.readonly) return -1;
+  for (int k = 0; k < MAXFILES; k++) if (files[k].used && files[k].vol == vol && files[k].fi.first == fi.first && fi.first) return -1;    // still open
+  if (fi.first >= 2) free_chain (v, fi.first, fi.nofat, clusters_of (v, fi.size));
+  return dir_remove (v, &fi);
+}
+
+int fat_rmdir (int vol, const char *path) {
+  if (!fat_vol_used (vol)) return -1;
+  struct vol *v = &vols[vol];
+  struct finfo fi, inner;
+  if (resolve (v, path, &fi) != 0 || !fi.is_dir || fi.first == v->root || fi.first < 2) return -1;
+  u32 pos = 0;
+  if (dir_next (v, fi.first, fi.nofat, &pos, &inner) == 0) return -1;     // not empty
+  free_chain (v, fi.first, 0, 0);
+  return dir_remove (v, &fi);
+}
+
+int fat_rename (int vol, const char *from, const char *to) {
+  if (!fat_vol_used (vol)) return -1;
+  struct vol *v = &vols[vol];
+  struct finfo src, dst, parent;  char leaf[256];
+  if (resolve (v, from, &src) != 0 || src.first == v->root) return -1;
+  if (resolve (v, to, &dst) == 0) {                            // the target exists: a file is replaced by a file
+    if (dst.is_dir || src.is_dir || dst.first == src.first) return dst.first == src.first ? 0 : -1;
+    if (fat_unlink (vol, to) != 0) return -1;
+  }
+  if (resolve_parent (v, to, &parent, leaf) != 0 || !leaf[0]) return -1;
+  struct finfo fresh;
+  dir_grew = 0;
+  if (dir_add (v, parent.first, parent.nofat, leaf, src.is_dir, src.first, &fresh) != 0) return -1;
+  fresh.size = src.size;  fresh.nofat = src.nofat;  fresh.mtime = src.mtime;
+  dir_update (v, &fresh);
+  grew_hook (v, &parent);
+  dir_remove (v, &src);
+  if (src.is_dir && !v->exfat && src.first >= 2) {             // ".." of a moved directory names its new parent
+    u8 e[32];
+    if (dir_get (v, src.first, 0, 1, e) == 0) { wr16 (e + 20, parent.first == v->root ? 0 : parent.first >> 16);  wr16 (e + 26, parent.first == v->root ? 0 : parent.first);  dir_put (v, src.first, 0, 1, e); }
+  }
+  for (int k = 0; k < MAXFILES; k++) if (files[k].used && files[k].vol == vol && files[k].fi.first == src.first) files[k].fi = fresh;
+  return 0;
+}
+
+static struct { int vol; u32 dir; u32 index; u32 pos; int valid; } listing;      // where the last listing stopped: the next index goes on from there
+
+static int list_dir (int vol, struct finfo *dir, int index, char *name, int namesize, u32 *ino, int *is_dir) {
+  struct vol *v = &vols[vol];
+  if (index < 2) {
+    name[0] = '.';  name[1] = index == 1 ? '.' : 0;  name[2] = 0;
+    *ino = dir->first ? dir->first : 1;  *is_dir = 1;
+    return 0;
+  }
+  u32 want = index - 2, have = 0, pos = 0;
+  if (listing.valid && listing.vol == vol && listing.dir == dir->first && listing.index <= want) { have = listing.index;  pos = listing.pos; }
+  struct finfo fi;
+  for (;;) {
+    if (dir_next (v, dir->first, dir->nofat, &pos, &fi) != 0) { listing.valid = 0;  return -1; }
+    if (have == want) break;
+    have++;
+  }
+  listing.vol = vol;  listing.dir = dir->first;  listing.index = want + 1;  listing.pos = pos;  listing.valid = 1;
+  int n = len (fi.name);
+  if (n >= namesize) n = namesize - 1;
+  copy (name, fi.name, n);  name[n] = 0;
+  *ino = fi.first ? fi.first : 1;  *is_dir = fi.is_dir;
+  return 0;
+}
+
+int fat_getdent (int vol, const char *path, int index, char *name, int namesize, u32 *ino) {
+  if (!fat_vol_used (vol) || index < 0) return -1;
+  struct finfo dir;  int is_dir;
+  if (resolve (&vols[vol], path, &dir) != 0 || !dir.is_dir) return -1;
+  return list_dir (vol, &dir, index, name, namesize, ino, &is_dir);
+}
+
+int fat_readdir (int fd, int index, char *name, int namesize, u32 *ino, int *is_dir) {      // the same for a directory that is open (getdents64)
+  if (fd < 0 || fd >= MAXFILES || !files[fd].used || !files[fd].fi.is_dir || index < 0) return -1;
+  if (!files[fd].fi.first) root_info (&vols[files[fd].vol], &files[fd].fi);
+  return list_dir (files[fd].vol, &files[fd].fi, index, name, namesize, ino, is_dir);
+}
+
+void fat_umount (int vol) {
+  if (!fat_vol_used (vol)) return;
+  for (int k = 0; k < MAXFILES; k++) if (files[k].used && files[k].vol == vol) files[k].used = 0;      // (a stick that was pulled out: its files are gone)
+  fat_dev_sync (vols[vol].disk);
+  for (int i = 0; i < NCACHE; i++) cache[i].valid = 0;
+  vols[vol].used = 0;
+  listing.valid = 0;
+}
+@
+
+\chapter{Mounting: Sticks under \texttt{/Volumes}}
+\label{ch:mount}
+
+The book's file system layer ([[u_open]], [[u_read]] and the others) already has a place for a second kind of file system: every one of its functions has a [[switch]] on the type of the mounted
+volume with a case for [[FS_FAT]] that says ``not implemented''. The port fills these cases in: [[tools/fatpatch.py]] changes the generated text of the book's functions so that [[FS_FAT]] calls [[fatfs_open]], [[fatfs_read]] and so on, which are in [[fatvfs.c]] and
+translate between the types of the book ([[struct stat]], [[struct dir_entry]]) and [[fat.c]].
+
+A \emph{mount} adds an entry to the mount table of the book: the path of the \emph{mount point} ([[/Volumes/FATSTICK/]]), the file system type [[FS_FAT]] and a device number ([[0x1000]] plus the number of the volume of [[fat.c]]). From then on, the book's [[get_dev_and_path]] sends every path below the mount point to the FAT code,
+with the rest of the path (relative to the volume). The directory [[/Volumes/FATSTICK]] on the root disk is made when a volume is mounted and removed when it is unmounted, so that [[ls /Volumes]] shows what is mounted (the way macOS does it).
+
+\paragraph{Plugging in.} When the system starts, [[fatfs_automount]] looks at every USB disk: the disk as one volume, then its partitions 1 to 4; every FAT32 or exFAT volume is mounted at [[/Volumes/]] and its label; if the name is taken, a number is added
+(\texttt{LABEL 1}). A stick that was plugged in later is found by [[mount]] without arguments (it asks the USB code to look at the ports first). [[mount usb0p1 /mnt/stick]] mounts one partition at a place of your choice, [[umount]] undoes it, and [[eject usb0]] unmounts everything on the disk
+and tells the stick to write its cache, so that it may be pulled out. The system call that the three programs use has the number 640 ([[ARCH_NR_MOUNT]]).
+
+<<fatvfs.c>>=
+#define hash fatvfs_hash                               // (the book's header defines a function of this name: keep it out of the link)
+#include "ulix-api.h"
+#undef hash
+#include "fat.h"
+#include "usb.h"
+
+extern void fs_lock (void), fs_unlock (void);           // pipes.c: the one thread in the file system code
+#define DEV_FAT0 0x1000
+#define strcat my_strcat                                // (the kernel has strcpy and strlen, but no strcat)
+static char *my_strcat (char *d, const char *s) { strcpy (d + strlen (d), s);  return d; }
+
+<<fatvfs.c: the disks and the clock>>
+
+<<fatvfs.c: the functions of the file system layer>>
+
+<<fatvfs.c: mount table>>
+
+<<fatvfs.c: the system call>>
+@
+
+<<fatvfs.c: the disks and the clock>>=
+int fat_dev_read (int disk, u64 lba, void *buf, u32 n)        { return usb_disk_read (disk, lba, buf, n); }
+int fat_dev_write (int disk, u64 lba, const void *buf, u32 n) { return usb_disk_write (disk, lba, (void *) buf, n); }
+u32 fat_dev_time (void)                                       { return system_time; }
+void fat_dev_sync (int disk)                                  { usb_disk_sync (disk); }
+@
+
+\subsection{The functions that the book's switches call}
+The book's file descriptor of an open file is [[(fs << 8) + number]]: the number is the index of [[fat.c]]'s table of open files. A mode of the book (permissions) does not exist on a FAT volume; every file gets 0777 (0555 if it is write protected)
+and belongs to root. A file that was opened with [[O_APPEND]] writes at its end whatever the position says; this is kept in [[append]].
+
+<<fatvfs.c: the functions of the file system layer>>=
+static char append[16];
+
+static void to_book_stat (int device, struct fat_stat *fs, struct stat *st) {
+  st->st_dev = device;  st->st_ino = fs->ino;  st->st_nlink = 1;  st->st_uid = 0;  st->st_gid = 0;  st->st_rdev = 0;
+  st->st_mode = (fs->is_dir ? S_IFDIR : S_IFREG) | (fs->readonly ? 0555 : 0777);
+  st->st_size = fs->size;  st->st_atime = fs->atime;  st->st_mtime = fs->mtime;  st->st_ctime = fs->ctime;
+}
+
+int fatfs_open (int device, const char *path, int oflag) {
+  int fd = fat_open (device - DEV_FAT0, path, (oflag & O_CREAT) != 0);
+  if (fd < 0) return -1;
+  append[fd] = (oflag & O_APPEND) != 0;
+  return fd;
+}
+
+int fatfs_read (int fd, void *buf, int n)  { return fat_read (fd, buf, n); }
+int fatfs_write (int fd, void *buf, int n) { if (fd >= 0 && fd < 16 && append[fd]) fat_lseek (fd, 0, 2);  return fat_write (fd, buf, n); }
+int fatfs_close (int fd)                   { return fat_close (fd); }
+int fatfs_lseek (int fd, int off, int whence) { long r = fat_lseek (fd, off, whence);  return r < 0 ? -1 : (int) r; }
+int fatfs_ftruncate (int fd, int length)   { return fat_ftruncate (fd, length); }
+int fatfs_reopen (int fd)                  { return fat_reopen (fd); }
+int fatfs_share (int fd)                   { return fat_share (fd); }
+
+int fatfs_stat (int device, const char *path, struct stat *st) {
+  struct fat_stat fs;
+  if (fat_stat (device - DEV_FAT0, path, &fs) != 0) return -1;
+  to_book_stat (device, &fs, st);
+  return 0;
+}
+
+int fatfs_fstat (int fd, struct stat *st) {
+  struct fat_stat fs;
+  if (fat_fstat (fd, &fs) != 0) return -1;
+  to_book_stat (DEV_FAT0 + fat_vol_of (fd), &fs, st);
+  return 0;
+}
+
+int fatfs_mkdir (int device, const char *path)  { return fat_mkdir (device - DEV_FAT0, path); }
+int fatfs_rmdir (int device, const char *path)  { return fat_rmdir (device - DEV_FAT0, path); }
+int fatfs_unlink (int device, const char *path) { return fat_unlink (device - DEV_FAT0, path); }
+
+int fatfs_getdent (int device, const char *path, int index, struct dir_entry *buf) {
+  char name[64];  u32 ino;
+  if (fat_getdent (device - DEV_FAT0, path, index, name, sizeof name, &ino) != 0) return -1;
+  buf->inode = ino;
+  int i = 0;  for (; name[i]; i++) buf->filename[i] = name[i];
+  buf->filename[i] = 0;
+  return 0;
+}
+
+// getdents64 of the Linux interface: entry number index of an open directory (0 on success)
+int fatfs_readdir (int fd, int index, char *name, int size, unsigned *ino, int *is_dir) { return fat_readdir (fd, index, name, size, ino, is_dir); }
+
+// rename (the Linux interface): -100 if the two paths are not on one FAT volume, else 0 or -1
+int fatfs_rename (const char *from, const char *to) {
+  char lp1[256], lp2[256], ab1[256], ab2[256];  short d1, f1, d2, f2;
+  if (*from != '/') relpath_to_abspath ((char *) from, ab1); else strncpy (ab1, from, 256);
+  if (*to != '/')   relpath_to_abspath ((char *) to, ab2);   else strncpy (ab2, to, 256);
+  get_dev_and_path (ab1, &d1, &f1, lp1);  get_dev_and_path (ab2, &d2, &f2, lp2);
+  if (f1 != FS_FAT && f2 != FS_FAT) return -100;
+  if (f1 != f2 || d1 != d2) return -1;                          // between two file systems a rename cannot work
+  return fat_rename (d1 - DEV_FAT0, lp1, lp2);
+}
+
+// statfs: size and free space of the volume that a path is on; 0 if the path is on a FAT volume, else -1
+int fatfs_space (const char *path, unsigned long *bsize, unsigned long *blocks, unsigned long *bfree) {
+  char lp[256], ab[256];  short d, f;
+  if (*path != '/') relpath_to_abspath ((char *) path, ab); else strncpy (ab, path, 256);
+  get_dev_and_path (ab, &d, &f, lp);
+  if (f != FS_FAT) return -1;
+  u64 total, free_c;  u32 cb;
+  fat_vol_space (d - DEV_FAT0, &total, &free_c, &cb);
+  *bsize = cb;  *blocks = total;  *bfree = free_c;
+  return 0;
+}
+@
+
+\subsection{The mount table}
+The table of the book has 16 entries; an entry that is added later is searched first ([[get_dev_and_path]] looks from the end), so a mount point inside another mounted volume works. [[add_mount]] and [[remove_mount]] are the
+two operations. For every FAT volume the code remembers from which disk and partition it came ([[vinfo]]), to be able to say [[usb0p1]] in the list and to find all volumes of a disk.
+
+<<fatvfs.c: mount table>>=
+struct { int used, disk, part; } vinfo[4];
+
+static int mount_index_of_vol (int vol) {
+  for (int i = 0; i < current_mounts; i++) if (mount_table[i].fstype == FS_FAT && mount_table[i].device == DEV_FAT0 + vol) return i;
+  return -1;
+}
+
+static int mount_index_of_path (const char *path) {                // a mount point with or without the slash at the end
+  int n = strlen (path);
+  while (n > 1 && path[n - 1] == '/') n--;
+  for (int i = 0; i < current_mounts; i++) {
+    int m = strlen (mount_table[i].mountpoint);
+    if (m > 1 && mount_table[i].mountpoint[m - 1] == '/') m--;
+    if (m == n && strncmp (mount_table[i].mountpoint, path, n) == 0) return i;
+  }
+  return -1;
+}
+
+static int add_mount (const char *mp, int vol) {                   // mp without the slash at the end; 0, or -1 (the table is full)
+  if (current_mounts >= 16 || strlen (mp) > 250) return -1;
+  mount_table_entry *e = &mount_table[current_mounts];
+  strcpy (e->mountpoint, mp);  strcat (e->mountpoint, "/");
+  e->fstype = FS_FAT;  e->device = DEV_FAT0 + vol;  e->mount_flags = 0;
+  current_mounts++;
+  return 0;
+}
+
+static void remove_mount (int index) {
+  for (int i = index; i < current_mounts - 1; i++) mount_table[i] = mount_table[i + 1];
+  current_mounts--;
+  mount_table[current_mounts].mountpoint[0] = 0;  mount_table[current_mounts].fstype = 0;  mount_table[current_mounts].device = 0;
+}
+
+static void volume_mount_point (int vol, char *mp) {                 // /Volumes/LABEL, or "/Volumes/LABEL 1" if that one is taken
+  int n = 0;
+  for (;; n++) {
+    strcpy (mp, "/Volumes/");  strcat (mp, fat_vol_label (vol));
+    if (n > 0) { int l = strlen (mp);  mp[l] = ' ';  mp[l + 1] = '0' + n % 10;  mp[l + 2] = 0; }
+    if (mount_index_of_path (mp) < 0) return;
+  }
+}
+
+static int mount_volume (int vol, int disk, int part, const char *where, char *msg) {      // where: 0 = /Volumes/LABEL (the directory is made), else the mount point
+  char mp[256];
+  struct stat st;
+  if (where) strcpy (mp, where);
+  else {                                                           // the directory under /Volumes is made by the file system code itself (at the start there is no user whose rights could be checked)
+    volume_mount_point (vol, mp);
+    mx_mkdir (mount_table[0].device, "/Volumes", 0777);
+    mx_mkdir (mount_table[0].device, mp, 0777);
+  }
+  if (u_stat (mp, &st) != 0 || (st.st_mode & S_IFMT) != S_IFDIR) { fat_umount (vol);  strcpy (msg, "mount: no such directory");  return -1; }
+  if (add_mount (mp, vol) != 0) { fat_umount (vol);  strcpy (msg, "mount: the mount table is full");  return -1; }
+  vinfo[vol].used = 1;  vinfo[vol].disk = disk;  vinfo[vol].part = part;
+  return 0;
+}
+
+static int unmount_volume (int index, int force, char *msg) {
+  int vol = mount_table[index].device - DEV_FAT0;
+  if (!force && fat_open_files (vol) > 0) { strcpy (msg, "umount: files are open");  return -16; }
+  char mp[256];
+  strcpy (mp, mount_table[index].mountpoint);
+  fat_umount (vol);
+  vinfo[vol].used = 0;
+  remove_mount (index);
+  int n = strlen (mp);  if (n > 1 && mp[n - 1] == '/') mp[n - 1] = 0;
+  if (strncmp (mp, "/Volumes/", 9) == 0) mx_rmdir (mount_table[0].device, mp, mp);      // (the directory that was made for it)
+  return 0;
+}
+
+static void source_name (int vol, char *out) {                       // "usb0" or "usb0p1"
+  strcpy (out, usb_disk_name (vinfo[vol].disk));
+  if (vinfo[vol].part > 0) { int l = strlen (out);  out[l] = 'p';  out[l + 1] = '0' + vinfo[vol].part;  out[l + 2] = 0; }
+}
+
+static int disk_has_volume (int disk) { for (int v = 0; v < 4; v++) if (vinfo[v].used && vinfo[v].disk == disk) return 1; return 0; }
+
+static int mount_new_disks (char *report) {                          // every USB disk that has no mounted volume yet: the disk itself, then partitions 1 to 4
+  int count = 0;
+  report[0] = 0;
+  for (int disk = 0; disk < usb_disks (); disk++) {
+    if (!usb_disk_present (disk) || disk_has_volume (disk)) continue;
+    for (int part = 0; part <= 4; part++) {
+      int vol = fat_mount (disk, part);
+      if (vol == -3) printf ("mount: %s partition %d: FAT12/FAT16 is not supported (only FAT32 and exFAT)\n", usb_disk_name (disk), part);
+      if (vol < 0) continue;
+      char msg[64];
+      if (mount_volume (vol, disk, part, 0, msg) == 0) {
+        char src[16];  source_name (vol, src);
+        printf ("mount: %s (%s) on %s, %s\n", src, fat_vol_label (vol), mount_table[current_mounts - 1].mountpoint, fat_vol_exfat (vol) ? "exFAT" : "FAT32");
+        count++;
+      } else printf ("%s\n", msg);
+    }
+  }
+  for (int vol = 0; vol < 4; vol++) {                                // a disk that was taken out: its volumes go away, too
+    if (!vinfo[vol].used || usb_disk_present (vinfo[vol].disk)) continue;
+    int idx = mount_index_of_vol (vol);
+    char msg[64];
+    if (idx >= 0) { printf ("mount: %s was taken out\n", mount_table[idx].mountpoint);  unmount_volume (idx, 1, msg); }
+  }
+  return count;
+}
+
+void fatfs_automount (void) {                                        // at the start of the system
+  char rep[256];
+  fs_lock ();
+  mount_new_disks (rep);
+  fs_unlock ();
+}
+@
+
+\subsection{The system call}
+One call for all the work of the three programs: the operation, a number and three strings in a structure. The text that [[mount]] prints comes back in [[out]].
+
+<<fatvfs.c: the system call>>=
+struct mount_args { int op, index; char a[64], b[256], out[256]; };      // the same as in userland/arm64-extra.h
+
+static void fs_name (int index, char *out) {                          // the source of a mount: usb0p1, hda, ...
+  mount_table_entry *e = &mount_table[index];
+  if (e->fstype == FS_FAT) { source_name (e->device - DEV_FAT0, out);  return; }
+  if (e->fstype == FS_DEV) { strcpy (out, "devfs");  return; }
+  switch (e->device) { case DEV_HDA: strcpy (out, "hda"); break;  case DEV_HDB: strcpy (out, "hdb"); break;  case DEV_FD0: strcpy (out, "fd0"); break;  case DEV_FD1: strcpy (out, "fd1"); break;  default: strcpy (out, "disk"); }
+}
+
+static int parse_source (const char *a, int *disk, int *part) {         // "usb0", "usb1p2", "/dev/usb0p1"
+  if (strncmp (a, "/dev/", 5) == 0) a += 5;
+  if (strncmp (a, "usb", 3) != 0 || a[3] < '0' || a[3] > '9') return -1;
+  *disk = a[3] - '0';  *part = 0;
+  if (a[4] == 'p' && a[5] >= '1' && a[5] <= '4' && a[6] == 0) *part = a[5] - '0';
+  else if (a[4] != 0) return -1;
+  return 0;
+}
+
+void syscall_mount (context_t *r) {
+  struct mount_args *m = (struct mount_args *) r->ebx;
+  int res = -1;
+  m->out[0] = 0;
+  fs_lock ();
+  switch (m->op) {
+    case 0:                                                           // look for new disks and mount them
+      usb_rescan ();
+      res = mount_new_disks (m->out);
+      break;
+    case 1:                                                           // entry number index of the mount table, as text
+      if (m->index >= 0 && m->index < current_mounts) {
+        char src[16];  fs_name (m->index, src);
+        int n = 0;
+        strcpy (m->out, src);  strcat (m->out, " on ");  strcat (m->out, mount_table[m->index].mountpoint);  strcat (m->out, " type ");
+        strcat (m->out, mount_table[m->index].fstype == FS_FAT ? (fat_vol_exfat (mount_table[m->index].device - DEV_FAT0) ? "exfat" : "vfat") : fs_names[mount_table[m->index].fstype]);
+        (void) n;
+        res = 0;
+      }
+      break;
+    case 2: {                                                         // mount a on b
+      int disk, part;
+      if (parse_source (m->a, &disk, &part) != 0 || !usb_disk_present (disk)) { strcpy (m->out, "mount: no such disk");  res = -2;  break; }
+      for (int v = 0; v < 4; v++) if (vinfo[v].used && vinfo[v].disk == disk && vinfo[v].part == part) { strcpy (m->out, "mount: already mounted");  res = -16;  goto done; }
+      int vol = fat_mount (disk, part);
+      if (vol < 0) { strcpy (m->out, vol == -3 ? "mount: FAT12 and FAT16 are not supported" : "mount: no FAT32 or exFAT file system there");  res = -22;  break; }
+      res = mount_volume (vol, disk, part, m->b[0] ? m->b : 0, m->out);
+      break; }
+    case 3: {                                                         // umount b
+      int idx = mount_index_of_path (m->b);
+      if (idx < 0 || mount_table[idx].fstype != FS_FAT) { strcpy (m->out, "umount: not a mounted stick");  res = -22;  break; }
+      res = unmount_volume (idx, 0, m->out);
+      break; }
+    case 4: {                                                         // eject a: unmount everything of the disk and flush the stick
+      int disk, part;
+      if (parse_source (m->a, &disk, &part) != 0 || !usb_disk_present (disk)) { strcpy (m->out, "eject: no such disk");  res = -2;  break; }
+      for (int v = 0; v < 4; v++) if (vinfo[v].used && vinfo[v].disk == disk) { int idx = mount_index_of_vol (v);  if (idx >= 0 && unmount_volume (idx, 0, m->out) != 0) { res = -16;  goto done; } }
+      usb_disk_sync (disk);
+      res = 0;
+      break; }
+  }
+done:
+  fs_unlock ();
+  eax_return (res);
+}
+@
+
+\subsection{The programs: mount, umount, eject}
+Three small programs for the system call. [[mount]] without arguments looks for sticks that were plugged in since the last time (and mounts them under [[/Volumes]]), then prints the mount table;
+[[mount usb0p1 /mnt]] mounts partition 1 of the first stick on a directory; [[umount /Volumes/FATSTICK]] and [[eject usb0]] undo it (a stick should always be ejected before it is pulled out).
+
+<<userland/arm64-extra.h: mount>>=
+// mount, umount and eject (fatvfs.c)
+#define __NR_mount_cmd    640
+struct mount_args { int op, index; char a[64], b[256], out[256]; };    // op: 0 look for new disks, 1 entry of the mount table, 2 mount a on b, 3 umount b, 4 eject a
+static inline int mount_call (struct mount_args *m) { return syscall2 (__NR_mount_cmd, (int)(long)m); }
+static inline void mount_args_init (struct mount_args *m, int op, const char *a, const char *b) {
+  char *p = (char *) m;
+  for (unsigned i = 0; i < sizeof *m; i++) p[i] = 0;
+  m->op = op;
+  for (int i = 0; a && a[i] && i < 63; i++) m->a[i] = a[i];
+  for (int i = 0; b && b[i] && i < 255; i++) m->b[i] = b[i];
+}
+@
+
+<<userland/mount.c>>=
+#include "../ulixlib.h"
+#include "../arm64-extra.h"
+
+int main (int argc, char *argv[]) {
+  struct mount_args m;
+  if (argc == 3) {                                             // mount usb0p1 /mnt
+    mount_args_init (&m, 2, argv[1], argv[2]);
+    int r = mount_call (&m);
+    if (r != 0) printf ("%s\n", m.out[0] ? m.out : "mount failed");
+    return r != 0;
+  }
+  if (argc != 1 && !(argc == 2 && argv[1][0] == '-' && argv[1][1] == 'a')) { printf ("usage: mount [-a]        (look for sticks and list what is mounted)\n       mount usb0p1 /dir  (mount a partition on a directory)\n");  return 1; }
+  mount_args_init (&m, 0, 0, 0);
+  mount_call (&m);                                             // a stick that was plugged in now is mounted under /Volumes
+  for (int i = 0; ; i++) {
+    mount_args_init (&m, 1, 0, 0);  m.index = i;
+    if (mount_call (&m) != 0) break;
+    printf ("%s\n", m.out);
+  }
+  return 0;
+}
+@
+
+<<userland/umount.c>>=
+#include "../ulixlib.h"
+#include "../arm64-extra.h"
+
+int main (int argc, char *argv[]) {
+  struct mount_args m;
+  if (argc != 2) { printf ("usage: umount /Volumes/NAME\n");  return 1; }
+  mount_args_init (&m, 3, 0, argv[1]);
+  int r = mount_call (&m);
+  if (r != 0) printf ("%s\n", m.out[0] ? m.out : "umount failed");
+  return r != 0;
+}
+@
+
+<<userland/eject.c>>=
+#include "../ulixlib.h"
+#include "../arm64-extra.h"
+
+int main (int argc, char *argv[]) {
+  struct mount_args m;
+  if (argc != 2) { printf ("usage: eject usb0   (unmounts the stick and writes its cache: then it can be pulled out)\n");  return 1; }
+  mount_args_init (&m, 4, argv[1], 0);
+  int r = mount_call (&m);
+  if (r != 0) printf ("%s\n", m.out[0] ? m.out : "eject failed");
+  else printf ("%s can be removed\n", argv[1]);
+  return r != 0;
+}
+@

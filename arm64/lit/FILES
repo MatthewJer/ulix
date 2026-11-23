@@ -46,6 +46,12 @@ usb.h
 pci.c
 xhci.c
 usbhid.c
+fat.h
+fat.c
+fatvfs.c
+userland/mount.c
+userland/umount.c
+userland/eject.c
 sntp.c
 stats.c
 bookfs_test.c

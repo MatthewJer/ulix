@@ -1333,11 +1333,19 @@ open file that did not come through \texttt{linux\_openat} has an empty name and
 
 <<linux_abi.c: file status, directories and descriptors>>=
 #define FD_PATH 256
-static char fd_path[256][FD_PATH];                           // (the book's table of open files has MX_MAX_FILES = 256 entries)
+static char fd_path[256 + 16][FD_PATH];                      // (the book's table of open files has MX_MAX_FILES = 256 entries; behind them the 16 files of a FAT stick)
+extern int fatfs_readdir (int fd, int index, char *name, int size, unsigned *ino, int *is_dir), fatfs_fstat (int fd, struct stat *st), fatfs_ftruncate (int fd, int length), fatfs_rename (const char *from, const char *to);
+extern int fatfs_space (const char *path, unsigned long *bsize, unsigned long *blocks, unsigned long *bfree);
+static int fdp (int gfd) {                                   // the place of a file in fd_path (-1: it keeps no name: terminal, pipe, socket, device)
+  if (gfd < 0) return -1;
+  if ((gfd >> 8) == FS_MINIX) return gfd & 0xff;
+  if ((gfd >> 8) == FS_FAT) return 256 + (gfd & 0xff);
+  return -1;
+}
 
 // a duplicate (dup, fcntl F_DUPFD) is a new open file in the book's table: it keeps the name
 static void copy_fd_path (int from_gfd, int to_gfd) {
-  if (from_gfd >= 0 && to_gfd >= 0 && (from_gfd >> 8) == FS_MINIX && (to_gfd >> 8) == FS_MINIX) strcpy (fd_path[to_gfd & 0xff], fd_path[from_gfd & 0xff]);
+  if (fdp (from_gfd) >= 0 && fdp (to_gfd) >= 0) strcpy (fd_path[fdp (to_gfd)], fd_path[fdp (from_gfd)]);
 }
 
 // the name to use for an *at call: the path itself if it is absolute or relative to the working directory, else the name of the directory and the path
@@ -1348,8 +1356,8 @@ static const char *at_name (int dirfd, const char *path, char *buf, long *err) {
   if (dirfd == AT_FDCWD || path[0] == '/') return path;
   int gfd = pfd2gfd (dirfd);
   if (dirfd < 0 || gfd == -1) { *err = -LE_EBADF;  return 0; }
-  if ((gfd >> 8) != FS_MINIX || !fd_path[gfd & 0xff][0]) { *err = -LE_ENOTDIR;  return 0; }
-  const char *d = fd_path[gfd & 0xff];
+  if (fdp (gfd) < 0 || !fd_path[fdp (gfd)][0]) { *err = -LE_ENOTDIR;  return 0; }
+  const char *d = fd_path[fdp (gfd)];
   unsigned n = strlen (d), m = strlen (path);
   if (n + 1 + m + 1 > FD_PATH) { *err = -LE_EINVAL;  return 0; }
   memcpy (buf, d, n);
@@ -1367,6 +1375,10 @@ static long linux_statfs (const char *path, void *buf) {      // path is 0 for f
   if (path) { struct stat st;  if (!user_string_ok ((u64) path)) return -LE_EFAULT;  char nb[FD_PATH];  long er = 0;  const char *name = at_name (AT_FDCWD, path, nb, &er);  if (!name || u_stat (name, &st) != 0 || strncmp (name, "/dev/", 5) == 0) return -LE_ENOENT; }   // (a name that does not exist: Python probes /dev/shm)
   long *f = buf;
   memset (buf, 0, 120);
+  if (path) {                                                  // a USB stick: its own numbers
+    unsigned long bs, bl, bf;
+    if (fatfs_space (path, &bs, &bl, &bf) == 0) { f[0] = 0x4d44;  f[1] = bs;  f[2] = bl;  f[3] = f[4] = bf;  f[8] = 255;  f[9] = bs;  return 0; }
+  }
   f[0] = 0x2478;  f[1] = 1024;  f[2] = 32768;  f[3] = f[4] = 16384;  f[5] = 2048;  f[6] = 1024;   // type, bsize, blocks, bfree, bavail, files, ffree
   f[8] = 30;  f[9] = 1024;                                    // (f[7] is the fsid) namelen, frsize
   return 0;
@@ -1399,8 +1411,8 @@ static long linux_openat (context_t *r, int dirfd, const char *path, int flags) 
   }
   {                                                           // remember the absolute name for later *at calls with this descriptor
     int gfd = pfd2gfd (fd);
-    if (gfd >= 0 && (gfd >> 8) == FS_MINIX) {
-      char *dst = fd_path[gfd & 0xff];
+    if (fdp (gfd) >= 0) {
+      char *dst = fd_path[fdp (gfd)];
       unsigned n = 0;
       if (path[0] != '/') {                                   // relative to the working directory: put that in front
         if (u_getcwd (dst, FD_PATH)) n = strlen (dst);
@@ -1631,6 +1643,12 @@ static long linux_fstat (int fd, struct kstat *k) {
   kstat_clear (k);
   if (gfd < 0 || (gfd >> 8) == FS_DEV || (gfd >> 8) == 5) { k->st_mode = S_IFCHR | 0620; return 0; }    // the terminal (negative numbers) and the devices
   if ((gfd >> 8) == FS_PIPE_NR)        { k->st_mode = S_IFIFO | 0600; return 0; }
+  if ((gfd >> 8) == FS_FAT) {                                  // a file of a USB stick
+    struct stat st = { 0 };
+    if (fatfs_fstat (gfd & 0xff, &st) != 0) return -LE_EBADF;
+    kstat_from_book (k, &st);
+    return 0;
+  }
   if ((gfd >> 8) != FS_MINIX) return -LE_EBADF;
   struct int_minix2_inode *in = mx_status[gfd & 0xff].int_inode;
   if (!in) return -LE_EBADF;
@@ -1664,8 +1682,28 @@ type of each entry is read from its inode (musl's \texttt{readdir} passes it on 
 #define DT_DIR_ 4
 #define DT_REG_ 8
 
+static long getdents_fat (int gfd, char *buf, u64 size) {      // a directory of a USB stick: the position of the descriptor is the number of the next entry
+  if (!user_ok ((u64) buf, size, 1)) return -LE_EFAULT;
+  u64 used = 0;
+  for (;;) {
+    int index = u_lseek (gfd, 0, 1);
+    char name[64];  unsigned ino;  int is_dir;
+    if (index < 0 || fatfs_readdir (gfd & 0xff, index, name, sizeof name, &ino, &is_dir) != 0) break;
+    int n = strlen (name);
+    u64 reclen = (19 + n + 1 + 7) & ~7UL;
+    if (used + reclen > size) return used ? (long) used : -LE_EINVAL;
+    char *e = buf + used;
+    *(u64 *) e = ino;  *(long *) (e + 8) = index + 1;  *(unsigned short *) (e + 16) = reclen;  e[18] = is_dir ? DT_DIR_ : DT_REG_;
+    memcpy (e + 19, name, n + 1);
+    used += reclen;
+    u_lseek (gfd, index + 1, 0);
+  }
+  return used;
+}
+
 static long linux_getdents64 (int fd, char *buf, u64 size) {
   int gfd = pfd2gfd (fd);
+  if (fd >= 0 && gfd >= 0 && (gfd >> 8) == FS_FAT) return getdents_fat (gfd, buf, size);
   if (fd < 0 || gfd < 0 || (gfd >> 8) != FS_MINIX || !mx_status[gfd & 0xff].int_inode) return -LE_EBADF;
   struct mx_filestat *f = &mx_status[gfd & 0xff];
   struct int_minix2_inode *dir = f->int_inode;
@@ -1790,6 +1828,7 @@ static long linux_prlimit64 (int pid, int res, const struct rlim *new, struct rl
 extern int u_lseek (int gfd, int offset, int whence), u_write (int gfd, void *buf, int n);
 static long linux_ftruncate (int fd, long length) {
   int gfd = pfd2gfd (fd);
+  if (fd >= 0 && gfd >= 0 && (gfd >> 8) == FS_FAT) return fatfs_ftruncate (gfd & 0xff, length) < 0 ? -LE_EACCES : 0;
   if (fd < 0 || gfd < 0 || (gfd >> 8) != FS_MINIX) return -LE_EBADF;
   struct int_minix2_inode *in = mx_status[gfd & 0xff].int_inode;
   if (in && (long) in->i_size == length) return 0;             // nothing to cut off (the book refuses that: open (..., O_CREAT | O_TRUNC) of a new file failed)
@@ -1829,6 +1868,8 @@ static long linux_renameat (int olddir, const char *old, int newdir, const char 
   if (!(old = at_name (olddir, old, obuf, &err)) || !(new = at_name (newdir, new, nbuf, &err))) return err;
   struct stat st = { 0 }, st2 = { 0 };
   if (u_stat (old, &st) != 0) return -LE_ENOENT;
+  { int fr = fatfs_rename (old, new);                          // on a USB stick: the file system does it itself (a directory, too)
+    if (fr != -100) return fr == 0 ? 0 : -LE_EACCES; }
   if ((st.st_mode & S_IFMT) == S_IFDIR) return -LE_EPERM;
   if (u_stat (new, &st2) == 0) {
     if ((st2.st_mode & S_IFMT) == S_IFDIR) return -LE_EISDIR;
@@ -2495,8 +2536,8 @@ static void linux_syscall_inner (context_t *r) {
     case L_fchdir: {                                           // the name that linux_openat remembered
       int gfd = pfd2gfd (a0);
       if (a0 < 0 || gfd == -1) { ret = -LE_EBADF; break; }
-      if ((gfd >> 8) != FS_MINIX || !fd_path[gfd & 0xff][0]) { ret = -LE_ENOTDIR; break; }
-      ret = ulix_call (r, syscall_chdir, (long) fd_path[gfd & 0xff], 0, 0, 0, 0) < 0 ? -LE_ENOENT : 0;
+      if (fdp (gfd) < 0 || !fd_path[fdp (gfd)][0]) { ret = -LE_ENOTDIR; break; }
+      ret = ulix_call (r, syscall_chdir, (long) fd_path[fdp (gfd)], 0, 0, 0, 0) < 0 ? -LE_ENOENT : 0;
       break;
     }
     case L_statfs:  ret = linux_statfs ((const char *) a0, (void *) a1); break;

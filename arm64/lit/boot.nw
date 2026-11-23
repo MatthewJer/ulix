@@ -791,10 +791,12 @@ static void console_main (void) {
   extern void net_configure_from_command_line (void), dbg_init (void);      // DBG-HTTP: dbg_init
   dbg_init ();                                                              // DBG-HTTP: debug=http on the command line
   extern int usb_init (void);
+  extern void fatfs_automount (void);
   usb_init ();                                                    // a USB keyboard and mouse, if the board has an xHCI controller (chapter "USB")
   int net_ok = net_init () == 0;                                  // the network card, if there is one (silent if not)
   if (net_ok) net_configure_from_command_line ();                 // ip=, gw=, dns=, netecho of the command line
-  arch_threads_init ();
+  arch_threads_init ();                                           // (this sets up the mount table: the sticks can be mounted only now)
+  fatfs_automount ();                                             // USB sticks with FAT32 or exFAT: mounted at /Volumes/LABEL (chapter "Mounting")
   console_irq_init ();
   extern void netd_start (void);
   if (net_ok) netd_start ();                                      // the network thread: frames are handled as they arrive

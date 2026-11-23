@@ -100,7 +100,9 @@ int u_close (int fd) {
 // share the read/write position. For a file of the root disk that is the same entry of mx_status (the book's u_reopen made a copy
 // with its own position); file_users counts the descriptors besides the first one, and only the last u_close closes the file. Everything
 // else (pipe ends, sockets, devices) is copied by u_reopen as before.
+extern int fatfs_share (int fd);
 int u_share (int fd) {
+  if (fd >= 0 && (fd >> 8) == FS_FAT) return fatfs_share (fd & 0xff) < 0 ? -1 : fd;       // a file of a stick: one open file with a shared position
   if (!is_file (fd)) return u_reopen (fd);
   file_users[fd & 0xff]++;
   return fd;
@@ -142,8 +144,18 @@ does not know them), but \texttt{open} finds them.
 
 <<pipes.c: virtual devices>>=
 #define FS_VDEV   5                           // /dev/null, /dev/zero, /dev/random and /dev/urandom
-static const char *vdev_names[] = { "/dev/null", "/dev/zero", "/dev/random", "/dev/urandom" };
-enum { VDEV_NULL, VDEV_ZERO, VDEV_RANDOM, VDEV_URANDOM, VDEVS };
+static const char *vdev_names[] = { "/dev/null", "/dev/zero", "/dev/random", "/dev/urandom", "/dev/cpustat" };
+enum { VDEV_NULL, VDEV_ZERO, VDEV_RANDOM, VDEV_URANDOM, VDEV_CPUSTAT, VDEVS };
+
+// /dev/cpustat: every read returns the numbers of the moment as text (a program reads it with one read of 512 bytes or more and subtracts the numbers of the
+// read before): the timer ticks since the start, and for every CPU the ticks in which it ran a process and the ticks in which it waited (stats.c, as top shows them)
+extern unsigned stats_busy[8], stats_idle[8];
+extern int smp_online_cpus (void);
+static int cpustat_text (char *out) {
+  int n = sprintf (out, "ticks %u\n", (unsigned) system_ticks);
+  for (int c = 0; c < smp_online_cpus () && c < 8; c++) n += sprintf (out + n, "cpu%d %u %u\n", c, stats_busy[c], stats_idle[c]);
+  return n;
+}
 
 static int is_vdev (int gfd) { return gfd >= 0 && (gfd >> 8) == FS_VDEV; }
 
@@ -151,6 +163,7 @@ static int vdev_read (int gfd, void *buf, int n) {
   switch (gfd & 0xff) {
     case VDEV_NULL: return 0;                                            // end of file
     case VDEV_ZERO: memset (buf, 0, n);  return n;
+    case VDEV_CPUSTAT: { char text[256];  int len = cpustat_text (text);  if (len > n) len = n;  memcpy (buf, text, len);  return len; }
     default: {
       char tmp[256];                                                     // the generator is asked for a few bytes at a time
       for (int done = 0; done < n; ) {
@@ -465,6 +478,8 @@ static void fs_enter (void) {
 int fs_busy_by_me (void) { return fs_owner == current_task; }      // swap.c: the thread is inside the file system code
 
 static void fs_leave (void) { if (--fs_depth <= 0) { fs_owner = -1;  fs_depth = 0; } }
+void fs_lock (void)   { fs_enter (); }               // for fatvfs.c (mount): the file system code runs one thread at a time
+void fs_unlock (void) { fs_leave (); }
 
 int u_stat (const char *path, struct stat *buf)    { char kp[FS_PATH];  struct stat st;  path = kpath (path, kp);  fs_enter ();  int r = book_u_stat (path, &st);  fs_leave ();  if (r == 0) *buf = st;  return r; }
 int u_unlink (const char *path)                    { char kp[FS_PATH];  path = kpath (path, kp);  fs_enter ();  int r = book_u_unlink (path);  fs_leave ();  return r; }

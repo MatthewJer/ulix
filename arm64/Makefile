@@ -76,7 +76,7 @@ check-submodules:
 all: check-submodules
 .PHONY: check-submodules
 
-OBJS = start.o vectors.o linux_abi.o pipes.o fastfs.o sockets.o pty.o irq.o mmu.o virtio.o sdcard.o virtionet.o genet.o netdev.o net.o ip6.o tcp.o dhcp.o dns.o netconf.o echo.o net_test.o net_syscalls.o random.o mbox.o fb.o fbcon.o fbfont.o pci.o xhci.o usbhid.o sntp.o netd.o rcconf.o stats.o dbg_http.o minixfs.o elf.o ulix-port.o glue.o arch_thread.o arch_console.o arch_clock.o arch_swap.o arch_vt.o dt.o gic.o smp.o \
+OBJS = start.o vectors.o linux_abi.o pipes.o fastfs.o sockets.o pty.o irq.o mmu.o virtio.o sdcard.o virtionet.o genet.o netdev.o net.o ip6.o tcp.o dhcp.o dns.o netconf.o echo.o net_test.o net_syscalls.o random.o mbox.o fb.o fbcon.o fbfont.o pci.o xhci.o usbhid.o fat.o fatvfs.o sntp.o netd.o rcconf.o stats.o dbg_http.o minixfs.o elf.o ulix-port.o glue.o arch_thread.o arch_console.o arch_clock.o arch_swap.o arch_vt.o dt.o gic.o smp.o \
        bookfs_test.o thread_test.o proc_test.o kmain.o
 
 all: ulix.elf ulix-console.elf ulix-shell.elf ulix.bin ulix-console.bin ulix-shell.bin $(DISK) $(GENDIR)/disk_expected.h
@@ -209,6 +209,7 @@ $(GENDIR)/ulix-port.c $(GENDIR)/ulix-api.h: $(GENFILES) port.manifest tools/port
 	           -e 's/^int u_link (const char \*path, const char \*path2) {/int book_u_link (const char *path, const char *path2) {/' -e 's/^int u_symlink (const char \*path, const char \*path2) {/int book_u_symlink (const char *path, const char *path2) {/' -e 's/^int u_ftruncate (int fd, int length) {/int book_u_ftruncate (int fd, int length) {/' -e 's/^int u_mkdir (const char \*path, int mode) {/int book_u_mkdir (const char *path, int mode) {/' \
 	           -e 's/^int u_getdent (const char \*path, int index, struct dir_entry \*buf) {/int book_u_getdent (const char *path, int index, struct dir_entry *buf) {/' -e 's/^int u_readlink (char \*path, char \*restrict buf, size_t bufsize) {/int book_u_readlink (char *path, char *restrict buf, size_t bufsize) {/' -e 's/^int u_chown (const char \*path, short owner, short group) {/int book_u_chown (const char *path, short owner, short group) {/' -e 's/^int u_chmod (const char \*path, word mode) {/int book_u_chmod (const char *path, word mode) {/' -e 's/^int mx_pathname_to_ino (int device, const char \*path) {/int book_mx_pathname_to_ino (int device, const char *path) {/' $(GENDIR)/ulix-port.c && rm $(GENDIR)/ulix-port.c.bak   # DBG-HTTP: readblock and mx_pathname_to_ino are timed in dbg_http.c (only with debug=http)
 	grep -q 'book_scheduler (context_t' $(GENDIR)/ulix-port.c && grep -q 'book_u_kill (int' $(GENDIR)/ulix-port.c && grep -q 'book_mutex_lock (lock' $(GENDIR)/ulix-port.c && grep -q 'book_u_read (int' $(GENDIR)/ulix-port.c && grep -q 'book_u_write (int' $(GENDIR)/ulix-port.c && grep -q 'book_u_close (int' $(GENDIR)/ulix-port.c && grep -q 'book_u_reopen (int' $(GENDIR)/ulix-port.c && grep -q 'book_u_open (char' $(GENDIR)/ulix-port.c && grep -q 'book_u_mkdir (const' $(GENDIR)/ulix-port.c && grep -q 'book_u_stat (const' $(GENDIR)/ulix-port.c && grep -q 'book_u_chmod (const' $(GENDIR)/ulix-port.c
+	python3 tools/fatpatch.py $(GENDIR)/ulix-port.c        # the FS_FAT cases of the book's file system layer (chapter "Mounting")
 
 BOOKFLAGS = -mno-outline-atomics -std=gnu99 -O0 -g -ffreestanding -nostdlib -nostdinc -fno-builtin -fno-stack-protector \
             -mgeneral-regs-only -Wall -Wno-unused -Wno-pointer-sign -I$(GENDIR)
@@ -264,6 +265,9 @@ virtionet.o genet.o netdev.o net.o ip6.o tcp.o dhcp.o dns.o netconf.o echo.o net
 random.o: plat.h ulix.h cache.h
 mbox.o fb.o fbcon.o: plat.h ulix.h cache.h fb.h
 pci.o xhci.o usbhid.o: plat.h ulix.h cache.h delay.h usb.h
+fat.o: fat.c fat.h
+fatvfs.o: fatvfs.c fat.h usb.h $(GENFILES) $(GENDIR)/ulix-api.h
+	$(CC) $(BOOKFLAGS) -I. -c -o $@ $<
 # the screen code moves megabytes (a scroll): optimised, but without the "replace this loop by a call of memmove" (the kernel has none)
 fbcon.o: fbcon.c
 	$(CC) $(CFLAGS) -O2 -fno-tree-loop-distribute-patterns -c -o $@ $<
