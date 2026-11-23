@@ -178,8 +178,9 @@ static void classify (const struct node *stack, int depth) {
     plat.sdhci_irq = (n->irq && n->irqlen >= 12) ? irq_number (n->irq) : 0;
   } else if (compat_has (n, "brcm,bcm2711-rng200", 1) && n->reg) {
     plat.rng = address (stack, depth, n->reg);
-  } else if (compat_has (n, "pci-host-ecam-generic", 1) && n->reg) {          // qemu virt: the PCI Express host (chapter "USB")
-    plat.pci_cfg = address (stack, depth, n->reg);
+  } else if ((compat_has (n, "pci-host-ecam-generic", 1) || compat_has (n, "brcm,bcm2711-pcie", 1)) && n->reg) {   // the PCI Express host (chapter "USB")
+    plat.pci_type = compat_has (n, "brcm,bcm2711-pcie", 1) ? 2 : 1;
+    plat.pci_cfg = address (stack, depth, n->reg);                // (the Pi: the registers of the controller)
     int psz = 4 * (n->ac + n->pac + n->sc);                    // an entry of "ranges": PCI address (3 cells: flags, address), CPU address, size
     for (int off = 0; n->ranges && off + psz <= n->rangeslen; off += psz) {
       if (((be32 (n->ranges + off) >> 24) & 3) == 2) {         // the window for 32 bit memory BARs

@@ -18,6 +18,7 @@ compatible with it. Never copy Linux code (GPL-2.0-only).
 | SQLite | <https://github.com/sqlite/sqlite> | `version-3.46.1` | public domain | Python `sqlite3` |
 | LLVM libc++, libc++abi, libunwind | <https://github.com/llvm/llvm-project> | `llvmorg-21.1.8` | Apache-2.0 with LLVM exception (`libcxx/LICENSE.TXT`) | the C++ standard library (issue #43), sparse checkout, see `third_party/LICENCE-CHECK-llvm.md` |
 | Terminus Font (bitmap fonts) | <https://sourceforge.net/projects/terminus-font/> | `4.49.1` | SIL OFL 1.1 (`third_party/terminus/OFL.TXT`) | the text of the HDMI console, three sizes converted at build time, copied files not a submodule, see `third_party/LICENCE-CHECK-terminus.md` |
+| BCM2711 PCIe bring-up (FreeBSD `bcm2838_pci.c`) | <https://github.com/freebsd/freebsd-src> | `main`, 2026-11-23 | ISC, Copyright (c) 2020 Dr Robert Harvey Crowston | register values and order of steps, rewritten in `arm64/lit/usb.nw`; see `third_party/LICENCE-CHECK-freebsd-bcm2838-pci.md` |
 | ncurses | <https://github.com/ThomasDickey/ncurses-snapshots> | `v6_5` | MIT-style | Python `curses` |
 | bzip2 | <https://sourceware.org/git/bzip2.git> | `bzip2-1.0.8` | BSD-style | Python `bz2`; libarchive (`tar -j`) |
 | xz (liblzma only) | <https://github.com/tukaani-project/xz> | `v5.4.7` (never 5.6.0 or 5.6.1) | 0BSD (liblzma) | Python `lzma`; libarchive (`tar -J`) |

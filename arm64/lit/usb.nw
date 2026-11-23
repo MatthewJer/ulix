@@ -34,14 +34,35 @@ the BAR is memory (bit 0 clear) and whether it is 64 bits wide (it then uses the
 <<pci.c>>=
 #include "ulix.h"
 #include "plat.h"
+#include "delay.h"
 #include "usb.h"
 
-static volatile u32 *cfg_word (int bus, int dev, int fn, int reg) {
+extern int mbox_property (u32 *buf);                          // mbox.c
+
+<<pci.c: the Raspberry Pi 4 host>>
+
+<<pci.c: configuration space>>
+
+<<pci.c: finding and setting up devices>>
+@
+
+<<pci.c: configuration space>>=
+static volatile u32 *cfg_word (int bus, int dev, int fn, int reg) {          // generic host: the configuration space is a piece of memory
   return (volatile u32 *) (KERNEL_VA + plat.pci_cfg + ((u64) bus << 20 | (u64) dev << 15 | (u64) fn << 12 | (reg & 0xffc)));
 }
-u32  pci_read (int bus, int dev, int fn, int reg)            { return *cfg_word (bus, dev, fn, reg); }
-void pci_write (int bus, int dev, int fn, int reg, u32 v)    { *cfg_word (bus, dev, fn, reg) = v; }
 
+u32 pci_read (int bus, int dev, int fn, int reg) {
+  if (plat.pci_type == 2) return brcm_read (bus, dev, fn, reg);
+  return *cfg_word (bus, dev, fn, reg);
+}
+
+void pci_write (int bus, int dev, int fn, int reg, u32 v) {
+  if (plat.pci_type == 2) { brcm_write (bus, dev, fn, reg, v);  return; }
+  *cfg_word (bus, dev, fn, reg) = v;
+}
+@
+
+<<pci.c: finding and setting up devices>>=
 static u64 mem_next;                                          // the next free address of the window (as the devices see it)
 
 u64 pci_assign_bar (const struct pci_dev *d, int bar, u64 *size_out) {   // gives BAR number bar an address; returns it as the cores see it (0: no)
@@ -73,18 +94,130 @@ void pci_enable (const struct pci_dev *d) {                   // memory space an
   pci_write (d->bus, d->dev, d->fn, 4, (cmd & 0xffff) | 0x6);
 }
 
-int pci_find (u32 class_if, struct pci_dev *d) {              // the first device with this class code (base, sub, interface): 0 if there is one
-  if (!plat.pci_cfg) return -1;
-  if (!mem_next) mem_next = plat.pci_mem_pci;
+static int host_up = 0, next_bus = 1;
+
+static int scan_bus (int bus, u32 class_if, struct pci_dev *d) {   // the devices of one bus; a bridge gets the next bus number and its bus is scanned, too
   for (int dev = 0; dev < 32; dev++) {
-    u32 id = pci_read (0, dev, 0, 0);
-    if ((id & 0xffff) == 0xffff) continue;                    // nobody there
-    if ((pci_read (0, dev, 0, 8) >> 8) == class_if) {
-      d->bus = 0;  d->dev = dev;  d->fn = 0;  d->vendor = id & 0xffff;  d->device = id >> 16;
+    if (plat.pci_type == 2 && dev != 0) break;               // on the Pi only device 0 exists on a bus (looking at the others hangs the memory controller)
+    u32 id = pci_read (bus, dev, 0, 0);
+    if ((id & 0xffff) == 0xffff || id == 0) continue;        // nobody there
+    u32 type = (pci_read (bus, dev, 0, 0x0c) >> 16) & 0x7f;
+    u32 class = pci_read (bus, dev, 0, 8) >> 8;
+    if (type == 1) {                                          // a bridge: bus numbers (primary, secondary, subordinate) and a window for the BARs behind it
+      int sec = next_bus++;
+      pci_write (bus, dev, 0, 0x18, bus | (sec << 8) | (sec << 16));
+      u64 end = plat.pci_mem_pci + plat.pci_mem_size - 1;
+      pci_write (bus, dev, 0, 0x20, ((plat.pci_mem_pci >> 16) & 0xfff0) | (end & 0xfff00000));
+      u32 cmd = pci_read (bus, dev, 0, 4);
+      pci_write (bus, dev, 0, 4, (cmd & 0xffff) | 0x6);
+      if (scan_bus (sec, class_if, d) == 0) return 0;
+      continue;
+    }
+    if (class == class_if) {
+      d->bus = bus;  d->dev = dev;  d->fn = 0;  d->vendor = id & 0xffff;  d->device = id >> 16;
       return 0;
     }
   }
   return -1;
+}
+
+int pci_find (u32 class_if, struct pci_dev *d) {              // the first device with this class code (base, sub, interface): 0 if there is one
+  if (!plat.pci_cfg) return -1;
+  if (!host_up) {
+    host_up = 1;
+    if (plat.pci_type == 2 && brcm_init () < 0) { plat.pci_cfg = 0;  return -1; }
+    mem_next = plat.pci_mem_pci;
+    next_bus = 1;
+  }
+  return scan_bus (0, class_if, d);
+}
+
+void pci_vl805_reset (const struct pci_dev *d) {              // see below: the VL805 gets its program from the VideoCore (only on the Pi)
+  if (plat.pci_type != 2) return;
+  static u32 msg[8] __attribute__ ((aligned (16)));
+  msg[0] = 32;  msg[1] = 0;
+  msg[2] = 0x00030058;  msg[3] = 4;  msg[4] = 4;               // tag "notify xHCI reset": the PCI address of the device
+  msg[5] = (u32) d->bus << 20 | (u32) d->dev << 15 | (u32) d->fn << 12;
+  msg[6] = 0;  msg[7] = 0;
+  if (mbox_property (msg) < 0) printf ("usb: the VideoCore did not answer the xHCI notification (the VL805 may have its program already)\n");
+  delay_us (20000);
+}
+@
+\subsection{The PCI Express controller of the Raspberry Pi 4B}
+The BCM2711 has its own PCIe root complex. It differs from the generic host in three ways:
+
+\begin{itemize}
+\item \textbf{It must be started.} A bit in the bridge control register ([[0x9210]]) holds it in reset; the kernel resets it, tells it the DMA window and the address window for the devices, and waits until
+  the link to the device is up (the status register [[0x4068]] shows ``physical link up'' and ``data link active'', and the link status [[0xbc]] a speed). \emph{Inbound} is the direction device to RAM (DMA): the controller maps PCI address 0 to RAM address 0, so a device uses
+  physical addresses, as on qemu. \emph{Outbound} is core to device: a window of the core's address space (here [[0x600000000]]) shows the PCI addresses [[0xc0000000]] and up, which is where the BARs go. Both addresses come from the device tree.
+\item \textbf{The configuration space is behind an index register.} The registers of the root port itself (bus 0) lie directly at the start of the controller; for every other device the kernel writes
+  its address (bus, device, function) into the index register ([[0x9000]]) and then reads or writes through a window ([[0x8000]]). Only device 0 exists on a bus; looking for others blocks the memory controller.
+\item \textbf{The VL805 gets its program from the VideoCore.} The USB chip behind the root port has no flash of its own: its program is loaded by the graphics processor, which the ARM cores ask (mailbox tag [[0x00030058]]) with the PCI address of the device. The kernel does it
+  after the BAR is assigned and before the device is switched on.
+\end{itemize}
+The values and the order of the steps follow the FreeBSD driver [[bcm2838_pci.c]] (ISC licence, Copyright (c) 2020 Dr Robert Harvey Crowston; see [[third_party/LICENCE-CHECK-freebsd-bcm2838-pci.md]]); the firmware tag is the one the Raspberry Pi firmware documents for this purpose.
+\textbf{This code has not run on a board yet.}
+
+<<pci.c: the Raspberry Pi 4 host>>=
+/* The register values and the order of the steps follow FreeBSD's sys/arm/broadcom/bcm2835/bcm2838_pci.c:
+ *   SPDX-License-Identifier: ISC, Copyright (c) 2020 Dr Robert Harvey Crowston <crowston@protonmail.com>
+ * (the licence text is in third_party/LICENCE-CHECK-freebsd-bcm2838-pci.md) */
+#define RC(off)  (*(volatile u32 *) (KERNEL_VA + plat.pci_cfg + (off)))
+#define RC_BRIDGE_CTRL    0x9210                               // bit 0: bridge disabled, bit 1: bridge in reset
+#define RC_HARD_DEBUG     0x4204                               // bit 1: clock request enable
+#define RC_DMA_CONFIG     0x4008
+#define RC_DMA_WINDOW_LO  0x4034
+#define RC_DMA_WINDOW_HI  0x4038
+#define RC_GISB_WINDOW    0x402c
+#define RC_DMA_WINDOW_1   0x403c
+#define RC_STATE          0x4068                               // bits 4 and 5: physical link up, data link active
+#define RC_LINK_STATE     0x00bc                               // link status of the root port: the speed is in bits 16..19, 0 = no link
+#define RC_BUS_WINDOW_LO  0x400c                               // the outbound window: PCI address,
+#define RC_BUS_WINDOW_HI  0x4010
+#define RC_CPU_WINDOW_LO  0x4070                               // ... and the addresses of the cores (bits 16..31 of start and end),
+#define RC_CPU_WINDOW_STARTHI 0x4080                           // ... their upper bits
+#define RC_CPU_WINDOW_ENDHI   0x4084
+#define RC_INDEX          0x9000                               // configuration space of the devices: index (bus, device, function) ...
+#define RC_DATA           0x8000                               // ... and window
+#define RC_CLASS          0x043c                               // class code of the root port (it starts as an endpoint)
+
+static u32 brcm_read (int bus, int dev, int fn, int reg) {
+  if (bus == 0) return (dev == 0 && fn == 0) ? RC (reg & 0xffc) : 0xffffffff;       // the root port: at the start of the controller
+  if (dev != 0 || fn != 0) return 0xffffffff;
+  RC (RC_INDEX) = (u32) bus << 20 | (u32) dev << 15 | (u32) fn << 12;
+  return RC (RC_DATA + (reg & 0xffc));
+}
+
+static void brcm_write (int bus, int dev, int fn, int reg, u32 v) {
+  if (bus == 0) { if (dev == 0 && fn == 0) RC (reg & 0xffc) = v;  return; }
+  if (dev != 0 || fn != 0) return;
+  RC (RC_INDEX) = (u32) bus << 20 | (u32) dev << 15 | (u32) fn << 12;
+  RC (RC_DATA + (reg & 0xffc)) = v;
+}
+
+static int brcm_init (void) {
+  arch_map_device (plat.pci_cfg);
+  arch_map_device (plat.pci_mem_cpu);
+  RC (RC_BRIDGE_CTRL) |= 3;   delay_us (100);                   // hold the bridge in reset (and disabled), then let the reset go
+  RC (RC_BRIDGE_CTRL) &= ~2u; delay_us (100);
+  RC (RC_HARD_DEBUG) = 0;     delay_us (100);
+  RC (RC_DMA_WINDOW_LO) = 0x12;  RC (RC_DMA_WINDOW_HI) = 0;      // inbound: PCI address 0 -> RAM address 0, a window of 8 GByte (log2 33 - 15 = 0x12)
+  RC (RC_DMA_CONFIG) = 0x90003000;                               // (the size again in bits 27..31, and "window enable")
+  RC (RC_GISB_WINDOW) = 0;  RC (RC_DMA_WINDOW_1) = 0;
+  RC (RC_BRIDGE_CTRL) &= ~1u; delay_us (100);                    // enable the bridge
+  int ready = 0;
+  for (int t = 0; t < 100 && !ready; t++) { if ((RC (RC_STATE) & 0x30) == 0x30) ready = 1; else delay_us (1000); }
+  if (!ready) { printf ("pcie: the link to the USB chip does not come up (state 0x%x)\n", RC (RC_STATE)); return -1; }
+  if ((RC (RC_LINK_STATE) >> 16) == 0) { printf ("pcie: no link\n"); return -1; }
+  u64 pci = plat.pci_mem_pci, cpu = plat.pci_mem_cpu, end = cpu + plat.pci_mem_size - 1;
+  RC (RC_BUS_WINDOW_LO) = (u32) pci;  RC (RC_BUS_WINDOW_HI) = (u32) (pci >> 32);
+  RC (RC_CPU_WINDOW_LO) = (u32) (((cpu >> 16) & 0xfff0) | (end & 0xfff00000));
+  RC (RC_CPU_WINDOW_STARTHI) = (cpu >> 32) & 0xff;
+  RC (RC_CPU_WINDOW_ENDHI) = (end >> 32) & 0xff;
+  RC (RC_CLASS) = (6 << 16) | (4 << 8);                          // the root port is a PCI-to-PCI bridge (class 6, sub class 4)
+  RC (RC_HARD_DEBUG) |= 2;    delay_us (100);                    // clock request
+  RC (0x20) = (u32) (((pci >> 16) & 0xfff0) | ((pci + plat.pci_mem_size - 1) & 0xfff00000));    // the window of the root port's bridge for the devices behind it
+  return 0;
 }
 @
 
@@ -99,6 +232,8 @@ void pci_write (int bus, int dev, int fn, int reg, u32 v);
 u64  pci_assign_bar (const struct pci_dev *d, int bar, u64 *size_out);
 void pci_enable (const struct pci_dev *d);
 int  pci_find (u32 class_if, struct pci_dev *d);
+extern void arch_map_device (u64 pa);                            // mmu.c: the 1 GByte block of pa as device memory
+void pci_vl805_reset (const struct pci_dev *d);
 
 int  usb_init (void);                  // 0: a controller was found (it may have no device)
 void usb_tick (void);                  // from the timer: look at the event ring
@@ -530,6 +665,7 @@ int usb_init (void) {
   const char *cl = plat_cmdline ();
   if (has_word (cl, "usb=off")) return -1;
   usb_debug = has_word (cl, "debug=usb");
+  DBG ("pci: type %d, registers at 0x%lx, window: PCI 0x%lx, cores 0x%lx, size 0x%lx\n", plat.pci_type, plat.pci_cfg, plat.pci_mem_pci, plat.pci_mem_cpu, plat.pci_mem_size);
   if (!plat.pci_cfg) return -1;
   arch_map_device (plat.pci_cfg);
   arch_map_device (plat.pci_mem_cpu);
@@ -537,6 +673,7 @@ int usb_init (void) {
   if (pci_find (0x0c0330, &d) < 0) return -1;                  // no xHCI controller on the bus (silent: most machines have none)
   u64 size = 0, bar = pci_assign_bar (&d, 0, &size);
   if (!bar) { printf ("usb: no address for the controller\n"); return -1; }
+  pci_vl805_reset (&d);                                        // the Pi: the VideoCore loads the program of the USB chip
   pci_enable (&d);
   arch_map_device (bar);
   base = (volatile u8 *) (KERNEL_VA + bar);

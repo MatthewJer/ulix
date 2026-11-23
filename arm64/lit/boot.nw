@@ -481,6 +481,7 @@ struct platform {
   u8  genet_mac[6];  int genet_has_mac;           // its Ethernet address as the firmware wrote it into the device tree
   u64 rtc;                       // PL031
   u64 rng;                       // the random number generator of the Raspberry Pi 4 (RNG200), 0: none (random.c)
+  int pci_type;                  // 1: generic PCI host (ECAM), 2: the Raspberry Pi 4 (BCM2711)
   u64 pci_cfg, pci_mem_pci, pci_mem_cpu, pci_mem_size;   // PCI Express: configuration space, window for the BARs (as the devices see it, as the cores see it, size); 0: no PCI (usb.nw)
   u64 mbox;                      // the mailbox of the VideoCore (frame buffer, clocks), 0: none (mbox.c, chapter "Screen")
   int timer_irq;                 // INTID of the EL1 physical timer (a PPI)
